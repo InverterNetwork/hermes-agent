@@ -491,15 +491,16 @@ class TestBuildNousSubscriptionPrompt:
 
 
 class TestBuildContextFilesPrompt:
-    def test_empty_dir_loads_seeded_global_soul(self, tmp_path):
-        from unittest.mock import patch
-
-        fake_home = tmp_path / "fake_home"
-        fake_home.mkdir()
-        with patch("pathlib.Path.home", return_value=fake_home):
-            result = build_context_files_prompt(cwd=str(tmp_path))
-        assert "Project Context" in result
-        assert "Hermes Agent" in result
+    def test_empty_dir_with_no_soul_returns_empty(self, tmp_path, monkeypatch):
+        # Runtime no longer seeds SOUL.md (rails are root-owned in the
+        # rendered install layout — only the installer can place it). With
+        # no SOUL.md and no project context files, the prompt is empty.
+        # ``test_loads_soul_md_from_hermes_home_only`` below already covers
+        # the present-and-loaded case.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+        (tmp_path / "hermes_home").mkdir()
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert result == ""
 
     def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")

@@ -1044,7 +1044,7 @@ class TestBundledSkillGuard:
 
     def test_guard_no_op_when_bundled_dir_unavailable(self, tmp_path):
         """If _get_bundled_dir raises (e.g. broken import), the guard becomes
-        a no-op. Better than blocking writes on a broken telemetry path —
+        a no-op. Better than blocking writes on a broken bundled-dir lookup —
         the syscall layer will still EACCES if the path is genuinely RO."""
         user = tmp_path / "skills"
         user.mkdir()

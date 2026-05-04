@@ -145,7 +145,7 @@ def _bundled_skills_root() -> Optional[Path]:
     a clear, actionable message.
 
     Best-effort: returns None if the lookup fails so the guard becomes a
-    no-op rather than blocking writes on a broken telemetry import.
+    no-op rather than blocking writes on a broken bundled-dir import.
     """
     try:
         from tools.skills_sync import _get_bundled_dir
