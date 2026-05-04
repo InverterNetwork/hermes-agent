@@ -25,14 +25,48 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 
 ### Prerequisites
 
-The installer assumes a local clone of the private `hermes-state` repo already exists on the host. Clone it before the first install:
+Pass exactly one of:
+
+- `--state <path>` — local clone of `hermes-state` already on the host. Clone it once before the first install:
+  ```sh
+  sudo git clone git@github.com:InverterNetwork/hermes-state.git \
+    /srv/hermes/repos/hermes-state
+  ```
+  The installer reads the source's `origin` URL and re-applies it to the rendered clone, so the agent pushes back to GitHub rather than to the local source path.
+- `--state-url <url>` — HTTPS URL to clone direct from GitHub. Requires `--auth-method app` (see [GitHub App auth](#github-app-auth) below) so the installer can authenticate the clone.
+
+### GitHub App auth
+
+For real deploys, the agent authenticates to GitHub as a dedicated App (one App per fork; install it on `hermes-agent` + `hermes-state` only). Pass `--auth-method app` to wire it in.
+
+**One-time App provisioning** (operator, in the GitHub UI):
+
+1. **Settings → Developer settings → GitHub Apps → New GitHub App** under the org that owns the private repos.
+2. **Permissions** (repository): _Contents: Read and write_ + _Pull requests: Read and write_. Metadata stays read-only by default.
+3. **Webhooks**: disable (the agent polls; no inbound webhook is needed).
+4. **Install** the App on the org and **scope it** to exactly `hermes-agent` + `hermes-state` (use "Only select repositories" — never grant org-wide).
+5. Generate a private key (`Settings → Generate a private key`); a `<slug>.<date>.private-key.pem` downloads.
+6. Note the **App ID** (Settings page) and **Installation ID** (the integer in the post-install URL: `https://github.com/organizations/<org>/settings/installations/<id>`).
+7. Stage the key on the host (e.g. `scp` it to `/root/<slug>.pem`, mode 0600 root-owned).
+
+**Per-host install:**
 
 ```sh
-sudo git clone git@github.com:InverterNetwork/hermes-state.git \
-  /srv/hermes/repos/hermes-state
+sudo ./installer/setup-hermes.sh \
+  --fork  /srv/hermes/repos/hermes-agent \
+  --state-url https://github.com/InverterNetwork/hermes-state.git \
+  --user  hermes \
+  --auth-method app \
+  --app-id <APP_ID> \
+  --app-installation-id <INSTALLATION_ID> \
+  --app-key-path /root/<slug>.pem
 ```
 
-The installer reads the source's `origin` URL and re-applies it to the rendered clone, so the agent pushes back to GitHub rather than to the local source path.
+The installer copies the PEM into `$TARGET/auth/github-app.pem` (root:hermes 0640), persists the App + Installation IDs to `$TARGET/auth/github-app.env`, and configures a git credential helper inside `state/.git/config` scoped to `https://github.com`. Subsequent runs reuse the persisted credentials and only need `--auth-method app` to re-assert wiring.
+
+Every run with `--auth-method app` ends with a live mint call (`hermes_github_token.py check`) to confirm the agent can actually authenticate to GitHub end-to-end. **This means re-installs require live `api.github.com` egress.** If GitHub is degraded or the host is offline, pass `--skip-auth-check` to skip the mint and still update the rails / state symlinks.
+
+Key rotation: re-run with `--app-key-path <new-path>` to overwrite the staged PEM. The token cache at `$TARGET/cache/github-token.json` self-refreshes within 5 minutes of expiry; delete it to force-refresh sooner.
 
 ### Render-target layout
 
@@ -46,6 +80,9 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `state/` | `hermes:hermes` | 755 | clone of `hermes-state`; `.git/` agent-owned |
 | `skills`, `memories`, `cron` | `hermes:hermes` (symlink) | — | resolve to `state/<name>` |
 | `sessions/`, `logs/`, `cache/` | `hermes:hermes` | 755 | local-only (gitignored content) |
+| `auth/` | `root:hermes` | 750 | App key + env config (only present with `--auth-method app`) |
+| `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent) |
+| `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path |
 
 Agent writes through the symlinks land inside the `state/` working tree, where the auto-commit pipeline can pick them up.
 
@@ -66,7 +103,6 @@ Repo-local `user.name = didier` and `user.email = didier@<hostname -s>` are conf
 
 Some pieces are deliberately deferred:
 
-- **Authenticated state-repo cloning (`--state-url`).** The installer requires a pre-existing local clone; cloning straight from GitHub depends on the agent-token design.
 - **`--verify` mode.** Drift detection without mutation is not yet implemented.
 - **systemd / launchd unit installation.** No daemon supervision yet.
 - **macOS branch.** v0 is Linux-only.
