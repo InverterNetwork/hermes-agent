@@ -13,6 +13,14 @@ Usage:
     python cli.py --gateway
 """
 
+import sys
+
+# Skip writing .pyc files. The render-target install lives at
+# ~/.hermes/hermes-agent/ which is root-owned read-only for the agent user, so
+# Python can't create __pycache__/ alongside source modules. Set this before
+# any other import so transitive imports inherit the flag.
+sys.dont_write_bytecode = True
+
 import asyncio
 import dataclasses
 import inspect
@@ -21,7 +29,6 @@ import logging
 import os
 import re
 import shlex
-import sys
 import signal
 import tempfile
 import threading

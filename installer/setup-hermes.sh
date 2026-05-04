@@ -218,8 +218,21 @@ find "$TARGET_DIR/hermes-agent" -type d -exec chmod 755 {} +
 find "$TARGET_DIR/hermes-agent" -type f ! -perm -u+x -exec chmod 644 {} +
 chown -R root:root "$TARGET_DIR/hermes-agent"
 
-# overlay files at the root of the render target
-install -o root -g root -m 644 "$FORK_DIR/SOUL.md" "$TARGET_DIR/SOUL.md"
+# overlay files at the root of the render target.
+#
+# SOUL.md: seed from the fork on first install only. The runtime no longer
+# writes SOUL.md (it's rails — root-owned, read-only to the agent), so the
+# installer is the only thing that can place it. Idempotent on re-run: an
+# operator's customized SOUL.md survives subsequent installs. To force a
+# refresh from the fork, delete $TARGET_DIR/SOUL.md before re-running.
+[[ -f "$FORK_DIR/SOUL.md" ]] \
+  || { echo "FAIL: fork is missing SOUL.md at $FORK_DIR/SOUL.md" >&2; exit 1; }
+if [[ -f "$TARGET_DIR/SOUL.md" ]]; then
+  echo "==> SOUL.md already present at $TARGET_DIR/SOUL.md (preserving)"
+else
+  echo "==> seeding SOUL.md from $FORK_DIR/SOUL.md"
+  install -o root -g root -m 644 "$FORK_DIR/SOUL.md" "$TARGET_DIR/SOUL.md"
+fi
 install -d -o root -g root -m 755 "$TARGET_DIR/hooks"
 
 # config.yaml is left unseeded for v0 — first-run wizard creates it.
