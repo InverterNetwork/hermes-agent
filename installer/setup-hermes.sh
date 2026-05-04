@@ -6,42 +6,61 @@
 # Builds the venv inside the rails so it shares the same read-only protection.
 #
 # TODO (subsequent passes):
-#   - clone the state repo + configure repo-local git identity in it
 #   - seed config.yaml (or document first-run wizard handoff)
 #   - install launchd plist / systemd unit for the gateway
-#   - provision + store agent-scoped GitHub tokens
+#   - provision + store agent-scoped GitHub tokens (--state-url + auth)
 #   - implement --verify (drift detection without mutation)
 #   - macOS branch (root:wheel, /Library/LaunchDaemons)
 #
 # Usage:
 #   sudo setup-hermes.sh \
 #     --fork    /srv/hermes/repos/hermes-agent \
+#     --state   /srv/hermes/repos/hermes-state \
 #     --user    hermes \
 #     --target  /home/hermes/.hermes
 #
 # Build deps (build-essential, python3.12-dev, python3.12-venv, libffi-dev,
 # rsync) are installed automatically on Debian/Ubuntu hosts. Pass --skip-prep
 # if you manage system packages externally.
+#
+# State repo: --state must point at a local clone of the private hermes-state
+# repo (operator clones it from GitHub once before the first install). The
+# installer clones into $TARGET/state/ on first run; subsequent runs leave the
+# existing clone untouched so the agent's uncommitted work is never destroyed.
+# Pass --force-state to force a fresh re-clone.
 
 set -euo pipefail
 
 # ---------- defaults ----------
 FORK_DIR="/srv/hermes/repos/hermes-agent"
+STATE_DIR="/srv/hermes/repos/hermes-state"
 AGENT_USER="hermes"
 TARGET_DIR=""
 PYTHON_BIN="python3.12"
 SKIP_PREP=0
+FORCE_STATE=0
+GIT_IDENTITY_NAME="didier"
+# Email default is derived per-host so each deployment self-identifies
+# in the state repo's commit log (e.g. didier@krustentier).
+GIT_IDENTITY_EMAIL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --fork)       FORK_DIR="$2";    shift 2 ;;
-    --user)       AGENT_USER="$2";  shift 2 ;;
-    --target)     TARGET_DIR="$2";  shift 2 ;;
-    --python)     PYTHON_BIN="$2";  shift 2 ;;
-    --skip-prep)  SKIP_PREP=1;      shift   ;;
+    --fork)                FORK_DIR="$2";          shift 2 ;;
+    --state)               STATE_DIR="$2";         shift 2 ;;
+    --user)                AGENT_USER="$2";        shift 2 ;;
+    --target)              TARGET_DIR="$2";        shift 2 ;;
+    --python)              PYTHON_BIN="$2";        shift 2 ;;
+    --skip-prep)           SKIP_PREP=1;            shift   ;;
+    --force-state)         FORCE_STATE=1;          shift   ;;
+    --git-identity-email)  GIT_IDENTITY_EMAIL="$2"; shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
+
+if [[ -z "$GIT_IDENTITY_EMAIL" ]]; then
+  GIT_IDENTITY_EMAIL="didier@$(hostname -s)"
+fi
 
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ "$(uname -s)" == "Linux" ]] || { echo "v0 is Linux-only" >&2; exit 1; }
@@ -84,17 +103,27 @@ TARGET_DIR="${TARGET_DIR:-$AGENT_HOME/.hermes}"
 
 [[ -d "$FORK_DIR/.git" ]] \
   || { echo "fork dir not a git repo: $FORK_DIR" >&2; exit 1; }
+[[ -d "$STATE_DIR/.git" ]] \
+  || { echo "state dir not a git repo: $STATE_DIR (clone hermes-state from GitHub manually first)" >&2; exit 1; }
 
 # RUNTIME_VERSION must reflect what's on disk, not just what's committed.
 # rsync copies the working tree, so a dirty tree means uncommitted edits will
 # be installed; record that with a -dirty suffix so the fingerprint doesn't lie.
 FORK_SHA="$(git -C "$FORK_DIR" describe --always --dirty --abbrev=40)"
 
+# State source's origin URL — re-applied to the destination clone so the agent
+# pushes back to GitHub, not to the local source path. Empty if source has no
+# origin (e.g. a fresh local fixture in CI), in which case the clone keeps its
+# default origin pointing at $STATE_DIR.
+STATE_ORIGIN_URL="$(git -C "$STATE_DIR" remote get-url origin 2>/dev/null || true)"
+
 echo "==> setup-hermes.sh"
 echo "    fork:    $FORK_DIR (@ $FORK_SHA)"
+echo "    state:   $STATE_DIR${STATE_ORIGIN_URL:+ (origin: $STATE_ORIGIN_URL)}"
 echo "    user:    $AGENT_USER"
 echo "    target:  $TARGET_DIR"
 echo "    python:  $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
+echo "    git id:  $GIT_IDENTITY_NAME <$GIT_IDENTITY_EMAIL>"
 echo
 
 # ---------- rails (root-owned, read-only to agent) ----------
@@ -154,13 +183,68 @@ find "$TARGET_DIR/hermes-agent/venv" -type f ! -perm -u+x -exec chmod 644 {} +
 find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 
 # ---------- state (agent-owned, writable) ----------
-# v0: empty agent-owned dirs only.
-# TODO: clone state repo into ~/.hermes/state/ with repo-local git identity
-# configured, then symlink skills/memories/cron into it.
+# state/ is a clone of the private hermes-state repo. skills/memories/cron at
+# the render-target root are symlinks into state/, so the agent's writes show
+# up as git changes that the auto-commit pipeline (future work) can ship.
+#
+# Re-run policy: if state/ already has a .git, leave it alone — destroying it
+# would clobber any uncommitted agent work. --force-state is the opt-in escape
+# hatch (re-clones from $STATE_DIR).
 
-echo "==> rendering state dirs (agent-owned)"
-for d in skills memories cron cron/output sessions logs cache; do
+STATE_TARGET="$TARGET_DIR/state"
+
+if [[ "$FORCE_STATE" -eq 1 && -e "$STATE_TARGET" ]]; then
+  echo "==> --force-state: removing existing $STATE_TARGET"
+  rm -rf "$STATE_TARGET"
+fi
+
+if [[ ! -d "$STATE_TARGET/.git" ]]; then
+  echo "==> cloning state repo into $STATE_TARGET"
+  # Clone as root; chown to agent afterwards so .git/ is fully agent-owned and
+  # the agent can run `git fetch` / `git commit` without sudo. --no-hardlinks
+  # is required: git's default local-clone optimization hardlinks .git/objects/
+  # from source to dest, which would mean our chown -R on the dest also flips
+  # ownership on the source repo's inodes (same inode, two paths).
+  git clone --quiet --no-hardlinks "$STATE_DIR" "$STATE_TARGET"
+  if [[ -n "$STATE_ORIGIN_URL" ]]; then
+    git -C "$STATE_TARGET" remote set-url origin "$STATE_ORIGIN_URL"
+  fi
+  chown -R "$AGENT_USER:$AGENT_USER" "$STATE_TARGET"
+else
+  echo "==> state repo already present at $STATE_TARGET (preserving; pass --force-state to re-clone)"
+fi
+
+# Identity is re-applied every run (idempotent) so config drift gets fixed.
+sudo -u "$AGENT_USER" git -C "$STATE_TARGET" config user.name  "$GIT_IDENTITY_NAME"
+sudo -u "$AGENT_USER" git -C "$STATE_TARGET" config user.email "$GIT_IDENTITY_EMAIL"
+
+# Real agent-owned dirs that don't belong in git (gitignored anyway).
+for d in sessions logs cache; do
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/$d"
+done
+
+# Symlinks at render-target root so the agent's existing paths
+# ($TARGET/skills, $TARGET/memories, $TARGET/cron) keep working but writes
+# land inside the git repo. ln -snf is idempotent: replaces existing symlinks
+# in place and refuses to descend into a real directory (we error below if so).
+echo "==> wiring state symlinks (skills, memories, cron)"
+for d in skills memories cron; do
+  link="$TARGET_DIR/$d"
+  # Pre-clean: if a previous v0 install left real dirs here, they need to go.
+  # Only delete if empty; non-empty means we'd lose data — refuse and let the
+  # operator decide. (This mostly affects machines that ran v0 of the installer
+  # and now upgrade to v0.2.)
+  if [[ -d "$link" && ! -L "$link" ]]; then
+    if rmdir "$link" 2>/dev/null; then
+      :
+    else
+      echo "FAIL: $link is a non-empty directory from a previous install." >&2
+      echo "      Move its contents into $STATE_TARGET/$d/ and retry, or remove it manually." >&2
+      exit 1
+    fi
+  fi
+  ln -snf "state/$d" "$link"
+  chown -h "$AGENT_USER:$AGENT_USER" "$link"
 done
 
 # ---------- post-install assertion ----------
@@ -168,6 +252,26 @@ done
 HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 [[ -x "$HERMES_BIN" ]] \
   || { echo "FAIL: hermes entry point missing or non-executable at $HERMES_BIN" >&2; exit 1; }
+
+# State assertions: the agent must own .git/ and the symlinks must resolve
+# into the clone, otherwise auto-commit (ITRY-1283) will silently fail later.
+[[ -d "$STATE_TARGET/.git" ]] \
+  || { echo "FAIL: state clone missing .git at $STATE_TARGET" >&2; exit 1; }
+state_git_owner="$(stat -c '%U' "$STATE_TARGET/.git")"
+[[ "$state_git_owner" == "$AGENT_USER" ]] \
+  || { echo "FAIL: $STATE_TARGET/.git owned by $state_git_owner, expected $AGENT_USER" >&2; exit 1; }
+for d in skills memories cron; do
+  [[ -L "$TARGET_DIR/$d" ]] \
+    || { echo "FAIL: $TARGET_DIR/$d is not a symlink" >&2; exit 1; }
+  resolved="$(readlink "$TARGET_DIR/$d")"
+  [[ "$resolved" == "state/$d" ]] \
+    || { echo "FAIL: $TARGET_DIR/$d -> $resolved (expected state/$d)" >&2; exit 1; }
+done
+configured_email="$(sudo -u "$AGENT_USER" git -C "$STATE_TARGET" config user.email)"
+[[ "$configured_email" == "$GIT_IDENTITY_EMAIL" ]] \
+  || { echo "FAIL: state git user.email=$configured_email (expected $GIT_IDENTITY_EMAIL)" >&2; exit 1; }
+
+STATE_SHA="$(git -C "$STATE_TARGET" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 # ---------- summary ----------
 
@@ -178,4 +282,6 @@ echo
 echo "RUNTIME_VERSION: $(cat "$TARGET_DIR/RUNTIME_VERSION")"
 echo "venv python:     $("$TARGET_DIR/hermes-agent/venv/bin/python" --version 2>&1)"
 echo "hermes entry:    $HERMES_BIN"
+echo "state HEAD:      $STATE_SHA"
+echo "git identity:    $GIT_IDENTITY_NAME <$GIT_IDENTITY_EMAIL>"
 echo "done."
