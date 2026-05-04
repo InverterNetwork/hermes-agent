@@ -1,0 +1,94 @@
+name: installer-smoke
+# Validates installer/setup-hermes.sh on a clean Ubuntu runner:
+# - renders into a target dir
+# - permission boundary holds (rails read-only to agent, state writable)
+# - hermes entry point runs as the agent user
+# - second run is idempotent and fast
+
+on:
+  pull_request:
+    paths:
+      - 'installer/**'
+      - 'ops/**'
+      - 'pyproject.toml'
+      - '.github/workflows/installer-smoke.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'installer/**'
+      - 'ops/**'
+      - 'pyproject.toml'
+      - '.github/workflows/installer-smoke.yml'
+
+permissions:
+  contents: read
+
+# Cancel in-flight runs on the same ref when a new commit lands; saves CI
+# minutes when rapid pushes obsolete previous runs.
+concurrency:
+  group: installer-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: stage fork at /srv/hermes/repos/hermes-agent
+        run: |
+          sudo mkdir -p /srv/hermes/repos
+          sudo cp -a "$GITHUB_WORKSPACE" /srv/hermes/repos/hermes-agent
+          sudo chown -R root:root /srv/hermes
+
+      - name: create hermes service user
+        run: sudo useradd -m -s /bin/bash hermes
+
+      - name: run installer (first run; should provision build deps)
+        run: |
+          sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
+            --fork /srv/hermes/repos/hermes-agent \
+            --user hermes
+
+      - name: permission probes (rails read-only, state writable)
+        run: |
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            if echo x > "$T/SOUL.md" 2>/dev/null;             then echo "FAIL: agent wrote rails SOUL.md"; exit 1; fi
+            if echo x > "$T/hermes-agent/probe.py" 2>/dev/null; then echo "FAIL: agent wrote rails hermes-agent/"; exit 1; fi
+            if echo x > "$T/RUNTIME_VERSION" 2>/dev/null;     then echo "FAIL: agent wrote rails RUNTIME_VERSION"; exit 1; fi
+            echo x > "$T/skills/probe.txt"
+            echo x > "$T/memories/probe.txt"
+            echo x > "$T/cron/output/probe.txt"
+            "$T/hermes-agent/venv/bin/hermes" --help > /dev/null
+            echo "permission probes: OK"
+          '
+
+      - name: idempotency (second run is fast no-op)
+        run: |
+          start=$SECONDS
+          sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
+            --fork /srv/hermes/repos/hermes-agent \
+            --user hermes \
+            --skip-prep
+          elapsed=$(( SECONDS - start ))
+          echo "second run took ${elapsed}s"
+          # Threshold is generous (120s vs ~10s observed) to absorb PyPI
+          # latency without flaky failures. The pip upgrade + editable
+          # reinstall hits the network even on a no-op pass; bumping past
+          # this should still be a real signal.
+          if [ "$elapsed" -gt 120 ]; then
+            echo "FAIL: second run too slow (${elapsed}s > 120s); idempotency may be broken"
+            exit 1
+          fi
+
+      - name: render summary on failure
+        if: failure()
+        run: |
+          echo "=== render target ==="
+          sudo ls -la /home/hermes/.hermes/ || true
+          echo "=== runtime version ==="
+          sudo cat /home/hermes/.hermes/RUNTIME_VERSION || true
+          echo "=== venv contents (head) ==="
+          sudo ls /home/hermes/.hermes/hermes-agent/venv/bin/ | head -20 || true
