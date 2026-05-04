@@ -43,12 +43,19 @@ Usage:
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
+import sys
+
+# Skip writing .pyc files. The render-target install lives at
+# ~/.hermes/hermes-agent/ which is root-owned read-only for the agent user, so
+# Python can't create __pycache__/ alongside source modules. Set this before
+# any other import so transitive imports inherit the flag.
+sys.dont_write_bytecode = True
+
 import argparse
 import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
 

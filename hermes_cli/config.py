@@ -97,7 +97,6 @@ _EXTRA_ENV_KEYS = frozenset({
 import yaml
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
 
 # =============================================================================
@@ -324,21 +323,17 @@ def _secure_file(path):
         pass
 
 
-def _ensure_default_soul_md(home: Path) -> None:
-    """Seed a default SOUL.md into HERMES_HOME if the user doesn't have one yet."""
-    soul_path = home / "SOUL.md"
-    if soul_path.exists():
-        return
-    soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
-    _secure_file(soul_path)
-
-
 def ensure_hermes_home():
     """Ensure ~/.hermes directory structure exists with secure permissions.
 
     In managed mode (NixOS), dirs are created by the activation script with
     setgid + group-writable (2770). We skip mkdir and set umask(0o007) so
-    any files created (e.g. SOUL.md) are group-writable (0660).
+    any files created here are group-writable (0660).
+
+    SOUL.md seeding is intentionally not done at runtime: in the rendered
+    install layout SOUL.md lives under the rails (root-owned, read-only to
+    the agent), so the installer seeds it during render. See
+    installer/setup-hermes.sh.
     """
     home = get_hermes_home()
     if is_managed():
@@ -354,11 +349,10 @@ def ensure_hermes_home():
             d = home / subdir
             d.mkdir(parents=True, exist_ok=True)
             _secure_dir(d)
-        _ensure_default_soul_md(home)
 
 
 def _ensure_hermes_home_managed(home: Path):
-    """Managed-mode variant: verify dirs exist (activation creates them), seed SOUL.md."""
+    """Managed-mode variant: verify dirs exist (activation creates them)."""
     if not home.is_dir():
         raise RuntimeError(
             f"HERMES_HOME {home} does not exist. "
@@ -375,8 +369,6 @@ def _ensure_hermes_home_managed(home: Path):
     # In managed mode the activation script may not know about this subdir,
     # so we mkdir it ourselves (it's inside an already-secured logs/ dir).
     (home / "logs" / "curator").mkdir(parents=True, exist_ok=True)
-    # Inside umask(0o007) scope — SOUL.md will be created as 0660
-    _ensure_default_soul_md(home)
 
 
 # =============================================================================

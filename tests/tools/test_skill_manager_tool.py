@@ -946,3 +946,112 @@ class TestPinnedGuard:
                        side_effect=RuntimeError("sidecar broken")):
                 result = _edit_skill("my-skill", VALID_SKILL_CONTENT_2)
         assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Bundled-skill guard
+# ---------------------------------------------------------------------------
+
+
+class TestBundledSkillGuard:
+    """All five mutating actions must refuse bundled skills with a clear
+    message, instead of letting the syscall fail with EACCES.
+
+    Bundled skills live under the rendered rails dir
+    (``~/.hermes/hermes-agent/skills/``) which is root-owned read-only to the
+    agent in the deployment model. Surfacing the reason here keeps logs
+    readable and tells the agent / operator the supported way to override.
+    """
+
+    @contextmanager
+    def _bundled_layout(self, tmp_path):
+        """Stand up a fake rendered install: a bundled rails dir AND a user
+        skills dir, both visible to ``_find_skill`` via get_all_skills_dirs.
+        ``_get_bundled_dir`` resolves to the rails dir."""
+        bundled = tmp_path / "hermes-agent" / "skills"
+        user = tmp_path / "skills"
+        bundled.mkdir(parents=True)
+        user.mkdir(parents=True)
+        with patch("tools.skill_manager_tool.SKILLS_DIR", user), \
+             patch("agent.skill_utils.get_all_skills_dirs",
+                   return_value=[user, bundled]), \
+             patch("tools.skills_sync._get_bundled_dir", return_value=bundled):
+            yield bundled, user
+
+    def _seed_bundled(self, bundled_dir: Path, name: str = "bundled-one"):
+        skill = bundled_dir / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+        return skill
+
+    def test_edit_bundled_refused(self, tmp_path):
+        with self._bundled_layout(tmp_path) as (bundled, _):
+            self._seed_bundled(bundled)
+            result = _edit_skill("bundled-one", VALID_SKILL_CONTENT_2)
+        assert result["success"] is False
+        assert "bundled" in result["error"].lower()
+        assert "read-only" in result["error"].lower()
+
+    def test_patch_bundled_refused(self, tmp_path):
+        with self._bundled_layout(tmp_path) as (bundled, _):
+            self._seed_bundled(bundled)
+            result = _patch_skill(
+                "bundled-one", "Do the thing.", "Do something else.",
+            )
+        assert result["success"] is False
+        assert "bundled" in result["error"].lower()
+
+    def test_delete_bundled_refused(self, tmp_path):
+        with self._bundled_layout(tmp_path) as (bundled, _):
+            self._seed_bundled(bundled)
+            result = _delete_skill("bundled-one", absorbed_into="")
+        assert result["success"] is False
+        assert "bundled" in result["error"].lower()
+        # Refused before any rmtree happened.
+        assert (bundled / "bundled-one" / "SKILL.md").exists()
+
+    def test_write_file_bundled_refused(self, tmp_path):
+        with self._bundled_layout(tmp_path) as (bundled, _):
+            self._seed_bundled(bundled)
+            result = _write_file(
+                "bundled-one", "references/note.md", "hello",
+            )
+        assert result["success"] is False
+        assert "bundled" in result["error"].lower()
+
+    def test_remove_file_bundled_refused(self, tmp_path):
+        with self._bundled_layout(tmp_path) as (bundled, _):
+            skill = self._seed_bundled(bundled)
+            (skill / "references").mkdir()
+            (skill / "references" / "note.md").write_text("hello")
+            result = _remove_file("bundled-one", "references/note.md")
+        assert result["success"] is False
+        assert "bundled" in result["error"].lower()
+        assert (skill / "references" / "note.md").exists()
+
+    def test_user_skill_with_same_name_unaffected(self, tmp_path):
+        """The local skills dir is searched first by _find_skill, so a user
+        skill with the same name as a bundled one resolves to the user copy
+        and is freely editable. The guard only fires for skills whose path
+        actually resolves under the bundled rails dir."""
+        with self._bundled_layout(tmp_path) as (bundled, user):
+            self._seed_bundled(bundled, "shared-name")
+            user_skill = user / "shared-name"
+            user_skill.mkdir()
+            (user_skill / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+            result = _edit_skill("shared-name", VALID_SKILL_CONTENT_2)
+        assert result["success"] is True
+
+    def test_guard_no_op_when_bundled_dir_unavailable(self, tmp_path):
+        """If _get_bundled_dir raises (e.g. broken import), the guard becomes
+        a no-op. Better than blocking writes on a broken bundled-dir lookup —
+        the syscall layer will still EACCES if the path is genuinely RO."""
+        user = tmp_path / "skills"
+        user.mkdir()
+        with patch("tools.skill_manager_tool.SKILLS_DIR", user), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[user]), \
+             patch("tools.skills_sync._get_bundled_dir",
+                   side_effect=RuntimeError("import broken")):
+            _create_skill("free-one", VALID_SKILL_CONTENT)
+            result = _edit_skill("free-one", VALID_SKILL_CONTENT_2)
+        assert result["success"] is True

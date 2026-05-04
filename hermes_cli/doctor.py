@@ -646,15 +646,26 @@ def run_doctor(args):
     else:
         check_warn(f"{_DHH}/SOUL.md not found", "(create it to give Hermes a custom personality)")
         if should_fix:
-            soul_path.parent.mkdir(parents=True, exist_ok=True)
-            soul_path.write_text(
-                "# Hermes Agent Persona\n\n"
-                "<!-- Edit this file to customize how Hermes communicates. -->\n\n"
-                "You are Hermes, a helpful AI assistant.\n",
-                encoding="utf-8",
-            )
-            check_ok(f"Created {_DHH}/SOUL.md with basic template")
-            fixed_count += 1
+            # SOUL.md lives under the rails (root-owned read-only to the agent
+            # in the rendered install layout). Probe write permission before
+            # touching it — operators using `hermes doctor --fix` from the
+            # agent user otherwise hit a bare EACCES. When unwritable, point
+            # at the installer instead of failing silently.
+            try:
+                soul_path.parent.mkdir(parents=True, exist_ok=True)
+                soul_path.write_text(
+                    "# Hermes Agent Persona\n\n"
+                    "<!-- Edit this file to customize how Hermes communicates. -->\n\n"
+                    "You are Hermes, a helpful AI assistant.\n",
+                    encoding="utf-8",
+                )
+                check_ok(f"Created {_DHH}/SOUL.md with basic template")
+                fixed_count += 1
+            except OSError:
+                check_warn(
+                    f"{_DHH}/SOUL.md is not writable from this user",
+                    "(re-run installer/setup-hermes.sh as root to seed it)",
+                )
     
     # Check memory directory
     memories_dir = hermes_home / "memories"

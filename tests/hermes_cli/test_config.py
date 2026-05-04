@@ -45,19 +45,14 @@ class TestEnsureHermesHome:
             assert (tmp_path / "logs").is_dir()
             assert (tmp_path / "memories").is_dir()
 
-    def test_creates_default_soul_md_if_missing(self, tmp_path):
+    def test_does_not_seed_soul_md_at_runtime(self, tmp_path):
+        # SOUL.md lives under the rails (root-owned, read-only to the agent
+        # in the rendered install layout). Runtime is not allowed to write it
+        # — the installer seeds it via setup-hermes.sh. Verify ensure_hermes_home
+        # makes no attempt at runtime.
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             ensure_hermes_home()
-            soul_path = tmp_path / "SOUL.md"
-            assert soul_path.exists()
-            assert soul_path.read_text(encoding="utf-8").strip() != ""
-
-    def test_does_not_overwrite_existing_soul_md(self, tmp_path):
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            soul_path = tmp_path / "SOUL.md"
-            soul_path.write_text("custom soul", encoding="utf-8")
-            ensure_hermes_home()
-            assert soul_path.read_text(encoding="utf-8") == "custom soul"
+            assert not (tmp_path / "SOUL.md").exists()
 
 
 class TestLoadConfigDefaults:

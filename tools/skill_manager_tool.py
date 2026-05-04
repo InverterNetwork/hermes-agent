@@ -134,6 +134,50 @@ def _containing_skills_root(skill_path: Path) -> Path:
     return SKILLS_DIR
 
 
+def _bundled_skills_root() -> Optional[Path]:
+    """Return the resolved path to the bundled skills directory, or None.
+
+    Bundled skills ship with the agent fork (under ``hermes-agent/skills/``
+    after rendering, ``<repo>/skills/`` in dev). In the read-only-rails
+    deployment model that directory is owned by root and the agent has no
+    write permission — so any attempt to mutate a skill that resolves there
+    will fail with EACCES at the syscall level. We catch it earlier with
+    a clear, actionable message.
+
+    Best-effort: returns None if the lookup fails so the guard becomes a
+    no-op rather than blocking writes on a broken bundled-dir import.
+    """
+    try:
+        from tools.skills_sync import _get_bundled_dir
+        bundled = _get_bundled_dir()
+        return bundled.resolve() if bundled.exists() else None
+    except Exception:
+        logger.debug("could not locate bundled skills dir for guard", exc_info=True)
+        return None
+
+
+def _bundled_guard(name: str, skill_path: Path) -> Optional[str]:
+    """Return a refusal message if ``skill_path`` is under bundled rails, else None.
+
+    Bundled skills are intentionally read-only; the only supported way to
+    modify one is to open a PR against the fork. Surfacing the reason here
+    is friendlier than letting the write fail with a raw permission error.
+    """
+    bundled_root = _bundled_skills_root()
+    if bundled_root is None:
+        return None
+    try:
+        skill_path.resolve().relative_to(bundled_root)
+    except (ValueError, OSError):
+        return None
+    return (
+        f"Skill '{name}' is bundled with the agent and is read-only. "
+        f"To modify it, open a PR against the fork repo. "
+        f"To create a user override, copy it to ~/.hermes/skills/{name}/ "
+        f"and edit there."
+    )
+
+
 def _pinned_guard(name: str) -> Optional[str]:
     """Return a refusal message if *name* is pinned, else None.
 
@@ -439,6 +483,10 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
 
+    bundled_err = _bundled_guard(name, existing["path"])
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
     pinned_err = _pinned_guard(name)
     if pinned_err:
         return {"success": False, "error": pinned_err}
@@ -482,6 +530,10 @@ def _patch_skill(
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
+
+    bundled_err = _bundled_guard(name, existing["path"])
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
 
     pinned_err = _pinned_guard(name)
     if pinned_err:
@@ -576,6 +628,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
 
+    bundled_err = _bundled_guard(name, existing["path"])
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
     pinned_err = _pinned_guard(name)
     if pinned_err:
         return {"success": False, "error": pinned_err}
@@ -645,6 +701,10 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found. Create it first with action='create'."}
 
+    bundled_err = _bundled_guard(name, existing["path"])
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
+
     pinned_err = _pinned_guard(name)
     if pinned_err:
         return {"success": False, "error": pinned_err}
@@ -682,6 +742,10 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": f"Skill '{name}' not found."}
+
+    bundled_err = _bundled_guard(name, existing["path"])
+    if bundled_err:
+        return {"success": False, "error": bundled_err}
 
     pinned_err = _pinned_guard(name)
     if pinned_err:
