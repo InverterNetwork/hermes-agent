@@ -336,10 +336,13 @@ fi
 # Credential helper command — used both for the initial --state-url clone and
 # persisted into state/.git/config so subsequent fetches/pushes use the App.
 # The leading '!' makes git execute via shell; git appends the action
-# (get/store/erase) as the next argv to the helper.
+# (get/store/erase) as the next argv to the helper. HERMES_HOME is baked in
+# so non-default --target installs (e.g. /opt/hermes) point the helper at the
+# correct auth/ + cache/ directories at git-fetch time, when the agent's env
+# may not carry HERMES_HOME.
 GIT_CRED_HELPER=""
 if [[ "$AUTH_METHOD" == "app" ]]; then
-  GIT_CRED_HELPER="!$VENV_PY $TOKEN_HELPER_PY credential"
+  GIT_CRED_HELPER="!HERMES_HOME='$TARGET_DIR' $VENV_PY $TOKEN_HELPER_PY credential"
 fi
 
 if [[ ! -d "$STATE_TARGET/.git" ]]; then

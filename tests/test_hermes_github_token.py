@@ -163,6 +163,33 @@ def test_credential_protocol_no_op(hermes_home):
     assert hgt.credential_protocol("erase", "") == ""
 
 
+@pytest.mark.parametrize(
+    "stdin",
+    [
+        # Non-github host
+        "protocol=https\nhost=evil.example.com\n",
+        # Non-https protocol
+        "protocol=http\nhost=github.com\n",
+        # Subdomain — github.com is the only allowed host.
+        "protocol=https\nhost=raw.githubusercontent.com\n",
+        # Missing host entirely
+        "protocol=https\n",
+        # Missing protocol
+        "host=github.com\n",
+        # Empty stdin
+        "",
+    ],
+)
+def test_credential_protocol_refuses_non_github(hermes_home, monkeypatch, stdin):
+    # Even though git's config scopes the helper to https://github.com, an
+    # unscoped invocation (config drift, manual `git credential fill`) must
+    # not surface the App token. Empty output = "no credential available".
+    monkeypatch.setenv("HERMES_GH_TOKEN_OVERRIDE", "ghs_should_never_leak")
+    out = hgt.credential_protocol("get", stdin=stdin)
+    assert out == ""
+    assert "ghs_should_never_leak" not in out
+
+
 def test_fetch_installation_token_posts_to_correct_endpoint(rsa_keypair):
     priv, _ = rsa_keypair
 
@@ -205,6 +232,25 @@ def test_check_action_silent_success(hermes_home, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "ghs_secret_should_never_print" not in captured.out
     assert captured.out == ""
+
+
+def test_hermes_home_self_locates_from_script(tmp_path, monkeypatch):
+    # The persisted git credential helper bakes HERMES_HOME=$TARGET_DIR, but
+    # if anything ever invokes the helper without that env (cron, manual
+    # debugging, future code paths), it should still find the install by
+    # walking up from its own __file__ path. Simulate the rendered layout:
+    # $TARGET/hermes-agent/installer/<this script>.
+    target = tmp_path / "render"
+    (target / "auth").mkdir(parents=True)
+    fake_installer = target / "hermes-agent" / "installer"
+    fake_installer.mkdir(parents=True)
+    fake_script = fake_installer / "hermes_github_token.py"
+    fake_script.write_text("# placeholder")
+
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(hgt, "__file__", str(fake_script))
+
+    assert hgt._hermes_home() == target
 
 
 def test_cache_created_with_secure_mode(hermes_home, rsa_keypair, monkeypatch):

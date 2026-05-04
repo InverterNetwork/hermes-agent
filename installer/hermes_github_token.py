@@ -41,7 +41,22 @@ class ConfigError(RuntimeError):
 
 
 def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    # Priority order, so a helper invoked from anywhere (cron, agent git push,
+    # ad-hoc operator shell) finds the right install:
+    # 1. HERMES_HOME env var — explicit override; the installer bakes this
+    #    into the persisted git credential helper so non-default --target
+    #    installs Just Work, and tests use it for fixtures.
+    # 2. Self-location: this script lives at $TARGET/hermes-agent/installer/,
+    #    so $TARGET = parents[2]. Validates that auth/ exists alongside before
+    #    trusting it, since editable installs / tests have a different layout.
+    # 3. Fallback to ~/.hermes for first-install / dev invocations.
+    if env := os.environ.get("HERMES_HOME"):
+        return Path(env)
+    here = Path(__file__).resolve()
+    candidate = here.parent.parent.parent
+    if (candidate / "auth").is_dir():
+        return candidate
+    return Path.home() / ".hermes"
 
 
 def _default_config_path() -> Path:
@@ -204,14 +219,20 @@ def get_token(cfg: dict[str, str] | None = None, *, now: int | None = None) -> s
 def credential_protocol(action: str, stdin: str = "") -> str:
     if action != "get":
         return ""
-    # Parse incoming key=value lines; we don't actually need them (always serve
-    # the same App token) but consuming stdin keeps git happy.
-    _ = {
+    fields = {
         k: v
         for line in stdin.splitlines()
         if "=" in line
         for k, _, v in [line.partition("=")]
     }
+    # Defense in depth: even though state/.git/config scopes the helper to
+    # https://github.com, a misconfigured remote / git config drift could
+    # invoke us for a different host. Refuse anything that isn't HTTPS+
+    # github.com — the App installation token has no business going elsewhere.
+    # Empty response is git's "no credential available" signal, so it falls
+    # through to the next helper rather than blowing up.
+    if fields.get("protocol") != "https" or fields.get("host") != "github.com":
+        return ""
     token = get_token()
     return f"username=x-access-token\npassword={token}\n"
 
