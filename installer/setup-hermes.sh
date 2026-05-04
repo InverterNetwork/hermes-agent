@@ -19,8 +19,9 @@
 #     --user    hermes \
 #     --target  /home/hermes/.hermes
 #
-# Defaults assume a fresh Linux VPS with build-essential, python3.12-dev,
-# python3.12-venv, and libffi-dev pre-installed.
+# Build deps (build-essential, python3.12-dev, python3.12-venv, libffi-dev,
+# rsync) are installed automatically on Debian/Ubuntu hosts. Pass --skip-prep
+# if you manage system packages externally.
 
 set -euo pipefail
 
@@ -29,13 +30,15 @@ FORK_DIR="/srv/hermes/repos/hermes-agent"
 AGENT_USER="hermes"
 TARGET_DIR=""
 PYTHON_BIN="python3.12"
+SKIP_PREP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --fork)    FORK_DIR="$2";    shift 2 ;;
-    --user)    AGENT_USER="$2";  shift 2 ;;
-    --target)  TARGET_DIR="$2";  shift 2 ;;
-    --python)  PYTHON_BIN="$2";  shift 2 ;;
+    --fork)       FORK_DIR="$2";    shift 2 ;;
+    --user)       AGENT_USER="$2";  shift 2 ;;
+    --target)     TARGET_DIR="$2";  shift 2 ;;
+    --python)     PYTHON_BIN="$2";  shift 2 ;;
+    --skip-prep)  SKIP_PREP=1;      shift   ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -43,10 +46,23 @@ done
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ "$(uname -s)" == "Linux" ]] || { echo "v0 is Linux-only" >&2; exit 1; }
 
+# ---------- build-deps prep (Debian/Ubuntu only; idempotent) ----------
+# Compilers + python headers are needed by some deps that don't ship a wheel
+# for our Python/arch combo. Idempotent: apt-get install is a no-op when the
+# packages are already at the desired version.
+if [[ "$SKIP_PREP" -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
+  echo "==> installing build deps (apt)"
+  DEBIAN_FRONTEND=noninteractive apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    build-essential python3.12-dev python3.12-venv libffi-dev rsync >/dev/null
+fi
+
 command -v "$PYTHON_BIN" >/dev/null 2>&1 \
-  || { echo "$PYTHON_BIN not found on PATH" >&2; exit 1; }
+  || { echo "$PYTHON_BIN not found on PATH (run without --skip-prep, or install manually)" >&2; exit 1; }
 "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' \
   || { echo "$PYTHON_BIN is < 3.11; pyproject.toml requires >=3.11" >&2; exit 1; }
+command -v rsync >/dev/null 2>&1 \
+  || { echo "rsync not found on PATH" >&2; exit 1; }
 
 id "$AGENT_USER" >/dev/null 2>&1 \
   || { echo "agent user '$AGENT_USER' does not exist" >&2; exit 1; }
