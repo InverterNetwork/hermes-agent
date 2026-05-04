@@ -180,11 +180,104 @@ jobs:
             echo "--force-state probe: OK"
           '
 
+      - name: --auth-method app probe (token helper + credential wiring)
+        # End-to-end exercise of the GitHub App auth path on top of the
+        # already-rendered target. We don't have real GitHub credentials in CI,
+        # so we mock /app/installations/<id>/access_tokens on localhost and
+        # point the installer at it via --gh-api-base. A throwaway RSA key
+        # stands in for the App's PEM.
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          openssl genrsa -out "$WORK/fake-app.pem" 2048 2>/dev/null
+          chmod 600 "$WORK/fake-app.pem"
+
+          # Mock GitHub API: always returns a fake installation token. Listens
+          # on 127.0.0.1:8765 in the background; killed on cleanup.
+          python3 - <<'PY' &
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import json
+          class H(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  body = json.dumps({"token": "ghs_ci_fake", "expires_at": "2099-01-01T00:00:00Z"}).encode()
+                  self.send_response(201)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *a, **k): pass
+          HTTPServer(("127.0.0.1", 8765), H).serve_forever()
+          PY
+          MOCK_PID=$!
+          trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
+          # Wait for the mock to be ready (max 5s).
+          for _ in $(seq 1 50); do
+            if curl -fsS -X POST http://127.0.0.1:8765/ping >/dev/null 2>&1 \
+              || nc -z 127.0.0.1 8765 2>/dev/null; then break; fi
+            sleep 0.1
+          done
+
+          sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
+            --fork /srv/hermes/repos/hermes-agent \
+            --state /srv/hermes/repos/hermes-state \
+            --user hermes \
+            --git-identity-email didier@ci \
+            --skip-prep \
+            --auth-method app \
+            --app-id 12345 \
+            --app-installation-id 67890 \
+            --app-key-path "$WORK/fake-app.pem" \
+            --gh-api-base http://127.0.0.1:8765
+
+          # Probes (run as hermes — the agent must be able to do all of this).
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+
+            # Auth dir + files exist with the expected perms.
+            [[ -d "$T/auth" ]]                         || { echo "FAIL: $T/auth missing"; exit 1; }
+            [[ -f "$T/auth/github-app.pem" ]]          || { echo "FAIL: pem missing"; exit 1; }
+            [[ -f "$T/auth/github-app.env" ]]          || { echo "FAIL: env missing"; exit 1; }
+            mode=$(stat -c "%a" "$T/auth")
+            [[ "$mode" == "750" ]]                     || { echo "FAIL: auth/ mode=$mode (expected 750)"; exit 1; }
+            mode=$(stat -c "%a" "$T/auth/github-app.pem")
+            [[ "$mode" == "640" ]]                     || { echo "FAIL: pem mode=$mode (expected 640)"; exit 1; }
+            owner=$(stat -c "%U:%G" "$T/auth/github-app.pem")
+            [[ "$owner" == "root:hermes" ]]            || { echo "FAIL: pem owner=$owner (expected root:hermes)"; exit 1; }
+
+            # Agent can read the env file (group access is the whole point).
+            grep -q "HERMES_GH_APP_ID=12345"           "$T/auth/github-app.env"
+            grep -q "HERMES_GH_INSTALLATION_ID=67890"  "$T/auth/github-app.env"
+            grep -q "HERMES_GH_API=http://127.0.0.1:8765" "$T/auth/github-app.env"
+
+            # Credential helper is wired into state/.git/config.
+            cd "$T/state"
+            helper=$(git config credential.https://github.com.helper)
+            [[ "$helper" == *hermes_github_token.py* ]] || { echo "FAIL: credential helper not set: $helper"; exit 1; }
+
+            # Mint a token through the helper (hits the localhost mock).
+            tok=$("$T/hermes-agent/venv/bin/python" \
+                  "$T/hermes-agent/installer/hermes_github_token.py" mint)
+            [[ "$tok" == "ghs_ci_fake" ]] || { echo "FAIL: minted token=$tok"; exit 1; }
+
+            # credential helper protocol output is shaped correctly.
+            out=$(printf "protocol=https\nhost=github.com\n\n" \
+                  | "$T/hermes-agent/venv/bin/python" \
+                    "$T/hermes-agent/installer/hermes_github_token.py" credential get)
+            grep -q "^username=x-access-token$" <<< "$out"
+            grep -q "^password=ghs_ci_fake$" <<< "$out"
+
+            echo "auth probes: OK"
+          '
+
       - name: render summary on failure
         if: failure()
         run: |
           echo "=== render target ==="
           sudo ls -la /home/hermes/.hermes/ || true
+          echo "=== auth dir ==="
+          sudo ls -la /home/hermes/.hermes/auth/ 2>/dev/null || true
+          echo "=== state .git/config ==="
+          sudo cat /home/hermes/.hermes/state/.git/config 2>/dev/null || true
           echo "=== runtime version ==="
           sudo cat /home/hermes/.hermes/RUNTIME_VERSION || true
           echo "=== venv contents (head) ==="
