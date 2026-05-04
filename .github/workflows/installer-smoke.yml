@@ -42,35 +42,95 @@ jobs:
           sudo cp -a "$GITHUB_WORKSPACE" /srv/hermes/repos/hermes-agent
           sudo chown -R root:root /srv/hermes
 
+      - name: stage fake state repo at /srv/hermes/repos/hermes-state
+        # Real deploys clone the private hermes-state repo from GitHub. CI
+        # doesn't have credentials for that, so we fabricate a local fixture
+        # with the same shape (skills/memories/cron + jobs.json + .gitignore).
+        # The installer should treat this just like the real thing.
+        run: |
+          sudo mkdir -p /srv/hermes/repos/hermes-state
+          sudo git -C /srv/hermes/repos/hermes-state init -q -b main
+          sudo install -d \
+            /srv/hermes/repos/hermes-state/skills \
+            /srv/hermes/repos/hermes-state/memories \
+            /srv/hermes/repos/hermes-state/cron \
+            /srv/hermes/repos/hermes-state/cron/output
+          sudo touch \
+            /srv/hermes/repos/hermes-state/skills/.gitkeep \
+            /srv/hermes/repos/hermes-state/memories/.gitkeep \
+            /srv/hermes/repos/hermes-state/cron/output/.gitkeep
+          echo '{}' | sudo tee /srv/hermes/repos/hermes-state/cron/jobs.json > /dev/null
+          sudo git -C /srv/hermes/repos/hermes-state \
+            -c user.email=ci@example.com -c user.name=ci add -A
+          sudo git -C /srv/hermes/repos/hermes-state \
+            -c user.email=ci@example.com -c user.name=ci commit -q -m "init fixture"
+          sudo chown -R root:root /srv/hermes/repos/hermes-state
+
       - name: create hermes service user
         run: sudo useradd -m -s /bin/bash hermes
 
-      - name: run installer (first run; should provision build deps)
+      - name: run installer (first run; should provision build deps + clone state)
         run: |
           sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
             --fork /srv/hermes/repos/hermes-agent \
-            --user hermes
+            --state /srv/hermes/repos/hermes-state \
+            --user hermes \
+            --git-identity-email didier@ci
 
-      - name: permission probes (rails read-only, state writable)
+      - name: permission probes (rails read-only, state writable + git-aware)
         run: |
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes
-            if echo x > "$T/SOUL.md" 2>/dev/null;             then echo "FAIL: agent wrote rails SOUL.md"; exit 1; fi
+
+            # rails read-only
+            if echo x > "$T/SOUL.md" 2>/dev/null;               then echo "FAIL: agent wrote rails SOUL.md"; exit 1; fi
             if echo x > "$T/hermes-agent/probe.py" 2>/dev/null; then echo "FAIL: agent wrote rails hermes-agent/"; exit 1; fi
-            if echo x > "$T/RUNTIME_VERSION" 2>/dev/null;     then echo "FAIL: agent wrote rails RUNTIME_VERSION"; exit 1; fi
-            echo x > "$T/skills/probe.txt"
-            echo x > "$T/memories/probe.txt"
-            echo x > "$T/cron/output/probe.txt"
+            if echo x > "$T/RUNTIME_VERSION" 2>/dev/null;       then echo "FAIL: agent wrote rails RUNTIME_VERSION"; exit 1; fi
+
+            # state symlinks resolve into the clone
+            for d in skills memories cron; do
+              [[ -L "$T/$d" ]] || { echo "FAIL: $T/$d is not a symlink"; exit 1; }
+              target=$(readlink "$T/$d")
+              [[ "$target" == "state/$d" ]] || { echo "FAIL: $T/$d -> $target (expected state/$d)"; exit 1; }
+            done
+
+            # writes through the symlinks land inside the git repo
+            echo "skill-data" > "$T/skills/probe.md"
+            echo "memory-data" > "$T/memories/probe.md"
+            echo "cron-output-data" > "$T/cron/output/probe.txt"
+            [[ -f "$T/state/skills/probe.md" ]]       || { echo "FAIL: skills write did not reach state/"; exit 1; }
+            [[ -f "$T/state/memories/probe.md" ]]     || { echo "FAIL: memories write did not reach state/"; exit 1; }
+            [[ -f "$T/state/cron/output/probe.txt" ]] || { echo "FAIL: cron/output write did not reach state/"; exit 1; }
+
+            # git sees those writes as new untracked files
+            cd "$T/state"
+            untracked=$(git status --porcelain | wc -l)
+            [[ "$untracked" -ge 3 ]] || { echo "FAIL: expected >=3 untracked entries, got $untracked"; git status; exit 1; }
+
+            # repo-local git identity is configured (so future commits use it)
+            cfg_email=$(git config user.email)
+            cfg_name=$(git config user.name)
+            [[ "$cfg_email" == "didier@ci" ]] || { echo "FAIL: user.email=$cfg_email"; exit 1; }
+            [[ "$cfg_name"  == "didier"    ]] || { echo "FAIL: user.name=$cfg_name";  exit 1; }
+
+            # agent can actually create a commit (no sudo, no auth needed locally)
+            git add .
+            git commit -q -m "ci: probe commit"
+            author=$(git log -1 --format="%an <%ae>")
+            [[ "$author" == "didier <didier@ci>" ]] || { echo "FAIL: commit author=$author"; exit 1; }
+
             "$T/hermes-agent/venv/bin/hermes" --help > /dev/null
             echo "permission probes: OK"
           '
 
-      - name: idempotency (second run is fast no-op)
+      - name: idempotency (second run is fast no-op; preserves agent commit)
         run: |
           start=$SECONDS
           sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
             --fork /srv/hermes/repos/hermes-agent \
+            --state /srv/hermes/repos/hermes-state \
             --user hermes \
+            --git-identity-email didier@ci \
             --skip-prep
           elapsed=$(( SECONDS - start ))
           echo "second run took ${elapsed}s"
@@ -82,6 +142,43 @@ jobs:
             echo "FAIL: second run too slow (${elapsed}s > 120s); idempotency may be broken"
             exit 1
           fi
+
+      - name: post-second-run state preservation probe
+        # Re-running the installer must NOT clobber agent work in state/. The
+        # previous step made a "ci: probe commit"; it has to still be there.
+        run: |
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            cd "$T/state"
+            last_subj=$(git log -1 --format="%s")
+            [[ "$last_subj" == "ci: probe commit" ]] \
+              || { echo "FAIL: agent commit lost on re-run (last subject=$last_subj)"; git log --oneline | head; exit 1; }
+            [[ -f skills/probe.md ]]       || { echo "FAIL: skills/probe.md missing after re-run"; exit 1; }
+            [[ -f memories/probe.md ]]     || { echo "FAIL: memories/probe.md missing after re-run"; exit 1; }
+            [[ -f cron/output/probe.txt ]] || { echo "FAIL: cron/output/probe.txt missing after re-run"; exit 1; }
+            echo "state preservation: OK"
+          '
+
+      - name: --force-state probe (opt-in re-clone wipes local work)
+        run: |
+          sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
+            --fork /srv/hermes/repos/hermes-agent \
+            --state /srv/hermes/repos/hermes-state \
+            --user hermes \
+            --git-identity-email didier@ci \
+            --skip-prep \
+            --force-state
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            cd "$T/state"
+            last_subj=$(git log -1 --format="%s")
+            [[ "$last_subj" == "init fixture" ]] \
+              || { echo "FAIL: --force-state did not reset to source HEAD (last subject=$last_subj)"; exit 1; }
+            [[ ! -f skills/probe.md ]]       || { echo "FAIL: skills/probe.md survived --force-state"; exit 1; }
+            [[ ! -f memories/probe.md ]]     || { echo "FAIL: memories/probe.md survived --force-state"; exit 1; }
+            [[ ! -f cron/output/probe.txt ]] || { echo "FAIL: cron/output/probe.txt survived --force-state"; exit 1; }
+            echo "--force-state probe: OK"
+          '
 
       - name: render summary on failure
         if: failure()
