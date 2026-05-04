@@ -271,7 +271,9 @@ configured_email="$(sudo -u "$AGENT_USER" git -C "$STATE_TARGET" config user.ema
 [[ "$configured_email" == "$GIT_IDENTITY_EMAIL" ]] \
   || { echo "FAIL: state git user.email=$configured_email (expected $GIT_IDENTITY_EMAIL)" >&2; exit 1; }
 
-STATE_SHA="$(git -C "$STATE_TARGET" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# Read state HEAD as the agent — root would otherwise hit git's safe.directory
+# guard ("dubious ownership") because the clone is hermes-owned.
+STATE_SHA="$(sudo -u "$AGENT_USER" git -C "$STATE_TARGET" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
 # ---------- summary ----------
 
