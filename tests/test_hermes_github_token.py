@@ -193,3 +193,43 @@ def test_fetch_installation_token_posts_to_correct_endpoint(rsa_keypair):
 def test_missing_required_config(hermes_home):
     with pytest.raises(hgt.ConfigError):
         hgt.get_token({})
+
+
+def test_check_action_silent_success(hermes_home, monkeypatch, capsys):
+    # `check` exercises the same path as `mint` but must not print the token
+    # to stdout — the installer's smoke test relies on this so retries on
+    # transient flakes can't leak credentials into operator logs.
+    monkeypatch.setenv("HERMES_GH_TOKEN_OVERRIDE", "ghs_secret_should_never_print")
+    rc = hgt.main(["hermes_github_token.py", "check"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "ghs_secret_should_never_print" not in captured.out
+    assert captured.out == ""
+
+
+def test_cache_created_with_secure_mode(hermes_home, rsa_keypair, monkeypatch):
+    # The cache file must never be world-readable, even briefly between create
+    # and chmod. We verify by running with a permissive umask; the file should
+    # still land at 0600 because it's opened with the mode upfront.
+    priv, _ = rsa_keypair
+    key_path = hermes_home / "auth" / "github-app.pem"
+    key_path.write_text(priv)
+
+    monkeypatch.setenv("HERMES_GH_APP_ID", "1")
+    monkeypatch.setenv("HERMES_GH_INSTALLATION_ID", "1")
+    monkeypatch.setenv("HERMES_GH_APP_KEY", str(key_path))
+
+    old_umask = os.umask(0o000)  # the most permissive case
+    try:
+        with patch.object(
+            hgt,
+            "fetch_installation_token",
+            return_value={"token": "x", "expires_at": "2099-01-01T00:00:00Z"},
+        ):
+            hgt.get_token()
+    finally:
+        os.umask(old_umask)
+
+    cache_path = hermes_home / "cache" / "github-token.json"
+    mode = os.stat(cache_path).st_mode & 0o777
+    assert mode == 0o600, f"cache mode {oct(mode)} (expected 0600)"

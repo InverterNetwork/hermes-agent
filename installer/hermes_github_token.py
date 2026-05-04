@@ -4,6 +4,7 @@
 #
 # Usage:
 #   hermes_github_token.py mint              # print a token to stdout
+#   hermes_github_token.py check             # exit 0 iff a token can be obtained, no stdout
 #   hermes_github_token.py credential get    # git credential helper protocol
 #
 # Configuration is read from $HERMES_GH_CONFIG (default: ~/.hermes/auth/github-app.env),
@@ -144,7 +145,21 @@ def _read_cache(cache_path: Path) -> dict[str, Any] | None:
 def _write_cache(cache_path: Path, payload: dict[str, Any]) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload))
+    # Open with the target mode upfront so the file is never world-readable —
+    # write_text() + chmod() leaves a window where a co-located low-priv user
+    # could read the token. The umask on the syscall caps the effective mode.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # If the file pre-existed with looser perms, the open() above won't have
+    # changed them — assert tight perms before the rename completes the swap.
     os.chmod(tmp, 0o600)
     tmp.replace(cache_path)
 
@@ -208,6 +223,11 @@ def main(argv: list[str]) -> int:
     cmd = argv[1]
     if cmd == "mint":
         print(get_token())
+        return 0
+    if cmd == "check":
+        # Exercise the same path as `mint` but never print the token — used by
+        # the installer's smoke test, which routinely lands in operator logs.
+        get_token()
         return 0
     if cmd == "credential":
         action = argv[2] if len(argv) > 2 else "get"

@@ -254,7 +254,13 @@ jobs:
             helper=$(git config credential.https://github.com.helper)
             [[ "$helper" == *hermes_github_token.py* ]] || { echo "FAIL: credential helper not set: $helper"; exit 1; }
 
-            # Mint a token through the helper (hits the localhost mock).
+            # `check` exercises the full mint path (JWT, API call, cache write)
+            # without ever printing the token. The installer itself uses this.
+            "$T/hermes-agent/venv/bin/python" \
+              "$T/hermes-agent/installer/hermes_github_token.py" check
+
+            # Mint a token through the helper (hits the localhost mock; this
+            # value is the hard-coded fixture token, never a real credential).
             tok=$("$T/hermes-agent/venv/bin/python" \
                   "$T/hermes-agent/installer/hermes_github_token.py" mint)
             [[ "$tok" == "ghs_ci_fake" ]] || { echo "FAIL: minted token=$tok"; exit 1; }

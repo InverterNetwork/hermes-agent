@@ -64,6 +64,8 @@ sudo ./installer/setup-hermes.sh \
 
 The installer copies the PEM into `$TARGET/auth/github-app.pem` (root:hermes 0640), persists the App + Installation IDs to `$TARGET/auth/github-app.env`, and configures a git credential helper inside `state/.git/config` scoped to `https://github.com`. Subsequent runs reuse the persisted credentials and only need `--auth-method app` to re-assert wiring.
 
+Every run with `--auth-method app` ends with a live mint call (`hermes_github_token.py check`) to confirm the agent can actually authenticate to GitHub end-to-end. **This means re-installs require live `api.github.com` egress.** If GitHub is degraded or the host is offline, pass `--skip-auth-check` to skip the mint and still update the rails / state symlinks.
+
 Key rotation: re-run with `--app-key-path <new-path>` to overwrite the staged PEM. The token cache at `$TARGET/cache/github-token.json` self-refreshes within 5 minutes of expiry; delete it to force-refresh sooner.
 
 ### Render-target layout

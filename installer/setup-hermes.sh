@@ -58,6 +58,7 @@ AUTH_METHOD="none"
 APP_ID=""
 APP_INSTALLATION_ID=""
 APP_KEY_PATH=""
+SKIP_AUTH_CHECK=0
 # API base override — only set in CI where we point at a localhost mock.
 GH_API_BASE=""
 
@@ -76,6 +77,7 @@ while [[ $# -gt 0 ]]; do
     --app-id)                APP_ID="$2";               shift 2 ;;
     --app-installation-id)   APP_INSTALLATION_ID="$2";  shift 2 ;;
     --app-key-path)          APP_KEY_PATH="$2";         shift 2 ;;
+    --skip-auth-check)       SKIP_AUTH_CHECK=1;         shift   ;;
     --gh-api-base)           GH_API_BASE="$2";          shift 2 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -97,6 +99,13 @@ esac
 # --state-url requires authenticated cloning, so the auth method must be set.
 if [[ -n "$STATE_URL" && "$AUTH_METHOD" == "none" ]]; then
   echo "--state-url requires --auth-method app" >&2; exit 2
+fi
+
+# The credential helper serves a GitHub installation token. Refuse any URL
+# that isn't on github.com so a typo'd or compromised STATE_URL can't trick
+# the helper into shipping the token to a different host.
+if [[ -n "$STATE_URL" && "$STATE_URL" != https://github.com/* ]]; then
+  echo "--state-url must be an https://github.com/ URL (got: $STATE_URL)" >&2; exit 2
 fi
 
 if [[ -z "$GIT_IDENTITY_EMAIL" ]]; then
@@ -255,8 +264,15 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
   if [[ -n "$APP_KEY_PATH" ]]; then
     [[ -f "$APP_KEY_PATH" ]] \
       || { echo "FAIL: --app-key-path file not found: $APP_KEY_PATH" >&2; exit 1; }
-    head -1 "$APP_KEY_PATH" | grep -q "BEGIN .*PRIVATE KEY" \
-      || { echo "FAIL: $APP_KEY_PATH does not look like a PEM private key" >&2; exit 1; }
+    # Tight regex: only PKCS#1 (RSA), SEC1 (EC), and PKCS#8 unencrypted PEMs.
+    # PyJWT can't read passphrase-protected keys, so reject ENCRYPTED upfront
+    # rather than letting it surface as a misleading error at the smoke step.
+    head -1 "$APP_KEY_PATH" | grep -Eq '^-----BEGIN (RSA |EC )?PRIVATE KEY-----$' \
+      || { echo "FAIL: $APP_KEY_PATH does not look like an unencrypted PEM private key" >&2; exit 1; }
+    if grep -q 'ENCRYPTED' "$APP_KEY_PATH"; then
+      echo "FAIL: $APP_KEY_PATH is passphrase-protected; PyJWT requires an unencrypted key" >&2
+      exit 1
+    fi
     install -o root -g "$AGENT_USER" -m 0640 "$APP_KEY_PATH" "$GH_APP_KEY_DST"
   elif [[ ! -f "$GH_APP_KEY_DST" ]]; then
     echo "FAIL: --auth-method=app but no key staged at $GH_APP_KEY_DST and no --app-key-path given" >&2
@@ -269,18 +285,20 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
 
   # Persist App identity. APP_ID / APP_INSTALLATION_ID are required on first
   # install; on re-runs we read whatever's in the existing env file unless the
-  # operator passed new values.
+  # operator passed new values. Extract via awk rather than `source`, because
+  # `source` evaluates the values in our shell — `--app-id 'foo$(rm -rf /)'`
+  # would be game-over on the next install.
   if [[ -f "$GH_APP_ENV" ]]; then
-    # shellcheck disable=SC1090
-    source "$GH_APP_ENV"
-    APP_ID="${APP_ID:-${HERMES_GH_APP_ID:-}}"
-    APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-${HERMES_GH_INSTALLATION_ID:-}}"
-    GH_API_BASE="${GH_API_BASE:-${HERMES_GH_API:-}}"
+    APP_ID="${APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$GH_APP_ENV")}"
+    APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$GH_APP_ENV")}"
+    GH_API_BASE="${GH_API_BASE:-$(awk -F= '$1=="HERMES_GH_API"{print $2; exit}' "$GH_APP_ENV")}"
   fi
-  [[ -n "$APP_ID" ]] \
-    || { echo "FAIL: --app-id required (or persisted in $GH_APP_ENV)" >&2; exit 1; }
-  [[ -n "$APP_INSTALLATION_ID" ]] \
-    || { echo "FAIL: --app-installation-id required (or persisted in $GH_APP_ENV)" >&2; exit 1; }
+  # GitHub App and installation IDs are positive integers — any other shape is
+  # a typo at best, an injection attempt at worst. Validate before persisting.
+  [[ "$APP_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --app-id must be a positive integer (got: '$APP_ID')" >&2; exit 1; }
+  [[ "$APP_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --app-installation-id must be a positive integer (got: '$APP_INSTALLATION_ID')" >&2; exit 1; }
 
   umask 0027
   cat > "$GH_APP_ENV" <<EOF
@@ -344,9 +362,12 @@ if [[ ! -d "$STATE_TARGET/.git" ]]; then
     # the resulting .git/ is agent-owned and auth works on the very first
     # fetch — no chown -R needed.
     install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$STATE_TARGET"
+    # Scope the helper to https://github.com for symmetry with the persisted
+    # config: even though we already asserted the URL is on github.com above,
+    # an unscoped helper would fire on any redirected host git follows.
     sudo -u "$AGENT_USER" \
       env HERMES_HOME="$TARGET_DIR" \
-      git -c "credential.helper=$GIT_CRED_HELPER" \
+      git -c "credential.https://github.com.helper=$GIT_CRED_HELPER" \
         clone --quiet "$STATE_URL" "$STATE_TARGET"
   fi
 else
@@ -422,15 +443,23 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
     config credential.https://github.com.helper 2>/dev/null || true)"
   [[ "$configured_helper" == "$GIT_CRED_HELPER" ]] \
     || { echo "FAIL: state credential helper not configured (got: $configured_helper)" >&2; exit 1; }
-  # Smoke-test the helper end-to-end: the agent must be able to read the App
-  # key, sign a JWT, hit the API, and emit a credential — without sudo.
-  if ! sudo -u "$AGENT_USER" \
-        env HERMES_HOME="$TARGET_DIR" \
-        "$VENV_PY" "$TOKEN_HELPER_PY" mint >/dev/null 2>&1; then
-    echo "FAIL: token helper mint failed for $AGENT_USER" >&2
-    sudo -u "$AGENT_USER" env HERMES_HOME="$TARGET_DIR" \
-      "$VENV_PY" "$TOKEN_HELPER_PY" mint >&2 || true
-    exit 1
+  if [[ "$SKIP_AUTH_CHECK" -eq 0 ]]; then
+    # Smoke-test the helper end-to-end: the agent must be able to read the App
+    # key, sign a JWT, hit the API, and emit credentials — without sudo. We use
+    # `check` (not `mint`) so the live token never lands in install logs even
+    # if a retry succeeds after a transient flake.
+    if ! sudo -u "$AGENT_USER" \
+          env HERMES_HOME="$TARGET_DIR" \
+          "$VENV_PY" "$TOKEN_HELPER_PY" check >/dev/null 2>&1; then
+      echo "FAIL: token helper check failed for $AGENT_USER" >&2
+      # Re-run with stderr only — `check` never writes to stdout, but pin both
+      # streams to fd 2 anyway so any future helper change can't leak the token.
+      sudo -u "$AGENT_USER" env HERMES_HOME="$TARGET_DIR" \
+        "$VENV_PY" "$TOKEN_HELPER_PY" check >/dev/null || true
+      exit 1
+    fi
+  else
+    echo "==> --skip-auth-check: skipping live token mint smoke"
   fi
 fi
 
