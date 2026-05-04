@@ -144,9 +144,8 @@ jobs:
           fi
 
       - name: post-second-run state preservation probe
-        # The big guarantee of #3: re-running the installer must NOT clobber
-        # agent work in state/. We made a "ci: probe commit" in the previous
-        # step; it has to still be there.
+        # Re-running the installer must NOT clobber agent work in state/. The
+        # previous step made a "ci: probe commit"; it has to still be there.
         run: |
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes

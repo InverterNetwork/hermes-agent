@@ -254,7 +254,7 @@ HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
   || { echo "FAIL: hermes entry point missing or non-executable at $HERMES_BIN" >&2; exit 1; }
 
 # State assertions: the agent must own .git/ and the symlinks must resolve
-# into the clone, otherwise auto-commit (ITRY-1283) will silently fail later.
+# into the clone, otherwise the auto-commit pipeline will silently fail later.
 [[ -d "$STATE_TARGET/.git" ]] \
   || { echo "FAIL: state clone missing .git at $STATE_TARGET" >&2; exit 1; }
 state_git_owner="$(stat -c '%U' "$STATE_TARGET/.git")"
