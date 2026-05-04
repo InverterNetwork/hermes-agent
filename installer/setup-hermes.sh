@@ -231,14 +231,14 @@ echo "==> wiring state symlinks (skills, memories, cron)"
 for d in skills memories cron; do
   link="$TARGET_DIR/$d"
   # Pre-clean: if a previous v0 install left real dirs here, they need to go.
-  # Only delete if empty; non-empty means we'd lose data — refuse and let the
-  # operator decide. (This mostly affects machines that ran v0 of the installer
-  # and now upgrade to v0.2.)
+  # Safe-to-remove check: no regular files / symlinks / sockets anywhere in
+  # the tree — only empty dirs (e.g. v0 left cron/output/ as an empty subdir).
+  # If any data file exists, refuse and let the operator decide.
   if [[ -d "$link" && ! -L "$link" ]]; then
-    if rmdir "$link" 2>/dev/null; then
-      :
+    if [[ -z "$(find "$link" -mindepth 1 -not -type d -print -quit)" ]]; then
+      rm -rf "$link"
     else
-      echo "FAIL: $link is a non-empty directory from a previous install." >&2
+      echo "FAIL: $link contains data from a previous install." >&2
       echo "      Move its contents into $STATE_TARGET/$d/ and retry, or remove it manually." >&2
       exit 1
     fi
