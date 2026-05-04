@@ -46,21 +46,33 @@ done
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ "$(uname -s)" == "Linux" ]] || { echo "v0 is Linux-only" >&2; exit 1; }
 
+# Python interpreter must exist (and meet version) before we can derive its
+# X.Y version for the apt prep package names below.
+command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+  || { echo "$PYTHON_BIN not found on PATH; install it manually first (e.g. apt install python3.12)" >&2; exit 1; }
+"$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' \
+  || { echo "$PYTHON_BIN is < 3.11; pyproject.toml requires >=3.11" >&2; exit 1; }
+
+PY_VERSION="$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
 # ---------- build-deps prep (Debian/Ubuntu only; idempotent) ----------
 # Compilers + python headers are needed by some deps that don't ship a wheel
 # for our Python/arch combo. Idempotent: apt-get install is a no-op when the
-# packages are already at the desired version.
-if [[ "$SKIP_PREP" -eq 0 ]] && command -v apt-get >/dev/null 2>&1; then
-  echo "==> installing build deps (apt)"
-  DEBIAN_FRONTEND=noninteractive apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    build-essential python3.12-dev python3.12-venv libffi-dev rsync >/dev/null
+# packages are already at the desired version. Package names are derived from
+# the chosen interpreter so --python python3.11 installs python3.11-{dev,venv}.
+if [[ "$SKIP_PREP" -eq 0 ]]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "==> installing build deps (apt) for python${PY_VERSION}"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      build-essential "python${PY_VERSION}-dev" "python${PY_VERSION}-venv" libffi-dev rsync >/dev/null
+  else
+    echo "==> no apt-get detected; skipping automated prep" >&2
+    echo "    ensure these are installed manually if anything below fails:" >&2
+    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync" >&2
+  fi
 fi
 
-command -v "$PYTHON_BIN" >/dev/null 2>&1 \
-  || { echo "$PYTHON_BIN not found on PATH (run without --skip-prep, or install manually)" >&2; exit 1; }
-"$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' \
-  || { echo "$PYTHON_BIN is < 3.11; pyproject.toml requires >=3.11" >&2; exit 1; }
 command -v rsync >/dev/null 2>&1 \
   || { echo "rsync not found on PATH" >&2; exit 1; }
 

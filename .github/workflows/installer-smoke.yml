@@ -23,6 +23,12 @@ on:
 permissions:
   contents: read
 
+# Cancel in-flight runs on the same ref when a new commit lands; saves CI
+# minutes when rapid pushes obsolete previous runs.
+concurrency:
+  group: installer-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   install:
     runs-on: ubuntu-24.04
@@ -68,8 +74,12 @@ jobs:
             --skip-prep
           elapsed=$(( SECONDS - start ))
           echo "second run took ${elapsed}s"
-          if [ "$elapsed" -gt 60 ]; then
-            echo "FAIL: second run too slow (${elapsed}s > 60s); idempotency may be broken"
+          # Threshold is generous (120s vs ~10s observed) to absorb PyPI
+          # latency without flaky failures. The pip upgrade + editable
+          # reinstall hits the network even on a no-op pass; bumping past
+          # this should still be a real signal.
+          if [ "$elapsed" -gt 120 ]; then
+            echo "FAIL: second run too slow (${elapsed}s > 120s); idempotency may be broken"
             exit 1
           fi
 
