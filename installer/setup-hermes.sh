@@ -144,8 +144,10 @@ v_drift() {
 _owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null; }
 _group() { stat -c '%G' "$1" 2>/dev/null || stat -f '%Sg' "$1" 2>/dev/null; }
 _mode()  {
+  # GNU `%a` returns full octal perms including setuid/setgid/sticky.
+  # BSD `%OLp` would drop the high bits, so concat `%Mp%Lp` to keep them.
   local m
-  m=$(stat -c '%a' "$1" 2>/dev/null) || m=$(stat -f '%OLp' "$1" 2>/dev/null) || return 1
+  m=$(stat -c '%a' "$1" 2>/dev/null) || m=$(stat -f '%Mp%Lp' "$1" 2>/dev/null) || return 1
   echo "${m#0}"
 }
 
@@ -187,6 +189,20 @@ do_verify() {
     return 1
   fi
   v_ok "target dir present: $target"
+
+  # ---- target dir mode + group ownership ----
+  # HERMES_HOME must be root:$AGENT_USER mode 02775 (setgid). Drift here
+  # silently breaks the gateway: without g+w the runtime can't create
+  # gateway.lock / gateway.pid / platforms/, and without setgid+group
+  # those files won't inherit the hermes group on creation.
+  local tmode towner_g
+  tmode="$(_mode "$target")"
+  towner_g="$(_owner "$target"):$(_group "$target")"
+  if [[ "$tmode" == "2775" && "$towner_g" == "$rails_owner:$agent_group" ]]; then
+    v_ok "target dir: $tmode $towner_g"
+  else
+    v_drift "target dir" "mode=$tmode owner=$towner_g (expected 2775 $rails_owner:$agent_group)"
+  fi
 
   # ---- rails ----
   local rails="$target/hermes-agent"
@@ -267,7 +283,7 @@ do_verify() {
 
   # ---- agent-owned dirs ----
   local d own
-  for d in sessions logs cache; do
+  for d in sessions logs cache platforms platforms/pairing; do
     if [[ -d "$target/$d" ]]; then
       own="$(_owner "$target/$d")"
       if [[ "$own" == "$agent_owner" ]]; then
@@ -547,10 +563,13 @@ echo
 # keeps the agent from rewriting its own code paths. The setgid bit lets
 # the gateway (running as $AGENT_USER) create its own runtime files
 # (gateway.lock, gateway.pid, platforms/) at HERMES_HOME root, which the
-# upstream runtime expects to write directly there. Trade-off: the agent
-# can `rm` the top-level rails files (it can't modify their content,
-# they're root-owned 0644), but hermes-sync drift detection catches any
-# missing rails file and the next setup-hermes.sh run re-seeds them.
+# upstream runtime expects to write directly there. Trade-off: with write
+# access to the parent dir, the agent can `rm` a top-level rails file and
+# recreate it under its own ownership with arbitrary content (in-place
+# modification is still blocked by the file's 0644 mode). hermes-sync
+# drift detection picks up the deletion of any rails file and the next
+# setup-hermes.sh run re-seeds them; rails/ ownership drift on the
+# replacement is caught by do_verify's rails check.
 echo "==> rendering rails"
 install -d -o root -g "$AGENT_USER" -m 02775 "$TARGET_DIR"
 

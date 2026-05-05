@@ -59,6 +59,10 @@ def install(tmp_path: Path) -> dict:
 
     # ---- target (the rendered install) ----
     target.mkdir()
+    # HERMES_HOME mirror: prod is root:hermes 02775 (setgid). The test runs
+    # as the developer so ownership is $USER:$primary_group; mode still
+    # carries the setgid bit so verify's mode check stays exercised.
+    target.chmod(0o2775)
 
     # rails: a few files mimicking the rsynced hermes-agent tree.
     rails = target / "hermes-agent"
@@ -87,7 +91,7 @@ def install(tmp_path: Path) -> dict:
     _git(state, "remote", "set-url", "origin", "https://github.com/example/hermes-state.git")
 
     # Agent dirs (gitignored siblings of state/).
-    for d in ("sessions", "logs", "cache"):
+    for d in ("sessions", "logs", "cache", "platforms", "platforms/pairing"):
         (target / d).mkdir()
 
     # Symlinks at render-target root pointing into state/ (matches the
