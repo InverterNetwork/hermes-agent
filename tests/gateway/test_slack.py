@@ -3089,3 +3089,88 @@ class TestSlashEphemeralAck:
         # the normal single-user case; the ContextVar path is the precise one.
         # The key invariant is: when the ContextVar IS set, it matches exactly.
         assert ctx is not None  # fallback path finds the entry
+
+
+class TestSlackAllowedChannels:
+    """SLACK_ALLOWED_CHANNELS hard-gates the bot to a channel set.
+
+    Mirrors DISCORD_ALLOWED_CHANNELS semantics:
+      - unset   → no gate (legacy behavior)
+      - "*"     → gate explicitly disabled
+      - csv ids → bot only responds in those channels (DMs bypass)
+    """
+
+    def _channel_event(self, channel_id="C_ALLOW"):
+        return {
+            "text": "<@U_BOT> hello",
+            "user": "U_USER",
+            "channel": channel_id,
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+
+    def _dm_event(self):
+        return {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unset_allowlist_passes_through(self, adapter, monkeypatch):
+        monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+        await adapter._handle_slack_message(self._channel_event("C_ANY"))
+        assert adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_allowed_channel_passes_through(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_ALLOW,C_OTHER")
+        await adapter._handle_slack_message(self._channel_event("C_ALLOW"))
+        assert adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_disallowed_channel_dropped(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_ALLOW")
+        await adapter._handle_slack_message(self._channel_event("C_OTHER"))
+        assert not adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_wildcard_disables_gate(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "*")
+        await adapter._handle_slack_message(self._channel_event("C_ANY"))
+        assert adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_dm_bypasses_channel_allowlist(self, adapter, monkeypatch):
+        # DMs aren't on the channel allowlist; user-allowlist gates them.
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_ALLOW")
+        await adapter._handle_slack_message(self._dm_event())
+        assert adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_slash_command_disallowed_channel_dropped(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_ALLOW")
+        command = {
+            "command": "/lmdtfy",
+            "text": "what is X",
+            "user_id": "U123",
+            "channel_id": "C_OTHER",
+            "team_id": "T123",
+        }
+        await adapter._handle_slash_command(command)
+        assert not adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_slash_command_in_dm_bypasses_gate(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_ALLOW")
+        command = {
+            "command": "/lmdtfy",
+            "text": "what is X",
+            "user_id": "U123",
+            "channel_id": "D123",
+            "team_id": "T123",
+        }
+        await adapter._handle_slash_command(command)
+        assert adapter.handle_message.called

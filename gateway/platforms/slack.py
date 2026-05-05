@@ -1859,6 +1859,23 @@ class SlackAdapter(BasePlatformAdapter):
             channel_type = "im"
         is_dm = channel_type in ("im", "mpim")  # Both 1:1 and group DMs
 
+        # SLACK_ALLOWED_CHANNELS: hard channel allowlist. When set, the bot
+        # ignores messages in any channel not on the list. DMs bypass — the
+        # SLACK_ALLOWED_USERS user-allowlist gates them separately. Mirrors
+        # DISCORD_ALLOWED_CHANNELS semantics; "*" disables the gate.
+        if not is_dm and channel_id:
+            allowed_channels_raw = os.getenv("SLACK_ALLOWED_CHANNELS", "").strip()
+            if allowed_channels_raw:
+                allowed_channels = {
+                    ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()
+                }
+                if "*" not in allowed_channels and channel_id not in allowed_channels:
+                    logger.debug(
+                        "[Slack] Ignoring message in non-allowed channel: %s",
+                        channel_id,
+                    )
+                    return
+
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
         #   new thread/session (the bot always replies in a thread).
@@ -2721,6 +2738,24 @@ class SlackAdapter(BasePlatformAdapter):
         # keep group semantics so different users do not collide into one
         # session key.
         is_dm = str(channel_id).startswith("D")
+
+        # SLACK_ALLOWED_CHANNELS gate (channel-scope only — DMs pass through
+        # to the user-allowlist). Drop slash commands fired in non-allowed
+        # channels silently; the slash already got an ack upstream so Slack
+        # won't show a "dispatch_failed" banner.
+        if not is_dm and channel_id:
+            allowed_channels_raw = os.getenv("SLACK_ALLOWED_CHANNELS", "").strip()
+            if allowed_channels_raw:
+                allowed_channels = {
+                    ch.strip() for ch in allowed_channels_raw.split(",") if ch.strip()
+                }
+                if "*" not in allowed_channels and channel_id not in allowed_channels:
+                    logger.debug(
+                        "[Slack] Ignoring slash command in non-allowed channel: %s",
+                        channel_id,
+                    )
+                    return
+
         source = self.build_source(
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
