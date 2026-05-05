@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# hermes-sync — periodic two-way sync for the agent's state repo.
+#
+# Pulls remote edits into the agent's working tree and pushes any local
+# work (including mid-session memory writes the inline commit hooks don't
+# cover). Designed to run from a root-owned timer (launchd plist or systemd
+# timer); the script itself runs as the agent user via `sudo -u`.
+#
+# ITRY-1283 D3.
+#
+# Failure modes:
+#   * pull rebase conflict → abort, write CONFLICT.md, exit non-zero. Do NOT
+#     auto-resolve. Operator runs `git rebase` manually before the next tick.
+#   * push failure → exit non-zero. The next tick retries; ITRY-1283 explicitly
+#     allows silent retry on remote-only failures.
+#
+# Usage:
+#   hermes-sync                # uses default ~/.hermes/state
+#   HERMES_STATE_DIR=/path hermes-sync
+#
+set -u
+
+STATE_DIR="${HERMES_STATE_DIR:-$HOME/.hermes/state}"
+CONFLICT_FILE="$STATE_DIR/CONFLICT.md"
+LOG_PREFIX="hermes-sync"
+
+log()  { printf '[%s] %s\n' "$LOG_PREFIX" "$*"; }
+warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
+die()  { printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
+
+[[ -d "$STATE_DIR/.git" ]] \
+  || die "no state repo at $STATE_DIR (run setup-hermes.sh)"
+
+cd "$STATE_DIR"
+
+# A pre-existing CONFLICT.md from a previous failed tick blocks further sync
+# work. The operator must clear it (after resolving) before we resume —
+# otherwise we'd happily layer more auto-commits over an unresolved divergence.
+if [[ -f "$CONFLICT_FILE" ]]; then
+  warn "CONFLICT.md present at $CONFLICT_FILE — sync paused until cleared"
+  exit 2
+fi
+
+git fetch origin --quiet || die "git fetch origin failed"
+
+# Pull remote first so local-only commits (skill_manage, session-start,
+# fallback auto-commits below) replay on top of upstream. --autostash keeps
+# uncommitted memory edits intact across the rebase; conflicts on those files
+# are handled identically to commit conflicts.
+if ! git pull --rebase --autostash --quiet origin main; then
+  warn "rebase conflict against origin/main — aborting and surfacing"
+  git rebase --abort 2>/dev/null || true
+  # Restore any autostashed working-tree changes so the operator sees the
+  # full picture when resolving.
+  git stash list | grep -q 'autostash' && git stash pop 2>/dev/null || true
+  cat >"$CONFLICT_FILE" <<EOF
+# hermes-sync rebase conflict
+
+Time:   $(date -u +%FT%TZ)
+Branch: main
+Remote: origin/main
+
+The periodic sync timer hit a rebase conflict pulling origin/main and
+aborted the rebase. Your local commits are intact; the remote has not
+been touched.
+
+## To resolve
+
+1. cd $STATE_DIR
+2. git status                 # inspect divergence
+3. git pull --rebase origin main   # re-run; resolve conflicts as prompted
+4. git push origin main
+5. rm $CONFLICT_FILE          # unblocks the next sync tick
+
+The sync timer will refuse to run while this file exists.
+EOF
+  die "rebase aborted; see $CONFLICT_FILE"
+fi
+
+# Fallback auto-commit for everything the inline hooks don't cover (mid-session
+# memory writes, cron edits, etc.). The inline hooks handle skills/ already, so
+# this is mostly memories/ + cron/. -A also captures deletes.
+git add -A
+if ! git diff --cached --quiet; then
+  TS="$(date -u +%FT%TZ)"
+  git commit -m "auto: state @ $TS" --quiet \
+    || warn "auto-commit failed at $TS (continuing to push)"
+fi
+
+# Push is allowed to fail-and-retry silently per ITRY-1283 D3. We log so a
+# persistent failure is visible in journalctl/syslog without surfacing it as
+# a hard error to launchd/systemd (which would otherwise mark the unit failed
+# every tick and stop retrying).
+if ! git push origin main --quiet; then
+  warn "git push origin main failed (will retry on next tick)"
+  exit 0
+fi
+
+log "synced @ $(git rev-parse --short HEAD)"

@@ -10569,6 +10569,16 @@ class AIAgent:
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
 
+        # Publish session context for inline state-repo commits (ITRY-1283 D1):
+        # skill_manage reads (session_id, invocation_n) from this context to
+        # format its commit messages. Set after the turn-count bump so the
+        # invocation number reflects the current turn.
+        try:
+            from agent.state_repo import set_session_context as _set_state_ctx
+            _set_state_ctx(self.session_id, self._user_turn_count)
+        except Exception:
+            pass
+
         # Reset the streaming context scrubber at the top of each turn so a
         # hung span from a prior interrupted stream can't taint this turn's
         # output.
@@ -10629,6 +10639,33 @@ class AIAgent:
             else:
                 # First turn of a new session — build from scratch.
                 self._cached_system_prompt = self._build_system_prompt(system_message)
+
+                # ITRY-1283 D2: snapshot ~/.hermes/state/memories at the moment
+                # the LLM freezes its memory view, so replay can pin the SHA
+                # the LLM actually read. Failure propagates loudly — better to
+                # fail session boot than to start with a missing SHA.
+                try:
+                    from agent.state_repo import (
+                        commit_session_start as _commit_session_start,
+                        StateRepoError,
+                    )
+                    _mem_sha = _commit_session_start(self.session_id or "")
+                    if _mem_sha and self._session_db:
+                        try:
+                            self._session_db.set_memory_snapshot_sha(
+                                self.session_id, _mem_sha
+                            )
+                        except Exception as _persist_err:
+                            logger.warning(
+                                "Could not persist memory_snapshot_sha for %s: %s",
+                                self.session_id, _persist_err,
+                            )
+                except StateRepoError:
+                    raise
+                except Exception as _state_err:
+                    # Import errors etc. — log but don't fail the session.
+                    logger.debug("state_repo session-start hook unavailable: %s", _state_err)
+
                 # Plugin hook: on_session_start
                 # Fired once when a brand-new session is created (not on
                 # continuation).  Plugins can use this to initialise
