@@ -48,10 +48,11 @@ git fetch origin --quiet || die "git fetch origin failed"
 # are handled identically to commit conflicts.
 if ! git pull --rebase --autostash --quiet origin main; then
   warn "rebase conflict against origin/main — aborting and surfacing"
+  # `git rebase --abort` with --autostash already restores the autostashed
+  # working tree as part of the abort. A manual `git stash pop` here would
+  # pop the wrong stash on edge cases (operator stash earlier in the list)
+  # and silently drop pop conflicts.
   git rebase --abort 2>/dev/null || true
-  # Restore any autostashed working-tree changes so the operator sees the
-  # full picture when resolving.
-  git stash list | grep -q 'autostash' && git stash pop 2>/dev/null || true
   cat >"$CONFLICT_FILE" <<EOF
 # hermes-sync rebase conflict
 

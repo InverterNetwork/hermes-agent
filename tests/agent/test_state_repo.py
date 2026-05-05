@@ -296,6 +296,23 @@ class TestCommitSessionStart:
         # Cron stays staged for whoever owns it.
         assert "A  cron/tick.cron" in _git(state_repo_dir, "status", "--porcelain")
 
+    def test_propagates_add_failure(self, state_repo_dir, monkeypatch):
+        """An `add` step that fails (permissions, index corruption) must
+        propagate as StateRepoError — otherwise allow-empty commit would
+        land a misleading SHA on top of broken state."""
+        real_git = state_repo._git
+
+        def _add_fails(state_path, *args, **kwargs):
+            if args and args[0] == "add":
+                raise subprocess.CalledProcessError(
+                    1, ("git", "add"), stderr="permission denied: .git/index",
+                )
+            return real_git(state_path, *args, **kwargs)
+
+        monkeypatch.setattr(state_repo, "_git", _add_fails)
+        with pytest.raises(state_repo.StateRepoError, match="permission denied"):
+            state_repo.commit_session_start("sess-add-fail")
+
     def test_seeds_anchor_on_brand_new_install(self, tmp_path, monkeypatch):
         """Empty memories/ on a fresh install must still record a SHA.
 

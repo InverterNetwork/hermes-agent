@@ -191,14 +191,16 @@ def _ensure_memories_anchor(state: Path) -> None:
     a tracked file in there, ``git commit --allow-empty -- memories/`` fails
     with "pathspec did not match any file(s)". We drop a ``.gitkeep`` only
     when the directory is genuinely empty; existing memory writes are left
-    untouched.
+    untouched. Failures here propagate — a permission error or corrupted
+    index is a real problem the caller needs to see, not something to paper
+    over with an allow-empty commit landing a misleading SHA.
     """
     mem = state / "memories"
     mem.mkdir(exist_ok=True)
     ls = _git(state, "ls-files", "--", "memories/", check=False)
     if not ls.stdout.strip() and not any(mem.iterdir()):
         (mem / ".gitkeep").touch()
-        _git(state, "add", "--", "memories/.gitkeep", check=False)
+        _git(state, "add", "--", "memories/.gitkeep")
 
 
 def commit_session_start(session_id: str, *,
@@ -221,9 +223,11 @@ def commit_session_start(session_id: str, *,
     with _GIT_LOCK:
         try:
             _ensure_memories_anchor(state)
-            # Stage current memories/ state. ``add`` tolerates an empty
-            # tree; the anchor above guarantees pathspec match either way.
-            _git(state, "add", "--", "memories/", check=False)
+            # Stage current memories/ state. The anchor above guarantees the
+            # pathspec resolves; a real add failure (permissions, index
+            # corruption) propagates rather than being papered over by the
+            # subsequent allow-empty commit.
+            _git(state, "add", "--", "memories/")
             # Pathspec limits the commit to memories/ even if cron/ or other
             # subtrees happen to be staged from a prior tick.
             _git(state, "commit", "--allow-empty", "-m", msg, "--", "memories/")
