@@ -1055,3 +1055,88 @@ class TestBundledSkillGuard:
             _create_skill("free-one", VALID_SKILL_CONTENT)
             result = _edit_skill("free-one", VALID_SKILL_CONTENT_2)
         assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# State-repo commit propagation (ITRY-1283 D1)
+# ---------------------------------------------------------------------------
+
+
+class TestStateRepoCommitPropagation:
+    """skill_manage must surface state-repo commit failures as tool errors.
+
+    The disk write succeeds first (atomic_write_text already ran); we want the
+    LLM to know the change wasn't versioned so it can retry once the state
+    repo is healthy.
+    """
+
+    def test_commit_failure_propagates_as_tool_error(self, tmp_path):
+        from agent.state_repo import StateRepoError
+
+        with _skill_dir(tmp_path), \
+             patch("agent.state_repo.commit_skill_change",
+                   side_effect=StateRepoError("simulated index lock contention")):
+            raw = skill_manage(
+                action="create", name="propagation-test",
+                content=VALID_SKILL_CONTENT,
+            )
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "state-repo commit failed" in result["error"]
+        assert "simulated index lock contention" in result["error"]
+        # The disk write happened — that's expected; the tool error tells the
+        # LLM the version-control side didn't land. Retrying picks it up via
+        # `git add -A` since the file is still on disk.
+        assert (tmp_path / "propagation-test" / "SKILL.md").exists()
+
+    def test_no_state_repo_does_not_block_success(self, tmp_path, monkeypatch):
+        """On a dev workstation without ~/.hermes/state, commit_skill_change
+        returns None. skill_manage must still succeed — the install simply
+        isn't versioned."""
+        monkeypatch.delenv("HERMES_STATE_DIR", raising=False)
+        # state_repo_dir() falls back to ~/.hermes/state which doesn't exist
+        # in tmp; force the fallback path with a fake home.
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "fake-home"))
+        with _skill_dir(tmp_path):
+            raw = skill_manage(
+                action="create", name="dev-mode",
+                content=VALID_SKILL_CONTENT,
+            )
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "state_commit_sha" not in result
+
+    def test_successful_commit_attaches_sha(self, tmp_path, monkeypatch):
+        """When the state repo is configured and the commit lands, the SHA is
+        attached to the tool result so downstream consumers (snapshot/replay)
+        can pin the write."""
+        # Build a real tmp git repo as the state repo with a skills/ subdir
+        # that doubles as the SKILLS_DIR for this test.
+        import subprocess as _sp
+        state = tmp_path / "state"
+        state.mkdir()
+        _sp.run(["git", "init", "--quiet", "-b", "main", str(state)], check=True)
+        for k, v in (("user.email", "t@h.l"), ("user.name", "t")):
+            _sp.run(["git", "-C", str(state), "config", k, v], check=True)
+        skills_root = state / "skills"
+        skills_root.mkdir()
+        (state / "README.md").write_text("seed\n")
+        _sp.run(["git", "-C", str(state), "add", "-A"], check=True)
+        _sp.run(["git", "-C", str(state), "commit", "-m", "seed", "--quiet"], check=True)
+        monkeypatch.setenv("HERMES_STATE_DIR", str(state))
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]):
+            raw = skill_manage(
+                action="create", name="versioned",
+                content=VALID_SKILL_CONTENT,
+            )
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "state_commit_sha" in result
+        # Verify the commit actually landed with the expected message shape.
+        msg = _sp.run(
+            ["git", "-C", str(state), "log", "-1", "--pretty=%B"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert msg.startswith("skill: create versioned (session ")

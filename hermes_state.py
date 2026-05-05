@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
+    memory_snapshot_sha TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -582,6 +583,30 @@ class SessionDB:
                 (system_prompt, session_id),
             )
         self._execute_write(_do)
+
+    def set_memory_snapshot_sha(self, session_id: str, sha: str) -> None:
+        """Persist the state-repo SHA captured at session start.
+
+        Used by the session-start hook so replay can pin the exact memory
+        view the LLM froze for that session.
+        """
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET memory_snapshot_sha = ? WHERE id = ?",
+                (sha, session_id),
+            )
+        self._execute_write(_do)
+
+    def get_memory_snapshot_sha(self, session_id: str) -> Optional[str]:
+        """Return the memory-snapshot SHA recorded at session start, if any."""
+        cursor = self._conn.execute(
+            "SELECT memory_snapshot_sha FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return row["memory_snapshot_sha"] if isinstance(row, sqlite3.Row) else row[0]
 
     def update_token_counts(
         self,

@@ -2185,6 +2185,26 @@ class AIAgent:
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
 
+    def _record_session_start_memory_snapshot(self) -> None:
+        """Snapshot ``memories/`` and persist the resulting SHA on this session.
+
+        Both the git commit and the SessionDB persist must succeed; either
+        failure propagates so the session fails loudly rather than booting
+        with a missing SHA. The only tolerated failure is import-time
+        unavailability of the state-repo module — that's logged as a debug
+        line and the session continues without a snapshot, matching dev
+        workstations that don't ship state_repo plumbing.
+        """
+        try:
+            from agent.state_repo import commit_session_start as _commit_session_start
+        except Exception as exc:
+            logger.debug("state_repo unavailable: %s", exc)
+            return
+
+        sha = _commit_session_start(self.session_id or "")
+        if sha and self._session_db:
+            self._session_db.set_memory_snapshot_sha(self.session_id, sha)
+
     def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
         if self._session_db_created or not self._session_db:
@@ -10569,6 +10589,16 @@ class AIAgent:
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
 
+        # Publish session context for inline state-repo commits: skill_manage
+        # reads (session_id, invocation_n) from this context to format its
+        # commit messages. Set after the turn-count bump so the invocation
+        # number reflects the current turn.
+        try:
+            from agent.state_repo import set_session_context as _set_state_ctx
+            _set_state_ctx(self.session_id, self._user_turn_count)
+        except Exception:
+            pass
+
         # Reset the streaming context scrubber at the top of each turn so a
         # hung span from a prior interrupted stream can't taint this turn's
         # output.
@@ -10627,12 +10657,21 @@ class AIAgent:
                 # the previous turn so the Anthropic cache prefix matches.
                 self._cached_system_prompt = stored_prompt
             else:
-                # First turn of a new session — build from scratch.
-                self._cached_system_prompt = self._build_system_prompt(system_message)
-                # Plugin hook: on_session_start
-                # Fired once when a brand-new session is created (not on
-                # continuation).  Plugins can use this to initialise
-                # session-scoped state (e.g. warm a memory cache).
+                # First turn of a new session. The order below is load-bearing:
+                # snapshot the memory state and persist its SHA BEFORE caching
+                # the system prompt. If the snapshot or persist step fails,
+                # ``_cached_system_prompt`` stays None so the next attempt
+                # re-enters this branch and retries — caching first would let
+                # subsequent turns skip the snapshot entirely on retry.
+                _new_system_prompt = self._build_system_prompt(system_message)
+
+                # Memory snapshot — propagates on commit OR persist failure.
+                self._record_session_start_memory_snapshot()
+
+                # Plugin hook: on_session_start. Fired once when a brand-new
+                # session is created (not on continuation). Plugins can use
+                # this to initialise session-scoped state (e.g. warm a memory
+                # cache).
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _invoke_hook(
@@ -10644,12 +10683,18 @@ class AIAgent:
                 except Exception as exc:
                     logger.warning("on_session_start hook failed: %s", exc)
 
-                # Store the system prompt snapshot in SQLite
+                # Store the system prompt snapshot in SQLite. Failure is
+                # tolerated — system_prompt is rebuildable on next start.
                 if self._session_db:
                     try:
-                        self._session_db.update_system_prompt(self.session_id, self._cached_system_prompt)
+                        self._session_db.update_system_prompt(self.session_id, _new_system_prompt)
                     except Exception as e:
                         logger.debug("Session DB update_system_prompt failed: %s", e)
+
+                # Only now is it safe to cache the prompt — every required
+                # snapshot/persist step has either succeeded or been logged
+                # as an acceptable degradation.
+                self._cached_system_prompt = _new_system_prompt
 
         active_system_prompt = self._cached_system_prompt
 

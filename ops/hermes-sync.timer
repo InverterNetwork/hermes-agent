@@ -1,0 +1,15 @@
+[Unit]
+Description=Run hermes-sync every 2 minutes
+
+[Timer]
+# Initial delay after boot to let the network settle.
+OnBootSec=30s
+# Cadence: 2 minutes between ticks. Override in
+# /etc/systemd/system/hermes-sync.timer.d/override.conf to retune.
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+Unit=hermes-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=Hermes state-repo two-way sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the agent user — root invokes the unit, drops privilege via User=.
+# __AGENT_USER__ is substituted by setup-hermes.sh at install time so non-
+# default agent users get a correctly-targeted unit.
+User=__AGENT_USER__
+Group=__AGENT_USER__
+# State dir override (defaults to ~/.hermes/state inside the script). Override
+# in /etc/default/hermes-sync if the install lives elsewhere.
+EnvironmentFile=-/etc/default/hermes-sync
+ExecStart=/usr/local/sbin/hermes-sync
+# Best-effort: a single bad tick should not lock the timer out forever, and
+# transient push failures already exit 0 from the script. Restart=no keeps
+# the systemd state honest — failures show up in `systemctl list-units`.
+Restart=no
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
