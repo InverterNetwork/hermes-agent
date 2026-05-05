@@ -99,10 +99,23 @@ The installer is idempotent and **never destroys agent work in `state/` by defau
 
 Repo-local `user.name = didier` and `user.email = didier@<hostname -s>` are configured inside `state/` on every run. Override with `--git-identity-email <addr>` (e.g. CI uses `didier@ci`).
 
+### `--verify` mode
+
+Read-only health check. Does not write to the install:
+
+```sh
+bash installer/setup-hermes.sh --verify \
+  --fork /srv/hermes/repos/hermes-agent \
+  --target /home/hermes/.hermes \
+  --user hermes \
+  --auth-method app
+```
+
+Reports `[OK] <subject>` per check (suppress with `--quiet`) and `[DRIFT] <subject>: <detail>` to stderr for each failure, with a closing `==> verify: N checks, M drift`. Exits 0 if no drift, 1 otherwise. Each check is independent so a single run surfaces every drifted subject.
+
 ### Out of scope (v0)
 
 Some pieces are deliberately deferred:
 
-- **`--verify` mode.** Drift detection without mutation is not yet implemented.
-- **systemd / launchd unit installation.** No daemon supervision yet.
+- **launchd unit installation.** systemd timers ship today; the macOS launchd path is tracked under the existing macOS TODO at the top of `installer/setup-hermes.sh`.
 - **macOS branch.** v0 is Linux-only.

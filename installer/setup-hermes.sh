@@ -17,6 +17,15 @@
 #     --user    hermes \
 #     --target  /home/hermes/.hermes
 #
+# Health check (read-only, no root required):
+#   bash setup-hermes.sh --verify \
+#     --fork    /srv/hermes/repos/hermes-agent \
+#     --target  /home/hermes/.hermes \
+#     --user    hermes \
+#     --auth-method app
+#   # exits 0 if no drift; 1 with [DRIFT] lines on stderr otherwise.
+#   # add --quiet to suppress [OK] lines.
+#
 # Build deps (build-essential, python3.12-dev, python3.12-venv, libffi-dev,
 # rsync) are installed automatically on Debian/Ubuntu hosts. Pass --skip-prep
 # if you manage system packages externally.
@@ -202,11 +211,22 @@ do_verify() {
     v_drift "rails" "missing: $rails"
   fi
 
-  # ---- auth dir (when present) ----
+  # ---- auth dir + files ----
+  # When --auth-method=app the operator declares the install was provisioned
+  # with GitHub App auth, so all artefacts MUST be present. Without that
+  # contract, deleting auth/ silently passes verify because every check below
+  # is gated on existence — see review of #10 for the failure mode.
   local auth_dir="$target/auth"
   local auth_present=0
-  if [[ -d "$auth_dir" ]]; then
-    auth_present=1
+  local app_auth_expected=0
+  [[ -d "$auth_dir" ]] && auth_present=1
+  [[ "$AUTH_METHOD" == "app" ]] && app_auth_expected=1
+
+  if [[ "$app_auth_expected" -eq 1 && "$auth_present" -eq 0 ]]; then
+    v_drift "auth dir" "missing: $auth_dir (required by --auth-method app)"
+  fi
+
+  if [[ "$auth_present" -eq 1 ]]; then
     local mode owner_g
     mode="$(_mode "$auth_dir")"
     owner_g="$(_owner "$auth_dir"):$(_group "$auth_dir")"
@@ -215,6 +235,20 @@ do_verify() {
     else
       v_drift "auth dir" "mode=$mode owner=$owner_g (expected 750 $rails_owner:$agent_group)"
     fi
+  fi
+
+  # Required artefacts under app auth — list explicitly so a missing file is
+  # named in the drift line, instead of relying on the glob below to find it.
+  if [[ "$app_auth_expected" -eq 1 ]]; then
+    local required
+    for required in github-app.env github-app.pem; do
+      if [[ ! -f "$auth_dir/$required" ]]; then
+        v_drift "auth file $required" "missing (required by --auth-method app)"
+      fi
+    done
+  fi
+
+  if [[ "$auth_present" -eq 1 ]]; then
     local f
     for f in "$auth_dir"/*.pem "$auth_dir"/*.env; do
       [[ -e "$f" ]] || continue
@@ -290,16 +324,17 @@ do_verify() {
     else
       v_drift "state origin" "filesystem path: $origin_url"
     fi
-    # When app auth is wired (auth/github-app.env present), the credential
-    # helper must be persisted into state/.git/config — otherwise hermes-sync
-    # pushes silently lose authentication on re-clone or config drift.
-    if [[ "$auth_present" -eq 1 && -f "$auth_dir/github-app.env" ]]; then
+    # Under --auth-method=app, the credential helper must be persisted into
+    # state/.git/config — otherwise hermes-sync pushes silently lose
+    # authentication on re-clone or config drift. Tied to AUTH_METHOD rather
+    # than auth/ presence so a wiped auth/ doesn't sneak past this check.
+    if [[ "$app_auth_expected" -eq 1 ]]; then
       local helper
       helper="$(_git_as_owner "$state" config --local credential.https://github.com.helper 2>/dev/null || true)"
       if [[ -n "$helper" ]]; then
         v_ok "state credential helper configured"
       else
-        v_drift "state credential helper" "missing (auth/ present so app auth expected)"
+        v_drift "state credential helper" "missing (required by --auth-method app)"
       fi
     fi
   else
@@ -326,33 +361,50 @@ do_verify() {
   fi
 
   # ---- systemd units ----
+  # Parse `systemctl show` output line-by-line and compare each field with
+  # exact equality — substring matching ("active" in "*active*") quietly
+  # accepts ActiveState=inactive, which is exactly the failure mode this
+  # check is supposed to catch. See review of #10.
   if command -v systemctl >/dev/null 2>&1; then
-    local u out svc so
+    local u base unit_file so
+    local active load unitfile
     for u in hermes-sync.timer hermes-upstream-sync.timer; do
-      out="$(systemctl show -p ActiveState,LoadState,UnitFileState --value "$u" 2>/dev/null | tr '\n' ' ')"
-      out="${out% }"
-      if [[ "$out" == *"loaded"* && "$out" == *"enabled"* && "$out" == *"active"* ]]; then
-        v_ok "$u: $out"
+      active="$(systemctl show -p ActiveState --value "$u" 2>/dev/null)"
+      load="$(systemctl show -p LoadState --value "$u" 2>/dev/null)"
+      unitfile="$(systemctl show -p UnitFileState --value "$u" 2>/dev/null)"
+      if [[ "$active" == "active" && "$load" == "loaded" && "$unitfile" == "enabled" ]]; then
+        v_ok "$u: active loaded enabled"
       else
-        v_drift "$u" "${out:-not loaded}"
+        v_drift "$u" "active=${active:-?} load=${load:-?} unitfile=${unitfile:-?}"
       fi
-      svc="/etc/systemd/system/${u%.timer}.service"
-      if [[ -f "$svc" ]]; then
-        so="$(_owner "$svc")"
-        if [[ "$so" == "$rails_owner" ]]; then
-          v_ok "$svc ownership: $so"
-        else
-          v_drift "$svc ownership" "expected $rails_owner, got $so"
+      # Both .service and .timer files ship together, so check both for
+      # ownership drift — a chowned .timer is just as bad as a chowned .service.
+      base="${u%.timer}"
+      for unit_file in "/etc/systemd/system/$base.service" "/etc/systemd/system/$base.timer"; do
+        if [[ -f "$unit_file" ]]; then
+          so="$(_owner "$unit_file")"
+          if [[ "$so" == "$rails_owner" ]]; then
+            v_ok "$unit_file ownership: $so"
+          else
+            v_drift "$unit_file ownership" "expected $rails_owner, got $so"
+          fi
         fi
-      fi
+      done
     done
   fi
 
   # ---- token helper smoke ----
-  if [[ "$auth_present" -eq 1 && -f "$auth_dir/github-app.env" ]]; then
+  # Under --auth-method=app, the helper must be runnable end-to-end. We name
+  # missing helper vs missing venv python separately so the drift line points
+  # at the actual broken artefact instead of a vague "auth check failed".
+  if [[ "$app_auth_expected" -eq 1 ]]; then
     local helper_py="$rails/installer/hermes_github_token.py"
     local venv_py="$rails/venv/bin/python"
-    if [[ -f "$helper_py" && -x "$venv_py" ]]; then
+    if [[ ! -f "$helper_py" ]]; then
+      v_drift "token helper" "missing helper at $helper_py"
+    elif [[ ! -x "$venv_py" ]]; then
+      v_drift "token helper" "missing venv python at $venv_py"
+    else
       local rc=0
       if [[ "$(id -un)" == "$agent_owner" ]]; then
         env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
@@ -366,8 +418,6 @@ do_verify() {
       else
         v_drift "token helper check" "exited $rc"
       fi
-    else
-      v_drift "token helper" "missing helper or venv python"
     fi
   fi
 

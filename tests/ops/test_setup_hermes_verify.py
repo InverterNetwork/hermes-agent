@@ -100,14 +100,29 @@ def install(tmp_path: Path) -> dict:
     (target / "RUNTIME_VERSION").write_text(fork_sha)
 
     # Stub systemctl in PATH bin so verify thinks the timers are loaded.
-    # Also captures argv for assertions if a future test needs them.
+    # Verify invokes `systemctl show -p <Prop> --value <unit>` once per
+    # property, so the stub returns a single value matching the requested
+    # prop — same wire format as real systemctl.
     systemctl_log = tmp_path / "systemctl.log"
     systemctl = bin_dir / "systemctl"
     systemctl.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "%s\\n" "$*" >> {systemctl_log}\n'
         "if [[ \"$1\" == \"show\" ]]; then\n"
-        "  printf 'active\\nloaded\\nenabled\\n'\n"
+        "  prop=\"\"\n"
+        "  shift\n"
+        "  while [[ $# -gt 0 ]]; do\n"
+        "    case \"$1\" in\n"
+        "      -p) prop=\"$2\"; shift 2 ;;\n"
+        "      --value) shift ;;\n"
+        "      *) shift ;;\n"
+        "    esac\n"
+        "  done\n"
+        "  case \"$prop\" in\n"
+        "    ActiveState)   echo active ;;\n"
+        "    LoadState)     echo loaded ;;\n"
+        "    UnitFileState) echo enabled ;;\n"
+        "  esac\n"
         "  exit 0\n"
         "fi\n"
         "exit 0\n"
@@ -239,9 +254,8 @@ class TestSetupHermesVerify:
         assert "[DRIFT] sessions" in result.stderr
 
     def test_app_auth_clean_passes(self, install):
-        """auth/ + github-app.env present → verify also runs the helper smoke
-        and the credential-helper config check, and both pass on a clean
-        install."""
+        """--auth-method app + every artefact in place → verify runs the
+        helper smoke and credential-helper check, and both pass."""
         target = install["target"]
         auth = target / "auth"
         auth.mkdir(mode=0o750)
@@ -260,7 +274,7 @@ class TestSetupHermesVerify:
         _git(install["state"], "config",
              "credential.https://github.com.helper", helper_cmd)
 
-        result = _run_verify(install)
+        result = _run_verify(install, "--auth-method", "app")
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "token helper check passes" in result.stdout
         assert "state credential helper configured" in result.stdout
@@ -271,8 +285,10 @@ class TestSetupHermesVerify:
         auth.mkdir(mode=0o750)
         (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
         (auth / "github-app.env").chmod(0o640)
+        (auth / "github-app.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\n")
+        (auth / "github-app.pem").chmod(0o640)
         # No credential helper configured on the state repo → drift.
-        result = _run_verify(install)
+        result = _run_verify(install, "--auth-method", "app")
         assert result.returncode == 1
         assert "[DRIFT] state credential helper" in result.stderr
 
@@ -284,6 +300,8 @@ class TestSetupHermesVerify:
         auth.mkdir(mode=0o750)
         (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
         (auth / "github-app.env").chmod(0o640)
+        (auth / "github-app.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\n")
+        (auth / "github-app.pem").chmod(0o640)
         helper_cmd = (
             f"!HERMES_HOME='{target}' /bin/true credential"
         )
@@ -296,9 +314,92 @@ class TestSetupHermesVerify:
         )
         helper.chmod(0o755)
 
-        result = _run_verify(install)
+        result = _run_verify(install, "--auth-method", "app")
         assert result.returncode == 1
         assert "[DRIFT] token helper check" in result.stderr
+
+    def test_app_auth_missing_auth_dir_is_drift(self, install):
+        """--auth-method app + no auth/ dir → drift on every required artefact.
+
+        Prior to the review, the auth, credential-helper, and token-helper
+        checks were all gated on `auth/` existing — deleting the directory
+        silently passed verify. The contract is now: passing `--auth-method
+        app` declares the install as app-auth and every artefact MUST be
+        present.
+        """
+        # No auth/ on the fixture, but pass --auth-method app.
+        result = _run_verify(install, "--auth-method", "app")
+        assert result.returncode == 1
+        # Auth dir, both required files, and credential helper each fire
+        # their own [DRIFT] line. The token helper smoke runs against the
+        # helper script (which lives in rails, not auth/) — in the test stub
+        # it succeeds regardless; in production it'd fail trying to read the
+        # missing github-app.env. The contract violation is named explicitly
+        # in the four drift lines above.
+        assert "[DRIFT] auth dir" in result.stderr
+        assert "[DRIFT] auth file github-app.env" in result.stderr
+        assert "[DRIFT] auth file github-app.pem" in result.stderr
+        assert "[DRIFT] state credential helper" in result.stderr
+
+    def test_app_auth_missing_pem_is_drift(self, install):
+        """--auth-method app present but github-app.pem absent → drift named
+        explicitly so operators see which file is missing instead of relying
+        on a vague mode-glob check that skips when the file isn't there."""
+        target = install["target"]
+        auth = target / "auth"
+        auth.mkdir(mode=0o750)
+        (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
+        (auth / "github-app.env").chmod(0o640)
+        # No github-app.pem.
+
+        helper_cmd = (
+            f"!HERMES_HOME='{target}' "
+            f"{install['rails'] / 'venv' / 'bin' / 'python'} "
+            f"{install['rails'] / 'installer' / 'hermes_github_token.py'} credential"
+        )
+        _git(install["state"], "config",
+             "credential.https://github.com.helper", helper_cmd)
+
+        result = _run_verify(install, "--auth-method", "app")
+        assert result.returncode == 1
+        assert "[DRIFT] auth file github-app.pem" in result.stderr
+
+    def test_inactive_timer_is_drift(self, install, tmp_path):
+        """ActiveState=inactive must report drift. Substring matching
+        ('inactive' contains 'active') quietly accepted stopped timers
+        before the review fix."""
+        # Replace the systemctl stub with one that reports the timer
+        # inactive but still loaded+enabled. Substring matching used to let
+        # this state through ("inactive" contains "active") — exact-equality
+        # parsing in the script now catches it.
+        systemctl = install["bin"] / "systemctl"
+        systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ \"$1\" == \"show\" ]]; then\n"
+            "  prop=\"\"\n"
+            "  shift\n"
+            "  while [[ $# -gt 0 ]]; do\n"
+            "    case \"$1\" in\n"
+            "      -p) prop=\"$2\"; shift 2 ;;\n"
+            "      --value) shift ;;\n"
+            "      *) shift ;;\n"
+            "    esac\n"
+            "  done\n"
+            "  case \"$prop\" in\n"
+            "    ActiveState)   echo inactive ;;\n"
+            "    LoadState)     echo loaded ;;\n"
+            "    UnitFileState) echo enabled ;;\n"
+            "  esac\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        systemctl.chmod(0o755)
+
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-sync.timer" in result.stderr
+        assert "active=inactive" in result.stderr
 
     def test_upstream_workspace_non_github_origin_is_drift(self, install):
         """When upstream-workspace exists, both remotes must be on github.com."""
