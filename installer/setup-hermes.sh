@@ -8,7 +8,6 @@
 # TODO (subsequent passes):
 #   - seed config.yaml (or document first-run wizard handoff)
 #   - install launchd plist / systemd unit for the gateway
-#   - implement --verify (drift detection without mutation)
 #   - macOS branch (root:wheel, /Library/LaunchDaemons)
 #
 # Usage:
@@ -48,6 +47,8 @@ TARGET_DIR=""
 PYTHON_BIN="python3.12"
 SKIP_PREP=0
 FORCE_STATE=0
+VERIFY=0
+QUIET=0
 GIT_IDENTITY_NAME="didier"
 # Email default is derived per-host so each deployment self-identifies
 # in the state repo's commit log (e.g. didier@krustentier).
@@ -79,9 +80,323 @@ while [[ $# -gt 0 ]]; do
     --app-key-path)          APP_KEY_PATH="$2";         shift 2 ;;
     --skip-auth-check)       SKIP_AUTH_CHECK=1;         shift   ;;
     --gh-api-base)           GH_API_BASE="$2";          shift 2 ;;
+    --verify)                VERIFY=1;                  shift   ;;
+    --quiet)                 QUIET=1;                   shift   ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
+
+# ---------- shared validation (install + verify) ----------
+
+case "$AUTH_METHOD" in
+  none|app) ;;
+  *) echo "--auth-method must be 'none' or 'app' (got: $AUTH_METHOD)" >&2; exit 2 ;;
+esac
+
+if [[ -z "$GIT_IDENTITY_EMAIL" ]]; then
+  GIT_IDENTITY_EMAIL="didier@$(hostname -s)"
+fi
+
+# Agent user must exist (verify and install both need to know its home).
+# getent is Linux-only; fall back to tilde expansion so verify works on dev
+# macOS too. Production install still gates on uname=Linux below.
+id "$AGENT_USER" >/dev/null 2>&1 \
+  || { echo "agent user '$AGENT_USER' does not exist" >&2; exit 1; }
+if command -v getent >/dev/null 2>&1; then
+  AGENT_HOME="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
+else
+  AGENT_HOME="$(eval echo "~$AGENT_USER")"
+fi
+TARGET_DIR="${TARGET_DIR:-$AGENT_HOME/.hermes}"
+
+# ---------- verify mode ----------
+# Read-only health check. Inspects the live install for drift, prints
+# [OK]/[DRIFT] lines, exits 0 (no drift) or 1 (drift detected). Never writes —
+# operators run it before/after deploys to catch ownership, perms, symlink,
+# git-config, RUNTIME_VERSION, systemd-unit, and auth-helper drift in one shot.
+#
+# Each check is independent (no early exit); the closing summary always prints.
+
+V_TOTAL=0
+V_DRIFT=0
+
+v_ok() {
+  V_TOTAL=$((V_TOTAL + 1))
+  [[ "$QUIET" -eq 1 ]] || echo "[OK] $1"
+}
+v_drift() {
+  V_TOTAL=$((V_TOTAL + 1))
+  V_DRIFT=$((V_DRIFT + 1))
+  echo "[DRIFT] $1: $2" >&2
+}
+
+# Cross-platform stat — GNU first, BSD fallback. The mode helper strips the
+# leading zero so callers can compare against "750"/"640" string-style.
+_owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null; }
+_group() { stat -c '%G' "$1" 2>/dev/null || stat -f '%Sg' "$1" 2>/dev/null; }
+_mode()  {
+  local m
+  m=$(stat -c '%a' "$1" 2>/dev/null) || m=$(stat -f '%OLp' "$1" 2>/dev/null) || return 1
+  echo "${m#0}"
+}
+
+# Run a git command on a repo as the user that owns its .git/. Sidesteps git's
+# safe.directory guard when verify runs as root over an agent-owned repo. When
+# we're neither root nor the owner, just fire it directly and let git decide.
+_git_as_owner() {
+  local repo="$1"; shift
+  local owner
+  owner="$(_owner "$repo/.git" 2>/dev/null || _owner "$repo" 2>/dev/null || true)"
+  if [[ -z "$owner" || "$(id -un)" == "$owner" ]]; then
+    git -C "$repo" "$@"
+  elif [[ "$(id -u)" -eq 0 ]]; then
+    sudo -u "$owner" git -C "$repo" "$@"
+  else
+    git -C "$repo" "$@"
+  fi
+}
+
+do_verify() {
+  local target="$TARGET_DIR"
+  local fork="$FORK_DIR"
+  # Internal env-var overrides for the test fixture, which can't actually
+  # chown to root. In production these stay at their defaults.
+  #
+  # Note on agent_group: on Linux, useradd creates a primary group with the
+  # same name as the user, so the installer's `-g "$AGENT_USER"` does the
+  # right thing for both ownership and group. On macOS dev (where tests run)
+  # the user's primary group is `staff`, which is why this is overridable.
+  local rails_owner="${HERMES_VERIFY_EXPECT_RAILS_OWNER:-root}"
+  local agent_owner="${HERMES_VERIFY_EXPECT_AGENT_OWNER:-$AGENT_USER}"
+  local agent_group="${HERMES_VERIFY_EXPECT_AGENT_GROUP:-$agent_owner}"
+
+  echo "==> verify: $target (rails=$rails_owner agent=$agent_owner)"
+
+  if [[ ! -d "$target" ]]; then
+    v_drift "target dir" "missing: $target"
+    echo "==> verify: $V_TOTAL checks, $V_DRIFT drift"
+    return 1
+  fi
+  v_ok "target dir present: $target"
+
+  # ---- rails ----
+  local rails="$target/hermes-agent"
+  if [[ -d "$rails" ]]; then
+    local owner
+    owner="$(_owner "$rails")"
+    if [[ "$owner" == "$rails_owner" ]]; then
+      v_ok "rails ownership: $owner"
+    else
+      v_drift "rails ownership" "expected $rails_owner, got $owner"
+    fi
+    # Rails must not be writable by group or world — that's the protection
+    # boundary that keeps the agent from rewriting its own code paths.
+    local bad
+    bad=$(find "$rails" \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -3 | tr '\n' ' ')
+    if [[ -z "$bad" ]]; then
+      v_ok "rails perms: no group/world-writable files"
+    else
+      v_drift "rails perms" "writable: ${bad% }"
+    fi
+  else
+    v_drift "rails" "missing: $rails"
+  fi
+
+  # ---- auth dir (when present) ----
+  local auth_dir="$target/auth"
+  local auth_present=0
+  if [[ -d "$auth_dir" ]]; then
+    auth_present=1
+    local mode owner_g
+    mode="$(_mode "$auth_dir")"
+    owner_g="$(_owner "$auth_dir"):$(_group "$auth_dir")"
+    if [[ "$mode" == "750" && "$owner_g" == "$rails_owner:$agent_group" ]]; then
+      v_ok "auth dir: $mode $owner_g"
+    else
+      v_drift "auth dir" "mode=$mode owner=$owner_g (expected 750 $rails_owner:$agent_group)"
+    fi
+    local f
+    for f in "$auth_dir"/*.pem "$auth_dir"/*.env; do
+      [[ -e "$f" ]] || continue
+      local fm
+      fm="$(_mode "$f")"
+      if [[ "$fm" == "640" ]]; then
+        v_ok "auth file $(basename "$f"): $fm"
+      else
+        v_drift "auth file $(basename "$f")" "mode=$fm (expected 640)"
+      fi
+    done
+  fi
+
+  # ---- agent-owned dirs ----
+  local d own
+  for d in sessions logs cache; do
+    if [[ -d "$target/$d" ]]; then
+      own="$(_owner "$target/$d")"
+      if [[ "$own" == "$agent_owner" ]]; then
+        v_ok "$d ownership: $own"
+      else
+        v_drift "$d ownership" "expected $agent_owner, got $own"
+      fi
+    else
+      v_drift "$d" "missing: $target/$d"
+    fi
+  done
+
+  # ---- state symlinks ----
+  local link tgt
+  for d in skills memories cron; do
+    link="$target/$d"
+    if [[ -L "$link" ]]; then
+      tgt="$(readlink "$link")"
+      if [[ "$tgt" == "state/$d" ]]; then
+        v_ok "symlink $d -> $tgt"
+      else
+        v_drift "symlink $d" "points to $tgt (expected state/$d)"
+      fi
+    else
+      v_drift "symlink $d" "not a symlink: $link"
+    fi
+  done
+
+  # ---- state repo ----
+  local state="$target/state"
+  if [[ -d "$state/.git" ]]; then
+    local sown
+    sown="$(_owner "$state/.git")"
+    if [[ "$sown" == "$agent_owner" ]]; then
+      v_ok "state .git ownership: $sown"
+    else
+      v_drift "state ownership" "expected $agent_owner, got $sown"
+    fi
+    local k val
+    for k in user.name user.email; do
+      # `--local` so we only read this repo's own config — the agent user's
+      # global config (if any) is not what the installer wrote, and accepting
+      # it would mask drift after a `git config --unset`.
+      val="$(_git_as_owner "$state" config --local "$k" 2>/dev/null || true)"
+      if [[ -n "$val" ]]; then
+        v_ok "state git $k: $val"
+      else
+        v_drift "state git $k" "not configured"
+      fi
+    done
+    local origin_url
+    origin_url="$(_git_as_owner "$state" remote get-url origin 2>/dev/null || true)"
+    if [[ -z "$origin_url" ]]; then
+      v_drift "state origin" "not configured"
+    elif [[ "$origin_url" =~ ^(https?://|ssh://|git://|git@) ]]; then
+      v_ok "state origin: $origin_url"
+    else
+      v_drift "state origin" "filesystem path: $origin_url"
+    fi
+    # When app auth is wired (auth/github-app.env present), the credential
+    # helper must be persisted into state/.git/config — otherwise hermes-sync
+    # pushes silently lose authentication on re-clone or config drift.
+    if [[ "$auth_present" -eq 1 && -f "$auth_dir/github-app.env" ]]; then
+      local helper
+      helper="$(_git_as_owner "$state" config --local credential.https://github.com.helper 2>/dev/null || true)"
+      if [[ -n "$helper" ]]; then
+        v_ok "state credential helper configured"
+      else
+        v_drift "state credential helper" "missing (auth/ present so app auth expected)"
+      fi
+    fi
+  else
+    v_drift "state repo" "missing or not a git repo: $state"
+  fi
+
+  # ---- RUNTIME_VERSION freshness ----
+  if [[ -f "$target/RUNTIME_VERSION" ]]; then
+    local rv fork_sha
+    rv="$(< "$target/RUNTIME_VERSION")"
+    if [[ -d "$fork/.git" ]]; then
+      fork_sha="$(_git_as_owner "$fork" describe --always --dirty --abbrev=40 2>/dev/null || true)"
+      if [[ -n "$fork_sha" && "$rv" == "$fork_sha" ]]; then
+        v_ok "RUNTIME_VERSION matches fork HEAD: $rv"
+      else
+        v_drift "RUNTIME_VERSION" "$rv != fork HEAD ${fork_sha:-<unavailable>}"
+      fi
+    else
+      # Fork unavailable — record what's installed but don't claim it's fresh.
+      v_ok "RUNTIME_VERSION: $rv (fork unavailable for comparison)"
+    fi
+  else
+    v_drift "RUNTIME_VERSION" "missing at $target/RUNTIME_VERSION"
+  fi
+
+  # ---- systemd units ----
+  if command -v systemctl >/dev/null 2>&1; then
+    local u out svc so
+    for u in hermes-sync.timer hermes-upstream-sync.timer; do
+      out="$(systemctl show -p ActiveState,LoadState,UnitFileState --value "$u" 2>/dev/null | tr '\n' ' ')"
+      out="${out% }"
+      if [[ "$out" == *"loaded"* && "$out" == *"enabled"* && "$out" == *"active"* ]]; then
+        v_ok "$u: $out"
+      else
+        v_drift "$u" "${out:-not loaded}"
+      fi
+      svc="/etc/systemd/system/${u%.timer}.service"
+      if [[ -f "$svc" ]]; then
+        so="$(_owner "$svc")"
+        if [[ "$so" == "$rails_owner" ]]; then
+          v_ok "$svc ownership: $so"
+        else
+          v_drift "$svc ownership" "expected $rails_owner, got $so"
+        fi
+      fi
+    done
+  fi
+
+  # ---- token helper smoke ----
+  if [[ "$auth_present" -eq 1 && -f "$auth_dir/github-app.env" ]]; then
+    local helper_py="$rails/installer/hermes_github_token.py"
+    local venv_py="$rails/venv/bin/python"
+    if [[ -f "$helper_py" && -x "$venv_py" ]]; then
+      local rc=0
+      if [[ "$(id -un)" == "$agent_owner" ]]; then
+        env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
+      elif [[ "$(id -u)" -eq 0 ]]; then
+        sudo -u "$agent_owner" env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
+      else
+        env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
+      fi
+      if [[ "$rc" -eq 0 ]]; then
+        v_ok "token helper check passes"
+      else
+        v_drift "token helper check" "exited $rc"
+      fi
+    else
+      v_drift "token helper" "missing helper or venv python"
+    fi
+  fi
+
+  # ---- upstream-workspace ----
+  local ws="$target/upstream-workspace"
+  if [[ -d "$ws/.git" ]]; then
+    local rname url
+    for rname in origin upstream; do
+      url="$(_git_as_owner "$ws" remote get-url "$rname" 2>/dev/null || true)"
+      if [[ -z "$url" ]]; then
+        v_drift "upstream-workspace $rname" "not configured"
+      elif [[ "$url" == https://github.com/* || "$url" == git@github.com:* || "$url" == ssh://git@github.com/* ]]; then
+        v_ok "upstream-workspace $rname: $url"
+      else
+        v_drift "upstream-workspace $rname" "not a github.com URL: $url"
+      fi
+    done
+  fi
+
+  echo "==> verify: $V_TOTAL checks, $V_DRIFT drift"
+  [[ "$V_DRIFT" -eq 0 ]]
+}
+
+if [[ "$VERIFY" -eq 1 ]]; then
+  do_verify
+  exit $?
+fi
+
+# ---------- install-only validation ----------
 
 # State source: exactly one of --state or --state-url.
 if [[ -n "$STATE_DIR" && -n "$STATE_URL" ]]; then
@@ -90,11 +405,6 @@ fi
 if [[ -z "$STATE_DIR" && -z "$STATE_URL" ]]; then
   echo "must pass --state <path> or --state-url <url>" >&2; exit 2
 fi
-
-case "$AUTH_METHOD" in
-  none|app) ;;
-  *) echo "--auth-method must be 'none' or 'app' (got: $AUTH_METHOD)" >&2; exit 2 ;;
-esac
 
 # --state-url requires authenticated cloning, so the auth method must be set.
 if [[ -n "$STATE_URL" && "$AUTH_METHOD" == "none" ]]; then
@@ -106,10 +416,6 @@ fi
 # the helper into shipping the token to a different host.
 if [[ -n "$STATE_URL" && "$STATE_URL" != https://github.com/* ]]; then
   echo "--state-url must be an https://github.com/ URL (got: $STATE_URL)" >&2; exit 2
-fi
-
-if [[ -z "$GIT_IDENTITY_EMAIL" ]]; then
-  GIT_IDENTITY_EMAIL="didier@$(hostname -s)"
 fi
 
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
@@ -144,12 +450,6 @@ fi
 
 command -v rsync >/dev/null 2>&1 \
   || { echo "rsync not found on PATH" >&2; exit 1; }
-
-id "$AGENT_USER" >/dev/null 2>&1 \
-  || { echo "agent user '$AGENT_USER' does not exist" >&2; exit 1; }
-
-AGENT_HOME="$(getent passwd "$AGENT_USER" | cut -d: -f6)"
-TARGET_DIR="${TARGET_DIR:-$AGENT_HOME/.hermes}"
 
 [[ -d "$FORK_DIR/.git" ]] \
   || { echo "fork dir not a git repo: $FORK_DIR" >&2; exit 1; }
