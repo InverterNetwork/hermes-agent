@@ -1,0 +1,18 @@
+[Unit]
+Description=Propose an upstream hermes-agent merge as a PR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Drop privilege from root (the unit invocation) to the agent user. The
+# placeholder is substituted by setup-hermes.sh at install time.
+User=__AGENT_USER__
+Group=__AGENT_USER__
+EnvironmentFile=-/etc/default/hermes-upstream-sync
+ExecStart=/usr/local/sbin/hermes-upstream-sync
+Restart=no
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

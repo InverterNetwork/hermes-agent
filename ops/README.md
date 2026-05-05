@@ -1,18 +1,25 @@
-# Operator runbook: hermes-sync
+# Operator runbook: hermes-sync + hermes-upstream-sync
 
-This directory holds the periodic two-way sync that keeps the agent's local
-state repo (`~/.hermes/state/`) in step with the remote on GitHub. Inline
-commit hooks already record skill writes and session-start memory snapshots
-synchronously; this timer covers everything else (mid-session memory writes,
-cron edits) and ships local commits to the remote.
+Two timers live here:
+
+* **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
+  repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
+  session-start snapshots synchronously; this timer ships those commits
+  to the remote and pulls back any human edits.
+* **`hermes-upstream-sync`** — weekly proposer that detects upstream
+  hermes-agent commits and opens a PR for human review. Branch
+  protection on `origin/main` enforces that the agent can't self-merge.
 
 ## Files
 
-| Path                                | Purpose                                      |
-| ----------------------------------- | -------------------------------------------- |
-| `ops/hermes-sync`                   | The sync script. Installed to `/usr/local/sbin/hermes-sync`, root-owned. |
-| `ops/hermes-sync.service`           | systemd service unit. `User=__AGENT_USER__` is templated by `setup-hermes.sh`. |
-| `ops/hermes-sync.timer`             | systemd timer unit. 2-min cadence. |
+| Path                                       | Purpose                                      |
+| ------------------------------------------ | -------------------------------------------- |
+| `ops/hermes-sync`                          | State-sync script. Installed to `/usr/local/sbin/hermes-sync`, root-owned. |
+| `ops/hermes-sync.service`                  | systemd service unit. `User=__AGENT_USER__` is templated by `setup-hermes.sh`. |
+| `ops/hermes-sync.timer`                    | systemd timer unit. 2-min cadence. |
+| `ops/hermes-upstream-sync`                 | Upstream-sync script. Installed to `/usr/local/sbin/hermes-upstream-sync`, root-owned. |
+| `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
+| `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 
 `com.hermes.sync.plist` (launchd) is not shipped yet — the installer is
 Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
@@ -156,3 +163,106 @@ of {1, 2} ↔ 3) is handled by git's own `.git/index.lock`. **Don't add a
 fourth committer without first introducing an explicit mutex** — the
 current correctness argument relies on these three being the only
 writers.
+
+---
+
+# hermes-upstream-sync
+
+Detects when `upstream/main` (NousResearch/hermes-agent) is ahead of the
+merge-base with `origin/main` and opens a PR titled
+`Sync upstream hermes-agent @ <sha>`. Conflicts produce a `--draft` PR
+with a `WIP: upstream sync with conflicts` commit and a `(CONFLICTS)`
+suffix; auto-resolution is never attempted.
+
+## Workspace
+
+The script needs an agent-writable git checkout with both `origin` (this
+fork) and `upstream` (NousResearch/hermes-agent) configured. The installer
+provisions one at `~/.hermes/upstream-workspace/` on first install:
+
+* Cloned from the fork's `origin` URL (read from `$FORK_DIR/.git/config`).
+* `upstream` remote added pointing at
+  `https://github.com/nousresearch/hermes-agent.git`.
+* git identity set to the same name/email used by the state repo.
+
+If you delete `~/.hermes/upstream-workspace/`, the next installer run
+re-provisions it.
+
+## Cadence
+
+Weekly: `OnCalendar=Mon *-*-* 09:00:00 UTC` with a 15-minute randomized
+delay. Override via `systemctl edit hermes-upstream-sync.timer`:
+
+```sh
+sudo systemctl edit hermes-upstream-sync.timer
+# In the editor:
+# [Timer]
+# OnCalendar=
+# OnCalendar=Sun *-*-* 03:00:00 UTC
+sudo systemctl daemon-reload
+```
+
+## Logs
+
+```sh
+sudo journalctl -u hermes-upstream-sync.service -n 50 --no-pager
+```
+
+A no-divergence tick exits 0 with `… is fully merged into origin/main`.
+
+## Manual operations
+
+Force a tick (also useful right after upstream pushes something):
+
+```sh
+sudo systemctl start hermes-upstream-sync.service
+```
+
+Dry-run to preview without touching anything:
+
+```sh
+sudo -u <agent_user> PR_DRY_RUN=1 \
+  /usr/local/sbin/hermes-upstream-sync
+```
+
+## Auth
+
+The script mints a short-lived GitHub App installation token at the top
+of every tick (via `installer/hermes_github_token.py mint`) and exports
+it as `$GH_TOKEN`. Both `gh pr create` and `git push` over HTTPS read
+from `$GH_TOKEN`, so a single fresh token covers both ends of the run.
+
+Override the helper by setting any of these in the EnvironmentFile:
+
+| Variable               | Default                                                          |
+| ---------------------- | ---------------------------------------------------------------- |
+| `HERMES_HOME`          | `$HOME/.hermes`                                                  |
+| `HERMES_TOKEN_HELPER`  | `$HERMES_HOME/hermes-agent/installer/hermes_github_token.py`     |
+| `HERMES_TOKEN_PYTHON`  | `$HERMES_HOME/hermes-agent/venv/bin/python`                      |
+| `GH_TOKEN`             | (unset → mint via helper; set → use as-is and skip the helper)   |
+
+First-run failures usually mean either the App lacks `contents:write` +
+`pull_requests:write` on the fork, or the helper config at
+`$HERMES_HOME/auth/github-app.env` is missing/wrong. Run the installer's
+smoke test to verify:
+
+```sh
+sudo -u <agent_user> env HERMES_HOME=/home/<agent_user>/.hermes \
+  /home/<agent_user>/.hermes/hermes-agent/venv/bin/python \
+  /home/<agent_user>/.hermes/hermes-agent/installer/hermes_github_token.py check
+```
+
+A non-zero exit there means the same on the next sync tick.
+
+## What to expect
+
+* **No upstream activity:** silent exit, no PR.
+* **Upstream advances cleanly:** branch `upstream-sync/<date>-<sha>` on
+  origin, PR opened against `main`. Review and merge as you would any
+  PR. `RUNTIME_VERSION` rolls forward on the next `sudo setup-hermes.sh`.
+* **Upstream conflicts:** draft PR with the conflict files listed in
+  the body. Resolve locally, push to the same branch, mark the PR
+  ready, merge.
+* **In-flight branch already on origin:** next tick logs
+  `branch already exists on origin; skipping` and exits 0. The agent
+  won't open a duplicate PR while one is open.
