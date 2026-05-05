@@ -630,7 +630,11 @@ if [[ ! -d "$TARGET_DIR/hermes-agent/venv" ]]; then
   "$PYTHON_BIN" -m venv "$TARGET_DIR/hermes-agent/venv"
 fi
 "$TARGET_DIR/hermes-agent/venv/bin/pip" install --quiet --upgrade pip wheel setuptools
-"$TARGET_DIR/hermes-agent/venv/bin/pip" install --quiet -e "$TARGET_DIR/hermes-agent"
+# [slack] pulls in slack-bolt + slack-sdk so the gateway's Slack adapter is
+# usable on first start. Without this extra, hermes-gateway.service crashes
+# immediately with "slack-bolt not installed" until an operator runs pip
+# manually inside the venv.
+"$TARGET_DIR/hermes-agent/venv/bin/pip" install --quiet -e "$TARGET_DIR/hermes-agent[slack]"
 chown -R root:root "$TARGET_DIR/hermes-agent/venv"
 find "$TARGET_DIR/hermes-agent/venv" -type d -exec chmod 755 {} +
 find "$TARGET_DIR/hermes-agent/venv" -type f ! -perm -u+x -exec chmod 644 {} +
