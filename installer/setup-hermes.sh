@@ -144,8 +144,10 @@ v_drift() {
 _owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null; }
 _group() { stat -c '%G' "$1" 2>/dev/null || stat -f '%Sg' "$1" 2>/dev/null; }
 _mode()  {
+  # GNU `%a` returns full octal perms including setuid/setgid/sticky.
+  # BSD `%OLp` would drop the high bits, so concat `%Mp%Lp` to keep them.
   local m
-  m=$(stat -c '%a' "$1" 2>/dev/null) || m=$(stat -f '%OLp' "$1" 2>/dev/null) || return 1
+  m=$(stat -c '%a' "$1" 2>/dev/null) || m=$(stat -f '%Mp%Lp' "$1" 2>/dev/null) || return 1
   echo "${m#0}"
 }
 
@@ -187,6 +189,20 @@ do_verify() {
     return 1
   fi
   v_ok "target dir present: $target"
+
+  # ---- target dir mode + group ownership ----
+  # HERMES_HOME must be root:$AGENT_USER mode 02775 (setgid). Drift here
+  # silently breaks the gateway: without g+w the runtime can't create
+  # gateway.lock / gateway.pid / platforms/, and without setgid+group
+  # those files won't inherit the hermes group on creation.
+  local tmode towner_g
+  tmode="$(_mode "$target")"
+  towner_g="$(_owner "$target"):$(_group "$target")"
+  if [[ "$tmode" == "2775" && "$towner_g" == "$rails_owner:$agent_group" ]]; then
+    v_ok "target dir: $tmode $towner_g"
+  else
+    v_drift "target dir" "mode=$tmode owner=$towner_g (expected 2775 $rails_owner:$agent_group)"
+  fi
 
   # ---- rails ----
   local rails="$target/hermes-agent"
@@ -267,7 +283,7 @@ do_verify() {
 
   # ---- agent-owned dirs ----
   local d own
-  for d in sessions logs cache; do
+  for d in sessions logs cache platforms platforms/pairing; do
     if [[ -d "$target/$d" ]]; then
       own="$(_owner "$target/$d")"
       if [[ "$own" == "$agent_owner" ]]; then
@@ -541,8 +557,21 @@ echo
 
 # ---------- rails (root-owned, read-only to agent) ----------
 
+# HERMES_HOME itself is root:hermes 02775 (setgid). Rails subdirs and the
+# top-level rails files (hermes-agent/, hooks/, SOUL.md, RUNTIME_VERSION)
+# stay root-owned and read-only to the agent — that's the protection that
+# keeps the agent from rewriting its own code paths. The setgid bit lets
+# the gateway (running as $AGENT_USER) create its own runtime files
+# (gateway.lock, gateway.pid, platforms/) at HERMES_HOME root, which the
+# upstream runtime expects to write directly there. Trade-off: with write
+# access to the parent dir, the agent can `rm` a top-level rails file and
+# recreate it under its own ownership with arbitrary content (in-place
+# modification is still blocked by the file's 0644 mode). hermes-sync
+# drift detection picks up the deletion of any rails file and the next
+# setup-hermes.sh run re-seeds them; rails/ ownership drift on the
+# replacement is caught by do_verify's rails check.
 echo "==> rendering rails"
-install -d -o root -g root -m 755 "$TARGET_DIR"
+install -d -o root -g "$AGENT_USER" -m 02775 "$TARGET_DIR"
 
 # rsync upstream source into rails dir.
 # Excludes guard against accidentally rendering files that should never leave
@@ -627,6 +656,12 @@ HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
   install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
+  # Strip setgid that propagates from $TARGET_DIR's setgid bit on Linux
+  # (System V dir semantics). auth/ has a strict mode-750 invariant —
+  # files inside are explicitly chmod'd, no need for group inheritance.
+  # `install -m 0750` doesn't reliably clear the bit on coreutils we've
+  # seen in CI; `g-s` is unambiguous.
+  chmod g-s "$AUTH_DIR"
 
   if [[ -n "$APP_KEY_PATH" ]]; then
     [[ -f "$APP_KEY_PATH" ]] \
@@ -769,7 +804,11 @@ if [[ -n "$GIT_CRED_HELPER" ]]; then
 fi
 
 # Real agent-owned dirs that don't belong in git (gitignored anyway).
-for d in sessions logs cache; do
+# `platforms/` and `platforms/pairing/` host the gateway's per-platform
+# pairing/auth state — the upstream runtime mkdirs them lazily, but
+# pre-creating with agent ownership avoids the mkdir failing under the
+# rails-mode HERMES_HOME on the very first start.
+for d in sessions logs cache platforms platforms/pairing; do
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/$d"
 done
 
@@ -961,20 +1000,22 @@ EOF
     # resolves /root/.hermes (since we run as root) and the remap logic only
     # handles the default ~/.hermes shape.
     #
-    # HERMES_HOME_MODE=0755 keeps the rails dir traversable. The CLI's
-    # ensure_hermes_home() chmods $HERMES_HOME via _secure_dir, which
-    # defaults to 0700; that strips world-x on the rails dir and locks
-    # the agent user out of state/ on the next `sudo -u $AGENT_USER git
-    # -C state ...` call. The CLI doc-string at _secure_dir explicitly
-    # names HERMES_HOME_MODE as the escape hatch for cases like ours.
+    # HERMES_HOME_MODE=02775 preserves the setgid+group-write mode the
+    # rails-rendering step set on $TARGET_DIR. The CLI's ensure_hermes_home()
+    # chmods $HERMES_HOME via _secure_dir, which defaults to 0700 and would
+    # strip both world-x (locking the agent out of traversal) and the
+    # group-write bit (locking the gateway out of writing gateway.lock /
+    # gateway.pid / platforms/ at HERMES_HOME root). _secure_dir's docstring
+    # documents HERMES_HOME_MODE as the escape hatch.
     echo "==> installing canonical hermes-gateway unit via upstream CLI"
-    HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=0755 \
+    HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=02775 \
       "$HERMES_BIN" gateway install --system \
       --force --run-as-user "$AGENT_USER"
-    # Re-assert the rails-dir mode regardless. If a future CLI change
-    # ignores HERMES_HOME_MODE or applies a stricter mode for some
-    # reason, this keeps the agent user able to traverse.
-    chmod 0755 "$TARGET_DIR"
+    # Re-assert mode + group ownership regardless: if a future CLI change
+    # ignores HERMES_HOME_MODE or _secure_dir clamps stricter, the gateway
+    # would lose write access to its runtime files.
+    chgrp "$AGENT_USER" "$TARGET_DIR"
+    chmod 02775 "$TARGET_DIR"
 
     echo "==> installing slack-env drop-in at $GATEWAY_DROPIN_DST"
     install -d -o root -g root -m 0755 "$GATEWAY_DROPIN_DIR"
