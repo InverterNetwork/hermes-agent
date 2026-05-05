@@ -227,11 +227,32 @@ sudo -u <agent_user> PR_DRY_RUN=1 \
 
 ## Auth
 
-`gh pr create` uses the same GitHub App credential helper that
-`setup-hermes.sh --auth-method app` provisioned for the state repo.
-First-run failure usually means the App lacks `pull_requests:write` on
-the fork — install the App on the fork's GitHub org with that
-permission.
+The script mints a short-lived GitHub App installation token at the top
+of every tick (via `installer/hermes_github_token.py mint`) and exports
+it as `$GH_TOKEN`. Both `gh pr create` and `git push` over HTTPS read
+from `$GH_TOKEN`, so a single fresh token covers both ends of the run.
+
+Override the helper by setting any of these in the EnvironmentFile:
+
+| Variable               | Default                                                          |
+| ---------------------- | ---------------------------------------------------------------- |
+| `HERMES_HOME`          | `$HOME/.hermes`                                                  |
+| `HERMES_TOKEN_HELPER`  | `$HERMES_HOME/hermes-agent/installer/hermes_github_token.py`     |
+| `HERMES_TOKEN_PYTHON`  | `$HERMES_HOME/hermes-agent/venv/bin/python`                      |
+| `GH_TOKEN`             | (unset → mint via helper; set → use as-is and skip the helper)   |
+
+First-run failures usually mean either the App lacks `contents:write` +
+`pull_requests:write` on the fork, or the helper config at
+`$HERMES_HOME/auth/github-app.env` is missing/wrong. Run the installer's
+smoke test to verify:
+
+```sh
+sudo -u <agent_user> env HERMES_HOME=/home/<agent_user>/.hermes \
+  /home/<agent_user>/.hermes/hermes-agent/venv/bin/python \
+  /home/<agent_user>/.hermes/hermes-agent/installer/hermes_github_token.py check
+```
+
+A non-zero exit there means the same on the next sync tick.
 
 ## What to expect
 

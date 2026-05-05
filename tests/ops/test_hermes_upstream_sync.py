@@ -10,8 +10,8 @@ that's hardest to reason about by inspection.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -64,17 +64,19 @@ def triplet(tmp_path: Path) -> dict:
     _git(fork, "remote", "add", "upstream", str(upstream_bare))
     _git(fork, "fetch", "--quiet", "upstream")
 
-    # Stubbed gh records its argv to the bin dir for assertions.
+    # Stubbed gh records its argv + env to the bin dir for assertions.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    log = tmp_path / "gh.log"
-    stub = bin_dir / "gh"
-    stub.write_text(
+    gh_log = tmp_path / "gh.log"
+    gh_env_log = tmp_path / "gh.env.log"
+    gh_stub = bin_dir / "gh"
+    gh_stub.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s\\n" "$*" >> {log}\n'
+        f'printf "%s\\n" "$*" >> {gh_log}\n'
+        f'printf "GH_TOKEN=%s\\n" "${{GH_TOKEN:-}}" >> {gh_env_log}\n'
         "exit 0\n"
     )
-    stub.chmod(0o755)
+    gh_stub.chmod(0o755)
 
     return {
         "tmp": tmp_path,
@@ -83,7 +85,8 @@ def triplet(tmp_path: Path) -> dict:
         "origin_bare": origin_bare,
         "fork": fork,
         "bin": bin_dir,
-        "gh_log": log,
+        "gh_log": gh_log,
+        "gh_env_log": gh_env_log,
     }
 
 
@@ -210,3 +213,66 @@ class TestHermesUpstreamSync:
         assert result.returncode != 0
         assert "no 'upstream' remote" in result.stderr
         assert not triplet["gh_log"].exists()
+
+    def test_token_helper_is_minted_when_gh_token_unset(self, triplet, tmp_path):
+        """When GH_TOKEN is not in the environment, the script mints one
+        via $HERMES_TOKEN_HELPER and exports it before invoking gh.
+
+        Verified by stubbing the helper to print a marker token and
+        checking the recorded GH_TOKEN seen by the gh stub matches.
+        """
+        _advance_upstream(triplet)
+        helper = tmp_path / "fake_token_helper.py"
+        helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "if sys.argv[1] == 'mint':\n"
+            "    print('marker-installation-token-xyz')\n"
+        )
+        helper.chmod(0o755)
+        result = _run_script(
+            triplet,
+            HERMES_TOKEN_HELPER=str(helper),
+            HERMES_TOKEN_PYTHON=sys.executable,
+            GH_TOKEN="",
+            GITHUB_TOKEN="",
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        env_seen = triplet["gh_env_log"].read_text().strip()
+        assert env_seen == "GH_TOKEN=marker-installation-token-xyz"
+
+    def test_existing_gh_token_is_reused(self, triplet):
+        """When the caller supplies $GH_TOKEN, the helper is skipped and
+        the existing token flows through to gh."""
+        _advance_upstream(triplet)
+        result = _run_script(triplet, GH_TOKEN="caller-supplied-token")
+        assert result.returncode == 0, result.stderr
+        env_seen = triplet["gh_env_log"].read_text().strip()
+        assert env_seen == "GH_TOKEN=caller-supplied-token"
+
+    def test_stale_local_branch_is_replaced(self, triplet):
+        """A previous failed tick can leave a local sync branch with the
+        same name as the new one. The remote check above passes (push
+        never landed last time), so the script must delete the stale
+        local branch before recreating it — otherwise ``checkout -b``
+        fails on 'branch already exists'."""
+        upstream_short = _advance_upstream(triplet)
+        date = subprocess.run(
+            ["date", "-u", "+%Y-%m-%d"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        stale = f"upstream-sync/{date}-{upstream_short}"
+        _git(triplet["fork"], "branch", stale, "main")
+        # Confirm the branch exists locally but not on origin.
+        local = _git(triplet["fork"], "show-ref", "--verify",
+                     f"refs/heads/{stale}")
+        assert local.returncode == 0
+        remote_branches = _git(triplet["origin_bare"], "branch").stdout
+        assert stale not in remote_branches
+
+        result = _run_script(triplet)
+        assert result.returncode == 0, result.stderr
+        assert "stale local" in result.stderr
+        # Remote branch was created cleanly.
+        remote_branches = _git(triplet["origin_bare"], "branch").stdout
+        assert stale in remote_branches
