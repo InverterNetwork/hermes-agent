@@ -216,6 +216,21 @@ class TestSetupHermesVerify:
         assert result.returncode == 1
         assert "[DRIFT] rails perms" in result.stderr
 
+    def test_rails_symlinks_do_not_trip_perms_check(self, install):
+        """Symlinks always have mode lrwxrwxrwx — naive `find -perm -g+w`
+        flags them as writable. The check must skip symlinks because their
+        effective writability comes from the target, not the link itself.
+
+        Real-world repro: a clean install hit this on the venv's
+        bin/python3 → python3.12 and lib64 → lib symlinks.
+        """
+        rails_link = install["rails"] / "venv" / "bin" / "python3-extra"
+        rails_link.symlink_to("python")  # 0777 by default on creation
+        result = _run_verify(install)
+        assert result.returncode == 0, (
+            "verify flagged a symlink as group/world-writable:\n" + result.stderr
+        )
+
     def test_state_origin_filesystem_path_is_drift(self, install):
         _git(install["state"], "remote", "set-url", "origin", "/tmp/somewhere")
         result = _run_verify(install)
