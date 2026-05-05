@@ -25,13 +25,18 @@
                 "channels:history",
                 "channels:read",
                 "chat:write",
+                "commands",
+                "files:read",
+                "files:write",
+                "groups:history",
                 "groups:read",
+                "im:history",
+                "im:read",
+                "im:write",
+                "incoming-webhook",
                 "reactions:read",
                 "reactions:write",
-                "users:read",
-                "files:read",
-                "incoming-webhook",
-                "commands"
+                "users:read"
             ]
         },
         "pkce_enabled": false
@@ -40,7 +45,9 @@
         "event_subscriptions": {
             "bot_events": [
                 "app_mention",
-                "message.channels"
+                "message.channels",
+                "message.groups",
+                "message.im"
             ]
         },
         "interactivity": {
