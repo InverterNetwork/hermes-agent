@@ -200,8 +200,11 @@ do_verify() {
     fi
     # Rails must not be writable by group or world — that's the protection
     # boundary that keeps the agent from rewriting its own code paths.
+    # Skip symlinks: they're always created with mode lrwxrwxrwx and would
+    # trip `-perm -g+w` even though their effective writability comes from
+    # the target. The venv ships several (lib64 → lib, bin/python → python3.12).
     local bad
-    bad=$(find "$rails" \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -3 | tr '\n' ' ')
+    bad=$(find "$rails" ! -type l \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -3 | tr '\n' ' ')
     if [[ -z "$bad" ]]; then
       v_ok "rails perms: no group/world-writable files"
     else
