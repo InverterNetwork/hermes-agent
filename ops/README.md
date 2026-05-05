@@ -88,6 +88,42 @@ exits 0 so systemd doesn't mark the unit failed. Look for `WARN`:
 hermes-sync[NNN]: [hermes-sync] WARN: git push origin main failed (will retry on next tick)
 ```
 
+## Health check (`--verify`)
+
+`setup-hermes.sh --verify` is a read-only inspection of an installed
+`~/.hermes/`. It never writes — operators run it before/after a deploy
+to catch drift in ownership, perms, symlinks, state git config,
+`RUNTIME_VERSION` freshness, systemd timers, and the GitHub App auth
+chain in one shot.
+
+```sh
+sudo bash installer/setup-hermes.sh --verify \
+  --fork /srv/hermes/repos/hermes-agent \
+  --target /home/hermes/.hermes \
+  --user hermes \
+  --auth-method app
+```
+
+Output:
+
+* `[OK] <subject>` to stdout for each passing check (suppress with `--quiet`)
+* `[DRIFT] <subject>: <detail>` to stderr for each failure
+* closing line `==> verify: N checks, M drift`
+* exit 0 if all green, 1 if any check drifts
+
+Each check is independent — a single run surfaces every drifted subject,
+not just the first. Pass `--auth-method app` to assert that the GitHub
+App auth artefacts (`auth/`, `github-app.env`, `github-app.pem`,
+credential helper, token helper smoke) are all present and valid;
+`--auth-method none` (the default) skips those checks.
+
+Sample drift line operators see when state origin gets repointed at a
+filesystem path (the ITRY-1286 failure mode):
+
+```
+[DRIFT] state origin: filesystem path: /tmp/fixture
+```
+
 ## Conflict resolution flow
 
 If a remote pull rebase fails, the script:
