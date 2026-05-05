@@ -430,10 +430,13 @@ for d in skills memories cron; do
   chown -h "$AGENT_USER:$AGENT_USER" "$link"
 done
 
-# ---------- hermes-sync (ITRY-1283 D3/D4) ----------
-# Install the periodic two-way sync script and the platform-appropriate timer.
-# The script lives at /usr/local/sbin so the agent (group hermes) can read but
-# not modify it; the timer unit is also root-owned for the same reason.
+# ---------- hermes-sync ----------
+# Install the periodic two-way sync script and its systemd timer. The script
+# lives at /usr/local/sbin so the agent (group $AGENT_USER) can read but not
+# modify it; the unit files are also root-owned for the same reason.
+#
+# v0 is Linux/systemd-only — same scope as the rest of this installer. The
+# launchd path tracks under the existing macOS TODO at the top of this file.
 
 OPS_DIR="$FORK_DIR/ops"
 SYNC_SCRIPT_SRC="$OPS_DIR/hermes-sync"
@@ -454,34 +457,21 @@ EOF
   chown root:root /etc/default/hermes-sync
   chmod 0644 /etc/default/hermes-sync
 
-  case "$(uname -s)" in
-    Linux)
-      if command -v systemctl >/dev/null 2>&1; then
-        echo "==> installing systemd timer for hermes-sync"
-        install -o root -g root -m 0644 \
-          "$OPS_DIR/hermes-sync.service" /etc/systemd/system/hermes-sync.service
-        install -o root -g root -m 0644 \
-          "$OPS_DIR/hermes-sync.timer"   /etc/systemd/system/hermes-sync.timer
-        systemctl daemon-reload
-        systemctl enable --now hermes-sync.timer
-      else
-        echo "==> systemctl not present; skipping timer enable (script installed)" >&2
-      fi
-      ;;
-    Darwin)
-      echo "==> installing launchd plist for hermes-sync"
-      install -o root -g wheel -m 0644 \
-        "$OPS_DIR/com.hermes.sync.plist" /Library/LaunchDaemons/com.hermes.sync.plist
-      # Re-load the daemon so cadence changes pick up. Failures here are not
-      # fatal — operator can `launchctl bootstrap` manually.
-      launchctl bootout system/com.hermes.sync 2>/dev/null || true
-      launchctl bootstrap system /Library/LaunchDaemons/com.hermes.sync.plist \
-        || echo "==> launchctl bootstrap failed; bootstrap manually if needed" >&2
-      ;;
-    *)
-      echo "==> unknown platform $(uname -s); hermes-sync script installed but no timer wired" >&2
-      ;;
-  esac
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd timer for hermes-sync (user=$AGENT_USER)"
+    # Template the service unit's User=/Group= from the install-time agent
+    # user so non-default --user values don't get a unit hard-coded to
+    # "hermes". The source file uses __AGENT_USER__ placeholders.
+    sed "s|__AGENT_USER__|$AGENT_USER|g" \
+      "$OPS_DIR/hermes-sync.service" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/hermes-sync.service
+    install -o root -g root -m 0644 \
+      "$OPS_DIR/hermes-sync.timer" /etc/systemd/system/hermes-sync.timer
+    systemctl daemon-reload
+    systemctl enable --now hermes-sync.timer
+  else
+    echo "==> systemctl not present; skipping timer enable (script installed)" >&2
+  fi
 else
   echo "==> WARNING: $SYNC_SCRIPT_SRC missing; skipping hermes-sync install" >&2
 fi

@@ -6,14 +6,20 @@ helpers used by ``skill_manage`` (per-action) and the agent's session-start
 hook (memory snapshot). Mid-session memory writes and cron edits are picked
 up by the periodic ``hermes-sync`` timer instead.
 
-ITRY-1283 invariants:
-* I1 — local commit failure propagates; never swallow.
-* I2 — single-writer for commits (the in-process lock here covers two
-  threads inside one agent; the sync timer runs in a separate process and
-  relies on git's own ``.git/index.lock`` for cross-process exclusion).
-* I3 — append-only history on ``main`` (no rebase/squash/force-push from
-  here; the sync timer's only rewrite is ``rebase --autostash`` on pull,
-  which it aborts on conflict).
+Invariants:
+
+* Local commit failure propagates; never swallow. The snapshot/replay
+  pipeline cannot detect orphan SHAs after the fact, so the only safe
+  option is to surface failure immediately and let the caller retry.
+* Single-writer for commits. The in-process lock here covers two threads
+  inside one agent; the sync timer runs in a separate process and relies
+  on git's own ``.git/index.lock`` for cross-process exclusion.
+* Append-only history on ``main`` — no rebase/squash/force-push from here.
+  The sync timer's only rewrite is ``rebase --autostash`` on pull, which
+  it aborts on conflict.
+* Path-isolated commits. Every commit uses an explicit ``-- <pathspec>``
+  so a pre-staged change in another subtree (left behind by the sync
+  timer or a crashed previous attempt) cannot leak into the wrong commit.
 """
 
 from __future__ import annotations
@@ -85,8 +91,10 @@ _GIT_LOCK = threading.RLock()
 class StateRepoError(RuntimeError):
     """Raised when a required commit cannot be recorded.
 
-    Per ITRY-1283 I1 this propagates out of ``skill_manage`` and the
-    session-start hook so the caller knows the write isn't recoverable.
+    Propagates out of ``skill_manage`` and the session-start hook so the
+    caller knows the write isn't recoverable. The snapshot/replay pipeline
+    cannot detect orphan SHAs after the fact, so swallowing here would
+    silently break replay fidelity.
     """
 
 
@@ -107,14 +115,43 @@ def _format_skill_message(action: str, name: str, session_id: Optional[str],
     return f"skill: {action} {name} (session {sid})"
 
 
+def _rollback_skill_subtree(state: Path, name: str) -> None:
+    """Restore ``skills/<name>/`` to HEAD after a failed commit.
+
+    Without this, a partial write (file on disk but not committed) would
+    trip the LLM's retry: ``create`` would hit the existing-skill collision,
+    ``delete``/``remove_file`` would hit "not found", etc. We undo the disk
+    mutation in three steps so both new-create and modify-existing cases
+    are covered:
+
+    1. ``git reset HEAD -- skills/<name>`` — unstage anything we just added.
+    2. ``git checkout HEAD -- skills/<name>`` — restore tracked content
+       (no-op when the path has no HEAD entry, e.g. brand-new create).
+    3. ``git clean -fd skills/<name>`` — remove now-untracked leftovers
+       (the new files from a failed create).
+
+    Best-effort — rollback failures are logged but never re-raised, because
+    the original commit-failure error is what the caller needs to see.
+    """
+    rel = f"skills/{name}"
+    try:
+        _git(state, "reset", "-q", "HEAD", "--", rel, check=False)
+        _git(state, "checkout", "HEAD", "--", rel, check=False)
+        _git(state, "clean", "-fd", "--", rel, check=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("state-repo rollback for %s failed: %s", rel, exc)
+
+
 def commit_skill_change(action: str, name: str, *,
                         state_root: Optional[Path] = None) -> Optional[str]:
-    """Stage ``skills/`` and commit a skill_manage write.
+    """Stage ``skills/<name>/`` and commit a skill_manage write.
 
     Returns the resulting commit SHA, or ``None`` when there's nothing staged
     (idempotent re-write) or when the install has no state repo. Raises
-    :class:`StateRepoError` when git fails — the caller must surface this so
-    the LLM knows the write didn't record a recoverable state.
+    :class:`StateRepoError` when git fails. On failure, also rolls the
+    on-disk skill subtree back to HEAD so the caller's retry sees pre-write
+    state — otherwise ``create`` retries collide on the half-applied file
+    and ``delete``/``remove_file`` retries trip on "not found".
     """
     state = state_root or state_repo_dir()
     if state is None:
@@ -122,22 +159,46 @@ def commit_skill_change(action: str, name: str, *,
 
     sid, inv = get_session_context()
     msg = _format_skill_message(action, name, sid, inv)
+    rel = f"skills/{name}"
 
     with _GIT_LOCK:
         try:
-            _git(state, "add", "-A", "skills/")
-            diff = _git(state, "diff", "--cached", "--quiet", check=False)
+            # Stage only this skill's subtree (covers new files, modifications,
+            # deletes inside skills/<name>/). Path-isolated so a pre-staged
+            # cron/ or memories/ change can't leak into the commit.
+            _git(state, "add", "-A", "--", rel)
+            diff = _git(state, "diff", "--cached", "--quiet", "--", rel, check=False)
             if diff.returncode == 0:
                 # Nothing actually changed (e.g. patch produced identical
                 # bytes). No commit, no SHA — still a success.
                 return None
-            _git(state, "commit", "-m", msg)
+            # Pathspec on commit limits the new tree to this skill's subtree;
+            # any other staged paths stay in the index for a future commit.
+            _git(state, "commit", "-m", msg, "--", rel)
             return _git(state, "rev-parse", "HEAD").stdout.strip()
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip()
+            _rollback_skill_subtree(state, name)
             raise StateRepoError(
                 f"state-repo commit failed for skill_manage({action} {name}): {stderr}"
             ) from exc
+
+
+def _ensure_memories_anchor(state: Path) -> None:
+    """Make sure ``memories/`` has at least one tracked file so pathspec works.
+
+    On a fresh install ``memories/`` may not exist or may be empty. Without
+    a tracked file in there, ``git commit --allow-empty -- memories/`` fails
+    with "pathspec did not match any file(s)". We drop a ``.gitkeep`` only
+    when the directory is genuinely empty; existing memory writes are left
+    untouched.
+    """
+    mem = state / "memories"
+    mem.mkdir(exist_ok=True)
+    ls = _git(state, "ls-files", "--", "memories/", check=False)
+    if not ls.stdout.strip() and not any(mem.iterdir()):
+        (mem / ".gitkeep").touch()
+        _git(state, "add", "--", "memories/.gitkeep", check=False)
 
 
 def commit_session_start(session_id: str, *,
@@ -147,8 +208,8 @@ def commit_session_start(session_id: str, *,
     Always emits an allow-empty commit so every session has exactly one
     snapshot SHA, even when memories haven't changed. Returns the resulting
     SHA, or ``None`` when the install has no state repo. Raises
-    :class:`StateRepoError` on git failure (per ITRY-1283 I1, session start
-    fails loudly rather than proceeding with a missing SHA).
+    :class:`StateRepoError` on git failure — session start fails loudly
+    rather than proceeding with a missing SHA.
     """
     state = state_root or state_repo_dir()
     if state is None:
@@ -159,11 +220,13 @@ def commit_session_start(session_id: str, *,
 
     with _GIT_LOCK:
         try:
-            # memories/ may legitimately be absent on a fresh install. ``add``
-            # tolerates a missing path with check=False; if there's nothing to
-            # stage the allow-empty commit still records the SHA.
-            _git(state, "add", "memories/", check=False)
-            _git(state, "commit", "--allow-empty", "-m", msg)
+            _ensure_memories_anchor(state)
+            # Stage current memories/ state. ``add`` tolerates an empty
+            # tree; the anchor above guarantees pathspec match either way.
+            _git(state, "add", "--", "memories/", check=False)
+            # Pathspec limits the commit to memories/ even if cron/ or other
+            # subtrees happen to be staged from a prior tick.
+            _git(state, "commit", "--allow-empty", "-m", msg, "--", "memories/")
             return _git(state, "rev-parse", "HEAD").stdout.strip()
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip()

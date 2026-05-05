@@ -587,8 +587,8 @@ class SessionDB:
     def set_memory_snapshot_sha(self, session_id: str, sha: str) -> None:
         """Persist the state-repo SHA captured at session start.
 
-        Used by ITRY-1283's session-start hook so replay can pin the exact
-        memory view the LLM froze for that session.
+        Used by the session-start hook so replay can pin the exact memory
+        view the LLM froze for that session.
         """
         def _do(conn):
             conn.execute(

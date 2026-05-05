@@ -109,13 +109,19 @@ class TestCommitSkillChange:
         assert "skills/test-skill/SKILL.md" in ls.splitlines()
 
     def test_no_op_when_nothing_staged(self, state_repo_dir):
+        """Idempotent re-write (same bytes) must not produce an empty commit."""
         state_repo.set_session_context("sess-B", None)
-        # No skill on disk → nothing to stage.
-        sha = state_repo.commit_skill_change("patch", "ghost")
+        skill = state_repo_dir / "skills" / "noop"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: noop\n---\nbody\n")
+        first = state_repo.commit_skill_change("create", "noop")
+        assert first is not None
+        baseline = len(_git(state_repo_dir, "log", "--oneline").splitlines())
+
+        # Same content, second call → nothing staged → None.
+        sha = state_repo.commit_skill_change("patch", "noop")
         assert sha is None
-        # And no new commit landed.
-        log = _git(state_repo_dir, "log", "--oneline")
-        assert len(log.splitlines()) == 1  # just the seed
+        assert len(_git(state_repo_dir, "log", "--oneline").splitlines()) == baseline
 
     def test_message_omits_invocation_when_unset(self, state_repo_dir):
         state_repo.set_session_context("sess-C", None)
@@ -133,13 +139,109 @@ class TestCommitSkillChange:
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("---\nname: y\n---\n")
 
-        def _broken_git(*args, **kwargs):
-            # Mimic git failing on commit (e.g. .git revoked write).
-            raise subprocess.CalledProcessError(1, args, stderr="cannot lock ref")
+        # Patch the commit step specifically so add/checkout/clean still work
+        # for the rollback path. The wrapped git call raises only when called
+        # with "commit" in its args.
+        real_git = state_repo._git
 
-        monkeypatch.setattr(state_repo, "_git", _broken_git)
+        def _flaky_git(state_path, *args, **kwargs):
+            if args and args[0] == "commit":
+                raise subprocess.CalledProcessError(
+                    1, ("git", "commit"), stderr="cannot lock ref",
+                )
+            return real_git(state_path, *args, **kwargs)
+
+        monkeypatch.setattr(state_repo, "_git", _flaky_git)
         with pytest.raises(state_repo.StateRepoError, match="cannot lock ref"):
             state_repo.commit_skill_change("create", "y")
+
+    def test_isolates_pathspec_from_pre_staged_cron(self, state_repo_dir):
+        """A pre-staged change in cron/ must NOT land in the skill commit.
+
+        Without pathspec isolation a leftover stage from an earlier tick
+        gets swept into the next inline commit, breaking audit semantics.
+        """
+        state_repo.set_session_context("sess-iso", 4)
+        # Pre-stage a cron/ change to simulate a leftover from another writer.
+        cron = state_repo_dir / "cron"
+        cron.mkdir(exist_ok=True)
+        (cron / "tick.cron").write_text("* * * * * /bin/true\n")
+        _git(state_repo_dir, "add", "cron/tick.cron")
+
+        # Now do a skill write + commit.
+        skill = state_repo_dir / "skills" / "iso-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: iso-skill\n---\n")
+        sha = state_repo.commit_skill_change("create", "iso-skill")
+        assert sha is not None
+
+        # The skill commit must NOT contain the cron change.
+        files = _git(state_repo_dir, "show", "--name-only", "--pretty=", sha)
+        names = files.splitlines()
+        assert "skills/iso-skill/SKILL.md" in names
+        assert "cron/tick.cron" not in names
+
+        # And the cron change must still be staged (intact for a future
+        # commit by whoever owns it).
+        status = _git(state_repo_dir, "status", "--porcelain")
+        assert "A  cron/tick.cron" in status
+
+    def test_rollback_removes_new_skill_on_commit_failure(self, state_repo_dir, monkeypatch):
+        """create + commit failure must restore skills/<name>/ to HEAD.
+
+        Otherwise the LLM's retry hits the existing-skill collision and
+        the synchronous-commit AC can never be satisfied for that action.
+        """
+        state_repo.set_session_context("sess-rb", 1)
+        skill = state_repo_dir / "skills" / "rb-create"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("---\nname: rb-create\n---\n")
+        assert skill.exists()
+
+        real_git = state_repo._git
+
+        def _commit_fails(state_path, *args, **kwargs):
+            if args and args[0] == "commit":
+                raise subprocess.CalledProcessError(
+                    1, ("git", "commit"), stderr="bad commit",
+                )
+            return real_git(state_path, *args, **kwargs)
+
+        monkeypatch.setattr(state_repo, "_git", _commit_fails)
+        with pytest.raises(state_repo.StateRepoError):
+            state_repo.commit_skill_change("create", "rb-create")
+        # The brand-new skill (never in HEAD) must be gone after rollback.
+        assert not skill.exists(), "rollback should have removed the new skill"
+
+    def test_rollback_restores_modified_skill_on_commit_failure(
+        self, state_repo_dir, monkeypatch,
+    ):
+        """edit + commit failure must restore the original SKILL.md."""
+        # Seed a skill so we have a HEAD version to roll back to.
+        skill = state_repo_dir / "skills" / "rb-edit"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("original\n")
+        _git(state_repo_dir, "add", "-A")
+        _git(state_repo_dir, "commit", "-m", "seed rb-edit", "--quiet")
+
+        # Mutate on disk.
+        (skill / "SKILL.md").write_text("modified-but-uncommitted\n")
+        state_repo.set_session_context("sess-rb2", 2)
+
+        real_git = state_repo._git
+
+        def _commit_fails(state_path, *args, **kwargs):
+            if args and args[0] == "commit":
+                raise subprocess.CalledProcessError(
+                    1, ("git", "commit"), stderr="bad commit",
+                )
+            return real_git(state_path, *args, **kwargs)
+
+        monkeypatch.setattr(state_repo, "_git", _commit_fails)
+        with pytest.raises(state_repo.StateRepoError):
+            state_repo.commit_skill_change("edit", "rb-edit")
+        # File is back to the HEAD version.
+        assert (skill / "SKILL.md").read_text() == "original\n"
 
 
 # ---------------------------------------------------------------------------
@@ -167,8 +269,53 @@ class TestCommitSessionStart:
         assert "memories/MEMORY.md" in files.splitlines()
 
     def test_propagates_git_failure(self, state_repo_dir, monkeypatch):
-        def _broken_git(*args, **kwargs):
-            raise subprocess.CalledProcessError(1, args, stderr="bad commit")
-        monkeypatch.setattr(state_repo, "_git", _broken_git)
+        real_git = state_repo._git
+
+        def _commit_fails(state_path, *args, **kwargs):
+            if args and args[0] == "commit":
+                raise subprocess.CalledProcessError(
+                    1, ("git", "commit"), stderr="bad commit",
+                )
+            return real_git(state_path, *args, **kwargs)
+
+        monkeypatch.setattr(state_repo, "_git", _commit_fails)
         with pytest.raises(state_repo.StateRepoError, match="bad commit"):
             state_repo.commit_session_start("sess-fail")
+
+    def test_isolates_pathspec_from_pre_staged_cron(self, state_repo_dir):
+        """Session-start snapshot must NOT include pre-staged cron/ work."""
+        cron = state_repo_dir / "cron"
+        cron.mkdir(exist_ok=True)
+        (cron / "tick.cron").write_text("* * * * *\n")
+        _git(state_repo_dir, "add", "cron/tick.cron")
+
+        sha = state_repo.commit_session_start("sess-iso")
+        assert sha is not None
+        files = _git(state_repo_dir, "show", "--name-only", "--pretty=", sha)
+        assert "cron/tick.cron" not in files.splitlines()
+        # Cron stays staged for whoever owns it.
+        assert "A  cron/tick.cron" in _git(state_repo_dir, "status", "--porcelain")
+
+    def test_seeds_anchor_on_brand_new_install(self, tmp_path, monkeypatch):
+        """Empty memories/ on a fresh install must still record a SHA.
+
+        Without an anchor file, ``git commit --allow-empty -- memories/``
+        fails because pathspec doesn't match anything. The helper drops a
+        ``.gitkeep`` only when memories/ is empty so the pathspec resolves.
+        """
+        repo = tmp_path / "fresh"
+        repo.mkdir()
+        subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)], check=True)
+        _git(repo, "config", "user.email", "t@h.l")
+        _git(repo, "config", "user.name", "t")
+        (repo / "README.md").write_text("seed\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "seed", "--quiet")
+        # Note: no memories/ dir at all yet.
+        monkeypatch.setenv("HERMES_STATE_DIR", str(repo))
+
+        sha = state_repo.commit_session_start("sess-fresh")
+        assert sha is not None
+        # .gitkeep should now be in HEAD's tree.
+        ls = _git(repo, "ls-tree", "-r", "HEAD", "--name-only")
+        assert "memories/.gitkeep" in ls.splitlines()

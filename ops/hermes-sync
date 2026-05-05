@@ -3,16 +3,15 @@
 #
 # Pulls remote edits into the agent's working tree and pushes any local
 # work (including mid-session memory writes the inline commit hooks don't
-# cover). Designed to run from a root-owned timer (launchd plist or systemd
-# timer); the script itself runs as the agent user via `sudo -u`.
-#
-# ITRY-1283 D3.
+# cover). Designed to run from a root-owned timer; the script itself runs
+# as the agent user via systemd's User= drop-privilege.
 #
 # Failure modes:
 #   * pull rebase conflict → abort, write CONFLICT.md, exit non-zero. Do NOT
 #     auto-resolve. Operator runs `git rebase` manually before the next tick.
-#   * push failure → exit non-zero. The next tick retries; ITRY-1283 explicitly
-#     allows silent retry on remote-only failures.
+#   * push failure → exit 0 with WARN. The next tick retries; remote push
+#     is allowed to fail-and-retry silently because the inline commit hooks
+#     have already recorded the SHA locally.
 #
 # Usage:
 #   hermes-sync                # uses default ~/.hermes/state
@@ -87,10 +86,11 @@ if ! git diff --cached --quiet; then
     || warn "auto-commit failed at $TS (continuing to push)"
 fi
 
-# Push is allowed to fail-and-retry silently per ITRY-1283 D3. We log so a
-# persistent failure is visible in journalctl/syslog without surfacing it as
-# a hard error to launchd/systemd (which would otherwise mark the unit failed
-# every tick and stop retrying).
+# Push is allowed to fail-and-retry silently. We log so a persistent failure
+# is visible in journalctl/syslog without surfacing it as a hard error to
+# systemd (which would otherwise mark the unit failed every tick and stop
+# retrying). The local commit has already landed via the inline hooks, so
+# the SHA is recoverable — only delivery to the remote is delayed.
 if ! git push origin main --quiet; then
   warn "git push origin main failed (will retry on next tick)"
   exit 0

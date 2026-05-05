@@ -841,10 +841,11 @@ def skill_manage(
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
     if result.get("success"):
-        # ITRY-1283 D1: synchronously commit the write into ~/.hermes/state.
-        # Local commit failure must propagate as a tool error so the caller
-        # knows the write didn't record a recoverable state. No-op when the
-        # install has no state repo (dev workstations).
+        # Synchronously commit the write into ~/.hermes/state. Local commit
+        # failure must propagate as a tool error so the caller knows the
+        # write didn't record a recoverable state — the helper rolls the
+        # disk mutation back to HEAD so a retry sees pre-write state. No-op
+        # when the install has no state repo (dev workstations).
         try:
             from agent.state_repo import commit_skill_change, StateRepoError
             sha = commit_skill_change(action, name)
@@ -852,8 +853,8 @@ def skill_manage(
                 result["state_commit_sha"] = sha
         except StateRepoError as state_err:
             return tool_error(
-                f"Skill write succeeded on disk but the state-repo commit "
-                f"failed; the change is not yet recoverable. Retry once the "
+                f"Skill write rolled back: state-repo commit failed and the "
+                f"on-disk change has been reverted to HEAD. Retry once the "
                 f"state repo is healthy. Detail: {state_err}",
                 success=False,
             )

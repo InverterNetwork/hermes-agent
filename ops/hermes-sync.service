@@ -1,14 +1,15 @@
 [Unit]
 Description=Hermes state-repo two-way sync
-Documentation=https://linear.app/inverter/issue/ITRY-1283
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 # Runs as the agent user — root invokes the unit, drops privilege via User=.
-User=hermes
-Group=hermes
+# __AGENT_USER__ is substituted by setup-hermes.sh at install time so non-
+# default agent users get a correctly-targeted unit.
+User=__AGENT_USER__
+Group=__AGENT_USER__
 # State dir override (defaults to ~/.hermes/state inside the script). Override
 # in /etc/default/hermes-sync if the install lives elsewhere.
 EnvironmentFile=-/etc/default/hermes-sync
