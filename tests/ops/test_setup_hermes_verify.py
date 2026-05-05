@@ -277,7 +277,7 @@ class TestSetupHermesVerify:
         helper smoke and credential-helper check, and both pass."""
         target = install["target"]
         auth = target / "auth"
-        auth.mkdir(mode=0o750)
+        auth.mkdir(mode=0o750); auth.chmod(0o750)  # clear setgid inherited from setgid parent on Linux
         (auth / "github-app.pem").write_text(
             "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
         )
@@ -301,7 +301,7 @@ class TestSetupHermesVerify:
     def test_app_auth_missing_credential_helper_is_drift(self, install):
         target = install["target"]
         auth = target / "auth"
-        auth.mkdir(mode=0o750)
+        auth.mkdir(mode=0o750); auth.chmod(0o750)  # clear setgid inherited from setgid parent on Linux
         (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
         (auth / "github-app.env").chmod(0o640)
         (auth / "github-app.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\n")
@@ -316,7 +316,7 @@ class TestSetupHermesVerify:
         must report the drift instead of swallowing the failure."""
         target = install["target"]
         auth = target / "auth"
-        auth.mkdir(mode=0o750)
+        auth.mkdir(mode=0o750); auth.chmod(0o750)  # clear setgid inherited from setgid parent on Linux
         (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
         (auth / "github-app.env").chmod(0o640)
         (auth / "github-app.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\n")
@@ -366,7 +366,7 @@ class TestSetupHermesVerify:
         on a vague mode-glob check that skips when the file isn't there."""
         target = install["target"]
         auth = target / "auth"
-        auth.mkdir(mode=0o750)
+        auth.mkdir(mode=0o750); auth.chmod(0o750)  # clear setgid inherited from setgid parent on Linux
         (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
         (auth / "github-app.env").chmod(0o640)
         # No github-app.pem.

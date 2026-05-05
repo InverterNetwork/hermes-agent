@@ -656,6 +656,12 @@ HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
   install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
+  # Strip setgid that propagates from $TARGET_DIR's setgid bit on Linux
+  # (System V dir semantics). auth/ has a strict mode-750 invariant —
+  # files inside are explicitly chmod'd, no need for group inheritance.
+  # `install -m 0750` doesn't reliably clear the bit on coreutils we've
+  # seen in CI; `g-s` is unambiguous.
+  chmod g-s "$AUTH_DIR"
 
   if [[ -n "$APP_KEY_PATH" ]]; then
     [[ -f "$APP_KEY_PATH" ]] \
