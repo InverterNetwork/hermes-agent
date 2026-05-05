@@ -392,10 +392,10 @@ fi
 
 # Guardrail: if the state repo's origin is a filesystem path the sync timer's
 # pushes will fail every tick (the agent user can't write into a root-owned
-# fixture's .git/objects/). ITRY-1286 was the symptom — a bootstrap from
-# `--state <path>` where the source's own origin was a local fixture
-# propagated through to the installed clone. Surface the misconfig here so
-# operators see it on every install run instead of digging through journalctl.
+# fixture's .git/objects/). This happens when a `--state <path>` bootstrap
+# inherits a local-fixture origin from the source repo and propagates it to
+# the installed clone. Surface the misconfig here so operators see it on
+# every install run instead of digging through journalctl.
 LIVE_STATE_ORIGIN="$(sudo -u "$AGENT_USER" git -C "$STATE_TARGET" remote get-url origin 2>/dev/null || true)"
 if [[ -n "$LIVE_STATE_ORIGIN" && ! "$LIVE_STATE_ORIGIN" =~ ^(https?://|ssh://|git://|git@) ]]; then
   echo "==> WARNING: state repo origin is a filesystem path: $LIVE_STATE_ORIGIN" >&2
