@@ -33,8 +33,6 @@
                 "im:history",
                 "im:read",
                 "im:write",
-                "incoming-webhook",
-                "reactions:read",
                 "reactions:write",
                 "users:read"
             ]

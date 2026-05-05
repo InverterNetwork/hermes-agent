@@ -3174,3 +3174,16 @@ class TestSlackAllowedChannels:
         }
         await adapter._handle_slash_command(command)
         assert adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_missing_channel_id_with_allowlist_fails_closed(self, adapter, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_ALLOW")
+        event = {
+            "text": "<@U_BOT> hello",
+            "user": "U_USER",
+            "channel": "",
+            "channel_type": "channel",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(event)
+        assert not adapter.handle_message.called

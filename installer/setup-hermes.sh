@@ -622,6 +622,7 @@ GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
 TOKEN_HELPER_PY="$TARGET_DIR/hermes-agent/installer/hermes_github_token.py"
 VENV_PY="$TARGET_DIR/hermes-agent/venv/bin/python"
+HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
@@ -936,7 +937,6 @@ fi
 # and refreshed by `hermes update`; we layer our additions via a systemd
 # drop-in. See ops/README.md for the rationale.
 
-HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 GATEWAY_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/slack-env.conf"
 GATEWAY_DROPIN_DIR="/etc/systemd/system/hermes-gateway.service.d"
 GATEWAY_DROPIN_DST="$GATEWAY_DROPIN_DIR/slack-env.conf"
@@ -962,12 +962,11 @@ EOF
     # handles the default ~/.hermes shape.
     #
     # HERMES_HOME_MODE=0755 keeps the rails dir traversable. The CLI's
-    # _ensure_hermes_home (hermes_cli/config.py:346) chmods $HERMES_HOME
-    # via _secure_dir, which defaults to 0700; that strips world-x on
-    # the rails dir and locks the agent user out of state/ on the next
-    # `sudo -u $AGENT_USER git -C state ...` call. The CLI doc-string at
-    # _secure_dir explicitly names HERMES_HOME_MODE as the escape hatch
-    # for cases like ours.
+    # ensure_hermes_home() chmods $HERMES_HOME via _secure_dir, which
+    # defaults to 0700; that strips world-x on the rails dir and locks
+    # the agent user out of state/ on the next `sudo -u $AGENT_USER git
+    # -C state ...` call. The CLI doc-string at _secure_dir explicitly
+    # names HERMES_HOME_MODE as the escape hatch for cases like ours.
     echo "==> installing canonical hermes-gateway unit via upstream CLI"
     HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=0755 \
       "$HERMES_BIN" gateway install --system \
@@ -1003,7 +1002,6 @@ fi
 
 # ---------- post-install assertion ----------
 
-HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 [[ -x "$HERMES_BIN" ]] \
   || { echo "FAIL: hermes entry point missing or non-executable at $HERMES_BIN" >&2; exit 1; }
 

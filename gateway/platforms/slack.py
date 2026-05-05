@@ -2952,11 +2952,14 @@ class SlackAdapter(BasePlatformAdapter):
         """True iff a channel allowlist is set and ``channel_id`` isn't on it.
 
         DMs bypass — they're gated by ``SLACK_ALLOWED_USERS``. ``"*"`` anywhere
-        in the list disables the gate (matches DISCORD_ALLOWED_CHANNELS).
+        in the list disables the gate. Empty ``channel_id`` is treated as
+        not-allowed (fail closed). Mirrors ``DISCORD_ALLOWED_CHANNELS``.
         """
-        if is_dm or not channel_id:
+        if is_dm:
             return False
         allowed = self._slack_allowed_channels()
         if not allowed or "*" in allowed:
             return False
+        if not channel_id:
+            return True
         return channel_id not in allowed
