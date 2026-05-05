@@ -1859,6 +1859,10 @@ class SlackAdapter(BasePlatformAdapter):
             channel_type = "im"
         is_dm = channel_type in ("im", "mpim")  # Both 1:1 and group DMs
 
+        if self._channel_blocked_by_allowlist(channel_id, is_dm):
+            logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
+            return
+
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
         #   new thread/session (the bot always replies in a thread).
@@ -2721,6 +2725,13 @@ class SlackAdapter(BasePlatformAdapter):
         # keep group semantics so different users do not collide into one
         # session key.
         is_dm = str(channel_id).startswith("D")
+
+        if self._channel_blocked_by_allowlist(channel_id, is_dm):
+            # Slash already got an upstream ack so Slack won't render
+            # "dispatch_failed" — silent drop is the right shape.
+            logger.debug("[Slack] Ignoring slash command in non-allowed channel: %s", channel_id)
+            return
+
         source = self.build_source(
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
@@ -2924,3 +2935,31 @@ class SlackAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _slack_allowed_channels(self) -> set:
+        """Channels the bot is allowed to respond in. Empty set = no gate."""
+        raw = self.config.extra.get("allowed_channels")
+        if raw is None:
+            raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        s = str(raw).strip() if raw is not None else ""
+        if s:
+            return {part.strip() for part in s.split(",") if part.strip()}
+        return set()
+
+    def _channel_blocked_by_allowlist(self, channel_id: str, is_dm: bool) -> bool:
+        """True iff a channel allowlist is set and ``channel_id`` isn't on it.
+
+        DMs bypass — they're gated by ``SLACK_ALLOWED_USERS``. ``"*"`` anywhere
+        in the list disables the gate. Empty ``channel_id`` is treated as
+        not-allowed (fail closed). Mirrors ``DISCORD_ALLOWED_CHANNELS``.
+        """
+        if is_dm:
+            return False
+        allowed = self._slack_allowed_channels()
+        if not allowed or "*" in allowed:
+            return False
+        if not channel_id:
+            return True
+        return channel_id not in allowed
