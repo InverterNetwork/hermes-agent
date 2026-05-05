@@ -390,6 +390,19 @@ else
   echo "==> state repo already present at $STATE_TARGET (preserving; pass --force-state to re-clone)"
 fi
 
+# Guardrail: if the state repo's origin is a filesystem path the sync timer's
+# pushes will fail every tick (the agent user can't write into a root-owned
+# fixture's .git/objects/). ITRY-1286 was the symptom — a bootstrap from
+# `--state <path>` where the source's own origin was a local fixture
+# propagated through to the installed clone. Surface the misconfig here so
+# operators see it on every install run instead of digging through journalctl.
+LIVE_STATE_ORIGIN="$(sudo -u "$AGENT_USER" git -C "$STATE_TARGET" remote get-url origin 2>/dev/null || true)"
+if [[ -n "$LIVE_STATE_ORIGIN" && ! "$LIVE_STATE_ORIGIN" =~ ^(https?://|ssh://|git://|git@) ]]; then
+  echo "==> WARNING: state repo origin is a filesystem path: $LIVE_STATE_ORIGIN" >&2
+  echo "    hermes-sync push will fail every tick until repointed. To fix:" >&2
+  echo "      sudo -u $AGENT_USER git -C $STATE_TARGET remote set-url origin <github-url>" >&2
+fi
+
 # Identity is re-applied every run (idempotent) so config drift gets fixed.
 sudo -u "$AGENT_USER" git -C "$STATE_TARGET" config user.name  "$GIT_IDENTITY_NAME"
 sudo -u "$AGENT_USER" git -C "$STATE_TARGET" config user.email "$GIT_IDENTITY_EMAIL"
