@@ -960,9 +960,22 @@ EOF
     # HERMES_HOME pins the unit's HERMES_HOME to $TARGET — without it the CLI
     # resolves /root/.hermes (since we run as root) and the remap logic only
     # handles the default ~/.hermes shape.
+    #
+    # HERMES_HOME_MODE=0755 keeps the rails dir traversable. The CLI's
+    # _ensure_hermes_home (hermes_cli/config.py:346) chmods $HERMES_HOME
+    # via _secure_dir, which defaults to 0700; that strips world-x on
+    # the rails dir and locks the agent user out of state/ on the next
+    # `sudo -u $AGENT_USER git -C state ...` call. The CLI doc-string at
+    # _secure_dir explicitly names HERMES_HOME_MODE as the escape hatch
+    # for cases like ours.
     echo "==> installing canonical hermes-gateway unit via upstream CLI"
-    HERMES_HOME="$TARGET_DIR" "$HERMES_BIN" gateway install --system \
+    HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=0755 \
+      "$HERMES_BIN" gateway install --system \
       --force --run-as-user "$AGENT_USER"
+    # Re-assert the rails-dir mode regardless. If a future CLI change
+    # ignores HERMES_HOME_MODE or applies a stricter mode for some
+    # reason, this keeps the agent user able to traverse.
+    chmod 0755 "$TARGET_DIR"
 
     echo "==> installing slack-env drop-in at $GATEWAY_DROPIN_DST"
     install -d -o root -g root -m 0755 "$GATEWAY_DROPIN_DIR"
