@@ -541,8 +541,18 @@ echo
 
 # ---------- rails (root-owned, read-only to agent) ----------
 
+# HERMES_HOME itself is root:hermes 02775 (setgid). Rails subdirs and the
+# top-level rails files (hermes-agent/, hooks/, SOUL.md, RUNTIME_VERSION)
+# stay root-owned and read-only to the agent — that's the protection that
+# keeps the agent from rewriting its own code paths. The setgid bit lets
+# the gateway (running as $AGENT_USER) create its own runtime files
+# (gateway.lock, gateway.pid, platforms/) at HERMES_HOME root, which the
+# upstream runtime expects to write directly there. Trade-off: the agent
+# can `rm` the top-level rails files (it can't modify their content,
+# they're root-owned 0644), but hermes-sync drift detection catches any
+# missing rails file and the next setup-hermes.sh run re-seeds them.
 echo "==> rendering rails"
-install -d -o root -g root -m 755 "$TARGET_DIR"
+install -d -o root -g "$AGENT_USER" -m 02775 "$TARGET_DIR"
 
 # rsync upstream source into rails dir.
 # Excludes guard against accidentally rendering files that should never leave
@@ -769,7 +779,11 @@ if [[ -n "$GIT_CRED_HELPER" ]]; then
 fi
 
 # Real agent-owned dirs that don't belong in git (gitignored anyway).
-for d in sessions logs cache; do
+# `platforms/` and `platforms/pairing/` host the gateway's per-platform
+# pairing/auth state — the upstream runtime mkdirs them lazily, but
+# pre-creating with agent ownership avoids the mkdir failing under the
+# rails-mode HERMES_HOME on the very first start.
+for d in sessions logs cache platforms platforms/pairing; do
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/$d"
 done
 
@@ -961,20 +975,22 @@ EOF
     # resolves /root/.hermes (since we run as root) and the remap logic only
     # handles the default ~/.hermes shape.
     #
-    # HERMES_HOME_MODE=0755 keeps the rails dir traversable. The CLI's
-    # ensure_hermes_home() chmods $HERMES_HOME via _secure_dir, which
-    # defaults to 0700; that strips world-x on the rails dir and locks
-    # the agent user out of state/ on the next `sudo -u $AGENT_USER git
-    # -C state ...` call. The CLI doc-string at _secure_dir explicitly
-    # names HERMES_HOME_MODE as the escape hatch for cases like ours.
+    # HERMES_HOME_MODE=02775 preserves the setgid+group-write mode the
+    # rails-rendering step set on $TARGET_DIR. The CLI's ensure_hermes_home()
+    # chmods $HERMES_HOME via _secure_dir, which defaults to 0700 and would
+    # strip both world-x (locking the agent out of traversal) and the
+    # group-write bit (locking the gateway out of writing gateway.lock /
+    # gateway.pid / platforms/ at HERMES_HOME root). _secure_dir's docstring
+    # documents HERMES_HOME_MODE as the escape hatch.
     echo "==> installing canonical hermes-gateway unit via upstream CLI"
-    HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=0755 \
+    HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=02775 \
       "$HERMES_BIN" gateway install --system \
       --force --run-as-user "$AGENT_USER"
-    # Re-assert the rails-dir mode regardless. If a future CLI change
-    # ignores HERMES_HOME_MODE or applies a stricter mode for some
-    # reason, this keeps the agent user able to traverse.
-    chmod 0755 "$TARGET_DIR"
+    # Re-assert mode + group ownership regardless: if a future CLI change
+    # ignores HERMES_HOME_MODE or _secure_dir clamps stricter, the gateway
+    # would lose write access to its runtime files.
+    chgrp "$AGENT_USER" "$TARGET_DIR"
+    chmod 02775 "$TARGET_DIR"
 
     echo "==> installing slack-env drop-in at $GATEWAY_DROPIN_DST"
     install -d -o root -g root -m 0755 "$GATEWAY_DROPIN_DIR"
