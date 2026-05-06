@@ -984,10 +984,7 @@ for r in data:
       [[ -z "$repo_id" ]] && continue
       bare="$QUAY_REPOS_ROOT/${repo_id}.git"
       if [[ -d "$bare" ]]; then
-        # Use sudo -u so git's safe.directory guard doesn't trip on the
-        # agent-owned clone when the installer runs as root.
-        actual_url="$(sudo -u "$AGENT_USER" \
-          git -C "$bare" remote get-url origin 2>/dev/null || true)"
+        actual_url="$(_git_as_owner "$bare" remote get-url origin 2>/dev/null || true)"
         if [[ "$actual_url" != "$repo_url" ]]; then
           echo "FAIL: $bare origin=$actual_url, expected $repo_url" >&2
           echo "      refusing to silently re-point an existing bare clone." >&2
