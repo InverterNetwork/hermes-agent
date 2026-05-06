@@ -405,3 +405,54 @@ class TestListRepos:
         r = _run(values, "list-repos")
         assert r.returncode == 1
         assert "quay.repos must be a list" in r.stderr
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "../foo",       # path traversal up
+            "foo/bar",      # path separator
+            "..",           # parent-dir literal
+            ".hidden",      # leading dot
+            "-leading",     # leading dash → would be parsed as a CLI flag
+            "with space",   # whitespace
+            "name@host",    # special chars
+        ],
+    )
+    def test_id_shape_rejects_unsafe_values(self, tmp_path: Path, bad_id: str):
+        # id is interpolated into a filesystem path on the bash side; the
+        # helper is the validation choke point.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            f"    - id: {bad_id!r}\n"
+            "      url: https://github.com/example/x\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1, r.stdout
+        assert ".id=" in r.stderr
+        assert "must match" in r.stderr
+
+    @pytest.mark.parametrize(
+        "good_id",
+        ["alpha", "test-factory-code", "v1.2", "underscored_id", "x", "a1.b2-c3"],
+    )
+    def test_id_shape_accepts_typical_values(self, tmp_path: Path, good_id: str):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            f"    - id: {good_id}\n"
+            "      url: https://github.com/example/x\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split("\t")[0] == good_id

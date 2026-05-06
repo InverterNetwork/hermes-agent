@@ -962,8 +962,8 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
     # registrations" would re-invoke `quay repo add` on every re-run,
     # which is not documented as idempotent.
     QUAY_REGISTERED_IDS="$(
-      QUAY_DATA_DIR="$TARGET_DIR/quay" \
-        sudo -u "$AGENT_USER" "$QUAY_BIN_DST" repo list \
+      sudo -u "$AGENT_USER" \
+        env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
         | python3 -c '
 import json, sys
 try:
@@ -1002,8 +1002,8 @@ for r in data:
         echo "==> quay repo $repo_id already registered (preserving)"
       else
         echo "==> registering $repo_id with quay"
-        QUAY_DATA_DIR="$TARGET_DIR/quay" \
-          sudo -u "$AGENT_USER" "$QUAY_BIN_DST" repo add \
+        sudo -u "$AGENT_USER" \
+          env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
             --id "$repo_id" \
             --url "$repo_url" \
             --base-branch "$repo_base" \

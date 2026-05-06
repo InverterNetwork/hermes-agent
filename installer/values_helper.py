@@ -289,6 +289,14 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
 
 _REPO_FIELDS = ("id", "url", "base_branch", "package_manager", "install_cmd")
 
+# `id` is interpolated into the bare-clone path
+# ($QUAY_DATA_DIR/repos/<id>.git) by setup-hermes.sh. Reject anything
+# that could escape that directory or shape-confuse `quay repo add --id`:
+# disallow path separators, leading dots (no `..` / `.hidden`), leading
+# dashes (would be parsed as a flag), and any character outside the
+# alnum/dot/dash/underscore set.
+_REPO_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+
 
 def cmd_list_repos(args: argparse.Namespace) -> int:
     """Emit one TSV line per quay.repos entry: <id>\\t<url>\\t<base_branch>\\t<package_manager>\\t<install_cmd>.
@@ -297,7 +305,8 @@ def cmd_list_repos(args: argparse.Namespace) -> int:
     repo and register each with `quay repo add`. Required-field absence is
     a hard fail (don't silently skip a repo). Tabs/newlines inside any
     field also fail — TSV parsing on the shell side would split them
-    incorrectly.
+    incorrectly. The `id` field is shape-checked because it lands in a
+    filesystem path on the bash side.
     """
     data = _load(Path(args.values))
     quay = data.get("quay") or {}
@@ -331,6 +340,12 @@ def cmd_list_repos(args: argparse.Namespace) -> int:
                 )
                 return 1
             row.append(s)
+        if not _REPO_ID_RE.match(row[0]):
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].id={row[0]!r} must match "
+                f"{_REPO_ID_RE.pattern} (alnum/./-/_, no path separators, no leading dot)\n"
+            )
+            return 1
         sys.stdout.write("\t".join(row) + "\n")
     return 0
 

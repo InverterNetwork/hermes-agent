@@ -37,6 +37,19 @@
 #   quay.repos                 — list of repos quay manages. Each entry maps
 #                                 to `quay repo add` arguments and is backed
 #                                 by a bare clone provisioned at install time.
+#                                 v0 limitation: each `url` must be reachable
+#                                 by the agent user without further wiring —
+#                                 either a public HTTPS URL or a private repo
+#                                 the operator has pre-staged credentials for
+#                                 (SSH key in ~hermes/.ssh, or a global
+#                                 credential helper). The fork's GitHub App
+#                                 helper is scoped to hermes-agent +
+#                                 hermes-state and is NOT threaded into these
+#                                 clones.
+#   quay.repos[].id            — must match `^[A-Za-z0-9_][A-Za-z0-9._-]*$`
+#                                 (alnum/./-/_, no path separators, no leading
+#                                 dot or dash). The id lands in a filesystem
+#                                 path and a CLI flag.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
 #   quay.adapters.slack        — disabled in v0; reserved for waiting_human
