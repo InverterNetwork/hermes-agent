@@ -268,9 +268,9 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         lines.append("enabled = true")
         lines.append(f"api_key_env = {_toml_basic_string(str(api_key_env))}")
 
-    slack_a = adapters.get("slack") or {}
-    if isinstance(slack_a, dict) and slack_a.get("enabled"):
-        bot_token_env = slack_a.get("bot_token_env") or "SLACK_TOKEN"
+    slack_adapter = adapters.get("slack") or {}
+    if isinstance(slack_adapter, dict) and slack_adapter.get("enabled"):
+        bot_token_env = slack_adapter.get("bot_token_env") or "SLACK_TOKEN"
         lines.append("")
         lines.append("[adapters.slack]")
         lines.append("enabled = true")
