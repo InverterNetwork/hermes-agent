@@ -582,10 +582,8 @@ echo "    auth:    $AUTH_METHOD${APP_ID:+ (app=$APP_ID, install=$APP_INSTALLATIO
 echo
 
 # ---------- quay binary (rails-class, /usr/local/bin/quay) ----------
-# Fetch the quay binary pinned by quay.version from the GitHub Releases of
-# lafawnduh1966/quay, verify against the release's SHA256SUMS, and install
-# to /usr/local/bin/quay (root-owned, world-readable). The pin is the
-# security boundary — there is no override flag; bumps go through values.yaml.
+# The version pin is the security boundary: no override flag, SHA256
+# verified against the matching GitHub Release on every install run.
 
 QUAY_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.version)"
 [[ -n "$QUAY_VERSION" ]] \
@@ -603,20 +601,22 @@ QUAY_ASSET="quay-linux-${QUAY_ARCH}"
 
 echo "==> installing quay binary ${QUAY_VERSION} (${QUAY_ARCH}) to $QUAY_BIN_DST"
 QUAY_TMP="$(mktemp -d)"
+trap 'rm -rf "$QUAY_TMP"' EXIT
 curl -fsSL --retry 3 -o "$QUAY_TMP/$QUAY_ASSET" "$QUAY_RELEASE_URL/$QUAY_ASSET"
 curl -fsSL --retry 3 -o "$QUAY_TMP/SHA256SUMS"  "$QUAY_RELEASE_URL/SHA256SUMS"
 
-# Verify only our asset's line. Without the explicit grep guard, an empty
-# match would feed an empty stream to `sha256sum -c`, which exits 0 and
-# silently passes — exactly the failure mode this check exists to prevent.
-QUAY_EXPECTED_SUM="$(grep " ${QUAY_ASSET}\$" "$QUAY_TMP/SHA256SUMS" || true)"
-[[ -n "$QUAY_EXPECTED_SUM" ]] \
+# Match on field-2 (filename) so the asset name is treated as a literal
+# rather than a regex. An empty match would otherwise feed an empty stream
+# to `sha256sum -c`, which exits 0 and silently passes.
+QUAY_EXPECTED_LINE="$(awk -v asset="$QUAY_ASSET" '$2 == asset {print; exit}' "$QUAY_TMP/SHA256SUMS")"
+[[ -n "$QUAY_EXPECTED_LINE" ]] \
   || { echo "FAIL: $QUAY_ASSET not listed in SHA256SUMS for ${QUAY_VERSION}" >&2; exit 1; }
-( cd "$QUAY_TMP" && echo "$QUAY_EXPECTED_SUM" | sha256sum -c --strict --status ) \
+( cd "$QUAY_TMP" && echo "$QUAY_EXPECTED_LINE" | sha256sum -c --strict --status ) \
   || { echo "FAIL: SHA256 mismatch for $QUAY_ASSET (release ${QUAY_VERSION})" >&2; exit 1; }
 
 install -o root -g root -m 0755 "$QUAY_TMP/$QUAY_ASSET" "$QUAY_BIN_DST"
 rm -rf "$QUAY_TMP"
+trap - EXIT
 
 # ---------- rails (root-owned, read-only to agent) ----------
 
@@ -907,10 +907,10 @@ for d in sessions logs cache platforms platforms/pairing quay; do
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/$d"
 done
 
-# quay/config.toml — first-install seed only; preserved on re-runs so
-# operator hand-edits survive (delete to refresh from values.yaml). The
-# helper itself also preserves the file when it exists, but we mirror the
-# config.yaml block so the print line + chown only fire on first creation.
+# quay/config.toml — same first-install-seed pattern as config.yaml above.
+# The bash gate scopes chown/chmod to first install (the helper itself
+# also preserves the file body, but the gate avoids re-flipping perms on
+# every re-run, which would clobber any operator chmod).
 QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
 if [[ -f "$QUAY_CONFIG_OUT" ]]; then
   echo "==> $QUAY_CONFIG_OUT already present (preserving)"
