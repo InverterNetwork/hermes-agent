@@ -425,10 +425,15 @@ do_verify() {
       fi
       local actual_version
       actual_version="$("$quay_bin" --version 2>/dev/null | head -n1 || true)"
-      if [[ -n "$actual_version" ]] && grep -Fq "$quay_version" <<<"$actual_version"; then
+      # quay.version is a git tag (`v0.1.0`); the binary embeds
+      # `${pkg.version}+${shortSHA}` (`0.1.0+abc1234`) — no `v` prefix.
+      # Strip the leading `v` from the pin for the substring compare so a
+      # clean release-built binary doesn't fire false drift.
+      local pin_semver="${quay_version#v}"
+      if [[ -n "$actual_version" ]] && grep -Fq "$pin_semver" <<<"$actual_version"; then
         v_ok "quay binary version: $actual_version"
       else
-        v_drift "quay binary version" "got '${actual_version:-?}' (expected to contain '$quay_version')"
+        v_drift "quay binary version" "got '${actual_version:-?}' (expected to contain '$pin_semver')"
       fi
     fi
 
