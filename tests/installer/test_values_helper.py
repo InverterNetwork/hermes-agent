@@ -308,3 +308,100 @@ class TestRenderQuayConfig:
         # the file is not valid TOML.
         text = out.read_text()
         assert r'\"be terse\"' in text
+
+
+class TestListRepos:
+    @pytest.fixture
+    def repos_values(self, tmp_path: Path) -> Path:
+        p = tmp_path / "values.yaml"
+        p.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: beta\n"
+            "      url: https://github.com/example/beta\n"
+            "      base_branch: trunk\n"
+            "      package_manager: npm\n"
+            "      install_cmd: npm ci --no-audit\n",
+            encoding="utf-8",
+        )
+        return p
+
+    def test_emits_one_tsv_line_per_repo(self, repos_values: Path):
+        r = _run(repos_values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        lines = r.stdout.splitlines()
+        assert lines == [
+            "alpha\thttps://github.com/example/alpha\tmain\tbun\tbun install",
+            "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
+        ]
+
+    def test_missing_repos_section_emits_nothing(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  version: v0.1.0\n", encoding="utf-8")
+        r = _run(values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_missing_required_field_exits_nonzero(self, tmp_path: Path):
+        # Missing install_cmd — should fail loudly so an under-specified
+        # deploy.values.yaml doesn't silently skip the repo at install time.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "install_cmd is required" in r.stderr
+
+    def test_empty_required_field_exits_nonzero(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            '    - id: ""\n'
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "id is required" in r.stderr
+
+    def test_tab_in_field_exits_nonzero(self, tmp_path: Path):
+        # A tab inside a field would silently corrupt the bash-side parse.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            '      install_cmd: "bun\tinstall"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "tab or newline" in r.stderr
+
+    def test_repos_must_be_a_list(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  repos: not-a-list\n", encoding="utf-8"
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "quay.repos must be a list" in r.stderr

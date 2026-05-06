@@ -1,0 +1,35 @@
+[Unit]
+Description=Quay tick — drive queued tasks forward
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User/Group and the target-dir-derived paths below are substituted by
+# setup-hermes.sh at install time, so non-default --user / --target
+# values get a correctly-targeted unit (matches hermes-sync).
+User=__AGENT_USER__
+Group=__AGENT_USER__
+# QUAY_DATA_DIR pins the data dir (sqlite, worktrees, repo bare clones,
+# logs) — set here rather than in config.toml so the runtime path lives
+# in exactly one place that the installer can reason about.
+Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
+# Adapter tokens (LINEAR_API_KEY etc.) live in auth/quay.env, written by
+# stage-quay-env.sh out-of-band. Leading `-` makes the file optional so
+# the unit starts even before tokens are staged: a tick without a Linear
+# adapter just has nothing to enqueue.
+EnvironmentFile=-__TARGET_DIR__/auth/quay.env
+# Operator overrides (cadence retunes, ad-hoc env vars). Preserved
+# across installer re-runs — same /etc/default/ pattern as hermes-sync.
+EnvironmentFile=-/etc/default/quay-tick
+ExecStart=/usr/local/bin/quay tick
+# A single bad tick should not lock the timer out forever. Restart=no
+# keeps the systemd state honest — failures show up in `systemctl
+# list-units`.
+Restart=no
+# Generous: a tick may spawn a worker tmux session; the supervisor lock
+# in quay prevents overlapping ticks regardless.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

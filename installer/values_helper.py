@@ -2,7 +2,7 @@
 """Read deploy.values.yaml and emit shell-friendly outputs.
 
 setup-hermes.sh shells out to this helper rather than parsing YAML in bash.
-Four subcommands:
+Five subcommands:
 
   get <key>                    — print scalar at dotted path (org.name) or a
                                   list joined by `--sep` (default ",").
@@ -13,6 +13,9 @@ Four subcommands:
                                   exists, so operator hand-edits survive.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
+  list-repos                   — emit one TSV line per quay.repos entry
+                                  (id, url, base_branch, package_manager,
+                                  install_cmd) for setup-hermes.sh to iterate.
 """
 
 from __future__ import annotations
@@ -284,6 +287,54 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
     return 0
 
 
+_REPO_FIELDS = ("id", "url", "base_branch", "package_manager", "install_cmd")
+
+
+def cmd_list_repos(args: argparse.Namespace) -> int:
+    """Emit one TSV line per quay.repos entry: <id>\\t<url>\\t<base_branch>\\t<package_manager>\\t<install_cmd>.
+
+    setup-hermes.sh iterates this output to provision a bare clone per
+    repo and register each with `quay repo add`. Required-field absence is
+    a hard fail (don't silently skip a repo). Tabs/newlines inside any
+    field also fail — TSV parsing on the shell side would split them
+    incorrectly.
+    """
+    data = _load(Path(args.values))
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+    repos = quay.get("repos")
+    if repos is None:
+        return 0
+    if not isinstance(repos, list):
+        sys.stderr.write("values_helper.py: quay.repos must be a list\n")
+        return 1
+
+    for i, entry in enumerate(repos):
+        if not isinstance(entry, dict):
+            sys.stderr.write(f"values_helper.py: quay.repos[{i}] must be a mapping\n")
+            return 1
+        row: list[str] = []
+        for field in _REPO_FIELDS:
+            v = entry.get(field)
+            if v is None or v == "":
+                sys.stderr.write(
+                    f"values_helper.py: quay.repos[{i}].{field} is required\n"
+                )
+                return 1
+            s = str(v)
+            if "\t" in s or "\n" in s:
+                sys.stderr.write(
+                    f"values_helper.py: quay.repos[{i}].{field} contains tab or newline; "
+                    "refusing to emit ambiguous TSV\n"
+                )
+                return 1
+            row.append(s)
+        sys.stdout.write("\t".join(row) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -316,6 +367,10 @@ def main(argv: list[str] | None = None) -> int:
     p_quay.add_argument("--force", action="store_true",
                         help="overwrite an existing file")
     p_quay.set_defaults(func=cmd_render_quay_config)
+
+    p_list = sub.add_parser("list-repos",
+                            help="emit TSV rows for quay.repos entries")
+    p_list.set_defaults(func=cmd_list_repos)
 
     args = parser.parse_args(argv)
     return args.func(args)
