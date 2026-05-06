@@ -96,6 +96,7 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `state/` | `hermes:hermes` | 755 | clone of `hermes-state`; `.git/` agent-owned |
 | `skills`, `memories`, `cron` | `hermes:hermes` (symlink) | — | resolve to `state/<name>` |
 | `sessions/`, `logs/`, `cache/` | `hermes:hermes` | 755 | local-only (gitignored content) |
+| `quay/` | `hermes:hermes` | 755 | quay data dir (sqlite, worktrees, bare clones, logs); seeded `config.toml` lives inside, preserved across re-runs |
 | `auth/` | `root:hermes` | 750 | App key + env config (only present with `--auth-method app`) |
 | `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent) |
 | `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path |
