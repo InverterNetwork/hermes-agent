@@ -184,6 +184,21 @@ do_verify() {
   local agent_owner="${HERMES_VERIFY_EXPECT_AGENT_OWNER:-$AGENT_USER}"
   local agent_group="${HERMES_VERIFY_EXPECT_AGENT_GROUP:-$agent_owner}"
 
+  # Quay artefacts are gated on `quay.version` in the values file — empty (or
+  # values file absent, e.g. in the verify-only test fixture) means quay isn't
+  # provisioned on this host, and every quay-* check below silently skips.
+  # values_file/values_helper resolution mirrors the install-flow defaults
+  # but is tolerant: missing files just disable the gate instead of
+  # erroring, since `--verify` is also exercised against fixtures that
+  # don't carry a values file.
+  local values_file="${VALUES_FILE:-$fork/deploy.values.yaml}"
+  local values_helper="${VALUES_HELPER:-$fork/installer/values_helper.py}"
+  local quay_version=""
+  if [[ -f "$values_file" && -f "$values_helper" ]]; then
+    quay_version="$(python3 "$values_helper" --values "$values_file" get quay.version 2>/dev/null || true)"
+  fi
+  local quay_bin="${HERMES_VERIFY_QUAY_BIN:-/usr/local/bin/quay}"
+
   echo "==> verify: $target (rails=$rails_owner agent=$agent_owner)"
 
   if [[ ! -d "$target" ]]; then
@@ -382,6 +397,135 @@ do_verify() {
     v_drift "RUNTIME_VERSION" "missing at $target/RUNTIME_VERSION"
   fi
 
+  # ---- quay artefacts (gated on quay.version) ----
+  # Mirror the install-time provisioning: binary in rails-class
+  # /usr/local/bin, agent-owned data dir + config.toml, one bare clone
+  # per quay.repos entry, and each id registered with the quay CLI. All
+  # checks no-op when quay.version is empty.
+  if [[ -n "$quay_version" ]]; then
+    local quay_dir="$target/quay"
+
+    # Binary: rails-class root:root 0755 + version pin must match the
+    # value the values file claims is deployed. The version compare is a
+    # substring check — `quay --version` may print extra context (commit,
+    # build date) and we just need to assert the tag isn't lying.
+    if [[ ! -x "$quay_bin" ]]; then
+      v_drift "quay binary" "missing or non-executable: $quay_bin"
+    else
+      local qmode qowner
+      qmode="$(_mode "$quay_bin")"
+      qowner="$(_owner "$quay_bin")"
+      # Owner (not owner:group) — matches the rails ownership check; the
+      # primary defense is mode 0755 + root-owned, and on some distros the
+      # default group on /usr/local/bin/* is wheel rather than root.
+      if [[ "$qmode" == "755" && "$qowner" == "$rails_owner" ]]; then
+        v_ok "quay binary: $qmode $qowner"
+      else
+        v_drift "quay binary" "mode=$qmode owner=$qowner (expected 755 $rails_owner)"
+      fi
+      local actual_version
+      actual_version="$("$quay_bin" --version 2>/dev/null | head -n1 || true)"
+      if [[ -n "$actual_version" ]] && grep -Fq "$quay_version" <<<"$actual_version"; then
+        v_ok "quay binary version: $actual_version"
+      else
+        v_drift "quay binary version" "got '${actual_version:-?}' (expected to contain '$quay_version')"
+      fi
+    fi
+
+    # Data dir + config.toml: agent-owned, mirrors the install-time
+    # provisioning. config.toml is the rendered runtime config; its
+    # absence is a drift, not a soft skip.
+    if [[ ! -d "$quay_dir" ]]; then
+      v_drift "quay data dir" "missing: $quay_dir"
+    else
+      local dmode downer_g
+      dmode="$(_mode "$quay_dir")"
+      downer_g="$(_owner "$quay_dir"):$(_group "$quay_dir")"
+      if [[ "$dmode" == "755" && "$downer_g" == "$agent_owner:$agent_group" ]]; then
+        v_ok "quay data dir: $dmode $downer_g"
+      else
+        v_drift "quay data dir" "mode=$dmode owner=$downer_g (expected 755 $agent_owner:$agent_group)"
+      fi
+      local quay_cfg="$quay_dir/config.toml"
+      if [[ ! -f "$quay_cfg" ]]; then
+        v_drift "quay config.toml" "missing: $quay_cfg"
+      else
+        local cmode cowner
+        cmode="$(_mode "$quay_cfg")"
+        cowner="$(_owner "$quay_cfg")"
+        if [[ "$cmode" == "644" && "$cowner" == "$agent_owner" ]]; then
+          v_ok "quay config.toml: $cmode $cowner"
+        else
+          v_drift "quay config.toml" "mode=$cmode owner=$cowner (expected 644 $agent_owner)"
+        fi
+      fi
+    fi
+
+    # Per-repo: bare clone present + agent-owned + origin matches values
+    # file, AND id appears in `quay repo list`. Mirrors the install-time
+    # invocation pattern (sudo -u env QUAY_DATA_DIR=…) — env_reset on
+    # Debian/Ubuntu strips prefix-style env vars, so the env wrapper is
+    # required, not stylistic. See PR #18 review.
+    local quay_repos_tsv=""
+    if [[ -f "$values_file" && -f "$values_helper" ]]; then
+      quay_repos_tsv="$(python3 "$values_helper" --values "$values_file" list-repos 2>/dev/null || true)"
+    fi
+    if [[ -n "$quay_repos_tsv" ]]; then
+      local registered_ids=""
+      if [[ -x "$quay_bin" && -d "$quay_dir" ]]; then
+        # Same invocation pattern as install-time: prefix with sudo only
+        # when we're root running as a different user; otherwise call
+        # directly. env QUAY_DATA_DIR=… must come AFTER any sudo prefix
+        # because env_reset strips prefix-style vars.
+        local cmd_prefix=()
+        if [[ "$(id -u)" -eq 0 && "$(id -un)" != "$agent_owner" ]]; then
+          cmd_prefix=(sudo -u "$agent_owner")
+        fi
+        # bash 3.2 (macOS default) under set -u trips on "${arr[@]}" when
+        # arr is empty; the +"${arr[@]}" guard expands to nothing in that
+        # case rather than referencing an unbound element.
+        registered_ids="$(${cmd_prefix[@]+"${cmd_prefix[@]}"} env "QUAY_DATA_DIR=$quay_dir" "$quay_bin" repo list 2>/dev/null \
+          | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(data, list):
+    for r in data:
+        if isinstance(r, dict) and r.get("id"):
+            print(r["id"])
+' 2>/dev/null || true)"
+      fi
+      local repo_id repo_url repo_base repo_pkg repo_install bare bowner bare_origin
+      while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
+        [[ -z "$repo_id" ]] && continue
+        bare="$quay_dir/repos/${repo_id}.git"
+        if [[ ! -d "$bare" ]]; then
+          v_drift "quay repo $repo_id" "bare clone missing: $bare"
+        else
+          bowner="$(_owner "$bare")"
+          if [[ "$bowner" == "$agent_owner" ]]; then
+            v_ok "quay repo $repo_id ownership: $bowner"
+          else
+            v_drift "quay repo $repo_id ownership" "expected $agent_owner, got $bowner"
+          fi
+          bare_origin="$(_git_as_owner "$bare" remote get-url origin 2>/dev/null || true)"
+          if [[ "$bare_origin" == "$repo_url" ]]; then
+            v_ok "quay repo $repo_id origin: $bare_origin"
+          else
+            v_drift "quay repo $repo_id origin" "got '${bare_origin:-?}' (expected '$repo_url')"
+          fi
+        fi
+        if [[ -n "$registered_ids" ]] && grep -Fxq "$repo_id" <<<"$registered_ids"; then
+          v_ok "quay repo $repo_id registered"
+        else
+          v_drift "quay repo $repo_id" "not registered with quay"
+        fi
+      done <<<"$quay_repos_tsv"
+    fi
+  fi
+
   # ---- systemd units ----
   # Parse `systemctl show` output line-by-line and compare each field with
   # exact equality — substring matching ("active" in "*active*") quietly
@@ -390,7 +534,9 @@ do_verify() {
   if command -v systemctl >/dev/null 2>&1; then
     local u base unit_file so
     local active load unitfile
-    for u in hermes-sync.timer hermes-upstream-sync.timer; do
+    local timers=(hermes-sync.timer hermes-upstream-sync.timer)
+    [[ -n "$quay_version" ]] && timers+=(quay-tick.timer)
+    for u in "${timers[@]}"; do
       active="$(systemctl show -p ActiveState --value "$u" 2>/dev/null)"
       load="$(systemctl show -p LoadState --value "$u" 2>/dev/null)"
       unitfile="$(systemctl show -p UnitFileState --value "$u" 2>/dev/null)"
