@@ -308,3 +308,151 @@ class TestRenderQuayConfig:
         # the file is not valid TOML.
         text = out.read_text()
         assert r'\"be terse\"' in text
+
+
+class TestListRepos:
+    @pytest.fixture
+    def repos_values(self, tmp_path: Path) -> Path:
+        p = tmp_path / "values.yaml"
+        p.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: beta\n"
+            "      url: https://github.com/example/beta\n"
+            "      base_branch: trunk\n"
+            "      package_manager: npm\n"
+            "      install_cmd: npm ci --no-audit\n",
+            encoding="utf-8",
+        )
+        return p
+
+    def test_emits_one_tsv_line_per_repo(self, repos_values: Path):
+        r = _run(repos_values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        lines = r.stdout.splitlines()
+        assert lines == [
+            "alpha\thttps://github.com/example/alpha\tmain\tbun\tbun install",
+            "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
+        ]
+
+    def test_missing_repos_section_emits_nothing(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  version: v0.1.0\n", encoding="utf-8")
+        r = _run(values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_missing_required_field_exits_nonzero(self, tmp_path: Path):
+        # Missing install_cmd — should fail loudly so an under-specified
+        # deploy.values.yaml doesn't silently skip the repo at install time.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "install_cmd is required" in r.stderr
+
+    def test_empty_required_field_exits_nonzero(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            '    - id: ""\n'
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "id is required" in r.stderr
+
+    def test_tab_in_field_exits_nonzero(self, tmp_path: Path):
+        # A tab inside a field would silently corrupt the bash-side parse.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/example/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            '      install_cmd: "bun\tinstall"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "tab or newline" in r.stderr
+
+    def test_repos_must_be_a_list(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  repos: not-a-list\n", encoding="utf-8"
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "quay.repos must be a list" in r.stderr
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "../foo",       # path traversal up
+            "foo/bar",      # path separator
+            "..",           # parent-dir literal
+            ".hidden",      # leading dot
+            "-leading",     # leading dash → would be parsed as a CLI flag
+            "with space",   # whitespace
+            "name@host",    # special chars
+        ],
+    )
+    def test_id_shape_rejects_unsafe_values(self, tmp_path: Path, bad_id: str):
+        # id is interpolated into a filesystem path on the bash side; the
+        # helper is the validation choke point.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            f"    - id: {bad_id!r}\n"
+            "      url: https://github.com/example/x\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1, r.stdout
+        assert ".id=" in r.stderr
+        assert "must match" in r.stderr
+
+    @pytest.mark.parametrize(
+        "good_id",
+        ["alpha", "test-factory-code", "v1.2", "underscored_id", "x", "a1.b2-c3"],
+    )
+    def test_id_shape_accepts_typical_values(self, tmp_path: Path, good_id: str):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            f"    - id: {good_id}\n"
+            "      url: https://github.com/example/x\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split("\t")[0] == good_id

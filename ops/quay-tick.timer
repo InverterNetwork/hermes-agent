@@ -1,0 +1,16 @@
+[Unit]
+Description=Run quay tick every minute
+
+[Timer]
+# Initial delay after boot to let the network settle.
+OnBootSec=30s
+# Cadence: 1 minute between ticks. Override in
+# /etc/systemd/system/quay-tick.timer.d/override.conf to retune
+# (`sudo systemctl edit quay-tick.timer` is the supported path).
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=quay-tick.service
+
+[Install]
+WantedBy=timers.target
