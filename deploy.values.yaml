@@ -1,0 +1,49 @@
+# Per-organization values for this hermes-agent fork.
+#
+# Re-forking for a different org: copy this file, change every value, then
+# re-run installer/setup-hermes.sh on the target host. Tokens never live here
+# — they're staged at install time into <target>/auth/slack.env (mode 0640
+# root:hermes) by stage-slack-env.sh and never committed.
+#
+# Schema:
+#   org.name                   — display label only; not currently consumed
+#                                 by code, used as documentation.
+#   org.agent_identity_name    — git user.name on commits the agent makes back
+#                                 to hermes-state. Surfaces in `git log` so
+#                                 deploys are self-identifying.
+#
+#   slack.app                  — fields rendered into installer/slack-manifest.json
+#                                 at install time. The rendered file is what
+#                                 the operator pastes into Slack's manifest UI
+#                                 when creating/updating the App.
+#   slack.runtime              — fields seeded into <target>/config.yaml on
+#                                 first install. Preserved across re-runs (the
+#                                 installer never overwrites a live config) so
+#                                 operator hand-edits survive.
+
+org:
+  name: Inverter
+  agent_identity_name: didier
+
+slack:
+  app:
+    display_name: BabyDidier(dev)
+    description: 'Clack clack, I''m cooking ("je cuisine")'
+    background_color: "#1b1b8c"
+    slash_command_name: lmdtfy
+    slash_command_description: Let Me Didier That For You
+  runtime:
+    # If non-empty, the bot ONLY responds in these channels (whitelist).
+    # Empty list / unset disables the gate. "*" anywhere disables it too.
+    allowed_channels:
+      - C0B23MZ0USV
+    # Optional Slack channel ID the gateway treats as the agent's "home"
+    # channel (for unsolicited posts). Leave blank to disable.
+    home_channel: ""
+    # When true, the bot only responds in channels when @-mentioned (DMs are
+    # unaffected). Mirrors slack.require_mention in upstream config.yaml.
+    require_mention: true
+    # Optional per-channel system prompt overrides:
+    #   channel_prompts:
+    #     C01ABC: "Code review mode"
+    channel_prompts: {}

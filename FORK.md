@@ -7,8 +7,24 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 - Upstream source — at repo root (unchanged from upstream so `git merge upstream/main` is a clean fast-forward).
 - `SOUL.md` — customized persona file overlaid on top of upstream.
 - `hooks/` — overlay slot for deployment-specific hooks (currently empty).
-- `installer/` — `setup-hermes.sh` and supporting scripts (filled by the installer workstream).
+- `deploy.values.yaml` — single source of truth for org-specific values (identity, Slack manifest fields, runtime allowlist). See [Re-forking for another org](#re-forking-for-another-org).
+- `installer/` — `setup-hermes.sh`, the values helper, and the Slack manifest template.
 - `ops/` — launchd plists / systemd units, sync scripts (filled by the auto-commit and upstream-sync workstreams).
+
+## Re-forking for another org
+
+Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instantiate this fork for a different org:
+
+1. Fork this repo (or clone + push to a new origin).
+2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`. Tokens never go here; they're staged at install time.
+3. Run `installer/setup-hermes.sh` on the target host. The installer:
+   - reads `deploy.values.yaml` (override the path with `--values <file>` if needed),
+   - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
+   - seeds `<HERMES_HOME>/config.yaml` from `slack.runtime.*` on first install (preserved on re-runs — operator hand-edits survive),
+   - configures `git user.name` on agent commits to `org.agent_identity_name`.
+4. Stage Slack tokens with `stage-slack-env.sh` (interactive — writes `<HERMES_HOME>/auth/slack.env`).
+
+Acceptance: once `deploy.values.yaml` is set for the new org, `grep -RE 'BabyDidier|didier|C0B23MZ0USV|lmdtfy' installer/ ops/ gateway/` should return no matches outside the values file.
 
 ## Remotes
 
