@@ -201,10 +201,12 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
 def _toml_basic_string(s: str) -> str:
     """Encode ``s`` as a TOML basic string (double-quoted, with escapes).
 
-    json.dumps yields the same escape set TOML basic strings accept for the
-    control characters that matter here (``\\"``, ``\\\\``, ``\\n``, ``\\r``,
-    ``\\t``, ``\\b``, ``\\f``, ``\\uXXXX``). Non-ASCII characters are allowed
-    literally in TOML basic strings, which matches ``ensure_ascii=False``.
+    Adequate for our inputs (CLI command templates, env var names): both
+    formats accept the same escapes for the control characters that
+    realistically appear (``\\"``, ``\\\\``, ``\\n``, ``\\r``, ``\\t``,
+    ``\\b``, ``\\f``), and TOML basic strings allow non-ASCII literals,
+    matching ``ensure_ascii=False``. Not a fully general TOML encoder —
+    raw U+007F (DEL) would round-trip through ``json.dumps`` unescaped.
     """
     return json.dumps(s, ensure_ascii=False)
 

@@ -7,7 +7,7 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 - Upstream source — at repo root (unchanged from upstream so `git merge upstream/main` is a clean fast-forward).
 - `SOUL.md` — customized persona file overlaid on top of upstream.
 - `hooks/` — overlay slot for deployment-specific hooks (currently empty).
-- `deploy.values.yaml` — single source of truth for org-specific values (identity, Slack manifest fields, runtime allowlist). See [Re-forking for another org](#re-forking-for-another-org).
+- `deploy.values.yaml` — single source of truth for org-specific values (identity, Slack manifest fields, runtime allowlist, quay deployment knobs). See [Re-forking for another org](#re-forking-for-another-org).
 - `installer/` — `setup-hermes.sh`, the values helper, and the Slack manifest template.
 - `ops/` — launchd plists / systemd units, sync scripts (filled by the auto-commit and upstream-sync workstreams).
 
@@ -16,7 +16,7 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instantiate this fork for a different org:
 
 1. Fork this repo (or clone + push to a new origin).
-2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`. Tokens never go here; they're staged at install time.
+2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `quay.*` (note: `quay.version` is required — pin to a published `v*` tag). Tokens never go here; they're staged at install time.
 3. Run `installer/setup-hermes.sh` on the target host. The installer:
    - reads `deploy.values.yaml` (override the path with `--values <file>` if needed),
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
