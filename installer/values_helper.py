@@ -180,16 +180,17 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     if isinstance(cp, dict) and cp:
         slack_block["channel_prompts"] = {str(k): str(v) for k, v in cp.items()}
 
-    if not slack_block:
-        sys.stdout.write(f"skipped: no recognized slack.runtime keys in {args.values}\n")
-        return 0
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     header = (
         "# Seeded by setup-hermes.sh from deploy.values.yaml on first install.\n"
         "# Subsequent installer runs preserve this file — edit freely.\n"
     )
-    body = yaml.safe_dump({"slack": slack_block}, sort_keys=False, default_flow_style=False)
+    # Always write a file (even with an empty body) so setup-hermes.sh can
+    # rely on the path existing for chown/chmod.
+    if slack_block:
+        body = yaml.safe_dump({"slack": slack_block}, sort_keys=False, default_flow_style=False)
+    else:
+        body = "# No recognized slack.runtime keys in deploy.values.yaml.\n"
     out_path.write_text(header + body, encoding="utf-8")
     sys.stdout.write(f"wrote: {out_path}\n")
     return 0

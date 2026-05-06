@@ -803,6 +803,9 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(ac, list):
                         ac = ",".join(str(v) for v in ac)
                     os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+                home = slack_cfg.get("home_channel")
+                if home and not os.getenv("SLACK_HOME_CHANNEL"):
+                    os.environ["SLACK_HOME_CHANNEL"] = str(home)
                 if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
                     os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
 
