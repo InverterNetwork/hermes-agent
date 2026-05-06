@@ -1,18 +1,18 @@
 {
     "display_information": {
-        "name": "BabyDidier(dev)",
-        "description": "Clack clack, I'm cooking (\"je cuisine\")",
-        "background_color": "#1b1b8c"
+        "name": "${slack.app.display_name}",
+        "description": "${slack.app.description}",
+        "background_color": "${slack.app.background_color}"
     },
     "features": {
         "bot_user": {
-            "display_name": "BabyDidier(dev)",
+            "display_name": "${slack.app.display_name}",
             "always_online": false
         },
         "slash_commands": [
             {
-                "command": "/lmdtfy",
-                "description": "Let Me Didier That For You",
+                "command": "/${slack.app.slash_command_name}",
+                "description": "${slack.app.slash_command_description}",
                 "usage_hint": "[questions]",
                 "should_escape": false
             }

@@ -399,6 +399,60 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
+    def test_bridges_slack_allowed_channels_list_from_config_yaml_to_env(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            "  allowed_channels:\n"
+            "    - C_ALLOW1\n"
+            "    - C_ALLOW2\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == "C_ALLOW1,C_ALLOW2"
+
+    def test_bridges_slack_allowed_channels_csv_from_config_yaml_to_env(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n  allowed_channels: 'C_ALLOW1,C_ALLOW2'\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == "C_ALLOW1,C_ALLOW2"
+
+    def test_slack_allowed_channels_env_takes_precedence_over_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n  allowed_channels: [C_FROM_YAML]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_FROM_ENV")
+
+        load_gateway_config()
+
+        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == "C_FROM_ENV"
+
     def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

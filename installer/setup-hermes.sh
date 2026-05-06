@@ -27,8 +27,12 @@
 #   # add --quiet to suppress [OK] lines.
 #
 # Build deps (build-essential, python3.12-dev, python3.12-venv, libffi-dev,
-# rsync) are installed automatically on Debian/Ubuntu hosts. Pass --skip-prep
-# if you manage system packages externally.
+# rsync, python3-yaml) are installed automatically on Debian/Ubuntu hosts.
+# Pass --skip-prep if you manage system packages externally.
+#
+# Org-specific values (identity, Slack manifest fields, runtime allowlist)
+# are read from $FORK_DIR/deploy.values.yaml. Override the path with
+# --values <file>; see FORK.md for the re-fork flow.
 #
 # State repo: pass exactly one of
 #   --state <path>     local clone of hermes-state (legacy / CI fixture path)
@@ -58,9 +62,11 @@ SKIP_PREP=0
 FORCE_STATE=0
 VERIFY=0
 QUIET=0
-GIT_IDENTITY_NAME="didier"
-# Email default is derived per-host so each deployment self-identifies
-# in the state repo's commit log (e.g. didier@krustentier).
+# Filled from deploy.values.yaml.org.agent_identity_name; email default is
+# <name>@<short-hostname> so each deployment self-identifies in the state
+# repo's commit log.
+VALUES_FILE=""
+GIT_IDENTITY_NAME=""
 GIT_IDENTITY_EMAIL=""
 
 # Auth wiring (off by default; CI uses the local fixture without auth).
@@ -83,6 +89,7 @@ while [[ $# -gt 0 ]]; do
     --skip-prep)             SKIP_PREP=1;               shift   ;;
     --force-state)           FORCE_STATE=1;             shift   ;;
     --git-identity-email)    GIT_IDENTITY_EMAIL="$2";   shift 2 ;;
+    --values)                VALUES_FILE="$2";          shift 2 ;;
     --auth-method)           AUTH_METHOD="$2";          shift 2 ;;
     --app-id)                APP_ID="$2";               shift 2 ;;
     --app-installation-id)   APP_INSTALLATION_ID="$2";  shift 2 ;;
@@ -101,10 +108,6 @@ case "$AUTH_METHOD" in
   none|app) ;;
   *) echo "--auth-method must be 'none' or 'app' (got: $AUTH_METHOD)" >&2; exit 2 ;;
 esac
-
-if [[ -z "$GIT_IDENTITY_EMAIL" ]]; then
-  GIT_IDENTITY_EMAIL="didier@$(hostname -s)"
-fi
 
 # Agent user must exist (verify and install both need to know its home).
 # getent is Linux-only; fall back to tilde expansion so verify works on dev
@@ -508,17 +511,35 @@ if [[ "$SKIP_PREP" -eq 0 ]]; then
   if command -v apt-get >/dev/null 2>&1; then
     echo "==> installing build deps (apt) for python${PY_VERSION}"
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    # python3-yaml gives the system python3 PyYAML so values_helper.py can run
+    # before the rails venv is built (we read deploy.values.yaml at apt-prep
+    # time to seed identity, manifest, and config.yaml).
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-      build-essential "python${PY_VERSION}-dev" "python${PY_VERSION}-venv" libffi-dev rsync >/dev/null
+      build-essential "python${PY_VERSION}-dev" "python${PY_VERSION}-venv" libffi-dev rsync python3-yaml >/dev/null
   else
     echo "==> no apt-get detected; skipping automated prep" >&2
     echo "    ensure these are installed manually if anything below fails:" >&2
-    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync" >&2
+    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync, python3-yaml" >&2
   fi
 fi
 
 command -v rsync >/dev/null 2>&1 \
   || { echo "rsync not found on PATH" >&2; exit 1; }
+
+# ---------- values file ----------
+VALUES_FILE="${VALUES_FILE:-$FORK_DIR/deploy.values.yaml}"
+[[ -f "$VALUES_FILE" ]] \
+  || { echo "deploy.values.yaml not found at $VALUES_FILE (re-fork: copy + edit, or pass --values)" >&2; exit 1; }
+VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
+[[ -f "$VALUES_HELPER" ]] \
+  || { echo "values helper missing at $VALUES_HELPER" >&2; exit 1; }
+
+if [[ -z "$GIT_IDENTITY_NAME" ]]; then
+  GIT_IDENTITY_NAME="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get org.agent_identity_name)"
+fi
+if [[ -z "$GIT_IDENTITY_EMAIL" ]]; then
+  GIT_IDENTITY_EMAIL="${GIT_IDENTITY_NAME}@$(hostname -s)"
+fi
 
 [[ -d "$FORK_DIR/.git" ]] \
   || { echo "fork dir not a git repo: $FORK_DIR" >&2; exit 1; }
@@ -617,11 +638,37 @@ else
 fi
 install -d -o root -g root -m 755 "$TARGET_DIR/hooks"
 
-# config.yaml is left unseeded for v0 — first-run wizard creates it.
 # RUNTIME_VERSION records the fork SHA we rendered from.
 echo "$FORK_SHA" > "$TARGET_DIR/RUNTIME_VERSION"
 chown root:root "$TARGET_DIR/RUNTIME_VERSION"
 chmod 644 "$TARGET_DIR/RUNTIME_VERSION"
+
+# Re-rendered every run so values.yaml edits propagate; operator pastes this
+# into Slack's manifest UI to update the App.
+SLACK_MANIFEST_TMPL="$FORK_DIR/installer/slack-manifest.json.tmpl"
+SLACK_MANIFEST_OUT="$TARGET_DIR/slack-manifest.json"
+if [[ -f "$SLACK_MANIFEST_TMPL" ]]; then
+  echo "==> rendering Slack manifest to $SLACK_MANIFEST_OUT"
+  python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+    render-manifest --in "$SLACK_MANIFEST_TMPL" --out "$SLACK_MANIFEST_OUT"
+  chown root:root "$SLACK_MANIFEST_OUT"
+  chmod 644 "$SLACK_MANIFEST_OUT"
+else
+  echo "==> WARNING: $SLACK_MANIFEST_TMPL missing; skipping manifest render" >&2
+fi
+
+# First-install seed only; preserved on re-runs so operator hand-edits
+# survive. Delete the file to force a refresh from values.yaml.
+CONFIG_YAML_OUT="$TARGET_DIR/config.yaml"
+if [[ -f "$CONFIG_YAML_OUT" ]]; then
+  echo "==> $CONFIG_YAML_OUT already present (preserving)"
+else
+  echo "==> seeding $CONFIG_YAML_OUT from $VALUES_FILE"
+  python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+    render-runtime-config --out "$CONFIG_YAML_OUT"
+  chown root:root "$CONFIG_YAML_OUT"
+  chmod 644 "$CONFIG_YAML_OUT"
+fi
 
 # ---------- venv (rails-class) ----------
 
@@ -989,11 +1036,14 @@ if [[ -f "$GATEWAY_DROPIN_SRC" && -x "$HERMES_BIN" ]]; then
   if [[ -f /etc/default/hermes-gateway ]]; then
     echo "==> /etc/default/hermes-gateway already present (preserving)"
   else
-    echo "==> seeding /etc/default/hermes-gateway"
-    cat >/etc/default/hermes-gateway <<EOF
+    echo "==> seeding /etc/default/hermes-gateway (empty; runtime values flow via config.yaml)"
+    cat >/etc/default/hermes-gateway <<'EOF'
 # Operator overrides for hermes-gateway.service. Survives re-runs of
 # setup-hermes.sh; delete to regenerate from defaults.
-SLACK_ALLOWED_CHANNELS=C0B23MZ0USV
+#
+# Empty by default — org-specific runtime values live in deploy.values.yaml
+# and are seeded into <HERMES_HOME>/config.yaml on first install. Set env
+# vars here only as a temporary override; env > config.yaml > defaults.
 EOF
     chown root:root /etc/default/hermes-gateway
     chmod 0644 /etc/default/hermes-gateway
