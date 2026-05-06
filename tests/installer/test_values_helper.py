@@ -191,3 +191,120 @@ class TestRenderRuntimeConfig:
         r = _run(values, "render-runtime-config", "--out", str(out))
         assert r.returncode == 0, r.stderr
         assert out.exists()
+
+
+class TestRenderQuayConfig:
+    @pytest.fixture
+    def quay_values(self, tmp_path: Path) -> Path:
+        p = tmp_path / "values.yaml"
+        p.write_text(
+            "quay:\n"
+            "  version: v0.1.0\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  adapters:\n"
+            "    linear:\n"
+            "      enabled: true\n"
+            "      api_key_env: LINEAR_API_KEY\n"
+            "    slack:\n"
+            "      enabled: false\n",
+            encoding="utf-8",
+        )
+        return p
+
+    def test_writes_agent_invocation_and_linear_block(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert 'agent_invocation = "claude < {prompt_file}"' in text
+        assert "[adapters.linear]" in text
+        assert "enabled = true" in text
+        assert 'api_key_env = "LINEAR_API_KEY"' in text
+
+    def test_omits_data_dir_repos_root_and_version(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        # data_dir is set via QUAY_DATA_DIR in the systemd unit; repos_root
+        # defaults to ${data_dir}/repos; version is consumed by the installer.
+        assert "data_dir =" not in text
+        assert "repos_root =" not in text
+        assert "version =" not in text
+
+    def test_slack_disabled_omits_section(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "[adapters.slack]" not in out.read_text()
+
+    def test_slack_enabled_renders_section(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  adapters:\n"
+            "    slack:\n"
+            "      enabled: true\n"
+            "      bot_token_env: QUAY_SLACK_TOKEN\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[adapters.slack]" in text
+        assert 'bot_token_env = "QUAY_SLACK_TOKEN"' in text
+
+    def test_missing_agent_invocation_exits_nonzero(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  adapters: {}\n", encoding="utf-8")
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "agent_invocation is required" in r.stderr
+        assert not out.exists()
+
+    def test_preserves_existing_file_without_force(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        out.write_text("# operator hand-edit\n", encoding="utf-8")
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0
+        assert "preserved" in r.stdout
+        assert out.read_text() == "# operator hand-edit\n"
+
+    def test_force_overwrites_existing_file(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        out.write_text("# stale\n", encoding="utf-8")
+        r = _run(
+            quay_values, "render-quay-config", "--out", str(out), "--force"
+        )
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "# stale" not in text
+        assert "agent_invocation" in text
+
+    def test_quote_in_agent_invocation_is_escaped(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  agent_invocation: 'claude --system \"be terse\" < {prompt_file}'\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        # The TOML basic string must escape internal double-quotes; otherwise
+        # the file is not valid TOML.
+        text = out.read_text()
+        assert r'\"be terse\"' in text

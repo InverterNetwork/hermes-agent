@@ -20,6 +20,24 @@
 #                                 first install. Preserved across re-runs (the
 #                                 installer never overwrites a live config) so
 #                                 operator hand-edits survive.
+#
+#   quay.version               — pinned quay release tag (e.g. "v0.1.0").
+#                                 REQUIRED, no default. The installer fetches
+#                                 quay-linux-<arch> from the matching GitHub
+#                                 Release and verifies it against SHA256SUMS;
+#                                 pinning is the security boundary.
+#   quay.agent_invocation      — shell-command template the quay tick
+#                                 supervisor invokes for each task.
+#                                 {prompt_file} is the only placeholder;
+#                                 substituted with the path to the synthesized
+#                                 brief inside the worktree.
+#   quay.repos                 — list of repos quay manages. Each entry maps
+#                                 to `quay repo add` arguments and is backed
+#                                 by a bare clone provisioned at install time.
+#   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
+#                                 lives in <target>/auth/quay.env, never here.
+#   quay.adapters.slack        — disabled in v0; reserved for waiting_human
+#                                 thread posts.
 
 org:
   name: Inverter
@@ -47,3 +65,26 @@ slack:
     #   channel_prompts:
     #     C01ABC: "Code review mode"
     channel_prompts: {}
+
+quay:
+  # Pinned quay release tag. Required — no default. Installer fetches
+  # quay-linux-<arch> from this release and verifies it against SHA256SUMS.
+  # Set once a v* tag is published on the quay repo.
+  version: ""
+  # Single global worker invocation. {prompt_file} is substituted with the
+  # path to the synthesized brief inside the task worktree.
+  agent_invocation: "claude --permission-mode bypassPermissions < {prompt_file}"
+  # Repos quay manages. Each entry is registered with `quay repo add` and
+  # backed by a bare clone at <repos_root>/<id>.git.
+  repos:
+    - id: test-factory-code
+      url: https://github.com/InverterNetwork/test-factory-code
+      base_branch: main
+      package_manager: bun
+      install_cmd: "bun install"
+  adapters:
+    linear:
+      enabled: true
+      api_key_env: LINEAR_API_KEY
+    slack:
+      enabled: false
