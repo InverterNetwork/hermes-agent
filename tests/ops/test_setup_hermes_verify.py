@@ -432,6 +432,17 @@ class TestSetupHermesVerify:
         assert result.returncode == 1
         assert "[DRIFT] upstream-workspace origin" in result.stderr
 
+    def test_quay_artefacts_skipped_when_no_values_file(self, install):
+        """The verify-only fixture has no deploy.values.yaml in the fork —
+        quay block must silently no-op so non-quay tests stay green."""
+        result = _run_verify(install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        # Match check lines specifically — the tmp path itself sometimes
+        # contains "quay" (pytest derives it from the test name).
+        assert "[OK] quay" not in result.stdout
+        assert "[DRIFT] quay" not in result.stderr
+        assert "quay-tick.timer" not in result.stdout
+
     def test_summary_line_counts_match(self, install):
         """The closing line should report the same total/drift counts that
         match the [OK]/[DRIFT] lines emitted above it."""
@@ -449,3 +460,246 @@ class TestSetupHermesVerify:
         assert n_checks == ok_count + drift_count
         assert n_drift == drift_count
         assert n_drift >= 1
+
+
+# ---------------------------------------------------------------------------
+# Quay verify
+# ---------------------------------------------------------------------------
+
+
+QUAY_VERSION = "v0.1.0"
+
+
+def _write_quay_stub(path: Path, version: str, registered_ids: list[str]) -> None:
+    """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
+
+    Mirrors the wire format the verify path consumes (single line `--version`
+    matched via substring, JSON array for `repo list`)."""
+    repos_json = ",".join(f'{{"id": "{i}"}}' for i in registered_ids)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == "--version" ]]; then echo "quay {version}"; exit 0; fi\n'
+        f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'[{repos_json}]\'; exit 0; fi\n'
+        "exit 0\n"
+    )
+    path.chmod(0o755)
+
+
+@pytest.fixture
+def quay_install(install: dict) -> dict:
+    """Extend the base install fixture with quay artefacts on disk + a values
+    file pinned to QUAY_VERSION + a stubbed `quay` binary on PATH-redirect."""
+    fork = install["fork"]
+    target = install["target"]
+    bin_dir = install["bin"]
+
+    # Values file with one quay repo entry. The values_helper is the real
+    # one in the fork — installer/values_helper.py is shipped with the repo,
+    # so the test fork needs the helper symlinked into installer/ to mirror
+    # `--fork pointing at a working tree`.
+    (fork / "installer").mkdir(exist_ok=True)
+    repo_helper_src = REPO_ROOT / "installer" / "values_helper.py"
+    fork_helper = fork / "installer" / "values_helper.py"
+    if not fork_helper.exists():
+        os.symlink(repo_helper_src, fork_helper)
+
+    repo_url = "https://github.com/example/test-factory-code"
+    repo_id = "test-factory-code"
+    (fork / "deploy.values.yaml").write_text(
+        "org:\n"
+        "  name: Test\n"
+        "  agent_identity_name: didier\n"
+        "slack:\n"
+        "  app:\n"
+        "    display_name: t\n"
+        "    description: t\n"
+        "    background_color: \"#000\"\n"
+        "    slash_command_name: t\n"
+        "    slash_command_description: t\n"
+        "  runtime:\n"
+        "    allowed_channels: []\n"
+        "    home_channel: \"\"\n"
+        "    require_mention: true\n"
+        "    channel_prompts: {}\n"
+        "quay:\n"
+        f"  version: \"{QUAY_VERSION}\"\n"
+        "  agent_invocation: \"claude < {prompt_file}\"\n"
+        "  repos:\n"
+        f"    - id: {repo_id}\n"
+        f"      url: {repo_url}\n"
+        "      base_branch: main\n"
+        "      package_manager: bun\n"
+        "      install_cmd: \"bun install\"\n"
+        "  adapters:\n"
+        "    linear:\n"
+        "      enabled: true\n"
+        "      api_key_env: LINEAR_API_KEY\n"
+        "    slack:\n"
+        "      enabled: false\n"
+    )
+
+    # Data dir + config.toml + bare clone. Mode/ownership matches the
+    # installer's `install -d -o $AGENT_USER -g $AGENT_USER -m 0755`.
+    quay_dir = target / "quay"
+    quay_dir.mkdir(mode=0o755)
+    (quay_dir / "config.toml").write_text("# stub\n")
+    (quay_dir / "config.toml").chmod(0o644)
+    repos_dir = quay_dir / "repos"
+    repos_dir.mkdir(mode=0o755)
+    bare = repos_dir / f"{repo_id}.git"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--bare", str(install["fork"]), str(bare)],
+        check=True,
+    )
+    # Point the bare clone's origin at the URL the values file claims, so
+    # the verify origin-equality check passes on a clean fixture.
+    subprocess.run(
+        ["git", "-C", str(bare), "remote", "set-url", "origin", repo_url],
+        check=True,
+    )
+
+    # Stubbed quay binary somewhere on PATH; verify reads
+    # HERMES_VERIFY_QUAY_BIN to redirect away from /usr/local/bin/quay.
+    quay_stub = bin_dir / "quay"
+    _write_quay_stub(quay_stub, QUAY_VERSION, [repo_id])
+
+    # values_helper.py imports pyyaml. The system `python3` on dev macOS
+    # often lacks it, so shadow `python3` in PATH with a shim that
+    # delegates to whichever interpreter is running pytest (it has pyyaml
+    # because the repo's pyproject pulls it in for tests).
+    py_shim = bin_dir / "python3"
+    if not py_shim.exists():
+        py_shim.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} "$@"\n')
+        py_shim.chmod(0o755)
+
+    install["values_file"] = fork / "deploy.values.yaml"
+    install["quay_dir"] = quay_dir
+    install["quay_bin"] = quay_stub
+    install["quay_repo_id"] = repo_id
+    install["quay_repo_url"] = repo_url
+    install["quay_bare"] = bare
+    return install
+
+
+def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["PATH"] = f"{install['bin']}{os.pathsep}{env['PATH']}"
+    env["HERMES_VERIFY_EXPECT_RAILS_OWNER"] = install["user"]
+    env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
+    env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
+    env["HERMES_VERIFY_QUAY_BIN"] = str(install["quay_bin"])
+    return subprocess.run(
+        [
+            "bash", str(SCRIPT),
+            "--verify",
+            "--target", str(install["target"]),
+            "--fork", str(install["fork"]),
+            "--user", install["user"],
+            "--values", str(install["values_file"]),
+            *extra,
+        ],
+        env=env, check=False, capture_output=True, text=True,
+    )
+
+
+class TestSetupHermesVerifyQuay:
+    def test_clean_quay_install_passes(self, quay_install):
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] quay binary:" in result.stdout
+        assert "[OK] quay binary version:" in result.stdout
+        assert "[OK] quay data dir:" in result.stdout
+        assert "[OK] quay config.toml:" in result.stdout
+        assert f"[OK] quay repo {quay_install['quay_repo_id']} ownership:" in result.stdout
+        assert f"[OK] quay repo {quay_install['quay_repo_id']} origin:" in result.stdout
+        assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
+
+    def test_missing_quay_binary_is_drift(self, quay_install):
+        quay_install["quay_bin"].unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay binary" in result.stderr
+
+    def test_quay_version_mismatch_is_drift(self, quay_install):
+        # Stub now reports a different tag than the values file claims —
+        # the binary on disk is lying about its tag, which is exactly the
+        # drift this check exists to catch.
+        _write_quay_stub(quay_install["quay_bin"], "v9.9.9", [quay_install["quay_repo_id"]])
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay binary version" in result.stderr
+
+    def test_missing_quay_data_dir_is_drift(self, quay_install):
+        shutil.rmtree(quay_install["quay_dir"])
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay data dir" in result.stderr
+
+    def test_missing_quay_config_toml_is_drift(self, quay_install):
+        (quay_install["quay_dir"] / "config.toml").unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay config.toml" in result.stderr
+
+    def test_missing_bare_clone_is_drift(self, quay_install):
+        shutil.rmtree(quay_install["quay_bare"])
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {quay_install['quay_repo_id']}" in result.stderr
+        assert "bare clone missing" in result.stderr
+
+    def test_bare_clone_origin_mismatch_is_drift(self, quay_install):
+        # Re-point the bare clone's origin at something other than what the
+        # values file claims — verify must catch the divergence rather than
+        # silently accepting whatever is on disk.
+        subprocess.run(
+            ["git", "-C", str(quay_install["quay_bare"]), "remote", "set-url",
+             "origin", "https://github.com/example/wrong.git"],
+            check=True,
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {quay_install['quay_repo_id']} origin" in result.stderr
+
+    def test_unregistered_repo_id_is_drift(self, quay_install):
+        # Stub now returns an empty registration list — the bare clone
+        # exists but quay never had `repo add` run against it.
+        _write_quay_stub(quay_install["quay_bin"], QUAY_VERSION, [])
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {quay_install['quay_repo_id']}" in result.stderr
+        assert "not registered" in result.stderr
+
+    def test_quay_tick_timer_included_in_systemd_loop(self, quay_install):
+        """When quay is enabled, the systemd loop must check quay-tick.timer
+        too. Repoint the systemctl stub at one that returns inactive for
+        quay-tick specifically, and assert verify catches it."""
+        systemctl = quay_install["bin"] / "systemctl"
+        systemctl.write_text(
+            "#!/usr/bin/env bash\n"
+            "unit=\"\"\n"
+            "if [[ \"$1\" == \"show\" ]]; then\n"
+            "  prop=\"\"\n"
+            "  shift\n"
+            "  while [[ $# -gt 0 ]]; do\n"
+            "    case \"$1\" in\n"
+            "      -p) prop=\"$2\"; shift 2 ;;\n"
+            "      --value) shift ;;\n"
+            "      *) unit=\"$1\"; shift ;;\n"
+            "    esac\n"
+            "  done\n"
+            "  case \"$prop\" in\n"
+            "    ActiveState)\n"
+            "      if [[ \"$unit\" == \"quay-tick.timer\" ]]; then echo inactive\n"
+            "      else echo active; fi ;;\n"
+            "    LoadState)     echo loaded ;;\n"
+            "    UnitFileState) echo enabled ;;\n"
+            "  esac\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        systemctl.chmod(0o755)
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay-tick.timer" in result.stderr
