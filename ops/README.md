@@ -370,6 +370,29 @@ The unit runs `/usr/local/bin/quay tick` with:
 * `/etc/default/quay-tick` — operator override slot. Preserved across
   re-runs of the installer; delete to regenerate from defaults.
 
+## Staging credentials
+
+`stage-quay-env.sh` (at the repo root) writes `<HERMES_HOME>/auth/quay.env`.
+Run it once after first install, and again whenever a token rotates:
+
+```sh
+sudo ./stage-quay-env.sh
+```
+
+Prompts:
+
+* `LINEAR_API_KEY` — required, gates `quay enqueue --linear-issue`.
+* `ANTHROPIC_API_KEY` — optional; needed only if `quay.agent_invocation`
+  shells out to a tool that requires it (e.g. `claude` without a global
+  login).
+* `SLACK_TOKEN` — optional; reserved for the quay slack adapter
+  (disabled in v0).
+
+Re-runs preserve any value the operator leaves blank, so rotating one
+key doesn't require re-typing the others. The next `quay-tick` run
+reads the file fresh via `EnvironmentFile=`, so there's nothing to
+restart.
+
 ## Logs
 
 ```sh
