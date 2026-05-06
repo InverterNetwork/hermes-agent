@@ -188,8 +188,8 @@ do_verify() {
   # values file absent, e.g. in the verify-only test fixture) means quay isn't
   # provisioned on this host, and every quay-* check below silently skips.
   # values_file/values_helper resolution mirrors the install-flow defaults
-  # (line ~535) but is tolerant: missing files just disable the gate instead
-  # of erroring, since `--verify` is also exercised against fixtures that
+  # but is tolerant: missing files just disable the gate instead of
+  # erroring, since `--verify` is also exercised against fixtures that
   # don't carry a values file.
   local values_file="${VALUES_FILE:-$fork/deploy.values.yaml}"
   local values_helper="${VALUES_HELPER:-$fork/installer/values_helper.py}"
@@ -398,10 +398,10 @@ do_verify() {
   fi
 
   # ---- quay artefacts (gated on quay.version) ----
-  # Mirror the install-time provisioning at line ~584 onward: binary in
-  # rails-class /usr/local/bin, agent-owned data dir + config.toml, one
-  # bare clone per quay.repos entry, and each id registered with the
-  # quay CLI. All checks no-op when quay.version is empty.
+  # Mirror the install-time provisioning: binary in rails-class
+  # /usr/local/bin, agent-owned data dir + config.toml, one bare clone
+  # per quay.repos entry, and each id registered with the quay CLI. All
+  # checks no-op when quay.version is empty.
   if [[ -n "$quay_version" ]]; then
     local quay_dir="$target/quay"
 
@@ -432,9 +432,9 @@ do_verify() {
       fi
     fi
 
-    # Data dir + config.toml: agent-owned, mirrors the install at
-    # line ~923. config.toml is the rendered runtime config; its absence
-    # is a drift, not a soft skip.
+    # Data dir + config.toml: agent-owned, mirrors the install-time
+    # provisioning. config.toml is the rendered runtime config; its
+    # absence is a drift, not a soft skip.
     if [[ ! -d "$quay_dir" ]]; then
       v_drift "quay data dir" "missing: $quay_dir"
     else
