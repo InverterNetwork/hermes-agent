@@ -21,11 +21,14 @@
 #                                 installer never overwrites a live config) so
 #                                 operator hand-edits survive.
 #
-#   quay.version               — pinned quay release tag (e.g. "v0.1.0").
-#                                 REQUIRED, no default. The installer fetches
-#                                 quay-linux-<arch> from the matching GitHub
-#                                 Release and verifies it against SHA256SUMS;
-#                                 pinning is the security boundary.
+#   quay.version               — pinned quay release tag (e.g. "v0.1.0"), or
+#                                 empty to skip all quay provisioning. Empty
+#                                 lets a fork stage before a quay release is
+#                                 cut and is the default in CI. When set, the
+#                                 installer fetches quay-linux-<arch> from
+#                                 the matching GitHub Release and verifies it
+#                                 against SHA256SUMS; the pin is the security
+#                                 boundary.
 #   quay.agent_invocation      — shell-command template the quay tick
 #                                 supervisor invokes for each task.
 #                                 {prompt_file} is the only placeholder;
@@ -67,9 +70,10 @@ slack:
     channel_prompts: {}
 
 quay:
-  # Pinned quay release tag. Required — no default. Installer fetches
-  # quay-linux-<arch> from this release and verifies it against SHA256SUMS.
-  # Set once a v* tag is published on the quay repo.
+  # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
+  # provisioning entirely (data dir, config.toml, binary fetch); set once
+  # a v* tag is published on the quay repo. The installer verifies the
+  # downloaded binary against SHA256SUMS — this pin is the security boundary.
   version: ""
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.

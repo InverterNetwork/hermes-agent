@@ -514,17 +514,22 @@ if [[ "$SKIP_PREP" -eq 0 ]]; then
     # python3-yaml gives the system python3 PyYAML so values_helper.py can run
     # before the rails venv is built (we read deploy.values.yaml at apt-prep
     # time to seed identity, manifest, and config.yaml).
+    # tmux + gh are runtime deps of quay: tmux hosts each task's worker
+    # session, gh is what the worker uses to open PRs.
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-      build-essential "python${PY_VERSION}-dev" "python${PY_VERSION}-venv" libffi-dev rsync python3-yaml >/dev/null
+      build-essential "python${PY_VERSION}-dev" "python${PY_VERSION}-venv" libffi-dev rsync python3-yaml \
+      curl tmux gh >/dev/null
   else
     echo "==> no apt-get detected; skipping automated prep" >&2
     echo "    ensure these are installed manually if anything below fails:" >&2
-    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync, python3-yaml" >&2
+    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync, python3-yaml, curl, tmux, gh" >&2
   fi
 fi
 
 command -v rsync >/dev/null 2>&1 \
   || { echo "rsync not found on PATH" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 \
+  || { echo "curl not found on PATH (needed to fetch the quay binary)" >&2; exit 1; }
 
 # ---------- values file ----------
 VALUES_FILE="${VALUES_FILE:-$FORK_DIR/deploy.values.yaml}"
@@ -575,6 +580,55 @@ echo "    python:  $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 echo "    git id:  $GIT_IDENTITY_NAME <$GIT_IDENTITY_EMAIL>"
 echo "    auth:    $AUTH_METHOD${APP_ID:+ (app=$APP_ID, install=$APP_INSTALLATION_ID)}"
 echo
+
+# ---------- quay binary (rails-class, /usr/local/bin/quay) ----------
+# The version pin is the security boundary: no override flag, SHA256
+# verified against the matching GitHub Release on every install run.
+# Empty `quay.version` is treated as "quay not enabled for this fork yet"
+# — staging the fork (or running CI) before a quay release is cut skips
+# every quay-related step below. Once a v* tag is pinned, all quay
+# provisioning kicks in on the next install.
+
+QUAY_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.version)"
+QUAY_BIN_DST="/usr/local/bin/quay"
+QUAY_ENABLED=0
+
+if [[ -z "$QUAY_VERSION" ]]; then
+  echo "==> quay.version unset in $VALUES_FILE; skipping quay provisioning"
+else
+  QUAY_ENABLED=1
+  case "$(uname -m)" in
+    x86_64)  QUAY_ARCH="amd64" ;;
+    aarch64) QUAY_ARCH="arm64" ;;
+    *) echo "FAIL: unsupported architecture $(uname -m); quay ships amd64/arm64 Linux only" >&2; exit 1 ;;
+  esac
+
+  QUAY_RELEASE_URL="https://github.com/lafawnduh1966/quay/releases/download/${QUAY_VERSION}"
+  QUAY_ASSET="quay-linux-${QUAY_ARCH}"
+
+  echo "==> installing quay binary ${QUAY_VERSION} (${QUAY_ARCH}) to $QUAY_BIN_DST"
+  QUAY_TMP="$(mktemp -d)"
+  trap 'rm -rf "$QUAY_TMP"' EXIT
+  curl -fsSL --retry 3 -o "$QUAY_TMP/$QUAY_ASSET" "$QUAY_RELEASE_URL/$QUAY_ASSET"
+  curl -fsSL --retry 3 -o "$QUAY_TMP/SHA256SUMS"  "$QUAY_RELEASE_URL/SHA256SUMS"
+
+  # Match on field-2 (filename) so the asset name is treated as a literal
+  # rather than a regex. An empty match would otherwise feed an empty
+  # stream to `sha256sum -c`, which exits 0 and silently passes. The
+  # leading-`*` strip keeps the match working if the SHA file is ever
+  # produced in binary mode (`sha256sum -b` emits `<hash> *<filename>`).
+  QUAY_EXPECTED_LINE="$(awk -v asset="$QUAY_ASSET" \
+    '{ name=$2; sub(/^\*/, "", name) } name == asset { print; exit }' \
+    "$QUAY_TMP/SHA256SUMS")"
+  [[ -n "$QUAY_EXPECTED_LINE" ]] \
+    || { echo "FAIL: $QUAY_ASSET not listed in SHA256SUMS for ${QUAY_VERSION}" >&2; exit 1; }
+  ( cd "$QUAY_TMP" && echo "$QUAY_EXPECTED_LINE" | sha256sum -c --strict --status ) \
+    || { echo "FAIL: SHA256 mismatch for $QUAY_ASSET (release ${QUAY_VERSION})" >&2; exit 1; }
+
+  install -o root -g root -m 0755 "$QUAY_TMP/$QUAY_ASSET" "$QUAY_BIN_DST"
+  rm -rf "$QUAY_TMP"
+  trap - EXIT
+fi
 
 # ---------- rails (root-owned, read-only to agent) ----------
 
@@ -863,6 +917,28 @@ for d in sessions logs cache platforms platforms/pairing; do
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/$d"
 done
 
+# `quay/` is the data dir consumed by quay (sqlite, worktrees, repo bare
+# clones, logs); QUAY_DATA_DIR will point here from the systemd unit.
+# Skipped entirely when quay isn't enabled — see the binary block above.
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/quay"
+
+  # quay/config.toml — same first-install-seed pattern as config.yaml above.
+  # The bash gate scopes chown/chmod to first install (the helper itself
+  # also preserves the file body, but the gate avoids re-flipping perms on
+  # every re-run, which would clobber any operator chmod).
+  QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
+  if [[ -f "$QUAY_CONFIG_OUT" ]]; then
+    echo "==> $QUAY_CONFIG_OUT already present (preserving)"
+  else
+    echo "==> seeding $QUAY_CONFIG_OUT from $VALUES_FILE"
+    python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+      render-quay-config --out "$QUAY_CONFIG_OUT"
+    chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
+    chmod 0644 "$QUAY_CONFIG_OUT"
+  fi
+fi
+
 # Symlinks at render-target root so the agent's existing paths
 # ($TARGET/skills, $TARGET/memories, $TARGET/cron) keep working but writes
 # land inside the git repo. ln -snf is idempotent: replaces existing symlinks
@@ -1099,6 +1175,10 @@ fi
 
 [[ -x "$HERMES_BIN" ]] \
   || { echo "FAIL: hermes entry point missing or non-executable at $HERMES_BIN" >&2; exit 1; }
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  [[ -x "$QUAY_BIN_DST" ]] \
+    || { echo "FAIL: quay binary missing or non-executable at $QUAY_BIN_DST" >&2; exit 1; }
+fi
 
 # State assertions: the agent must own .git/ and the symlinks must resolve
 # into the clone, otherwise the auto-commit pipeline will silently fail later.
