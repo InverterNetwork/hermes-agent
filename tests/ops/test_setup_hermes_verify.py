@@ -467,18 +467,22 @@ class TestSetupHermesVerify:
 # ---------------------------------------------------------------------------
 
 
-QUAY_VERSION = "v0.1.0"
+QUAY_VERSION = "v0.1.0"  # tag-shaped, with leading v, as in deploy.values.yaml
 
 
 def _write_quay_stub(path: Path, version: str, registered_ids: list[str]) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
-    Mirrors the wire format the verify path consumes (single line `--version`
-    matched via substring, JSON array for `repo list`)."""
+    `version` is the tag-shaped pin (`v0.1.0`); the stub strips the leading
+    `v` and appends a fake build SHA to mirror what the real binary emits
+    (`${pkg.version}+${shortSHA}`, see scripts/embed.ts in lafawnduh1966/quay).
+    The verify path strips the `v` from the pin before comparing, so the
+    test exercises that real format end-to-end."""
     repos_json = ",".join(f'{{"id": "{i}"}}' for i in registered_ids)
+    semver = version.removeprefix("v")
     path.write_text(
         "#!/usr/bin/env bash\n"
-        f'if [[ "$1" == "--version" ]]; then echo "quay {version}"; exit 0; fi\n'
+        f'if [[ "$1" == "--version" ]]; then echo "{semver}+abc1234"; exit 0; fi\n'
         f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'[{repos_json}]\'; exit 0; fi\n'
         "exit 0\n"
     )
