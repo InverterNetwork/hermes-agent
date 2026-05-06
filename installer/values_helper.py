@@ -2,7 +2,7 @@
 """Read deploy.values.yaml and emit shell-friendly outputs.
 
 setup-hermes.sh shells out to this helper rather than parsing YAML in bash.
-Three subcommands:
+Four subcommands:
 
   get <key>                    — print scalar at dotted path (org.name) or a
                                   list joined by `--sep` (default ",").
@@ -11,6 +11,8 @@ Three subcommands:
   render-runtime-config <out>  — write ~/.hermes/config.yaml from
                                   slack.runtime.*. Skips if <out> already
                                   exists, so operator hand-edits survive.
+  render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
+                                  quay.* block. Skips if <out> already exists.
 """
 
 from __future__ import annotations
@@ -196,6 +198,92 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _toml_basic_string(s: str) -> str:
+    """Encode ``s`` as a TOML basic string (double-quoted, with escapes).
+
+    Adequate for our inputs (CLI command templates, env var names): both
+    formats accept the same escapes for the control characters that
+    realistically appear (``\\"``, ``\\\\``, ``\\n``, ``\\r``, ``\\t``,
+    ``\\b``, ``\\f``), and TOML basic strings allow non-ASCII literals,
+    matching ``ensure_ascii=False``. Not a fully general TOML encoder —
+    raw U+007F (DEL) would round-trip through ``json.dumps`` unescaped.
+    """
+    return json.dumps(s, ensure_ascii=False)
+
+
+def cmd_render_quay_config(args: argparse.Namespace) -> int:
+    """Seed <target>/quay/config.toml from the quay.* block.
+
+    Idempotent: refuses to overwrite an existing file unless --force is passed,
+    so operator hand-edits to the live config survive subsequent installer
+    runs (matches render-runtime-config). Always creates a file when the
+    inputs validate, so setup-hermes.sh can chown/chmod the path without
+    racing the helper.
+
+    Deliberately omitted from the rendered TOML:
+      * data_dir   — set via QUAY_DATA_DIR in the systemd unit env, so the
+                     runtime path doesn't get duplicated in two places.
+      * repos_root — quay defaults this to ${data_dir}/repos, which lands
+                     where we want for free.
+      * version    — consumed by setup-hermes.sh to fetch the binary, not by
+                     quay at runtime; lives in deploy.values.yaml only.
+    """
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+
+    if out_path.exists() and not args.force:
+        sys.stdout.write(f"preserved: {out_path}\n")
+        return 0
+
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+
+    agent_invocation = quay.get("agent_invocation")
+    if not isinstance(agent_invocation, str) or not agent_invocation:
+        sys.stderr.write(
+            "values_helper.py: quay.agent_invocation is required (non-empty string)\n"
+        )
+        return 1
+
+    adapters = quay.get("adapters") or {}
+    if not isinstance(adapters, dict):
+        sys.stderr.write("values_helper.py: quay.adapters must be a mapping\n")
+        return 1
+
+    lines = [
+        "# Seeded by setup-hermes.sh from deploy.values.yaml on first install.",
+        "# Subsequent installer runs preserve this file — edit freely.",
+        "#",
+        "# data_dir comes from QUAY_DATA_DIR set in the systemd unit; repos_root",
+        "# defaults to ${data_dir}/repos. Set them here only to override.",
+        "",
+        f"agent_invocation = {_toml_basic_string(agent_invocation)}",
+    ]
+
+    linear = adapters.get("linear") or {}
+    if isinstance(linear, dict) and linear.get("enabled"):
+        api_key_env = linear.get("api_key_env") or "LINEAR_API_KEY"
+        lines.append("")
+        lines.append("[adapters.linear]")
+        lines.append("enabled = true")
+        lines.append(f"api_key_env = {_toml_basic_string(str(api_key_env))}")
+
+    slack_adapter = adapters.get("slack") or {}
+    if isinstance(slack_adapter, dict) and slack_adapter.get("enabled"):
+        bot_token_env = slack_adapter.get("bot_token_env") or "SLACK_TOKEN"
+        lines.append("")
+        lines.append("[adapters.slack]")
+        lines.append("enabled = true")
+        lines.append(f"bot_token_env = {_toml_basic_string(str(bot_token_env))}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sys.stdout.write(f"wrote: {out_path}\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -221,6 +309,13 @@ def main(argv: list[str] | None = None) -> int:
     p_cfg.add_argument("--force", action="store_true",
                        help="overwrite an existing file")
     p_cfg.set_defaults(func=cmd_render_runtime_config)
+
+    p_quay = sub.add_parser("render-quay-config",
+                            help="seed <target>/quay/config.toml from quay.*")
+    p_quay.add_argument("--out", required=True, help="output config.toml path")
+    p_quay.add_argument("--force", action="store_true",
+                        help="overwrite an existing file")
+    p_quay.set_defaults(func=cmd_render_quay_config)
 
     args = parser.parse_args(argv)
     return args.func(args)
