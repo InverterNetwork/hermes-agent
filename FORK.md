@@ -16,7 +16,7 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instantiate this fork for a different org:
 
 1. Fork this repo (or clone + push to a new origin).
-2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `quay.*` (note: `quay.version` is required — pin to a published `v*` tag). Tokens never go here; they're staged at install time.
+2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `quay.*` (set `quay.version` to a published `v*` tag to enable quay provisioning, or leave it empty to skip the quay binary + data dir entirely). Tokens never go here; they're staged at install time.
 3. Run `installer/setup-hermes.sh` on the target host. The installer:
    - reads `deploy.values.yaml` (override the path with `--values <file>` if needed),
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
@@ -96,7 +96,7 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `state/` | `hermes:hermes` | 755 | clone of `hermes-state`; `.git/` agent-owned |
 | `skills`, `memories`, `cron` | `hermes:hermes` (symlink) | — | resolve to `state/<name>` |
 | `sessions/`, `logs/`, `cache/` | `hermes:hermes` | 755 | local-only (gitignored content) |
-| `quay/` | `hermes:hermes` | 755 | quay data dir (sqlite, worktrees, bare clones, logs); seeded `config.toml` lives inside, preserved across re-runs |
+| `quay/` | `hermes:hermes` | 755 | quay data dir (sqlite, worktrees, bare clones, logs); seeded `config.toml` lives inside, preserved across re-runs. Only present when `quay.version` is set in `deploy.values.yaml` |
 | `auth/` | `root:hermes` | 750 | App key + env config (only present with `--auth-method app`) |
 | `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent) |
 | `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path |
