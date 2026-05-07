@@ -33,6 +33,18 @@ QUAY_ENV="${QUAY_ENV:-${AUTH_DIR}/quay.env}"
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root (try: sudo $0)" >&2; exit 1; }
 id "$AGENT_USER" >/dev/null 2>&1 || { echo "user '$AGENT_USER' does not exist" >&2; exit 1; }
 
+# Track every mktemp we create so a SIGINT or `install` failure can't
+# leak a plaintext-secret temp file in /tmp. Happy-path code still
+# rm -f's after each successful write; the trap is defense-in-depth.
+TMPFILES=()
+cleanup_tmpfiles() {
+  local f
+  for f in "${TMPFILES[@]+"${TMPFILES[@]}"}"; do
+    [[ -e "$f" ]] && rm -f "$f"
+  done
+}
+trap cleanup_tmpfiles EXIT INT TERM
+
 manage_quay=0
 [[ -x /usr/local/bin/quay ]] && manage_quay=1
 
@@ -110,8 +122,12 @@ prompt_value SLACK_USERS "SLACK_ALLOWED_USERS (comma-separated U-IDs, blank = no
 # --linear-issue`); optional otherwise (gateway can skip the
 # linear-create skill until staged).
 linear_required=0
-(( manage_quay )) && linear_required=1
-prompt_value LINEAR "LINEAR_API_KEY${manage_quay:+ (required for quay)}" "$linear_required" "$existing_linear" "" 1
+linear_label="LINEAR_API_KEY"
+if (( manage_quay )); then
+  linear_required=1
+  linear_label+=" (required for quay)"
+fi
+prompt_value LINEAR "$linear_label" "$linear_required" "$existing_linear" "" 1
 
 # Quay-only secrets, prompted only on quay-provisioned deployments
 if (( manage_quay )); then
@@ -121,14 +137,15 @@ fi
 
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
 
-# Write a single env file. Returns 0 on no-op (content unchanged) or
-# 1 on a real write — caller uses the return code to decide whether
-# the owning unit needs a restart.
+# Write a single env file. The optional third arg names a caller-side
+# variable to set to 1 when the file actually changed; no-op writes
+# leave it untouched. Always returns 0 — failures `set -e` out.
 slack_changed=0
 hermes_changed=0
 write_env() {
-  local target="$1" content="$2"
+  local target="$1" content="$2" changed_var="${3:-}"
   local tmp; tmp="$(mktemp)"
+  TMPFILES+=("$tmp")
   printf '%s\n' "$content" > "$tmp"
   if [[ -f "$target" ]] && cmp -s "$tmp" "$target"; then
     rm -f "$tmp"
@@ -138,7 +155,8 @@ write_env() {
   install -o root -g "$AGENT_USER" -m 0640 "$tmp" "$target"
   rm -f "$tmp"
   echo "✓ wrote $target ($(stat -c '%a %U:%G' "$target"))"
-  return 1
+  [[ -n "$changed_var" ]] && printf -v "$changed_var" '1'
+  return 0
 }
 
 # slack.env
@@ -146,22 +164,23 @@ slack_content="SLACK_BOT_TOKEN=${SLACK_BOT}
 SLACK_APP_TOKEN=${SLACK_APP}"
 [[ -n "$SLACK_USERS" ]] && slack_content+="
 SLACK_ALLOWED_USERS=${SLACK_USERS}"
-write_env "$SLACK_ENV" "$slack_content" || slack_changed=1
+write_env "$SLACK_ENV" "$slack_content" slack_changed
 
 # hermes.env (gateway-side LINEAR_API_KEY, when set)
 if [[ -n "$LINEAR" ]]; then
-  write_env "$HERMES_ENV" "LINEAR_API_KEY=${LINEAR}" || hermes_changed=1
+  write_env "$HERMES_ENV" "LINEAR_API_KEY=${LINEAR}" hermes_changed
 fi
 
-# quay.env — only on quay-provisioned hosts
+# quay.env — only on quay-provisioned hosts. quay-tick reads its env
+# file fresh per timer tick, so no restart concept; we don't track
+# whether quay.env changed.
 if (( manage_quay )); then
   quay_content="LINEAR_API_KEY=${LINEAR}"
   [[ -n "$ANTHROPIC" ]]  && quay_content+="
 ANTHROPIC_API_KEY=${ANTHROPIC}"
   [[ -n "$QUAY_SLACK" ]] && quay_content+="
 SLACK_TOKEN=${QUAY_SLACK}"
-  # quay-tick reads its env file fresh per timer tick; no restart concept.
-  write_env "$QUAY_ENV" "$quay_content" || true
+  write_env "$QUAY_ENV" "$quay_content"
 fi
 
 # hermes-gateway is long-running and only reads EnvironmentFile= at unit
