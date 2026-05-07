@@ -69,6 +69,17 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 - **Locus of fix:** hermes-agent (consumer-side bug; the data layer was correct).
 - **Why latent until now:** Every prior install (CI smoke fixture, dev-machine local) used a single-protocol path. The bug only fires when the operator legitimately bridges HTTPS↔SSH for the agent user, which only happens at real-host install time.
 
+## 9. 🟡 Worker auth: subscription vs. metered API key undocumented
+
+- **Symptom:** `stage-quay-env.sh` prompts for `ANTHROPIC_API_KEY` as optional, suggesting it's the canonical worker-auth path. But `quay.agent_invocation` runs `claude` (the CLI) which prefers `ANTHROPIC_API_KEY` over a `claude login` subscription session when both are present. An operator with a paid plan could silently get billed against the metered API instead of using their subscription.
+- **Root cause:** Two independent auth surfaces (subscription via `claude login`, metered via env var) and no guidance in the installer on which to pick. `claude login` also needs to run as the `hermes` user so credentials live in `~hermes/.claude/` and survive `quay-tick` worker invocations — undocumented today.
+- **Tonight's workaround:** Operator-side discipline. Leave `ANTHROPIC_API_KEY` blank when running `stage-quay-env.sh` (the prompt accepts empty input → omits the line from `quay.env`); run `sudo -u hermes -H claude login` separately.
+- **Locus of fix:** **hermes-agent.** Two cheap improvements:
+  1. `stage-quay-env.sh` should clarify the prompt: *"ANTHROPIC_API_KEY (optional — leave blank if using `claude login` subscription auth)"*. One-line text change.
+  2. `ops/README.md#quay-tick` (or a new `ops/README.md#worker-auth`) should document the two auth modes and explicitly recommend running `claude login` as the agent user post-install.
+  3. Optionally: add a `--check` mode to `stage-quay-env.sh` that detects `~hermes/.claude/auth.json` (or whatever the credential store is) and warns if both subscription auth and `ANTHROPIC_API_KEY` are present.
+- **Why:** Same flavour of operator-experience issue as entry #6 — the v0 design pushes auth onto the operator, but doesn't surface the choice clearly. Quay-side has nothing to do here; this is purely about the hermes-agent installer's UX.
+
 ## 7. 🔵 `url.insteadOf` paste mangled by terminal line-wrap
 
 - **Symptom:** First attempt to set the rewrite silently no-op'd. SSH worked but bare-clone still hit HTTPS. Diagnosis (via direct SSH from the operator's Mac) showed `git config --get-regexp '^url\.'` empty and `~hermes/.gitconfig` lacked the `[url "git@github.com:InverterNetwork/"]` block.
