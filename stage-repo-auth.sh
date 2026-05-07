@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Stage SSH deploy-key material for the quay worker on krustentier.
+# Stage SSH deploy-key material for the agent user.
 # Run as root (or via sudo). Idempotent — re-runs skip key generation and
 # converge ownership/permissions without clobbering anything.
 #
 # What it does:
 #   1. Generates ~hermes/.ssh/id_ed25519 if absent (no passphrase).
 #   2. Pre-seeds ~hermes/.ssh/known_hosts with github.com host keys.
-#   3. Reads distinct <org> prefixes from quay.repos[].url in VALUES_FILE
-#      and wires url.insteadOf git rewrites (HTTPS → SSH) for the agent user.
-#   4. Prints the public key so the operator can add it to each repo's
-#      GitHub deploy-key UI.
+#   3. Prints the public key plus a checklist of github.com repos[] entries
+#      the operator needs to register the key against (Settings → Deploy
+#      keys → Add deploy key, on each repo).
+#
+# The url.insteadOf rewrites that bridge HTTPS values URLs to SSH transport
+# are NOT done here — setup-hermes.sh wires them per-repo as part of its
+# repos[] provisioning loop. This script only handles the key material the
+# agent needs before clone-time auth can succeed.
 #
 # Environment overrides (useful in CI):
 #   AGENT_USER   — defaults to hermes
@@ -44,7 +48,7 @@ if [[ -f "$KEY_FILE" ]]; then
   echo "ℹ $KEY_FILE already exists — skipping key generation"
 else
   sudo -u "$AGENT_USER" ssh-keygen -t ed25519 -N "" \
-    -C "${AGENT_USER}@$(hostname -s) (quay deploy key)" \
+    -C "${AGENT_USER}@$(hostname -s) (hermes-agent deploy key)" \
     -f "$KEY_FILE"
   chmod 600 "$KEY_FILE"
   chmod 644 "$PUB_FILE"
@@ -73,50 +77,32 @@ ssh-keyscan -t ed25519,rsa,ecdsa github.com > "$GH_KEYS_TMP"
 sort -u "$KNOWN_HOSTS" "$GH_KEYS_TMP" | sudo -u "$AGENT_USER" tee "$KNOWN_HOSTS" > /dev/null
 echo "✓ updated $KNOWN_HOSTS"
 
-# ---------- url.insteadOf rewrites (HTTPS → SSH per org) ----------
-# Read distinct GitHub orgs from quay.repos[].url. A missing quay.version
-# or absent quay.repos block is fine — key + known_hosts are always useful,
-# but there's nothing to rewrite if no repos are configured.
+# ---------- Enumerate github.com repos for the deploy-key checklist ----------
+# Read every github.com URL out of repos[]; the agent needs the same key
+# registered on each repo (deploy keys are per-repo, not per-org). list-repos
+# rejects unmigrated `quay.repos[]` and bad URLs at this point, surfacing
+# schema problems before the operator pastes anything into GitHub.
 
-QUAY_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.version 2>/dev/null || true)"
-
-if [[ -z "$QUAY_VERSION" ]]; then
-  echo "ℹ quay.version not set in $VALUES_FILE — skipping url.insteadOf rewrites"
-else
-  ORGS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repo-orgs)"
-  if [[ -z "$ORGS" ]]; then
-    echo "ℹ no quay.repos entries found — skipping url.insteadOf rewrites"
-  else
-    GITCONFIG="$AGENT_HOME/.gitconfig"
-    sudo -u "$AGENT_USER" touch "$GITCONFIG"
-    while IFS= read -r org; do
-      [[ -z "$org" ]] && continue
-      # Two unrelated traps avoided here:
-      #   * git always stats CWD as part of repo discovery (even with --file
-      #     and --global). When CWD is outside the agent user's read scope
-      #     (CI: $GITHUB_WORKSPACE owned by `runner`; on-box: any operator
-      #     CWD they chose), the stat fails and git aborts. Subshell-cd to
-      #     $AGENT_HOME so hermes inherits a CWD it can stat.
-      #   * `--file` is used instead of `--global` because under sudo,
-      #     $HOME and $XDG_CONFIG_HOME may point at the caller's home
-      #     regardless of -H — `--global` then reads/writes the wrong file
-      #     (observed: a stray /home/runner/.config/git/config tripped the
-      #     read side even when the write landed correctly).
-      # Idempotent — a duplicate config key simply overwrites.
-      ( cd "$AGENT_HOME" && \
-        sudo -u "$AGENT_USER" git config --file "$GITCONFIG" \
-          "url.git@github.com:${org}/.insteadOf" \
-          "https://github.com/${org}/" )
-      echo "✓ git insteadOf: https://github.com/${org}/ → git@github.com:${org}/"
-    done <<< "$ORGS"
+GITHUB_URLS=()
+while IFS=$'\t' read -r repo_id repo_url _rest; do
+  [[ -z "$repo_id" ]] && continue
+  if [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]]; then
+    GITHUB_URLS+=("$repo_url")
   fi
-fi
+done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)
 
 # ---------- Print public key for deploy-key registration ----------
 
 echo ""
-echo "Add this to each repo's deploy-key UI (Settings → Deploy keys → Add deploy key):"
+if (( ${#GITHUB_URLS[@]} == 0 )); then
+  echo "ℹ No github.com entries in repos[] — public key staged but no repos to register against."
+else
+  echo "Add this public key to each repo's deploy-key UI (Settings → Deploy keys → Add deploy key):"
+  for url in "${GITHUB_URLS[@]}"; do
+    echo "  - ${url}/settings/keys"
+  done
+fi
 echo "-----------------------------------------------------------------------"
 cat "$PUB_FILE"
 echo "-----------------------------------------------------------------------"
-echo "ℹ The key is read-only — set 'Allow write access' only if quay needs push."
+echo "ℹ The key is read-only — set 'Allow write access' only if a worker eventually needs to push from a clone."

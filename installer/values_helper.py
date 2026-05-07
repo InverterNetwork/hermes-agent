@@ -2,7 +2,7 @@
 """Read deploy.values.yaml and emit shell-friendly outputs.
 
 setup-hermes.sh shells out to this helper rather than parsing YAML in bash.
-Seven subcommands:
+Subcommands:
 
   get <key>                    — print scalar at dotted path (org.name) or a
                                   list joined by `--sep` (default ",").
@@ -13,19 +13,28 @@ Seven subcommands:
                                   exists, so operator hand-edits survive.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
-  list-repos                   — emit one TSV line per quay.repos entry
+  list-repos                   — emit one TSV line per repos[] entry
                                   (id, url, base_branch, package_manager,
                                   install_cmd) for setup-hermes.sh to iterate.
+                                  Code-only entries (no `quay:` block) emit
+                                  empty package_manager + install_cmd
+                                  fields. Pass `--quay` to filter to
+                                  quay-managed entries only.
   parse-repo-list-ids          — read `quay repo list` JSON from stdin, emit
                                   one repo_id per line. Single source of truth
                                   for the field name on the consumer side.
                                   Exits 2 with a stderr message on parse
                                   failure (non-JSON / non-list shape).
-  list-repo-orgs               — emit one distinct GitHub org per line
-                                  (first-seen order) from quay.repos[].url.
-                                  Accepts only HTTPS GitHub URLs; rejects
-                                  anything else with a clear stderr message.
-                                  Empty quay.repos → exit 0, no output.
+  validate-schema              — exit 0 if the repos[] schema is well-formed;
+                                  exit 1 with the migration message if legacy
+                                  `quay.repos[]` is present, or with the
+                                  field-level error otherwise. Used by
+                                  setup-hermes.sh --verify so the legacy-key
+                                  rejection lives in one place.
+
+Legacy `quay.repos[]` is rejected on every subcommand that touches the repo
+list — migrate the block to top-level `repos[]` (with the per-entry
+`quay:` sub-block carrying `package_manager` + `install_cmd`).
 """
 
 from __future__ import annotations
@@ -66,6 +75,20 @@ def _load(values_path: Path) -> dict:
         )
         sys.exit(1)
     return data
+
+
+def _reject_legacy_quay_repos(data: dict) -> None:
+    # The new schema lives at top-level `repos[]`; silently honouring the
+    # old location would let a stale values file install only the quay-
+    # managed entries while skipping their code mirrors.
+    quay = data.get("quay")
+    if isinstance(quay, dict) and "repos" in quay:
+        sys.stderr.write(
+            "values_helper.py: `quay.repos[]` is no longer supported — move the\n"
+            "list to top-level `repos[]` and put `package_manager` /\n"
+            "`install_cmd` under each entry's `quay:` sub-block.\n"
+        )
+        sys.exit(1)
 
 
 def _lookup(data: dict, dotted: str) -> Any:
@@ -298,66 +321,202 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
     return 0
 
 
-_REPO_FIELDS = ("id", "url", "base_branch", "package_manager", "install_cmd")
-
-# `id` is interpolated into the bare-clone path
-# ($QUAY_DATA_DIR/repos/<id>.git) by setup-hermes.sh. Reject anything
-# that could escape that directory or shape-confuse `quay repo add --id`:
+# `id` is interpolated into both the code-mirror path
+# ($HERMES_HOME/code/<id>/) and the bare-clone path
+# ($HERMES_HOME/quay/repos/<id>.git) by setup-hermes.sh. Reject anything
+# that could escape those directories or shape-confuse `quay repo add --id`:
 # disallow path separators, leading dots (no `..` / `.hidden`), leading
 # dashes (would be parsed as a flag), and any character outside the
 # alnum/dot/dash/underscore set.
 _REPO_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
 
 
-def cmd_list_repos(args: argparse.Namespace) -> int:
-    """Emit one TSV line per quay.repos entry: <id>\\t<url>\\t<base_branch>\\t<package_manager>\\t<install_cmd>.
+def _validate_repo_url(url: str, idx: int) -> str | None:
+    """Return error message for invalid github.com URLs; ``None`` for OK ones.
 
-    setup-hermes.sh iterates this output to provision a bare clone per
-    repo and register each with `quay repo add`. Required-field absence is
-    a hard fail (don't silently skip a repo). Tabs/newlines inside any
-    field also fail — TSV parsing on the shell side would split them
-    incorrectly. The `id` field is shape-checked because it lands in a
-    filesystem path on the bash side.
+    github.com URLs MUST be `https://github.com/<org>/<repo>` with no
+    `.git` suffix — the per-repo `url.insteadOf` rewrite the installer
+    wires up matches the values URL as a literal prefix, and a `.git`
+    suffix on the values side would either double up (`foo.git.git`)
+    or skip the rewrite entirely depending on which side carries it.
+    Non-github URLs (CI's `file://...` fixtures, public mirrors elsewhere)
+    pass through unchecked — the installer only applies the SSH rewrite
+    on github.com URLs anyway.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc != "github.com":
+        # Not a github.com HTTPS URL — caller decides whether that's OK
+        # in context. For github.com on http or ssh we still flag the
+        # mismatch; for unrelated hosts/schemes we let the URL through.
+        if parsed.netloc == "github.com" or parsed.netloc.endswith("@github.com"):
+            return (
+                f"repos[{idx}].url={url!r}: github.com URLs must be HTTPS "
+                f"(got scheme={parsed.scheme!r})"
+            )
+        return None
+    # Reject trailing slashes and `.git` suffixes on the literal value:
+    # the install-time url.insteadOf rewrite is a prefix match, and
+    # `https://github.com/<org>/<repo>/` would leave a stray `/` for
+    # git to append, producing `git@github.com:<org>/<repo>.git/` —
+    # broken. Same shape problem for `.git` (would yield `.git.git`).
+    if parsed.path != parsed.path.rstrip("/") or parsed.path.endswith(".git"):
+        return (
+            f"repos[{idx}].url={url!r}: drop the trailing `/` or `.git` — "
+            f"the per-repo url.insteadOf rewrite expects a clean "
+            f"`https://github.com/<org>/<repo>` prefix"
+        )
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) != 2:
+        return (
+            f"repos[{idx}].url={url!r}: expected `https://github.com/<org>/<repo>`"
+        )
+    return None
+
+
+def _iter_repos(data: dict) -> list[dict]:
+    # Centralised entry point for repos[] schema validation: rejects legacy
+    # `quay.repos[]` first so the operator sees one migration error instead
+    # of N validation errors against an empty top-level `repos[]`. Exits
+    # the process on schema errors — same posture as `_reject_legacy_quay_repos`.
+    _reject_legacy_quay_repos(data)
+    repos = data.get("repos")
+    if repos is None:
+        return []
+    if not isinstance(repos, list):
+        sys.stderr.write("values_helper.py: repos must be a list\n")
+        sys.exit(1)
+    return repos
+
+
+def cmd_list_repos(args: argparse.Namespace) -> int:
+    """Emit one TSV line per repos[] entry: <id>\\t<url>\\t<base_branch>\\t<package_manager>\\t<install_cmd>.
+
+    Code-only entries (no `quay:` block) emit empty `package_manager` and
+    `install_cmd` fields. With `--quay`, those entries are filtered out so
+    setup-hermes.sh can iterate just the quay-managed subset for bare clones
+    and `quay repo add` registration.
+
+    Required-field absence is a hard fail (don't silently skip a repo).
+    Tabs/newlines inside any field also fail — TSV parsing on the shell
+    side would split them incorrectly. The `id` field is shape-checked
+    because it lands in a filesystem path on the bash side; github.com
+    URLs are shape-checked so the per-repo url.insteadOf rewrite can rely
+    on a clean prefix.
     """
     data = _load(Path(args.values))
-    quay = data.get("quay") or {}
-    if not isinstance(quay, dict):
-        sys.stderr.write("values_helper.py: quay must be a mapping\n")
-        return 1
-    repos = quay.get("repos")
-    if repos is None:
-        return 0
-    if not isinstance(repos, list):
-        sys.stderr.write("values_helper.py: quay.repos must be a list\n")
-        return 1
+    entries = _iter_repos(data)
 
-    for i, entry in enumerate(repos):
+    for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
-            sys.stderr.write(f"values_helper.py: quay.repos[{i}] must be a mapping\n")
+            sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
             return 1
+        # Required scalars: id, url, base_branch.
         row: list[str] = []
-        for field in _REPO_FIELDS:
+        for field in ("id", "url", "base_branch"):
             v = entry.get(field)
             if v is None or v == "":
                 sys.stderr.write(
-                    f"values_helper.py: quay.repos[{i}].{field} is required\n"
+                    f"values_helper.py: repos[{i}].{field} is required\n"
                 )
                 return 1
             s = str(v)
             if "\t" in s or "\n" in s:
                 sys.stderr.write(
-                    f"values_helper.py: quay.repos[{i}].{field} contains tab or newline; "
+                    f"values_helper.py: repos[{i}].{field} contains tab or newline; "
                     "refusing to emit ambiguous TSV\n"
                 )
                 return 1
             row.append(s)
         if not _REPO_ID_RE.match(row[0]):
             sys.stderr.write(
-                f"values_helper.py: quay.repos[{i}].id={row[0]!r} must match "
+                f"values_helper.py: repos[{i}].id={row[0]!r} must match "
                 f"{_REPO_ID_RE.pattern} (alnum/./-/_, no path separators, no leading dot)\n"
             )
             return 1
+        url_err = _validate_repo_url(row[1], i)
+        if url_err:
+            sys.stderr.write(f"values_helper.py: {url_err}\n")
+            return 1
+
+        # Optional `quay:` sub-block.
+        quay_block = entry.get("quay")
+        if quay_block is not None and not isinstance(quay_block, dict):
+            sys.stderr.write(
+                f"values_helper.py: repos[{i}].quay must be a mapping when present\n"
+            )
+            return 1
+        pkg = ""
+        install = ""
+        if isinstance(quay_block, dict):
+            for field in ("package_manager", "install_cmd"):
+                v = quay_block.get(field)
+                if v is None or v == "":
+                    sys.stderr.write(
+                        f"values_helper.py: repos[{i}].quay.{field} is required "
+                        f"when the `quay:` block is present\n"
+                    )
+                    return 1
+                s = str(v)
+                if "\t" in s or "\n" in s:
+                    sys.stderr.write(
+                        f"values_helper.py: repos[{i}].quay.{field} contains "
+                        "tab or newline; refusing to emit ambiguous TSV\n"
+                    )
+                    return 1
+                if field == "package_manager":
+                    pkg = s
+                else:
+                    install = s
+        elif args.quay:
+            # `--quay` filter and this entry has no quay: block — skip.
+            continue
+
+        row.extend([pkg, install])
         sys.stdout.write("\t".join(row) + "\n")
+    return 0
+
+
+def cmd_validate_schema(args: argparse.Namespace) -> int:
+    # Single source of truth for the repos[] schema check, called from
+    # setup-hermes.sh's verify path so the legacy-key migration message
+    # lives in exactly one place. Walks every entry to surface validation
+    # errors that would otherwise only fire at install time.
+    data = _load(Path(args.values))
+    entries = _iter_repos(data)
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
+            return 1
+        for field in ("id", "url", "base_branch"):
+            if not entry.get(field):
+                sys.stderr.write(
+                    f"values_helper.py: repos[{i}].{field} is required\n"
+                )
+                return 1
+        if not _REPO_ID_RE.match(str(entry["id"])):
+            sys.stderr.write(
+                f"values_helper.py: repos[{i}].id={entry['id']!r} must match "
+                f"{_REPO_ID_RE.pattern}\n"
+            )
+            return 1
+        url_err = _validate_repo_url(str(entry["url"]), i)
+        if url_err:
+            sys.stderr.write(f"values_helper.py: {url_err}\n")
+            return 1
+        quay_block = entry.get("quay")
+        if quay_block is not None and not isinstance(quay_block, dict):
+            sys.stderr.write(
+                f"values_helper.py: repos[{i}].quay must be a mapping when present\n"
+            )
+            return 1
+        if isinstance(quay_block, dict):
+            for field in ("package_manager", "install_cmd"):
+                if not quay_block.get(field):
+                    sys.stderr.write(
+                        f"values_helper.py: repos[{i}].quay.{field} is required "
+                        f"when the `quay:` block is present\n"
+                    )
+                    return 1
     return 0
 
 
@@ -388,62 +547,6 @@ def cmd_parse_repo_list_ids(args: argparse.Namespace) -> int:
     for r in data:
         if isinstance(r, dict) and r.get("repo_id"):
             sys.stdout.write(str(r["repo_id"]) + "\n")
-    return 0
-
-
-def cmd_list_repo_orgs(args: argparse.Namespace) -> int:
-    """Emit one distinct GitHub org per line from quay.repos[].url (first-seen order).
-
-    Only HTTPS GitHub URLs (https://github.com/<org>/<repo>[.git]) are accepted;
-    any other URL scheme or host causes a non-zero exit with a clear stderr message.
-    Empty quay.repos → exit 0 with no output. Missing quay.repos key → exit 0.
-    """
-    data = _load(Path(args.values))
-    quay = data.get("quay") or {}
-    if not isinstance(quay, dict):
-        sys.stderr.write("values_helper.py: quay must be a mapping\n")
-        return 1
-    repos = quay.get("repos")
-    if repos is None:
-        return 0
-    if not isinstance(repos, list):
-        sys.stderr.write("values_helper.py: quay.repos must be a list\n")
-        return 1
-
-    seen: list[str] = []
-    seen_set: set[str] = set()
-    for i, entry in enumerate(repos):
-        if not isinstance(entry, dict):
-            sys.stderr.write(f"values_helper.py: quay.repos[{i}] must be a mapping\n")
-            return 1
-        url = entry.get("url")
-        if not url:
-            sys.stderr.write(
-                f"values_helper.py: quay.repos[{i}].url is required\n"
-            )
-            return 1
-        parsed = urlparse(str(url))
-        if parsed.scheme != "https" or parsed.netloc != "github.com":
-            sys.stderr.write(
-                f"values_helper.py: quay.repos[{i}].url={url!r} is not a GitHub HTTPS URL "
-                f"(expected https://github.com/<org>/<repo>)\n"
-            )
-            return 1
-        # Strip leading/trailing slash, drop trailing `.git` suffix only,
-        # take first path segment as org.
-        path_parts = parsed.path.strip("/").removesuffix(".git").split("/")
-        if len(path_parts) < 2 or not path_parts[0]:
-            sys.stderr.write(
-                f"values_helper.py: quay.repos[{i}].url={url!r} has no org/repo path\n"
-            )
-            return 1
-        org = path_parts[0]
-        if org not in seen_set:
-            seen.append(org)
-            seen_set.add(org)
-
-    for org in seen:
-        sys.stdout.write(org + "\n")
     return 0
 
 
@@ -481,7 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     p_quay.set_defaults(func=cmd_render_quay_config)
 
     p_list = sub.add_parser("list-repos",
-                            help="emit TSV rows for quay.repos entries")
+                            help="emit TSV rows for repos[] entries")
+    p_list.add_argument("--quay", action="store_true",
+                        help="filter to entries with a `quay:` sub-block")
     p_list.set_defaults(func=cmd_list_repos)
 
     p_parse = sub.add_parser(
@@ -490,11 +595,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_parse.set_defaults(func=cmd_parse_repo_list_ids)
 
-    p_orgs = sub.add_parser(
-        "list-repo-orgs",
-        help="emit distinct GitHub org names from quay.repos[].url (first-seen order)",
+    p_validate = sub.add_parser(
+        "validate-schema",
+        help="validate repos[] schema (rejects legacy quay.repos[]); silent on success",
     )
-    p_orgs.set_defaults(func=cmd_list_repo_orgs)
+    p_validate.set_defaults(func=cmd_validate_schema)
 
     args = parser.parse_args(argv)
     return args.func(args)

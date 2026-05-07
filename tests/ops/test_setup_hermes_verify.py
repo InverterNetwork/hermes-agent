@@ -93,6 +93,9 @@ def install(tmp_path: Path) -> dict:
     # Agent dirs (gitignored siblings of state/).
     for d in ("sessions", "logs", "cache", "platforms", "platforms/pairing"):
         (target / d).mkdir()
+    # Verify treats a missing code/ root as drift, so the base fixture
+    # has to mirror what the installer always provisions.
+    (target / "code").mkdir(mode=0o755)
 
     # Symlinks at render-target root pointing into state/ (matches the
     # installer's wiring).
@@ -539,15 +542,16 @@ def quay_install(install: dict) -> dict:
         "    home_channel: \"\"\n"
         "    require_mention: true\n"
         "    channel_prompts: {}\n"
+        "repos:\n"
+        f"  - id: {repo_id}\n"
+        f"    url: {repo_url}\n"
+        "    base_branch: main\n"
+        "    quay:\n"
+        "      package_manager: bun\n"
+        "      install_cmd: \"bun install\"\n"
         "quay:\n"
         f"  version: \"{QUAY_VERSION}\"\n"
         "  agent_invocation: \"claude < {prompt_file}\"\n"
-        "  repos:\n"
-        f"    - id: {repo_id}\n"
-        f"      url: {repo_url}\n"
-        "      base_branch: main\n"
-        "      package_manager: bun\n"
-        "      install_cmd: \"bun install\"\n"
         "  adapters:\n"
         "    linear:\n"
         "      enabled: true\n"
@@ -573,6 +577,19 @@ def quay_install(install: dict) -> dict:
     # the verify origin-equality check passes on a clean fixture.
     subprocess.run(
         ["git", "-C", str(bare), "remote", "set-url", "origin", repo_url],
+        check=True,
+    )
+
+    # Code mirror cloned from the same fork as the bare clone so
+    # HEAD == origin/main satisfies the branch-freshness check.
+    code_mirror = target / "code" / repo_id
+    code_mirror.parent.mkdir(exist_ok=True, mode=0o755)
+    subprocess.run(
+        ["git", "clone", "--quiet", str(install["fork"]), str(code_mirror)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(code_mirror), "remote", "set-url", "origin", repo_url],
         check=True,
     )
 

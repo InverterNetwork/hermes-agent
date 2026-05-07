@@ -170,6 +170,48 @@ _git_as_owner() {
   fi
 }
 
+# Read the literal stored origin URL (sidestepping url.insteadOf rewrites
+# that may bridge HTTPS values URLs to SSH transport — we want the
+# comparand the values file declared, not what git resolves to). Exit
+# non-zero with a "move it aside" hint when the existing clone points
+# somewhere else; re-pointing silently would let a values-file edit
+# steal a populated clone and is the same posture as the state-clone
+# preserve check.
+_check_clone_origin_or_die() {
+  local kind="$1" dir="$2" expected_url="$3"
+  local actual_url
+  actual_url="$(_git_as_owner "$dir" config --get remote.origin.url 2>/dev/null || true)"
+  if [[ "$actual_url" != "$expected_url" ]]; then
+    echo "FAIL: $dir origin=$actual_url, expected $expected_url" >&2
+    echo "      refusing to silently re-point an existing $kind." >&2
+    echo "      Move it aside (mv $dir $dir.bak) and re-run to re-clone." >&2
+    exit 1
+  fi
+}
+
+# Verify-side counterpart to _check_clone_origin_or_die: check that an
+# existing clone is owned by the expected agent user and points at the
+# values-file URL, emitting v_ok/v_drift instead of dying. Origin read
+# uses the literal stored value, same rationale as the install path.
+# Caller is responsible for the existence check on $clone_path/.git
+# before calling — we treat absence as a separate drift category.
+_v_check_clone_basics() {
+  local label="$1" clone_path="$2" expected_url="$3" expected_owner="$4"
+  local owner origin
+  owner="$(_owner "$clone_path/.git" 2>/dev/null || _owner "$clone_path" 2>/dev/null)"
+  if [[ "$owner" == "$expected_owner" ]]; then
+    v_ok "$label ownership: $owner"
+  else
+    v_drift "$label ownership" "expected $expected_owner, got $owner"
+  fi
+  origin="$(_git_as_owner "$clone_path" config --get remote.origin.url 2>/dev/null || true)"
+  if [[ "$origin" == "$expected_url" ]]; then
+    v_ok "$label origin: $origin"
+  else
+    v_drift "$label origin" "got '${origin:-?}' (expected '$expected_url')"
+  fi
+}
+
 do_verify() {
   local target="$TARGET_DIR"
   local fork="$FORK_DIR"
@@ -397,11 +439,51 @@ do_verify() {
     v_drift "RUNTIME_VERSION" "missing at $target/RUNTIME_VERSION"
   fi
 
+  # ---- repos[] schema + legacy-key rejection ----
+  # validate-schema is the single source of truth for the migration error;
+  # its stderr is what the operator sees. Capture both stdout/stderr so
+  # the drift detail names the actual problem instead of "exit 1".
+  local schema_err=""
+  if [[ -f "$values_file" && -f "$values_helper" ]]; then
+    if ! schema_err="$(python3 "$values_helper" --values "$values_file" validate-schema 2>&1)"; then
+      v_drift "repos[] schema" "$(echo "$schema_err" | head -n3 | tr '\n' ' ')"
+    else
+      v_ok "repos[] schema valid"
+    fi
+  fi
+
+  # ---- repos[] (code mirrors always; bare clones gated on quay) ----
+  # Every entry produces a code mirror at $target/code/<id>/, agent-owned,
+  # on origin/<base_branch>. Entries with a `quay:` block (non-empty
+  # package_manager) additionally produce a bare clone at $target/quay/
+  # repos/<id>.git/ + a quay registration. The list-repos invocation
+  # surfaces helper-side schema errors (missing required fields, legacy
+  # key, bad URL shape) as a `repos[] schema` drift, distinct from the
+  # per-entry checks below.
+  local code_root="$target/code"
+  if [[ ! -d "$code_root" ]]; then
+    v_drift "code mirrors root" "missing: $code_root"
+  else
+    local crowner
+    crowner="$(_owner "$code_root")"
+    if [[ "$crowner" == "$agent_owner" ]]; then
+      v_ok "code mirrors root ownership: $crowner"
+    else
+      v_drift "code mirrors root ownership" "expected $agent_owner, got $crowner"
+    fi
+  fi
+
+  local repos_tsv="" repos_tsv_failed=0
+  if [[ -f "$values_file" && -f "$values_helper" ]]; then
+    repos_tsv="$(python3 "$values_helper" --values "$values_file" list-repos 2>/dev/null)" || repos_tsv_failed=1
+  fi
+  if [[ "$repos_tsv_failed" -eq 1 ]]; then
+    v_drift "repos[] schema" "values_helper.py list-repos exited non-zero (run it manually for details)"
+  fi
+
   # ---- quay artefacts (gated on quay.version) ----
-  # Mirror the install-time provisioning: binary in rails-class
-  # /usr/local/bin, agent-owned data dir + config.toml, one bare clone
-  # per quay.repos entry, and each id registered with the quay CLI. All
-  # checks no-op when quay.version is empty.
+  # Binary + data dir + config.toml + repos_root install on every quay-
+  # enabled host regardless of which entries (if any) carry a quay: block.
   if [[ -n "$quay_version" ]]; then
     local quay_dir="$target/quay"
 
@@ -469,66 +551,69 @@ do_verify() {
         fi
       fi
     fi
+  fi
 
-    # Per-repo: bare clone present + agent-owned + origin matches values
-    # file, AND id appears in `quay repo list`. Mirrors the install-time
-    # invocation pattern (sudo -u env QUAY_DATA_DIR=…) — env_reset on
-    # Debian/Ubuntu strips prefix-style env vars, so the env wrapper is
-    # required, not stylistic. See PR #18 review.
-    local quay_repos_tsv=""
-    if [[ -f "$values_file" && -f "$values_helper" ]]; then
-      quay_repos_tsv="$(python3 "$values_helper" --values "$values_file" list-repos 2>/dev/null || true)"
+  # ---- per-entry code mirror checks + optional bare clone + registration ----
+  # Iterates list-repos[]; the loop runs even when quay is disabled (code
+  # mirrors are the always-on subsystem). Bare-clone and registration
+  # sub-checks are conditional on (a) the entry carrying a quay: block
+  # (non-empty repo_pkg) and (b) quay being enabled on this host.
+  if [[ -n "$repos_tsv" ]]; then
+    local registered_ids=""
+    local list_failed=0
+    if [[ -n "$quay_version" && -x "$quay_bin" && -d "$target/quay" ]]; then
+      # Same invocation pattern as install-time: prefix with sudo only
+      # when we're root running as a different user; otherwise call
+      # directly. env QUAY_DATA_DIR=… must come AFTER any sudo prefix
+      # because env_reset strips prefix-style vars.
+      local cmd_prefix=()
+      if [[ "$(id -u)" -eq 0 && "$(id -un)" != "$agent_owner" ]]; then
+        cmd_prefix=(sudo -u "$agent_owner")
+      fi
+      # bash 3.2 (macOS default) under set -u trips on "${arr[@]}" when
+      # arr is empty; the +"${arr[@]}" guard expands to nothing in that
+      # case rather than referencing an unbound element.
+      # Capture parse failure into list_failed instead of swallowing it
+      # — a binary that crashes on `repo list` would otherwise produce
+      # N misleading "not registered" drifts (one per quay-enabled entry)
+      # when the real problem is a single broken pipeline.
+      registered_ids="$(${cmd_prefix[@]+"${cmd_prefix[@]}"} env "QUAY_DATA_DIR=$target/quay" "$quay_bin" repo list 2>/dev/null \
+        | python3 "$values_helper" parse-repo-list-ids 2>/dev/null)" || list_failed=1
     fi
-    if [[ -n "$quay_repos_tsv" ]]; then
-      local registered_ids=""
-      local list_failed=0
-      if [[ -x "$quay_bin" && -d "$quay_dir" ]]; then
-        # Same invocation pattern as install-time: prefix with sudo only
-        # when we're root running as a different user; otherwise call
-        # directly. env QUAY_DATA_DIR=… must come AFTER any sudo prefix
-        # because env_reset strips prefix-style vars.
-        local cmd_prefix=()
-        if [[ "$(id -u)" -eq 0 && "$(id -un)" != "$agent_owner" ]]; then
-          cmd_prefix=(sudo -u "$agent_owner")
+    if [[ "$list_failed" -eq 1 ]]; then
+      v_drift "quay repo list" "non-list/non-JSON output (binary crash, data dir corruption, or format drift)"
+    fi
+    local repo_id repo_url repo_base repo_pkg repo_install
+    local code_dir mhead expected_head bare
+    while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
+      [[ -z "$repo_id" ]] && continue
+
+      # ---- code mirror checks (every entry) ----
+      code_dir="$code_root/$repo_id"
+      if [[ ! -d "$code_dir/.git" ]]; then
+        v_drift "code mirror $repo_id" "missing or not a git repo: $code_dir"
+      else
+        _v_check_clone_basics "code mirror $repo_id" "$code_dir" "$repo_url" "$agent_owner"
+        # HEAD must be on origin/<base_branch> (or rather, point at the
+        # same commit). hermes-code-sync hard-resets to origin/<base>
+        # every tick; a mismatch here means the timer hasn't run since
+        # the install, which is itself worth surfacing.
+        mhead="$(_git_as_owner "$code_dir" rev-parse HEAD 2>/dev/null || true)"
+        expected_head="$(_git_as_owner "$code_dir" rev-parse "origin/$repo_base" 2>/dev/null || true)"
+        if [[ -n "$mhead" && -n "$expected_head" && "$mhead" == "$expected_head" ]]; then
+          v_ok "code mirror $repo_id at origin/$repo_base"
+        else
+          v_drift "code mirror $repo_id branch" "HEAD=${mhead:-?} expected origin/$repo_base=${expected_head:-?}"
         fi
-        # bash 3.2 (macOS default) under set -u trips on "${arr[@]}" when
-        # arr is empty; the +"${arr[@]}" guard expands to nothing in that
-        # case rather than referencing an unbound element.
-        # Capture parse failure into list_failed instead of swallowing it
-        # — a binary that crashes on `repo list` would otherwise produce
-        # N misleading "not registered" drifts (one per quay.repos entry)
-        # when the real problem is a single broken pipeline.
-        registered_ids="$(${cmd_prefix[@]+"${cmd_prefix[@]}"} env "QUAY_DATA_DIR=$quay_dir" "$quay_bin" repo list 2>/dev/null \
-          | python3 "$values_helper" parse-repo-list-ids 2>/dev/null)" || list_failed=1
       fi
-      if [[ "$list_failed" -eq 1 ]]; then
-        v_drift "quay repo list" "non-list/non-JSON output (binary crash, data dir corruption, or format drift)"
-      fi
-      local repo_id repo_url repo_base repo_pkg repo_install bare bowner bare_origin
-      while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
-        [[ -z "$repo_id" ]] && continue
-        bare="$quay_dir/repos/${repo_id}.git"
+
+      # ---- quay-side checks (entries with quay: block, gated on quay enabled) ----
+      if [[ -n "$repo_pkg" && -n "$quay_version" ]]; then
+        bare="$target/quay/repos/${repo_id}.git"
         if [[ ! -d "$bare" ]]; then
           v_drift "quay repo $repo_id" "bare clone missing: $bare"
         else
-          bowner="$(_owner "$bare")"
-          if [[ "$bowner" == "$agent_owner" ]]; then
-            v_ok "quay repo $repo_id ownership: $bowner"
-          else
-            v_drift "quay repo $repo_id ownership" "expected $agent_owner, got $bowner"
-          fi
-          # Use `git config --get remote.origin.url` (raw stored value)
-          # not `git remote get-url` (which applies url.<base>.insteadOf
-          # rewrites). Operators legitimately bridge HTTPS values URLs to
-          # SSH transport via insteadOf when the agent user only has SSH
-          # creds; the bare clone is functionally correct and the values
-          # URL is the right comparand.
-          bare_origin="$(_git_as_owner "$bare" config --get remote.origin.url 2>/dev/null || true)"
-          if [[ "$bare_origin" == "$repo_url" ]]; then
-            v_ok "quay repo $repo_id origin: $bare_origin"
-          else
-            v_drift "quay repo $repo_id origin" "got '${bare_origin:-?}' (expected '$repo_url')"
-          fi
+          _v_check_clone_basics "quay repo $repo_id" "$bare" "$repo_url" "$agent_owner"
         fi
         # Skip the per-id registration sub-check when the list pipeline
         # failed — the single named drift above already named the
@@ -540,8 +625,13 @@ do_verify() {
             v_drift "quay repo $repo_id" "not registered with quay"
           fi
         fi
-      done <<<"$quay_repos_tsv"
-    fi
+      elif [[ -n "$repo_pkg" && -z "$quay_version" ]]; then
+        # Values file declares this entry quay-managed but quay isn't
+        # enabled on this host — surface as drift so the operator either
+        # pins quay.version or removes the per-entry quay: block.
+        v_drift "quay repo $repo_id" "values file carries quay: block but quay.version is unset"
+      fi
+    done <<<"$repos_tsv"
   fi
 
   # ---- systemd units ----
@@ -552,7 +642,7 @@ do_verify() {
   if command -v systemctl >/dev/null 2>&1; then
     local u base unit_file so
     local active load unitfile
-    local timers=(hermes-sync.timer hermes-upstream-sync.timer)
+    local timers=(hermes-sync.timer hermes-code-sync.timer hermes-upstream-sync.timer)
     [[ -n "$quay_version" ]] && timers+=(quay-tick.timer)
     for u in "${timers[@]}"; do
       active="$(systemctl show -p ActiveState --value "$u" 2>/dev/null)"
@@ -1101,7 +1191,9 @@ done
 
 # `quay/` is the data dir consumed by quay (sqlite, worktrees, repo bare
 # clones, logs); QUAY_DATA_DIR will point here from the systemd unit.
-# Skipped entirely when quay isn't enabled — see the binary block above.
+# Skipped entirely when quay isn't enabled — the unified repos[] loop
+# below provisions code mirrors regardless and only runs the quay-side
+# branch when both QUAY_ENABLED and the entry's `quay:` block are present.
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/quay"
 
@@ -1120,71 +1212,108 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
     chmod 0644 "$QUAY_CONFIG_OUT"
   fi
 
-  # Bare clones + `quay repo add` registration per quay.repos entry.
-  # quay does NOT clone repos itself — the quickstart documents that the
-  # operator pre-provisions a bare clone at $QUAY_DATA_DIR/repos/<id>.git
-  # and then registers it. Bare clones are agent-owned: quay fetches into
-  # them at runtime (worktrees originate here), but we never push from
-  # them, so the agent's group-write is enough.
-  #
-  # Idempotency: an existing bare clone is preserved iff its origin URL
-  # matches the values-file URL — a mismatch is a hard fail rather than a
-  # silent re-point (matches the state-clone posture). Registration is
-  # gated on `quay repo list` so re-runs are no-ops.
-  QUAY_REPOS_ROOT="$TARGET_DIR/quay/repos"
-  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$QUAY_REPOS_ROOT"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/quay/repos"
+fi
 
-  QUAY_REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
+# ---------- repo provisioning (code mirrors + optional quay) ----------
+# Every entry in repos[] gets a working-tree code mirror at
+# $TARGET/code/<id>/. Entries with a `quay:` block additionally get a
+# bare clone + `quay repo add` registration when quay is enabled; a
+# `quay:` block with quay disabled produces a code mirror plus a warning.
+# Per-repo url.insteadOf rewrites land in ~hermes/.gitconfig, scoped to
+# the specific values URL — github.com URLs clone over SSH against the
+# deploy keys staged by stage-repo-auth.sh; non-github URLs (CI's file://
+# fixtures, public mirrors) clone as-is.
 
-  if [[ -n "$QUAY_REPOS_TSV" ]]; then
-    # Snapshot already-registered ids once. `quay repo list` emits a JSON
-    # array (per docs/user/cli-reference.md); a fresh data dir applies
-    # the embedded migrations on first invocation and returns []. A parse
-    # failure aborts the install — silently treating it as "no
-    # registrations" would re-invoke `quay repo add` on every re-run,
-    # which is not documented as idempotent.
-    QUAY_REGISTERED_IDS="$(
+CODE_ROOT="$TARGET_DIR/code"
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$CODE_ROOT"
+
+ALL_REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
+
+# Snapshot quay's already-registered ids ONCE per install, before the
+# per-repo loop, so re-runs of `quay repo add` are no-ops. A fresh data
+# dir applies embedded migrations on first invocation and returns [];
+# parse failure aborts the install — silently treating it as "no
+# registrations" would re-invoke `quay repo add` on every re-run, which
+# is not documented as idempotent.
+QUAY_REGISTERED_IDS=""
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  QUAY_REGISTERED_IDS="$(
+    sudo -u "$AGENT_USER" \
+      env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
+      | python3 "$VALUES_HELPER" parse-repo-list-ids
+  )"
+fi
+
+if [[ -n "$ALL_REPOS_TSV" ]]; then
+  AGENT_GITCONFIG="$AGENT_HOME/.gitconfig"
+
+  while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
+    [[ -z "$repo_id" ]] && continue
+
+    # ---- per-repo url.insteadOf rewrite (github.com only) ----
+    # Match the exact `https://github.com/<org>/<repo>` shape the values
+    # helper validates. Anything else (file://, non-github HTTPS) flows
+    # through unchanged; the agent inherits the OS-level git defaults.
+    # Two unrelated traps avoided:
+    #   * git always stats CWD as part of repo discovery (even with --file
+    #     and --global). When CWD is outside the agent user's read scope,
+    #     the stat fails and git aborts. Subshell-cd to $AGENT_HOME so
+    #     hermes inherits a CWD it can stat.
+    #   * `--file` is used instead of `--global` because under sudo,
+    #     $HOME and $XDG_CONFIG_HOME may point at the caller's home
+    #     regardless of -H — `--global` then reads/writes the wrong file.
+    if [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+      org="${BASH_REMATCH[1]}"
+      repo_short="${BASH_REMATCH[2]}"
+      ssh_url="git@github.com:${org}/${repo_short}.git"
+      sudo -u "$AGENT_USER" touch "$AGENT_GITCONFIG"
+      ( cd "$AGENT_HOME" && \
+        sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
+          "url.${ssh_url}.insteadOf" "$repo_url" )
+    fi
+
+    # ---- code mirror at $TARGET/code/<id>/ ----
+    code_dir="$CODE_ROOT/$repo_id"
+    if [[ -d "$code_dir/.git" ]]; then
+      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url"
+      echo "==> code mirror $repo_id present at $code_dir (preserving)"
+    else
+      echo "==> cloning $repo_url into $code_dir"
       sudo -u "$AGENT_USER" \
-        env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
-        | python3 "$VALUES_HELPER" parse-repo-list-ids
-    )"
+        git clone --quiet --branch "$repo_base" "$repo_url" "$code_dir"
+    fi
 
-    while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
-      [[ -z "$repo_id" ]] && continue
-      bare="$QUAY_REPOS_ROOT/${repo_id}.git"
-      if [[ -d "$bare" ]]; then
-        # `git config --get remote.origin.url` reads the literal stored
-        # value; `git remote get-url` would apply url.<base>.insteadOf
-        # rewrites and falsely report drift when the operator legitimately
-        # bridges an HTTPS values URL to SSH transport for the agent user.
-        actual_url="$(_git_as_owner "$bare" config --get remote.origin.url 2>/dev/null || true)"
-        if [[ "$actual_url" != "$repo_url" ]]; then
-          echo "FAIL: $bare origin=$actual_url, expected $repo_url" >&2
-          echo "      refusing to silently re-point an existing bare clone." >&2
-          echo "      Move it aside (mv $bare $bare.bak) and re-run to re-clone." >&2
-          exit 1
+    # ---- bare clone + quay registration (entries with `quay:` block) ----
+    if [[ -n "$repo_pkg" ]]; then
+      if [[ "$QUAY_ENABLED" -eq 0 ]]; then
+        echo "==> WARNING: $repo_id carries a quay: block but quay.version is unset; skipping bare clone + registration" >&2
+      else
+        bare="$TARGET_DIR/quay/repos/${repo_id}.git"
+        if [[ -d "$bare" ]]; then
+          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url"
+          echo "==> quay bare clone $repo_id present (preserving)"
+        else
+          echo "==> cloning $repo_url into $bare"
+          sudo -u "$AGENT_USER" \
+            git clone --quiet --bare "$repo_url" "$bare"
         fi
-        echo "==> quay bare clone $repo_id present (preserving)"
-      else
-        echo "==> cloning $repo_url into $bare"
-        sudo -u "$AGENT_USER" \
-          git clone --quiet --bare "$repo_url" "$bare"
-      fi
 
-      if grep -Fxq "$repo_id" <<<"$QUAY_REGISTERED_IDS"; then
-        echo "==> quay repo $repo_id already registered (preserving)"
-      else
-        echo "==> registering $repo_id with quay"
-        sudo -u "$AGENT_USER" \
-          env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
-            --id "$repo_id" \
-            --url "$repo_url" \
-            --base-branch "$repo_base" \
-            --package-manager "$repo_pkg" \
-            --install-cmd "$repo_install" >/dev/null
+        if grep -Fxq "$repo_id" <<<"$QUAY_REGISTERED_IDS"; then
+          echo "==> quay repo $repo_id already registered (preserving)"
+        else
+          echo "==> registering $repo_id with quay"
+          sudo -u "$AGENT_USER" \
+            env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
+              --id "$repo_id" \
+              --url "$repo_url" \
+              --base-branch "$repo_base" \
+              --package-manager "$repo_pkg" \
+              --install-cmd "$repo_install" >/dev/null
+        fi
       fi
-    done <<<"$QUAY_REPOS_TSV"
-  fi
+    fi
+  done <<<"$ALL_REPOS_TSV"
 fi
 
 # Symlinks at render-target root so the agent's existing paths
@@ -1265,6 +1394,53 @@ EOF
   fi
 else
   echo "==> WARNING: $SYNC_SCRIPT_SRC missing; skipping hermes-sync install" >&2
+fi
+
+# ---------- hermes-code-sync ----------
+# Periodic refresh of the working-tree code mirrors at $TARGET/code/<id>/.
+# Independent of quay-tick (which keeps bare clones fresh on its own
+# cadence). The script iterates every direct subdirectory of $TARGET/code
+# with a `.git` and runs `git fetch + git reset --hard origin/<base>`,
+# warn-and-continue on per-repo failure. Same install model as hermes-
+# sync: root-owned script + sed-templated service + preserved
+# /etc/default/ env.
+
+CODE_SYNC_SCRIPT_SRC="$OPS_DIR/hermes-code-sync"
+CODE_SYNC_SCRIPT_DST="/usr/local/sbin/hermes-code-sync"
+
+if [[ -f "$CODE_SYNC_SCRIPT_SRC" ]]; then
+  echo "==> installing hermes-code-sync at $CODE_SYNC_SCRIPT_DST"
+  install -o root -g root -m 0755 "$CODE_SYNC_SCRIPT_SRC" "$CODE_SYNC_SCRIPT_DST"
+
+  if [[ -f /etc/default/hermes-code-sync ]]; then
+    echo "==> /etc/default/hermes-code-sync already present (preserving)"
+  else
+    echo "==> seeding /etc/default/hermes-code-sync"
+    cat >/etc/default/hermes-code-sync <<EOF
+# Generated by setup-hermes.sh — overrides for hermes-code-sync.service.
+# Edits here survive re-runs of the installer; delete this file to force
+# regeneration from defaults.
+HERMES_CODE_DIR=$CODE_ROOT
+HOME=$AGENT_HOME
+EOF
+    chown root:root /etc/default/hermes-code-sync
+    chmod 0644 /etc/default/hermes-code-sync
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd timer for hermes-code-sync (user=$AGENT_USER)"
+    sed "s|__AGENT_USER__|$AGENT_USER|g" \
+      "$OPS_DIR/hermes-code-sync.service" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/hermes-code-sync.service
+    install -o root -g root -m 0644 \
+      "$OPS_DIR/hermes-code-sync.timer" /etc/systemd/system/hermes-code-sync.timer
+    systemctl daemon-reload
+    systemctl enable --now hermes-code-sync.timer
+  else
+    echo "==> systemctl not present; skipping hermes-code-sync timer enable" >&2
+  fi
+else
+  echo "==> WARNING: $CODE_SYNC_SCRIPT_SRC missing; skipping hermes-code-sync install" >&2
 fi
 
 # ---------- hermes-upstream-sync ----------

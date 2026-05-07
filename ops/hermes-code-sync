@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# hermes-code-sync — periodic refresh of the agent's code mirrors.
+#
+# Iterates every direct subdirectory of $HERMES_CODE_DIR (default
+# ~/.hermes/code) that contains a .git/, fetches its origin, and hard-
+# resets the working tree to origin/<base_branch>. The mirrors are read-
+# only from the gateway's perspective (they're for grep/answer-from-code,
+# never an editable workspace), so a hard reset is the right shape — any
+# local divergence is unintentional and should be discarded on the next
+# tick.
+#
+# Failure modes:
+#   * per-repo fetch/reset failure → log a WARN, continue with the next
+#     repo. A single broken mirror (e.g. credential rotation pending,
+#     transient network blip) must not stop the rest of the fleet from
+#     refreshing.
+#   * unreadable $HERMES_CODE_DIR → die. The installer always provisions
+#     it, so absence is real drift worth surfacing.
+#
+# Usage:
+#   hermes-code-sync                    # uses default ~/.hermes/code
+#   HERMES_CODE_DIR=/path hermes-code-sync
+#
+set -u
+
+CODE_DIR="${HERMES_CODE_DIR:-$HOME/.hermes/code}"
+LOG_PREFIX="hermes-code-sync"
+
+log()  { printf '[%s] %s\n' "$LOG_PREFIX" "$*"; }
+warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
+die()  { printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
+
+[[ -d "$CODE_DIR" ]] \
+  || die "no code root at $CODE_DIR (run setup-hermes.sh)"
+
+# nullglob-equivalent: the for-loop body skips when no subdirs match,
+# instead of iterating over the literal pattern.
+shopt -s nullglob
+
+ok=0
+skipped=0
+failed=0
+for repo in "$CODE_DIR"/*/; do
+  repo="${repo%/}"
+  repo_id="${repo##*/}"
+  if [[ ! -d "$repo/.git" ]]; then
+    warn "$repo_id: not a git repo, skipping"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  # The installer clones each mirror with `git clone --branch <base>`,
+  # which sets `refs/remotes/origin/HEAD` to that ref — that's the
+  # source of truth for which branch hermes-code-sync hard-resets to.
+  base="$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null \
+          | sed 's|^origin/||')"
+  if [[ -z "$base" ]]; then
+    warn "$repo_id: cannot determine base branch (no origin/HEAD); skipping"
+    skipped=$((skipped + 1))
+    continue
+  fi
+
+  if ! git -C "$repo" fetch origin --quiet --prune 2>/dev/null; then
+    warn "$repo_id: git fetch failed"
+    failed=$((failed + 1))
+    continue
+  fi
+  if ! git -C "$repo" reset --hard "origin/$base" --quiet 2>/dev/null; then
+    warn "$repo_id: git reset --hard origin/$base failed"
+    failed=$((failed + 1))
+    continue
+  fi
+  ok=$((ok + 1))
+done
+
+log "synced ${ok} ok, ${failed} failed, ${skipped} skipped"
+# Per-repo failures don't fail the unit — the next tick retries. Surface
+# only the catastrophic case of "no repos at all considered" as non-zero
+# so a misconfigured CODE_DIR shows up in `systemctl status`.
+if (( ok + failed + skipped == 0 )); then
+  warn "no code mirrors found under $CODE_DIR"
+fi
+exit 0
