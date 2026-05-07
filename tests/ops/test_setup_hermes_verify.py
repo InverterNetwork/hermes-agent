@@ -679,6 +679,20 @@ class TestSetupHermesVerifyQuay:
         assert result.returncode == 1
         assert f"[DRIFT] quay repo {quay_install['quay_repo_id']} origin" in result.stderr
 
+    def test_origin_check_ignores_insteadof_rewrite(self, quay_install):
+        """`url.<base>.insteadOf` rewrites are how an operator can bridge
+        an HTTPS values URL to SSH transport when the agent user only
+        has SSH credentials. The bare clone's stored URL stays as the
+        HTTPS values form; only `git remote get-url` rewrites it. Verify
+        must compare the raw stored URL (`git config --get`), not the
+        rewritten one — otherwise it fires spurious drift on a healthy
+        operator setup. Regression for install-log entry #8."""
+        _git(quay_install["quay_bare"], "config",
+             "url.git@github.com:.insteadOf", "https://github.com/")
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert f"[OK] quay repo {quay_install['quay_repo_id']} origin:" in result.stdout
+
     def test_unregistered_repo_id_is_drift(self, quay_install):
         # Stub now returns an empty registration list — the bare clone
         # exists but quay never had `repo add` run against it.

@@ -517,7 +517,13 @@ do_verify() {
           else
             v_drift "quay repo $repo_id ownership" "expected $agent_owner, got $bowner"
           fi
-          bare_origin="$(_git_as_owner "$bare" remote get-url origin 2>/dev/null || true)"
+          # Use `git config --get remote.origin.url` (raw stored value)
+          # not `git remote get-url` (which applies url.<base>.insteadOf
+          # rewrites). Operators legitimately bridge HTTPS values URLs to
+          # SSH transport via insteadOf when the agent user only has SSH
+          # creds; the bare clone is functionally correct and the values
+          # URL is the right comparand.
+          bare_origin="$(_git_as_owner "$bare" config --get remote.origin.url 2>/dev/null || true)"
           if [[ "$bare_origin" == "$repo_url" ]]; then
             v_ok "quay repo $repo_id origin: $bare_origin"
           else
@@ -1129,7 +1135,11 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
       [[ -z "$repo_id" ]] && continue
       bare="$QUAY_REPOS_ROOT/${repo_id}.git"
       if [[ -d "$bare" ]]; then
-        actual_url="$(_git_as_owner "$bare" remote get-url origin 2>/dev/null || true)"
+        # `git config --get remote.origin.url` reads the literal stored
+        # value; `git remote get-url` would apply url.<base>.insteadOf
+        # rewrites and falsely report drift when the operator legitimately
+        # bridges an HTTPS values URL to SSH transport for the agent user.
+        actual_url="$(_git_as_owner "$bare" config --get remote.origin.url 2>/dev/null || true)"
         if [[ "$actual_url" != "$repo_url" ]]; then
           echo "FAIL: $bare origin=$actual_url, expected $repo_url" >&2
           echo "      refusing to silently re-point an existing bare clone." >&2
