@@ -638,10 +638,12 @@ do_verify() {
     # slash before `.insteadof`) and don't match. NB: git canonicalises
     # the variable name (`insteadOf` → `insteadof`) in `--get-regexp`
     # output, so the regex must use lowercase to match.
+    # `sort -u` dedupes the same key emitted multiple times by a
+    # multi-valued entry — the drift line should name each key once.
     local legacy_keys
     legacy_keys="$(git config --file "$agent_gitconfig" --get-regexp \
       '^url\.git@github\.com:[^/]+/\.insteadof$' 2>/dev/null \
-      | awk '{print $1}' | tr '\n' ' ' | sed 's/ *$//' || true)"
+      | awk '{print $1}' | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)"
     if [[ -z "$legacy_keys" ]]; then
       v_ok "agent gitconfig insteadOf scope: per-repo (no legacy org-wide rewrite)"
     else

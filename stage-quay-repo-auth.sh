@@ -110,8 +110,14 @@ GITCONFIG="$AGENT_HOME/.gitconfig"
 sudo -u "$AGENT_USER" touch "$GITCONFIG"
 
 # ---- Pass 1: migrate legacy org-wide rewrites ----
-# `--get-regexp` on the key namespace yields one line per matching key:
-# `<full-key> <value>`. We only need the keys, so awk pulls field 1.
+# `--get-regexp` on the key namespace yields one line per matching
+# key/value pair: `<full-key> <value>`. A multi-valued key (same key
+# repeated with two values, possible via manual edits or merged
+# configs) emits the same key twice. `sort -u` on the awk output
+# ensures we don't iterate it twice — the first `--unset-all`
+# already removes every value, and a second pass on a now-absent
+# key exits 5 and aborts under `set -e`.
+#
 # The regex matches exactly the org-wide form: `<org>` segment followed
 # by a single trailing `/` (no embedded slash), then `.insteadof`. The
 # per-repo form (`<org>/<repo>.insteadof`) doesn't match because the
@@ -122,7 +128,7 @@ LEGACY_KEYS="$( \
   cd "$AGENT_HOME" && \
   sudo -u "$AGENT_USER" git config --file "$GITCONFIG" --get-regexp \
     '^url\.git@github\.com:[^/]+/\.insteadof$' 2>/dev/null \
-    | awk '{print $1}' \
+    | awk '{print $1}' | sort -u \
     || true \
 )"
 if [[ -n "$LEGACY_KEYS" ]]; then

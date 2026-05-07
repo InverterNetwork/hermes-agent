@@ -476,6 +476,26 @@ class TestSetupHermesVerify:
         # output, so the drift line carries `.insteadof`, not `.insteadOf`.
         assert "url.git@github.com:InverterNetwork/.insteadof" in result.stderr
 
+    def test_legacy_multi_valued_insteadof_dedupes_in_drift_line(self, install):
+        """A multi-valued legacy key (same key, two values — manual edits or
+        merged configs) emits the same key on two `--get-regexp` lines.
+        The drift line must name it once, not duplicate it."""
+        gc = install["agent_gitconfig"]
+        gc.write_text(
+            "[url \"git@github.com:InverterNetwork/\"]\n"
+            "\tinsteadOf = https://github.com/InverterNetwork/\n"
+            "\tinsteadOf = https://example.com/InverterNetwork/\n"
+        )
+        result = _run_verify(install)
+        assert result.returncode == 1
+        # Single drift line, key named once (sort -u in the pipeline).
+        drift_lines = [l for l in result.stderr.splitlines()
+                       if "[DRIFT] agent gitconfig insteadOf scope" in l]
+        assert len(drift_lines) == 1, drift_lines
+        line = drift_lines[0]
+        # The key appears exactly once even though it has two values.
+        assert line.count("url.git@github.com:InverterNetwork/.insteadof") == 1
+
     def test_per_repo_insteadof_rewrite_passes(self, install):
         """The new per-repo form is the post-migration steady state — verify
         must accept it. Per-repo keys carry `<org>/<repo>` between the `:` and

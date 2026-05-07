@@ -236,10 +236,18 @@ jobs:
           # will land in this state; fresh hosts won't, but the assertions
           # below check both the per-repo line is present AND the org-wide
           # one is gone — that holds in either entry path.
+          # Use `--add` twice to simulate a multi-valued legacy key (manual
+          # edits / merged configs can produce this shape). Without
+          # dedup-before-unset in the migration loop, the second
+          # iteration's --unset-all on an already-absent key would exit 5
+          # and abort the script.
           sudo -u hermes touch /home/hermes/.gitconfig
           sudo -u hermes git config --file /home/hermes/.gitconfig \
-            "url.git@github.com:InverterNetwork/.insteadOf" \
+            --add "url.git@github.com:InverterNetwork/.insteadOf" \
             "https://github.com/InverterNetwork/"
+          sudo -u hermes git config --file /home/hermes/.gitconfig \
+            --add "url.git@github.com:InverterNetwork/.insteadOf" \
+            "https://example.com/InverterNetwork/"
 
           sudo VALUES_FILE="$FIXTURE_YAML" \
             /srv/hermes/repos/hermes-agent/stage-quay-repo-auth.sh
