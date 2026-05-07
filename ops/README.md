@@ -478,8 +478,15 @@ Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
 * `ANTHROPIC_API_KEY` — optional; needed only if `quay.agent_invocation`
   shells out to a tool that requires it (e.g. `claude` without a global
   login).
-* `SLACK_TOKEN` — optional; reserved for the quay slack adapter
-  (disabled in v0).
+
+Quay-side `SLACK_TOKEN` is **not prompted for**. Quay's slack adapter and
+the gateway share one bot identity (same `xoxb-`), so the script copies
+`SLACK_BOT_TOKEN` into `quay.env`'s `SLACK_TOKEN` slot automatically.
+The slot is consumed only when `adapters.slack.enabled=true` in
+`deploy.values.yaml` (waiting_human thread posts, reply ingestion,
+enqueue-time brief enrichment); off as of v0 in the iTRY deployment, so
+the staged value sits unused until the flag flips. To run quay's slack
+adapter as a separate bot, edit `quay.env` by hand after staging.
 
 Re-runs preserve any value the operator leaves blank, so rotating one
 key doesn't require re-typing the others. Per-file `cmp -s`
