@@ -1369,7 +1369,7 @@ if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" ]]; then
 # Edits here survive re-runs of the installer; delete this file to force
 # regeneration from defaults. Empty by default — QUAY_DATA_DIR is set
 # directly on the unit, and adapter tokens flow from <HERMES_HOME>/auth/
-# quay.env (staged by stage-quay-env.sh).
+# quay.env (staged by stage-secrets.sh).
 EOF
     chown root:root /etc/default/quay-tick
     chmod 0644 /etc/default/quay-tick
