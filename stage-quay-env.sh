@@ -57,7 +57,7 @@ prompt_secret() {
 }
 
 prompt_secret LINEAR    "LINEAR_API_KEY (required)"    1 "$existing_linear"
-prompt_secret ANTHROPIC "ANTHROPIC_API_KEY (optional)" 0 "$existing_anthropic"
+prompt_secret ANTHROPIC "ANTHROPIC_API_KEY (optional — leave blank if using \"claude login\" subscription auth)" 0 "$existing_anthropic"
 prompt_secret SLACK     "SLACK_TOKEN (optional)"       0 "$existing_slack"
 
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"

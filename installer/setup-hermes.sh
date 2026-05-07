@@ -794,6 +794,24 @@ else
   trap - EXIT
 fi
 
+# ---------- claude CLI prerequisite check ----------
+# Fail loud here (before any user-side provisioning) rather than letting
+# the agent invoke fail with a cryptic "command not found" hours later.
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  agent_invocation="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.agent_invocation)"
+  if [[ "$agent_invocation" == *claude* ]]; then
+    if ! sudo -u "$AGENT_USER" -H bash -c 'command -v claude' >/dev/null 2>&1; then
+      echo "FAIL: quay.agent_invocation references 'claude' but the claude binary is not on PATH for $AGENT_USER" >&2
+      echo "      Install it (as $AGENT_USER) before re-running setup-hermes.sh:" >&2
+      echo "        sudo -u $AGENT_USER -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'" >&2
+      echo "        sudo ln -sf ~$AGENT_USER/.local/bin/claude /usr/local/bin/claude" >&2
+      echo "        sudo -u $AGENT_USER -H claude login" >&2
+      echo "      See ops/README.md → 'Pre-install: claude CLI' for details." >&2
+      exit 1
+    fi
+  fi
+fi
+
 # ---------- rails (root-owned, read-only to agent) ----------
 
 # HERMES_HOME itself is root:hermes 02775 (setgid). Rails subdirs and the

@@ -54,6 +54,29 @@ installer is the supported path.
 Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
 `installer/setup-hermes.sh`.
 
+## Pre-install: claude CLI
+
+`quay-tick` shells out to `claude` to run the agent worker. Install it as the
+agent user before running `setup-hermes.sh` (the installer fails loud if
+`quay.agent_invocation` references `claude` and the binary is absent).
+
+Install (lands in `~<agent>/.local/bin/`):
+
+```sh
+sudo -u <agent> -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+sudo ln -sf ~<agent>/.local/bin/claude /usr/local/bin/claude
+```
+
+Log in (subscription mode — interactive; complete before running the installer):
+
+```sh
+sudo -u <agent> -H claude login
+```
+
+The symlink makes `claude` available system-wide so root-owned scripts can
+invoke it. The login caches credentials under `~<agent>/.claude/` and is
+read by the worker process which runs as the agent user.
+
 ## Install
 
 `installer/setup-hermes.sh` handles everything. Re-running is idempotent:
@@ -342,6 +365,24 @@ from `<HERMES_HOME>/quay/config.toml`) inside a tmux session, and
 ingests artefacts produced by the previous tick's worker. Bare clones
 of the registered repos live at `<HERMES_HOME>/quay/repos/<id>.git`.
 
+## Worker auth
+
+The worker (`agent_invocation` in `quay/config.toml`) needs an Anthropic
+credential to call the Claude API. Two modes:
+
+* **Subscription auth** — run `sudo -u <agent_user> -H claude login` once;
+  the CLI caches the credential at `~<agent_user>/.claude/`. Leave
+  `ANTHROPIC_API_KEY` blank in `quay.env`. This is the recommended mode
+  for production on krustentier.
+* **Metered API auth** — set `ANTHROPIC_API_KEY` in `quay.env` via
+  `stage-quay-env.sh`. The env var is injected by the systemd
+  `EnvironmentFile=` and wins over the subscription cache.
+
+**Precedence gotcha:** when both are set (a stale key sits in `quay.env`
+and `claude login` was also done), the env var silently overrides the login.
+Operators expect "blank = use subscription" — rotate or clear a stale key
+before relying on subscription auth.
+
 ## Cadence
 
 1-minute interval, set in `quay-tick.timer`:
@@ -392,6 +433,37 @@ Re-runs preserve any value the operator leaves blank, so rotating one
 key doesn't require re-typing the others. The next `quay-tick` run
 reads the file fresh via `EnvironmentFile=`, so there's nothing to
 restart.
+
+## Staging repo SSH auth
+
+`stage-quay-repo-auth.sh` (at the repo root) provisions the SSH material
+the agent user needs to clone (and quay needs to fetch) the repos listed
+under `quay.repos` in `deploy.values.yaml`. Run it once after first
+install, and again whenever a new repo is added under a previously unseen
+GitHub org:
+
+```sh
+sudo ./stage-quay-repo-auth.sh
+```
+
+What it does (idempotent):
+
+* Generates `~<agent>/.ssh/id_ed25519` if absent (no passphrase).
+* Pre-seeds `~<agent>/.ssh/known_hosts` with current `github.com` host
+  keys via `ssh-keyscan` (deduplicated against existing entries).
+* For each distinct GitHub org in `quay.repos[].url`, configures
+  `git config --global url.git@github.com:<org>/.insteadOf
+  https://github.com/<org>/` for the agent user — the values file
+  carries HTTPS URLs, but the bare clones authenticate over SSH using
+  the deploy key.
+* Prints the public key (`~<agent>/.ssh/id_ed25519.pub`) at the end.
+
+The operator's job: paste the printed public key into each repo's
+**Settings → Deploy keys → Add deploy key** UI on GitHub. Read-only is
+sufficient for v0 (quay only fetches; pushes happen via the GitHub App
+token wired up by the main installer); enable "Allow write access" only
+if a worker eventually needs to push from a bare clone, which is not the
+v0 flow.
 
 ## Logs
 

@@ -2,7 +2,7 @@
 """Read deploy.values.yaml and emit shell-friendly outputs.
 
 setup-hermes.sh shells out to this helper rather than parsing YAML in bash.
-Six subcommands:
+Seven subcommands:
 
   get <key>                    — print scalar at dotted path (org.name) or a
                                   list joined by `--sep` (default ",").
@@ -21,6 +21,11 @@ Six subcommands:
                                   for the field name on the consumer side.
                                   Exits 2 with a stderr message on parse
                                   failure (non-JSON / non-list shape).
+  list-repo-orgs               — emit one distinct GitHub org per line
+                                  (first-seen order) from quay.repos[].url.
+                                  Accepts only HTTPS GitHub URLs; rejects
+                                  anything else with a clear stderr message.
+                                  Empty quay.repos → exit 0, no output.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ import string
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import yaml
@@ -385,6 +391,62 @@ def cmd_parse_repo_list_ids(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_list_repo_orgs(args: argparse.Namespace) -> int:
+    """Emit one distinct GitHub org per line from quay.repos[].url (first-seen order).
+
+    Only HTTPS GitHub URLs (https://github.com/<org>/<repo>[.git]) are accepted;
+    any other URL scheme or host causes a non-zero exit with a clear stderr message.
+    Empty quay.repos → exit 0 with no output. Missing quay.repos key → exit 0.
+    """
+    data = _load(Path(args.values))
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+    repos = quay.get("repos")
+    if repos is None:
+        return 0
+    if not isinstance(repos, list):
+        sys.stderr.write("values_helper.py: quay.repos must be a list\n")
+        return 1
+
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for i, entry in enumerate(repos):
+        if not isinstance(entry, dict):
+            sys.stderr.write(f"values_helper.py: quay.repos[{i}] must be a mapping\n")
+            return 1
+        url = entry.get("url")
+        if not url:
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].url is required\n"
+            )
+            return 1
+        parsed = urlparse(str(url))
+        if parsed.scheme != "https" or parsed.netloc != "github.com":
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].url={url!r} is not a GitHub HTTPS URL "
+                f"(expected https://github.com/<org>/<repo>)\n"
+            )
+            return 1
+        # Strip leading/trailing slash, drop trailing `.git` suffix only,
+        # take first path segment as org.
+        path_parts = parsed.path.strip("/").removesuffix(".git").split("/")
+        if len(path_parts) < 2 or not path_parts[0]:
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].url={url!r} has no org/repo path\n"
+            )
+            return 1
+        org = path_parts[0]
+        if org not in seen_set:
+            seen.append(org)
+            seen_set.add(org)
+
+    for org in seen:
+        sys.stdout.write(org + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -427,6 +489,12 @@ def main(argv: list[str] | None = None) -> int:
         help="read `quay repo list` JSON from stdin; emit repo_id per line",
     )
     p_parse.set_defaults(func=cmd_parse_repo_list_ids)
+
+    p_orgs = sub.add_parser(
+        "list-repo-orgs",
+        help="emit distinct GitHub org names from quay.repos[].url (first-seen order)",
+    )
+    p_orgs.set_defaults(func=cmd_list_repo_orgs)
 
     args = parser.parse_args(argv)
     return args.func(args)

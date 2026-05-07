@@ -517,3 +517,175 @@ class TestParseRepoListIds:
         r = self._run_parse(payload)
         assert r.returncode == 0, r.stderr
         assert r.stdout == ""
+
+
+class TestListRepoOrgs:
+    @pytest.fixture
+    def orgs_values(self, tmp_path: Path) -> Path:
+        p = tmp_path / "values.yaml"
+        p.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/InverterNetwork/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: beta\n"
+            "      url: https://github.com/InverterNetwork/beta\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: gamma\n"
+            "      url: https://github.com/AnotherOrg/gamma\n"
+            "      base_branch: main\n"
+            "      package_manager: npm\n"
+            "      install_cmd: npm ci\n",
+            encoding="utf-8",
+        )
+        return p
+
+    def test_emits_distinct_orgs_in_first_seen_order(self, orgs_values: Path):
+        r = _run(orgs_values, "list-repo-orgs")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["InverterNetwork", "AnotherOrg"]
+
+    def test_single_org_emits_once(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/ExampleOrg/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["ExampleOrg"]
+
+    def test_trailing_git_stripped(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/ExampleOrg/alpha.git\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "ExampleOrg"
+
+    def test_empty_repos_list_emits_nothing(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  repos: []\n", encoding="utf-8")
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_missing_repos_key_emits_nothing(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  version: v0.1.0\n", encoding="utf-8")
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_non_github_url_exits_nonzero(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://gitlab.com/ExampleOrg/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 1
+        assert "not a GitHub HTTPS URL" in r.stderr
+
+    def test_file_url_exits_nonzero(self, tmp_path: Path):
+        # CI patches the URL to file:///... — the subcommand must reject it cleanly.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: file:///srv/hermes/repos/quay-fixtures/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 1
+        assert "not a GitHub HTTPS URL" in r.stderr
+
+    def test_http_url_exits_nonzero(self, tmp_path: Path):
+        # Tightened from {http, https} to https-only: an http:// URL on a
+        # deploy-key staging path is almost certainly a misconfiguration.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: http://github.com/ExampleOrg/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 1
+        assert "not a GitHub HTTPS URL" in r.stderr
+
+    def test_ssh_url_exits_nonzero(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: git@github.com:ExampleOrg/alpha.git\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 1
+        assert "not a GitHub HTTPS URL" in r.stderr
+
+    def test_deduplication_preserves_first_seen_order(self, tmp_path: Path):
+        # B, A, B → emit B then A (first-seen, not sorted)
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: r1\n"
+            "      url: https://github.com/OrgB/r1\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: r2\n"
+            "      url: https://github.com/OrgA/r2\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: r3\n"
+            "      url: https://github.com/OrgB/r3\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["OrgB", "OrgA"]
