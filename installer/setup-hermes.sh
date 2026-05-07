@@ -367,6 +367,22 @@ do_verify() {
     fi
   done
 
+  # ---- config.yaml ----
+  # Must be agent-writable — see seed block below for the full WHY (ITRY-1316).
+  local cfg="$target/config.yaml"
+  if [[ ! -f "$cfg" ]]; then
+    v_drift "config.yaml" "missing: $cfg"
+  else
+    local cmode cowner
+    cmode="$(_mode "$cfg")"
+    cowner="$(_owner "$cfg")"
+    if [[ "$cmode" == "644" && "$cowner" == "$agent_owner" ]]; then
+      v_ok "config.yaml: $cmode $cowner"
+    else
+      v_drift "config.yaml" "mode=$cmode owner=$cowner (expected 644 $agent_owner)"
+    fi
+  fi
+
   # ---- state symlinks ----
   local link tgt
   for d in skills memories cron; do
@@ -1003,9 +1019,14 @@ else
   echo "==> seeding $CONFIG_YAML_OUT from $VALUES_FILE"
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
     render-runtime-config --out "$CONFIG_YAML_OUT"
-  chown root:root "$CONFIG_YAML_OUT"
-  chmod 644 "$CONFIG_YAML_OUT"
 fi
+# config.yaml must be agent-writable: `hermes auth add` rewrites
+# model.provider after the OAuth flow, and `hermes model` does the same on
+# the interactive picker. Root-owned silently no-ops those writes (ITRY-1316).
+# Re-asserted every run so legacy hosts seeded as root:root self-heal on the
+# next install (the body is never re-rendered, so operator hand-edits survive).
+chown "$AGENT_USER:$AGENT_USER" "$CONFIG_YAML_OUT"
+chmod 0644 "$CONFIG_YAML_OUT"
 
 # model.* is rewritten on every run, even when the file above was preserved
 # — the helper docstring covers the rationale (silent `hermes auth add`
