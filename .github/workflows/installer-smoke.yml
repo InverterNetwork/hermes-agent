@@ -241,6 +241,7 @@ jobs:
           # silently target the wrong file.
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes
+            cd "$T"  # git stats CWD even with --file; $GITHUB_WORKSPACE is unreadable to hermes
             key_mode=$(stat -c "%a" "$T/.ssh/id_ed25519")
             [[ "$key_mode" == "600" ]] \
               || { echo "FAIL: id_ed25519 mode=$key_mode (expected 600)"; exit 1; }
@@ -252,7 +253,7 @@ jobs:
             grep -q "github.com ssh-" "$T/.ssh/known_hosts" \
               || { echo "FAIL: known_hosts missing github.com keys"; exit 1; }
 
-            rewrite=$(git config --file "$T/.gitconfig" --get "url.git@github.com:InverterNetwork/.insteadOf" 2>/dev/null || true)
+            rewrite=$(git config --file "$T/.gitconfig" --get "url.git@github.com:InverterNetwork/.insteadOf" || true)
             [[ "$rewrite" == "https://github.com/InverterNetwork/" ]] \
               || { echo "FAIL: insteadOf rewrite missing or wrong: $rewrite"; cat "$T/.gitconfig" 2>&1 || true; exit 1; }
 
