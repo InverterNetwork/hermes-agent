@@ -32,7 +32,7 @@ Four units live here:
 | `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
-| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-hermes-env.sh`. |
+| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-secrets.sh`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
 
@@ -115,39 +115,6 @@ Token refresh is automatic — `hermes` mints a fresh access token from its
 refresh token on demand. If the refresh token is invalidated (e.g. the
 ChatGPT account password rotates), the gateway will fail loud at the next
 LLM call; re-running `hermes auth add openai-codex` is the fix.
-
-## Staging gateway adapter tokens
-
-`stage-hermes-env.sh` (at the repo root) writes
-`<HERMES_HOME>/auth/hermes.env`, which the `hermes-env.conf` drop-in pulls
-in via `EnvironmentFile=`. Run it once after first install, and again
-whenever a token rotates:
-
-```sh
-sudo ./stage-hermes-env.sh
-```
-
-Prompts:
-
-* `LINEAR_API_KEY` — required, gates the `linear-create` skill (the gateway
-  agent uses it to file iTRY issues from Slack).
-
-Re-runs preserve any value the operator leaves blank, so rotating one key
-doesn't require re-typing the others. Unlike `quay-tick` (which reads its
-env file fresh on each tick), `hermes-gateway` is long-running and only
-reads `EnvironmentFile=` at unit start — the script restarts the unit
-automatically when it detects one is enabled.
-
-The file lives at `<HERMES_HOME>/auth/hermes.env` with mode `0640
-root:<agent>`, sibling of `slack.env` (Slack tokens) and `quay.env`
-(worker-side tokens). Three files, three units that load them.
-
-Note: `LINEAR_API_KEY` deliberately lives in **both** `hermes.env`
-(gateway-side, this file) and `quay.env` (worker-side). The two units
-are independent — same key value, two staging actions on rotation
-(`stage-hermes-env.sh` + `stage-quay-env.sh`). This is the same shape
-as `SLACK_TOKEN` (slack.env vs the v1-reserved slot in quay.env): one
-secret, two consumers, two files. Keep them in sync on rotation.
 
 ## Install
 

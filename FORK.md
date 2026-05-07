@@ -22,9 +22,8 @@ Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instan
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
    - seeds `<HERMES_HOME>/config.yaml` from `slack.runtime.*` on first install (preserved on re-runs — operator hand-edits survive),
    - configures `git user.name` on agent commits to `org.agent_identity_name`.
-4. Stage Slack tokens at `<HERMES_HOME>/auth/slack.env` (mode `0640 root:<agent>`) with `SLACK_BOT_TOKEN=xoxb-…` and `SLACK_APP_TOKEN=xapp-…`. The installer leaves the gateway disabled until this file exists; once it does, `systemctl enable --now hermes-gateway.service` brings it up.
-5. Stage gateway adapter tokens with `stage-hermes-env.sh` (interactive — writes `<HERMES_HOME>/auth/hermes.env`). Required: `LINEAR_API_KEY`. Re-runs preserve unchanged values; identical content skips the gateway restart.
-6. If `quay.version` is set, stage quay adapter tokens with `stage-quay-env.sh` (interactive — writes `<HERMES_HOME>/auth/quay.env`). Required: `LINEAR_API_KEY` (same value as step 5; quay-tick reads its own env file). Re-runs preserve unchanged values.
+4. Stage Slack tokens with `stage-slack-env.sh` (interactive — writes `<HERMES_HOME>/auth/slack.env`).
+5. If `quay.version` is set, stage quay adapter tokens with `stage-quay-env.sh` (interactive — writes `<HERMES_HOME>/auth/quay.env`). Required: `LINEAR_API_KEY`. Re-runs preserve unchanged values.
 
 Acceptance: once `deploy.values.yaml` is set for the new org, `grep -RE 'BabyDidier|didier|C0B23MZ0USV|lmdtfy' installer/ ops/ gateway/` should return no matches outside the values file.
 
