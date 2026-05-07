@@ -478,8 +478,6 @@ Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
 * `ANTHROPIC_API_KEY` — optional; needed only if `quay.agent_invocation`
   shells out to a tool that requires it (e.g. `claude` without a global
   login).
-* `SLACK_TOKEN` — optional; reserved for the quay slack adapter
-  (disabled in v0).
 
 Re-runs preserve any value the operator leaves blank, so rotating one
 key doesn't require re-typing the others. Per-file `cmp -s`

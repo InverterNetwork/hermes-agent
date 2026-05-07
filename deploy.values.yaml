@@ -52,8 +52,15 @@
 #                                 path and a CLI flag.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
-#   quay.adapters.slack        — disabled in v0; reserved for waiting_human
-#                                 thread posts.
+#   quay.adapters.slack        — gates quay's slack adapter (waiting_human
+#                                 thread posts + reply ingestion + enqueue-time
+#                                 brief enrichment). Adapter code is built
+#                                 upstream; this flag is the on/off switch.
+#                                 Off in the iTRY deployment as of v0; flip
+#                                 to `enabled: true` to activate. quay.env's
+#                                 SLACK_TOKEN is staged by stage-secrets.sh
+#                                 from the gateway's SLACK_BOT_TOKEN — same
+#                                 xoxb-, same bot identity.
 
 org:
   name: Inverter

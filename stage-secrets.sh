@@ -24,8 +24,15 @@
 #     files sit ready for when it's enabled).
 #   - quay.env: staged only when /usr/local/bin/quay exists (i.e. the
 #     deployment pinned quay.version in deploy.values.yaml). Skipped
-#     otherwise — the prompts for ANTHROPIC_API_KEY / SLACK_TOKEN don't
-#     fire on Linear-only deployments.
+#     otherwise — the prompt for ANTHROPIC_API_KEY doesn't fire on
+#     Linear-only deployments.
+#
+# SLACK_TOKEN in quay.env is NOT prompted for. Quay's slack adapter and
+# the gateway's Slack transport share one bot identity (same xoxb-), so
+# the script copies SLACK_BOT_TOKEN into quay.env's SLACK_TOKEN slot
+# automatically. To run quay's slack adapter as a separate bot, edit
+# quay.env by hand after staging — left as an explicit edit so a typo
+# during prompt entry can't silently bifurcate the two identities.
 set -euo pipefail
 
 AGENT_USER="${AGENT_USER:-hermes}"
@@ -71,7 +78,6 @@ existing_slack_app=""
 existing_slack_users=""
 existing_linear=""
 existing_anthropic=""
-existing_quay_slack=""
 
 parse_existing_env "$SLACK_ENV"  existing_slack_bot   SLACK_BOT_TOKEN
 parse_existing_env "$SLACK_ENV"  existing_slack_app   SLACK_APP_TOKEN
@@ -84,7 +90,6 @@ parse_existing_env "$HERMES_ENV" existing_linear     LINEAR_API_KEY
 [[ -z "$existing_linear" ]] && parse_existing_env "$QUAY_ENV" existing_linear LINEAR_API_KEY
 
 parse_existing_env "$QUAY_ENV"   existing_anthropic  ANTHROPIC_API_KEY
-parse_existing_env "$QUAY_ENV"   existing_quay_slack SLACK_TOKEN
 
 # Prompt for a value with preserve-on-blank semantics, optional prefix
 # check, and silent input for secrets. Empty input keeps the current
@@ -136,10 +141,10 @@ if (( manage_quay )); then
 fi
 prompt_value LINEAR "$linear_label" "$linear_required" "$existing_linear" "" 1
 
-# Quay-only secrets, prompted only on quay-provisioned deployments
+# Quay-only secrets, prompted only on quay-provisioned deployments.
+# (SLACK_TOKEN is auto-populated from SLACK_BOT_TOKEN below — see header.)
 if (( manage_quay )); then
   prompt_value ANTHROPIC  "ANTHROPIC_API_KEY (optional — leave blank if using \"claude login\" subscription auth)" 0 "$existing_anthropic"  "" 1
-  prompt_value QUAY_SLACK "SLACK_TOKEN (optional — quay slack adapter, disabled in v0)"                            0 "$existing_quay_slack" "" 1
 fi
 
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
@@ -182,11 +187,14 @@ fi
 # file fresh per timer tick, so no restart concept; we don't track
 # whether quay.env changed.
 if (( manage_quay )); then
-  quay_content="LINEAR_API_KEY=${LINEAR}"
-  [[ -n "$ANTHROPIC" ]]  && quay_content+="
+  # SLACK_TOKEN mirrors the gateway's SLACK_BOT_TOKEN — same xoxb-, same
+  # bot identity, two consumer processes. Always set so flipping
+  # adapters.slack.enabled=true in deploy.values.yaml activates the
+  # adapter without a re-stage.
+  quay_content="LINEAR_API_KEY=${LINEAR}
+SLACK_TOKEN=${SLACK_BOT}"
+  [[ -n "$ANTHROPIC" ]] && quay_content+="
 ANTHROPIC_API_KEY=${ANTHROPIC}"
-  [[ -n "$QUAY_SLACK" ]] && quay_content+="
-SLACK_TOKEN=${QUAY_SLACK}"
   write_env "$QUAY_ENV" "$quay_content"
 fi
 
