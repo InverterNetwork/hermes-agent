@@ -26,7 +26,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 - **Symptom:** Second `setup-hermes.sh` invocation in CI produced `{"error":"duplicate_repo","message":"repo \"test-factory-code\" already exists","repo_id":"test-factory-code"}` and aborted; install was non-idempotent.
 - **Root cause:** Install-time and verify-time JSON parsers in `setup-hermes.sh` read `r["id"]` and silently emitted nothing. The "already-registered" snapshot was always empty, so re-runs always re-attempted `quay repo add`.
 - **Workaround:** PR #23 fixed both call sites and extracted the parser into `installer/values_helper.py` as `parse-repo-list-ids` so the field name lives in one place. New unit-test guard rejects an `id`-keyed payload.
-- **Locus of fix:** hermes-agent (consumer-side adapter). Could equivalently be quay-side: rename `repo_id` → `id` in the `repo list` output. Not necessarily wrong as-is — `repo_id` is more self-describing inside heterogeneous JSON output. Calling it out for the locus-of-fix triage.
+- **Locus of fix:** hermes-agent (consumer-side adapter). Quay-side rename considered for surface consistency — tracked as **AST-82** (low priority, not blocking).
 - **Why:** Integration shape mismatch caught only when the real binary first ran in CI.
 
 ## 4. ✅ `~/.hermes/quay/` ends up mode 2755 (not 755)
@@ -42,7 +42,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 - **Symptom:** Caught pre-install: `quay --version` → `0.1.0+abc1234`. `quay.version` in `deploy.values.yaml` is the tag name (`v0.1.0`). PR #19's substring compare would have fired false drift on every clean install.
 - **Root cause:** `package.json` carries `0.1.0` (no `v`); `scripts/embed.ts` emits `${pkg.version}+${shortSHA}`. Tag-vs-semver convention difference.
 - **Workaround:** PR #21 strips leading `v` from the pin (`${quay_version#v}`) before the substring-compare. Fetch URL stays unaffected because the tag name is required there.
-- **Locus of fix:** hermes-agent. Could equivalently be quay-side: have the embed script emit `v${pkg.version}` so the version string matches the tag. Worth raising on quay if that's the preferred direction.
+- **Locus of fix:** hermes-agent (shipped). Quay-side alignment (embed `v${pkg.version}`) tracked as **AST-81** (low priority, not blocking).
 - **Why:** Convention mismatch between two reasonable choices; consumer-side strip is cheap.
 
 ## 6. 🟡 Bare-clone needs hermes-user git auth to private repos
@@ -54,7 +54,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   2. Add the public half as a deploy key on `InverterNetwork/test-factory-code` (read-only).
   3. Pre-seed `~hermes/.ssh/known_hosts` with `ssh-keyscan github.com`.
   4. `git config --global url."git@github.com:InverterNetwork/".insteadOf "https://github.com/InverterNetwork/"` for the `hermes` user — keeps `deploy.values.yaml` HTTPS-shaped (and CI-compatible) while routing all `InverterNetwork/*` clones through SSH on the box.
-- **Locus of fix:** **TBD, leaning hermes-agent.** A `stage-quay-repo-auth.sh` sibling of `stage-quay-env.sh` would formalise steps 1–4 into a single operator-run script. Same shape as existing stage-scripts: idempotent, prompts only when needed, host-local output. Avoids re-deriving the dance per repo / per host. The manual setup proved the design works end-to-end (install completed at HEAD `6a0a883a`); now it just needs codifying. **Open follow-up:** PR for `stage-quay-repo-auth.sh`.
+- **Locus of fix:** **hermes-agent.** A `stage-quay-repo-auth.sh` sibling of `stage-quay-env.sh` formalises steps 1–4 into a single operator-run script. Same shape as existing stage-scripts: idempotent, prompts only when needed, host-local output. Avoids re-deriving the dance per repo / per host. The manual setup proved the design works end-to-end (install completed at HEAD `6a0a883a`); now it just needs codifying. **Tracked in ITRY-1311** (bundled with #9 and #10).
 - **Why:** Auth shouldn't live in the binary (quay-side). The v0 design pushes it onto the operator, which is fine for one repo but doesn't scale. Formalising as a stage-script keeps the locus on hermes-agent without leaking auth into quay or into `deploy.values.yaml`.
 
 ## 8. ✅ `git remote get-url` applies `insteadOf` rewrite, breaks idempotency check — fixed in PR #25
@@ -74,6 +74,8 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   1. `stage-quay-env.sh` should clarify the prompt: *"ANTHROPIC_API_KEY (optional — leave blank if using `claude login` subscription auth)"*. One-line text change.
   2. `ops/README.md#quay-tick` (or a new `ops/README.md#worker-auth`) should document the two auth modes and explicitly recommend running `claude login` as the agent user post-install.
   3. Optionally: add a `--check` mode to `stage-quay-env.sh` that detects `~hermes/.claude/auth.json` (or whatever the credential store is) and warns if both subscription auth and `ANTHROPIC_API_KEY` are present.
+
+  **Tracked in ITRY-1311** (bundled with #6 and #10).
 - **Why:** Same flavour of operator-experience issue as entry #6 — the v0 design pushes auth onto the operator, but doesn't surface the choice clearly. Quay-side has nothing to do here; this is purely about the hermes-agent installer's UX.
 
 ## 10. 🟡 `claude` CLI not installed on a fresh box
@@ -85,7 +87,9 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   1. Add a check in `setup-hermes.sh`: when `quay.version` is set and `quay.agent_invocation` references `claude`, refuse to install unless `claude` is on PATH. Cheap, fail-loud.
   2. Document in `ops/README.md#quay-tick`: "before staging tokens, install `claude` via `curl -fsSL https://claude.ai/install.sh | bash` and run `sudo -u hermes -H claude login`." Pure runbook; no code change.
   3. (Heavier) Have `setup-hermes.sh` install the binary if missing. Adds a third-party download to apt-prep, raises the supply-chain surface — probably not worth it for v0.
-- **Why:** Same family as #6 and #9 — the install path assumes operator already has the runtime tools, but doesn't signal which ones. Combining the three into a single hermes-agent PR (`stage-quay-repo-auth.sh` + ops/README "before you start" section) is probably the cleanest follow-up shape.
+- **Why:** Same family as #6 and #9 — the install path assumes operator already has the runtime tools, but doesn't signal which ones. Combining the three into a single hermes-agent PR (`stage-quay-repo-auth.sh` + ops/README "before you start" section) is the cleanest follow-up shape.
+
+  **Tracked in ITRY-1311** (bundled with #6 and #9).
 
 ## 11. 🔵 Bare clone + registration disappeared once between install and verify (unreproducible)
 
@@ -105,12 +109,18 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 
 ---
 
-## Triage rubric (apply once install is green)
+## Triage outcome (2026-05-07)
 
-For each open entry:
+Install completed green (40 checks, 0 drift). Open entries triaged into:
+
+- **ITRY-1311** (Inverter, hermes-agent): bundled follow-up covering entries #6, #9, #10 — `stage-quay-repo-auth.sh` + worker-auth runbook + `claude` CLI prerequisite. https://linear.app/inverter/issue/ITRY-1311
+- **AST-81** (Aster, quay): emit `--version` with leading `v` to match git tag (entry #5, low priority — consumer workaround already shipped). https://linear.app/aster69/issue/AST-81
+- **AST-82** (Aster, quay): rename `repo_id` → `id` in `repo list` output for surface consistency (entry #3, low priority — consumer fix already shipped). https://linear.app/aster69/issue/AST-82
+
+Entry #11 (unreproducible state loss) stays as a watch-list note — no action unless it recurs. Entries #1, #2, #4, #7, #8 fully resolved (✅ or 🔵 in the per-entry headers).
+
+### Triage rubric (kept for future installs)
 
 1. **Is the fix in code at all, or just operator runbook?** If runbook, document in `ops/README.md` and close.
 2. **If code: hermes-agent or quay?** Default to whichever side owns the concern (auth → hermes-agent operator-staging; binary surface → quay; integration adapter → hermes-agent).
 3. **Is the consumer-side adapter genuinely cheaper than the upstream change, or just easier from inside hermes-agent?** Per [feedback memory](../.claude/projects/-Users-fabianscherer-repos-inverter-brix-agents-hermes-agent/memory/feedback_hermes_quay_fix_locus.md), default to surfacing both options before patching.
-
-Each open entry that resolves to "fix on hermes-agent" or "fix on quay" → its own PR with link back to this log.
