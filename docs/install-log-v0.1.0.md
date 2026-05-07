@@ -91,6 +91,14 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   3. (Heavier) Have `setup-hermes.sh` install the binary if missing. Adds a third-party download to apt-prep, raises the supply-chain surface — probably not worth it for v0.
 - **Why:** Same family as #6 and #9 — the install path assumes operator already has the runtime tools, but doesn't signal which ones. Combining the three into a single hermes-agent PR (`stage-quay-repo-auth.sh` + ops/README "before you start" section) is probably the cleanest follow-up shape.
 
+## 11. 🔵 Bare clone + registration disappeared once between install and verify (unreproducible)
+
+- **Symptom:** First `--verify` run after the post-#25 install reported `[DRIFT] quay repo test-factory-code: bare clone missing` even though the install minutes earlier had logged `==> quay bare clone test-factory-code present (preserving)` and `==> registering test-factory-code with quay`. Direct inspection confirmed `/home/hermes/.hermes/quay/repos/` was empty AND `quay repo list` returned `[]`.
+- **What we tried:** Re-ran the installer (recreated bare clone + registration), then watched the dir + `quay repo list` every 35s for 5 minutes (~5 `quay-tick` fires). State held perfectly across every snapshot.
+- **Root cause:** Unknown — not reproduced. Quay's source has no automatic bare-clone cleanup path, so `quay tick` itself isn't the culprit. Possible triggers (none confirmed): a transient race during the earlier broken-symlink claude install state, the earlier mid-paste partial commands the terminal handled weirdly, or something related to the install's `==> registering` step running while a `quay tick` was in flight.
+- **Locus of fix:** **None until it reproduces.** Logging it here so if anyone hits it again, they have a starting point and aren't surprised.
+- **Why:** Untracked transient state mutations in a complex multi-process install path are sometimes one-time artifacts. The installer is idempotent — re-running cleanly recovered. If we see this again, the next debug step is to enable `quay tick`'s NDJSON output to journal (currently silent on success; `StandardOutput=journal` is already the default but quay isn't logging) and add a tripwire that snapshots the data dir on every tick.
+
 ## 7. 🔵 `url.insteadOf` paste mangled by terminal line-wrap
 
 - **Symptom:** First attempt to set the rewrite silently no-op'd. SSH worked but bare-clone still hit HTTPS. Diagnosis (via direct SSH from the operator's Mac) showed `git config --get-regexp '^url\.'` empty and `~hermes/.gitconfig` lacked the `[url "git@github.com:InverterNetwork/"]` block.
