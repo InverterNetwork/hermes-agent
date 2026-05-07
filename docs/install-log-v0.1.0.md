@@ -61,6 +61,14 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 - **Locus of fix:** **TBD, leaning hermes-agent.** A `stage-quay-repo-auth.sh` sibling of `stage-quay-env.sh` would formalise steps 1–4 into a single operator-run script. Same shape as existing stage-scripts: idempotent, prompts only when needed, host-local output. Avoids re-deriving the dance per repo / per host.
 - **Why:** Auth shouldn't live in the binary (quay-side). The v0 design pushes it onto the operator, which is fine for one repo but doesn't scale. Formalising as a stage-script keeps the locus on hermes-agent without leaking auth into quay or into `deploy.values.yaml`.
 
+## 8. 🟡 `git remote get-url` applies `insteadOf` rewrite, breaks idempotency check *(OPEN)*
+
+- **Symptom:** With the SSH key + `insteadOf` rewrite from entry #6 in place, re-running `setup-hermes.sh` aborted with `FAIL: /home/hermes/.hermes/quay/repos/test-factory-code.git origin=git@github.com:InverterNetwork/test-factory-code, expected https://github.com/InverterNetwork/test-factory-code … refusing to silently re-point an existing bare clone`.
+- **Root cause:** The script's bare-clone idempotency check (and the matching `--verify` check) reads the existing origin via `git remote get-url origin`, which **applies `insteadOf` rewrites at output time**. Diagnosis on krustentier confirms the raw stored URL in `.git/config` is the HTTPS form (matching `quay.repos[0].url`) — it's only the `get-url` subcommand that hands back the rewritten SSH form. The bare clone itself is functionally correct; fetches route via SSH transparently. The check is wrong, not the data.
+- **Tonight's workaround:** PR for the fix; the bare clone stays as-is.
+- **Locus of fix:** **hermes-agent.** Switch both compare sites (install at `setup-hermes.sh:~1095`, verify at `setup-hermes.sh:~522`) from `git remote get-url origin` to `git config --get remote.origin.url`. The latter returns the raw stored value with no rewrite applied — exactly the right primitive for "is the URL we'd fetch from the same as what values configures?"
+- **Why:** This is a hermes-agent-side bug exposed only when an operator legitimately uses `insteadOf` to bridge an HTTPS-shaped values URL to SSH transport. Every prior install (CI smoke, manual local test) used a single-protocol path so the bug was latent.
+
 ## 7. 🔵 `url.insteadOf` paste mangled by terminal line-wrap
 
 - **Symptom:** First attempt to set the rewrite silently no-op'd. SSH worked but bare-clone still hit HTTPS. Diagnosis (via direct SSH from the operator's Mac) showed `git config --get-regexp '^url\.'` empty and `~hermes/.gitconfig` lacked the `[url "git@github.com:InverterNetwork/"]` block.
