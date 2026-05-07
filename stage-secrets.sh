@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Stage every hermes-agent runtime secret in one pass. Run as root.
 #
-# Replaces the per-unit triplet (stage-slack-env.sh + stage-hermes-env.sh
-# + stage-quay-env.sh). Same files end up on disk:
+# Single staging script for all runtime secrets — three files on disk:
 #
 #   <HERMES_HOME>/auth/slack.env   — gateway, Slack tokens
 #   <HERMES_HOME>/auth/hermes.env  — gateway, adapter tokens (LINEAR_API_KEY)
 #   <HERMES_HOME>/auth/quay.env    — quay-tick worker tokens
+#
+# AUTH_DIR defaults to /home/${AGENT_USER}/.hermes/auth — the same path
+# setup-hermes.sh's `--target` defaults to. Non-default installs (e.g.
+# setup-hermes.sh --target /opt/hermes) must run this script with
+# AUTH_DIR=/opt/hermes/auth or the files land in the wrong place.
 #
 # Each unique secret is prompted once; LINEAR_API_KEY lands in BOTH
 # hermes.env and quay.env from one prompt instead of two. Re-runs preserve
@@ -55,7 +59,10 @@ parse_existing_env() {
   local file="$1" varname="$2" key="$3"
   [[ -r "$file" ]] || return 0
   while IFS='=' read -r k v; do
-    [[ "$k" == "$key" ]] && printf -v "$varname" '%s' "$v"
+    if [[ "$k" == "$key" ]]; then
+      printf -v "$varname" '%s' "$v"
+      return 0
+    fi
   done < "$file"
 }
 
