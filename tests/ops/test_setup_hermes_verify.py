@@ -687,14 +687,8 @@ class TestSetupHermesVerifyQuay:
         must compare the raw stored URL (`git config --get`), not the
         rewritten one — otherwise it fires spurious drift on a healthy
         operator setup. Regression for install-log entry #8."""
-        # Configure a rewrite local to this bare clone. With this set,
-        # `git remote get-url origin` would return the SSH form even
-        # though the stored URL in .git/config is still HTTPS.
-        subprocess.run(
-            ["git", "-C", str(quay_install["quay_bare"]), "config",
-             "url.git@github.com:.insteadOf", "https://github.com/"],
-            check=True,
-        )
+        _git(quay_install["quay_bare"], "config",
+             "url.git@github.com:.insteadOf", "https://github.com/")
         result = _run_verify_quay(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} origin:" in result.stdout
