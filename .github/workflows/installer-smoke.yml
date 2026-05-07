@@ -235,8 +235,10 @@ jobs:
             /srv/hermes/repos/hermes-agent/stage-quay-repo-auth.sh
 
           # Probe as hermes: key exists with correct mode, known_hosts seeded,
-          # insteadOf rewrite present for InverterNetwork.
-          sudo -u hermes bash -euo pipefail -c '
+          # insteadOf rewrite present for InverterNetwork. `-H` is required so
+          # `git config --global` reads /home/hermes/.gitconfig and not the
+          # caller's $HOME (which would silently miss the rewrite).
+          sudo -u hermes -H bash -euo pipefail -c '
             T=/home/hermes
             key_mode=$(stat -c "%a" "$T/.ssh/id_ed25519")
             [[ "$key_mode" == "600" ]] \
