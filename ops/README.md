@@ -140,8 +140,14 @@ automatically when it detects one is enabled.
 
 The file lives at `<HERMES_HOME>/auth/hermes.env` with mode `0640
 root:<agent>`, sibling of `slack.env` (Slack tokens) and `quay.env`
-(worker-side tokens). Three files, three concerns: rotating one doesn't
-touch the others.
+(worker-side tokens). Three files, three units that load them.
+
+Note: `LINEAR_API_KEY` deliberately lives in **both** `hermes.env`
+(gateway-side, this file) and `quay.env` (worker-side). The two units
+are independent — same key value, two staging actions on rotation
+(`stage-hermes-env.sh` + `stage-quay-env.sh`). This is the same shape
+as `SLACK_TOKEN` (slack.env vs the v1-reserved slot in quay.env): one
+secret, two consumers, two files. Keep them in sync on rotation.
 
 ## Install
 

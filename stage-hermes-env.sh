@@ -67,12 +67,19 @@ trap 'rm -f "$tmp"' EXIT
 {
   echo "LINEAR_API_KEY=${LINEAR}"
 } > "$tmp"
-install -o root -g "$AGENT_USER" -m 0640 "$tmp" "$HERMES_ENV"
 
+# Skip the install + systemctl restart when the new content is byte-identical
+# to what's already on disk. Otherwise an operator who re-runs to verify a
+# value (Enter through every prompt) would drop in-flight Slack requests for
+# nothing.
+if [[ -f "$HERMES_ENV" ]] && cmp -s "$tmp" "$HERMES_ENV"; then
+  echo "✓ $HERMES_ENV unchanged ($(stat -c '%a %U:%G' "$HERMES_ENV")); gateway not restarted"
+  exit 0
+fi
+
+install -o root -g "$AGENT_USER" -m 0640 "$tmp" "$HERMES_ENV"
 echo "✓ wrote $HERMES_ENV ($(stat -c '%a %U:%G' "$HERMES_ENV"))"
 
-# hermes-gateway is long-running and only reads EnvironmentFile= at unit
-# start, so a restart is required for changes to take effect.
 if systemctl is-enabled hermes-gateway.service >/dev/null 2>&1; then
   echo "↻ restarting hermes-gateway.service to pick up new env"
   systemctl restart hermes-gateway.service

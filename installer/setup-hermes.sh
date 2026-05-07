@@ -1449,18 +1449,11 @@ EOF
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_DROPIN_DST"
 
-    # Sibling drop-in for gateway-adapter tokens (LINEAR_API_KEY today).
-    # See ops/hermes-gateway.service.d/hermes-env.conf and
-    # stage-hermes-env.sh for the operator-side staging flow. Absent file
-    # is non-fatal — the leading `-` on EnvironmentFile= keeps the unit
-    # loading and adapter skills fail loud at call time when the token
-    # is missing, which is the right blast radius (vs. refusing to start
-    # the whole gateway just because Linear isn't wired up yet).
-    if [[ -f "$GATEWAY_HERMES_DROPIN_SRC" ]]; then
-      echo "==> installing hermes-env drop-in at $GATEWAY_HERMES_DROPIN_DST"
-      sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
-        | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
-    fi
+    # Sibling drop-in for gateway-adapter tokens. See
+    # ops/hermes-gateway.service.d/hermes-env.conf for the rationale.
+    echo "==> installing hermes-env drop-in at $GATEWAY_HERMES_DROPIN_DST"
+    sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
 
     systemctl daemon-reload
 

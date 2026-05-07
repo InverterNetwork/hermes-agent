@@ -272,21 +272,12 @@ jobs:
           rm -f "$FIXTURE_YAML"
 
       - name: hermes-env drop-in + stage-hermes-env.sh probes
-        # Verify the hermes-env.conf systemd drop-in lands with __TARGET_DIR__
-        # substituted, that stage-hermes-env.sh writes hermes.env with the
-        # expected mode/owner, and that re-running it preserves the existing
-        # value (idempotency contract — operator can rotate one key without
-        # re-typing the others). The drop-in install runs on the first
-        # installer pass alongside slack-env.conf; we just probe the result.
         run: |
           set -euo pipefail
 
           DROPIN=/etc/systemd/system/hermes-gateway.service.d/hermes-env.conf
           if [[ ! -f "$DROPIN" ]]; then
-            # `hermes gateway install --system` may have been skipped on the
-            # runner if the upstream CLI pre-flight failed (e.g. systemd not
-            # fully functional). Surface it loudly with context rather than
-            # silently passing the probe.
+            # CLI pre-flight may have skipped the install — surface with context, not a silent pass.
             echo "FAIL: hermes-env drop-in missing at $DROPIN"
             sudo ls -la /etc/systemd/system/hermes-gateway.service.d/ 2>&1 || true
             exit 1
