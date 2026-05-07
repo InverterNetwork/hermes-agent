@@ -45,7 +45,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 - **Locus of fix:** hermes-agent (shipped). Quay-side alignment (embed `v${pkg.version}`) tracked as **AST-81** (low priority, not blocking).
 - **Why:** Convention mismatch between two reasonable choices; consumer-side strip is cheap.
 
-## 6. 🟡 Bare-clone needs hermes-user git auth to private repos
+## 6. ✅ Bare-clone needs hermes-user git auth to private repos — fixed in PR #26 (ITRY-1311)
 
 - **Symptom:** `setup-hermes.sh` hung on `Username for 'https://github.com':` during the bare-clone step for `InverterNetwork/test-factory-code`.
 - **Root cause:** `quay.repos[].url` is HTTPS; the `hermes` user (which `setup-hermes.sh` invokes via `sudo -u hermes git clone --bare`) has no GitHub credentials. The v0 limitation in `deploy.values.yaml` documents this: *"each url must be reachable by the agent user without further wiring."*
@@ -54,7 +54,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   2. Add the public half as a deploy key on `InverterNetwork/test-factory-code` (read-only).
   3. Pre-seed `~hermes/.ssh/known_hosts` with `ssh-keyscan github.com`.
   4. `git config --global url."git@github.com:InverterNetwork/".insteadOf "https://github.com/InverterNetwork/"` for the `hermes` user — keeps `deploy.values.yaml` HTTPS-shaped (and CI-compatible) while routing all `InverterNetwork/*` clones through SSH on the box.
-- **Locus of fix:** **hermes-agent.** A `stage-quay-repo-auth.sh` sibling of `stage-quay-env.sh` formalises steps 1–4 into a single operator-run script. Same shape as existing stage-scripts: idempotent, prompts only when needed, host-local output. Avoids re-deriving the dance per repo / per host. The manual setup proved the design works end-to-end (install completed at HEAD `6a0a883a`); now it just needs codifying. **Tracked in ITRY-1311** (bundled with #9 and #10).
+- **Locus of fix:** hermes-agent. PR #26 shipped `stage-quay-repo-auth.sh` (idempotent, ssh-keygen + ssh-keyscan + url.insteadOf for each org in `quay.repos[].url`) and a new `values_helper.py: list-repo-orgs` subcommand to derive distinct GitHub orgs from the values file. Bundled with #9 and #10.
 - **Why:** Auth shouldn't live in the binary (quay-side). The v0 design pushes it onto the operator, which is fine for one repo but doesn't scale. Formalising as a stage-script keeps the locus on hermes-agent without leaking auth into quay or into `deploy.values.yaml`.
 
 ## 8. ✅ `git remote get-url` applies `insteadOf` rewrite, breaks idempotency check — fixed in PR #25
@@ -65,7 +65,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 - **Locus of fix:** hermes-agent (consumer-side bug; the data layer was correct).
 - **Why latent until now:** Every prior install (CI smoke fixture, dev-machine local) used a single-protocol path. The bug only fires when the operator legitimately bridges HTTPS↔SSH for the agent user, which only happens at real-host install time.
 
-## 9. 🟡 Worker auth: subscription vs. metered API key undocumented
+## 9. ✅ Worker auth: subscription vs. metered API key undocumented — fixed in PR #26 (ITRY-1311)
 
 - **Symptom:** `stage-quay-env.sh` prompts for `ANTHROPIC_API_KEY` as optional, suggesting it's the canonical worker-auth path. But `quay.agent_invocation` runs `claude` (the CLI) which prefers `ANTHROPIC_API_KEY` over a `claude login` subscription session when both are present. An operator with a paid plan could silently get billed against the metered API instead of using their subscription.
 - **Root cause:** Two independent auth surfaces (subscription via `claude login`, metered via env var) and no guidance in the installer on which to pick. `claude login` also needs to run as the `hermes` user so credentials live in `~hermes/.claude/` and survive `quay-tick` worker invocations — undocumented today.
@@ -75,10 +75,10 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   2. `ops/README.md#quay-tick` (or a new `ops/README.md#worker-auth`) should document the two auth modes and explicitly recommend running `claude login` as the agent user post-install.
   3. Optionally: add a `--check` mode to `stage-quay-env.sh` that detects `~hermes/.claude/auth.json` (or whatever the credential store is) and warns if both subscription auth and `ANTHROPIC_API_KEY` are present.
 
-  **Tracked in ITRY-1311** (bundled with #6 and #10).
+  **Resolved in PR #26** (ITRY-1311 — prompt now hints at `claude login`; `ops/README.md` grew a Worker auth subsection in the quay-tick section).
 - **Why:** Same flavour of operator-experience issue as entry #6 — the v0 design pushes auth onto the operator, but doesn't surface the choice clearly. Quay-side has nothing to do here; this is purely about the hermes-agent installer's UX.
 
-## 10. 🟡 `claude` CLI not installed on a fresh box
+## 10. ✅ `claude` CLI not installed on a fresh box — fixed in PR #26 (ITRY-1311)
 
 - **Symptom:** `sudo -u hermes -H claude login` → `sudo: claude: command not found` on krustentier despite a clean `setup-hermes.sh` install.
 - **Root cause:** Apt-prep installs `python3.12-venv`, build deps, etc., but the Anthropic CLI is not in any apt repo and not part of `setup-hermes.sh`'s provisioning. The v0 design treats `claude` as an operator-installed prerequisite — but doesn't say so anywhere.
@@ -89,7 +89,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   3. (Heavier) Have `setup-hermes.sh` install the binary if missing. Adds a third-party download to apt-prep, raises the supply-chain surface — probably not worth it for v0.
 - **Why:** Same family as #6 and #9 — the install path assumes operator already has the runtime tools, but doesn't signal which ones. Combining the three into a single hermes-agent PR (`stage-quay-repo-auth.sh` + ops/README "before you start" section) is the cleanest follow-up shape.
 
-  **Tracked in ITRY-1311** (bundled with #6 and #9).
+  **Resolved in PR #26** (ITRY-1311 — `setup-hermes.sh` now refuses to install when `quay.agent_invocation` references `claude` and the binary isn't on the agent user's PATH; `ops/README.md` grew a Pre-install: claude CLI section).
 
 ## 11. 🔵 Bare clone + registration disappeared once between install and verify (unreproducible)
 
@@ -113,7 +113,7 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 
 Install completed green (40 checks, 0 drift). Open entries triaged into:
 
-- **ITRY-1311** (Inverter, hermes-agent): bundled follow-up covering entries #6, #9, #10 — `stage-quay-repo-auth.sh` + worker-auth runbook + `claude` CLI prerequisite. https://linear.app/inverter/issue/ITRY-1311
+- ✅ **ITRY-1311** (Inverter, hermes-agent) — bundled follow-up covering entries #6, #9, #10. **Shipped in PR #26.** Includes `stage-quay-repo-auth.sh`, `values_helper.py: list-repo-orgs`, `stage-quay-env.sh` prompt update, `ops/README.md` Worker auth + Pre-install:claude sections, `setup-hermes.sh` fail-loud check, plus `installer-smoke` CI probes. https://linear.app/inverter/issue/ITRY-1311
 - **AST-81** (Aster, quay): emit `--version` with leading `v` to match git tag (entry #5, low priority — consumer workaround already shipped). https://linear.app/aster69/issue/AST-81
 - **AST-82** (Aster, quay): rename `repo_id` → `id` in `repo list` output for surface consistency (entry #3, low priority — consumer fix already shipped). https://linear.app/aster69/issue/AST-82
 
