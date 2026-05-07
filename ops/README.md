@@ -32,6 +32,7 @@ Four units live here:
 | `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
+| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-hermes-env.sh`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
 
@@ -54,7 +55,7 @@ installer is the supported path.
 Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
 `installer/setup-hermes.sh`.
 
-## Pre-install: claude CLI
+## Pre-install: claude CLI (quay workers)
 
 `quay-tick` shells out to `claude` to run the agent worker. Install it as the
 agent user before running `setup-hermes.sh` (the installer fails loud if
@@ -76,6 +77,71 @@ sudo -u <agent> -H claude login
 The symlink makes `claude` available system-wide so root-owned scripts can
 invoke it. The login caches credentials under `~<agent>/.claude/` and is
 read by the worker process which runs as the agent user.
+
+## Pre-install: Codex auth (gateway runtime)
+
+`hermes-gateway` needs an LLM credential to interpret Slack messages and call
+adapter skills. **Use OpenAI Codex via subscription auth, not Anthropic.**
+Anthropic's subscription terms authorize subscription auth only for Claude
+Code use; quay workers shell out to `claude` directly (those *are* Claude
+Code calls — fine), but the gateway is a general-purpose agent and must use
+a different surface.
+
+The upstream gateway already has `openai-codex` as a first-class provider
+(see `hermes_cli/auth.py` `PROVIDER_REGISTRY`), so no Codex CLI install is
+required — the `hermes` binary runs the device-code flow itself and stores
+its own session at `~<agent>/.hermes/auth.json`.
+
+Run as the agent user before enabling the gateway service:
+
+```sh
+sudo -u <agent> -H hermes auth add openai-codex
+```
+
+This prints a device-code URL and a short user code. Open the URL in any
+browser, paste the code, and complete the sign-in with the ChatGPT account
+that owns the subscription. On success, `hermes` writes the OAuth tokens to
+`~<agent>/.hermes/auth.json` and updates `~<agent>/.hermes/config.yaml` to
+set `model.provider=openai-codex`.
+
+Subscription scope at a glance:
+
+| Surface         | Auth                              | Stored at                          |
+| --------------- | --------------------------------- | ---------------------------------- |
+| quay workers    | `claude login` (Anthropic sub)    | `~<agent>/.claude/`                |
+| `hermes-gateway`| `hermes auth add openai-codex`    | `~<agent>/.hermes/auth.json`       |
+
+Token refresh is automatic — `hermes` mints a fresh access token from its
+refresh token on demand. If the refresh token is invalidated (e.g. the
+ChatGPT account password rotates), the gateway will fail loud at the next
+LLM call; re-running `hermes auth add openai-codex` is the fix.
+
+## Staging gateway adapter tokens
+
+`stage-hermes-env.sh` (at the repo root) writes
+`<HERMES_HOME>/auth/hermes.env`, which the `hermes-env.conf` drop-in pulls
+in via `EnvironmentFile=`. Run it once after first install, and again
+whenever a token rotates:
+
+```sh
+sudo ./stage-hermes-env.sh
+```
+
+Prompts:
+
+* `LINEAR_API_KEY` — required, gates the `linear-create` skill (the gateway
+  agent uses it to file iTRY issues from Slack).
+
+Re-runs preserve any value the operator leaves blank, so rotating one key
+doesn't require re-typing the others. Unlike `quay-tick` (which reads its
+env file fresh on each tick), `hermes-gateway` is long-running and only
+reads `EnvironmentFile=` at unit start — the script restarts the unit
+automatically when it detects one is enabled.
+
+The file lives at `<HERMES_HOME>/auth/hermes.env` with mode `0640
+root:<agent>`, sibling of `slack.env` (Slack tokens) and `quay.env`
+(worker-side tokens). Three files, three concerns: rotating one doesn't
+touch the others.
 
 ## Install
 
