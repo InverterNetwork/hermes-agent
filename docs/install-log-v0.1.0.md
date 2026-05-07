@@ -10,12 +10,8 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 
 - **Symptom:** First post-tag CI run failed with `curl: (22) The requested URL returned error: 404` on `releases/download/v0.1.0/quay-linux-amd64`. Local unauth'd `curl -sI` against the asset also returned `404`.
 - **Root cause:** `lafawnduh1966/quay` was private. GitHub returns `404` (not `401`) on unauthenticated requests for private-repo release assets, so the failure looks like "missing" rather than "forbidden."
-- **Workaround:** Operator flipped the repo to public.
-- **Locus of fix:** **TBD.** Three options:
-  - Keep quay public — simplest, lowest friction.
-  - Hermes-agent threads a `gh release download` (or `curl -H Authorization`) into `setup-hermes.sh` and grows a one-shot operator-staged token. Adds a `stage-quay-fetch-auth.sh`-shaped script.
-  - Quay distributes binaries via a different surface entirely.
-- **Why:** Whichever the user prefers; tonight is unblocked because the repo is public.
+- **Resolution:** **Quay stays public** (decided 2026-05-07). Simplest, lowest friction; eliminates any need to thread fetch auth through the installer.
+- **Locus of fix:** Resolved on the quay-side (visibility change). No code follow-up.
 
 ## 2. ✅ Bare-clone of private `InverterNetwork/test-factory-code` failed in CI
 
