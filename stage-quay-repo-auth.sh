@@ -89,10 +89,14 @@ else
   else
     while IFS= read -r org; do
       [[ -z "$org" ]] && continue
-      # git config --global is idempotent — a duplicate key simply overwrites.
-      sudo -u "$AGENT_USER" git config --global \
-        "url.git@github.com:${org}/.insteadOf" \
-        "https://github.com/${org}/"
+      # cd to $HOME before invoking git: with --global, git still walks up
+      # from CWD looking for a .git/ and stats every parent. If CWD is
+      # outside the agent user's read scope (CI runner: $GITHUB_WORKSPACE
+      # is owned by `runner`; on-box: any path the operator happens to
+      # invoke from), the stat fails before git realizes it's a global op.
+      # Idempotent — a duplicate config key simply overwrites.
+      sudo -u "$AGENT_USER" -H sh -c 'cd && git config --global "$1" "$2"' \
+        _ "url.git@github.com:${org}/.insteadOf" "https://github.com/${org}/"
       echo "✓ git insteadOf: https://github.com/${org}/ → git@github.com:${org}/"
     done <<< "$ORGS"
   fi
