@@ -478,7 +478,10 @@ def _write_quay_stub(path: Path, version: str, registered_ids: list[str]) -> Non
     (`${pkg.version}+${shortSHA}`, see scripts/embed.ts in lafawnduh1966/quay).
     The verify path strips the `v` from the pin before comparing, so the
     test exercises that real format end-to-end."""
-    repos_json = ",".join(f'{{"id": "{i}"}}' for i in registered_ids)
+    # Real binary keys this `repo_id`, not `id` — see lafawnduh1966/quay
+    # repo list output. The verify and install parsers both consume
+    # `repo_id`; the stub mirrors that shape.
+    repos_json = ",".join(f'{{"repo_id": "{i}"}}' for i in registered_ids)
     semver = version.removeprefix("v")
     path.write_text(
         "#!/usr/bin/env bash\n"
@@ -612,7 +615,7 @@ class TestSetupHermesVerifyQuay:
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "[OK] quay binary:" in result.stdout
         assert "[OK] quay binary version:" in result.stdout
-        assert "[OK] quay data dir:" in result.stdout
+        assert "[OK] quay data dir ownership:" in result.stdout
         assert "[OK] quay config.toml:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} ownership:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} origin:" in result.stdout

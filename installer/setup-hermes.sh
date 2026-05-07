@@ -443,13 +443,17 @@ do_verify() {
     if [[ ! -d "$quay_dir" ]]; then
       v_drift "quay data dir" "missing: $quay_dir"
     else
-      local dmode downer_g
-      dmode="$(_mode "$quay_dir")"
-      downer_g="$(_owner "$quay_dir"):$(_group "$quay_dir")"
-      if [[ "$dmode" == "755" && "$downer_g" == "$agent_owner:$agent_group" ]]; then
-        v_ok "quay data dir: $dmode $downer_g"
+      # Owner-only, matching the agent-dir pattern at ~line 304. The data
+      # dir inherits a setgid bit from the 02775 parent ($HERMES_HOME), so
+      # exact-mode matching against 755 is broken on Linux even though
+      # `install -d -m 755` was used. The security-meaningful invariant
+      # is owner = agent (so quay can read/write), not the mode bits.
+      local downer
+      downer="$(_owner "$quay_dir")"
+      if [[ "$downer" == "$agent_owner" ]]; then
+        v_ok "quay data dir ownership: $downer"
       else
-        v_drift "quay data dir" "mode=$dmode owner=$downer_g (expected 755 $agent_owner:$agent_group)"
+        v_drift "quay data dir ownership" "expected $agent_owner, got $downer"
       fi
       local quay_cfg="$quay_dir/config.toml"
       if [[ ! -f "$quay_cfg" ]]; then
@@ -498,8 +502,8 @@ except Exception:
     sys.exit(0)
 if isinstance(data, list):
     for r in data:
-        if isinstance(r, dict) and r.get("id"):
-            print(r["id"])
+        if isinstance(r, dict) and r.get("repo_id"):
+            print(r["repo_id"])
 ' 2>/dev/null || true)"
       fi
       local repo_id repo_url repo_base repo_pkg repo_install bare bowner bare_origin
@@ -1126,8 +1130,8 @@ if not isinstance(data, list):
     sys.stderr.write(f"quay repo list: expected JSON array, got {type(data).__name__}\n")
     sys.exit(2)
 for r in data:
-    if isinstance(r, dict) and r.get("id"):
-        print(r["id"])
+    if isinstance(r, dict) and r.get("repo_id"):
+        print(r["repo_id"])
 '
     )"
 
