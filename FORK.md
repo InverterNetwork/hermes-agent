@@ -22,8 +22,7 @@ Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instan
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
    - seeds `<HERMES_HOME>/config.yaml` from `slack.runtime.*` on first install (preserved on re-runs — operator hand-edits survive),
    - configures `git user.name` on agent commits to `org.agent_identity_name`.
-4. Stage Slack tokens with `stage-slack-env.sh` (interactive — writes `<HERMES_HOME>/auth/slack.env`).
-5. If `quay.version` is set, stage quay adapter tokens with `stage-quay-env.sh` (interactive — writes `<HERMES_HOME>/auth/quay.env`). Required: `LINEAR_API_KEY`. Re-runs preserve unchanged values.
+4. Stage all runtime secrets with `stage-secrets.sh` (interactive — writes `<HERMES_HOME>/auth/slack.env`, `auth/hermes.env`, and `auth/quay.env` in one pass). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, plus `LINEAR_API_KEY` when `quay.version` is set. Quay-only secrets (`ANTHROPIC_API_KEY`, the v0-reserved `SLACK_TOKEN`) are skipped on Linear-only deployments. Re-runs preserve unchanged values; identical content skips the gateway restart.
 
 Acceptance: once `deploy.values.yaml` is set for the new org, `grep -RE 'BabyDidier|didier|C0B23MZ0USV|lmdtfy' installer/ ops/ gateway/` should return no matches outside the values file.
 

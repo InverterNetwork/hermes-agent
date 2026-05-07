@@ -414,7 +414,7 @@ credential to call the Claude API. Two modes:
   `ANTHROPIC_API_KEY` blank in `quay.env`. This is the recommended mode
   for production on krustentier.
 * **Metered API auth** — set `ANTHROPIC_API_KEY` in `quay.env` via
-  `stage-quay-env.sh`. The env var is injected by the systemd
+  `stage-secrets.sh`. The env var is injected by the systemd
   `EnvironmentFile=` and wins over the subscription cache.
 
 **Precedence gotcha:** when both are set (a stale key sits in `quay.env`
@@ -444,7 +444,7 @@ The unit runs `/usr/local/bin/quay tick` with:
 * `QUAY_DATA_DIR=<HERMES_HOME>/quay` — pinned by `Environment=` on the
   unit so the runtime path lives in exactly one place.
 * `<HERMES_HOME>/auth/quay.env` — adapter tokens (`LINEAR_API_KEY` etc.),
-  staged out-of-band by `stage-quay-env.sh`. The `EnvironmentFile=` line
+  staged out-of-band by `stage-secrets.sh`. The `EnvironmentFile=` line
   is prefixed with `-` so the unit starts even before tokens are staged
   (a tick without a Linear adapter just has nothing to enqueue).
 * `/etc/default/quay-tick` — operator override slot. Preserved across
@@ -452,16 +452,29 @@ The unit runs `/usr/local/bin/quay tick` with:
 
 ## Staging credentials
 
-`stage-quay-env.sh` (at the repo root) writes `<HERMES_HOME>/auth/quay.env`.
-Run it once after first install, and again whenever a token rotates:
+`stage-secrets.sh` (at the repo root) is the single entry point for
+every runtime secret. One pass writes `auth/slack.env`,
+`auth/hermes.env`, and (on quay-provisioned hosts) `auth/quay.env` —
+each unique value prompted once, even when the same key (e.g.
+`LINEAR_API_KEY`) lands in two files. Run it once after first install,
+and again whenever a token rotates:
 
 ```sh
-sudo ./stage-quay-env.sh
+sudo ./stage-secrets.sh
 ```
 
-Prompts:
+Prompts (gateway side, always):
 
-* `LINEAR_API_KEY` — required, gates `quay enqueue --linear-issue`.
+* `SLACK_BOT_TOKEN` — required, `xoxb-…`.
+* `SLACK_APP_TOKEN` — required, `xapp-…`.
+* `SLACK_ALLOWED_USERS` — optional; comma-separated `U…` IDs the bot
+  responds to.
+* `LINEAR_API_KEY` — required when quay is provisioned, optional
+  otherwise; gates `quay enqueue --linear-issue` and the gateway's
+  linear-create skill.
+
+Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
+
 * `ANTHROPIC_API_KEY` — optional; needed only if `quay.agent_invocation`
   shells out to a tool that requires it (e.g. `claude` without a global
   login).
@@ -469,9 +482,11 @@ Prompts:
   (disabled in v0).
 
 Re-runs preserve any value the operator leaves blank, so rotating one
-key doesn't require re-typing the others. The next `quay-tick` run
-reads the file fresh via `EnvironmentFile=`, so there's nothing to
-restart.
+key doesn't require re-typing the others. Per-file `cmp -s`
+short-circuits skip writes (and the gateway restart) when content is
+byte-identical; only the unit whose env actually changed gets
+restarted. `quay-tick` reads its env fresh per timer tick — no restart
+needed there.
 
 ## Staging repo SSH auth
 

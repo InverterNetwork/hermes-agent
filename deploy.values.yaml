@@ -2,8 +2,8 @@
 #
 # Re-forking for a different org: copy this file, change every value, then
 # re-run installer/setup-hermes.sh on the target host. Tokens never live here
-# — they're staged at install time into <target>/auth/slack.env (mode 0640
-# root:hermes) by stage-slack-env.sh and never committed.
+# — they're staged at install time into <target>/auth/*.env (mode 0640
+# root:hermes) by stage-secrets.sh and never committed.
 #
 # Schema:
 #   org.name                   — display label only; not currently consumed
