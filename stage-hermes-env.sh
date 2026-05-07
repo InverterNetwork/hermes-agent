@@ -4,8 +4,7 @@
 # any value the operator leaves blank, so rotating one key doesn't
 # require re-typing the others.
 #
-# Sibling of stage-slack-env.sh (Slack tokens, slack.env) and
-# stage-quay-env.sh (worker-side tokens, quay.env). This script writes
+# Sibling of stage-quay-env.sh (worker-side tokens, quay.env). Writes
 # auth/hermes.env, which the gateway loads via the hermes-env.conf
 # systemd drop-in.
 set -euo pipefail
@@ -85,5 +84,5 @@ if systemctl is-enabled hermes-gateway.service >/dev/null 2>&1; then
   systemctl restart hermes-gateway.service
   systemctl --no-pager --lines=0 status hermes-gateway.service || true
 else
-  echo "ℹ hermes-gateway.service not enabled yet — re-run setup-hermes.sh after staging Slack creds."
+  echo "ℹ hermes-gateway.service not enabled yet — re-run setup-hermes.sh once $AUTH_DIR/slack.env exists (SLACK_BOT_TOKEN + SLACK_APP_TOKEN)."
 fi

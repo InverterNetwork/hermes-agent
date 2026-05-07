@@ -1449,8 +1449,6 @@ EOF
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_DROPIN_DST"
 
-    # Sibling drop-in for gateway-adapter tokens. See
-    # ops/hermes-gateway.service.d/hermes-env.conf for the rationale.
     echo "==> installing hermes-env drop-in at $GATEWAY_HERMES_DROPIN_DST"
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
