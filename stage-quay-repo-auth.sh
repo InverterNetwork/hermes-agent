@@ -88,22 +88,25 @@ else
     echo "ℹ no quay.repos entries found — skipping url.insteadOf rewrites"
   else
     GITCONFIG="$AGENT_HOME/.gitconfig"
-    # Touch the file so `git config --file` has something to write to with
-    # the right ownership (otherwise git creates it as the invoking user,
-    # which is correct here, but explicit is friendlier).
     sudo -u "$AGENT_USER" touch "$GITCONFIG"
     while IFS= read -r org; do
       [[ -z "$org" ]] && continue
-      # `--file` is used instead of `--global` to avoid git's HOME / XDG
-      # resolution: under sudo, $HOME and $XDG_CONFIG_HOME can point at the
-      # caller's home (depending on env_keep policy and -H), and `--global`
-      # then reads/writes the wrong file. Also bypasses the CWD repo-walk
-      # that bites when the operator's CWD is outside the agent user's
-      # read scope (e.g. $GITHUB_WORKSPACE on the CI runner).
+      # Two unrelated traps avoided here:
+      #   * git always stats CWD as part of repo discovery (even with --file
+      #     and --global). When CWD is outside the agent user's read scope
+      #     (CI: $GITHUB_WORKSPACE owned by `runner`; on-box: any operator
+      #     CWD they chose), the stat fails and git aborts. Subshell-cd to
+      #     $AGENT_HOME so hermes inherits a CWD it can stat.
+      #   * `--file` is used instead of `--global` because under sudo,
+      #     $HOME and $XDG_CONFIG_HOME may point at the caller's home
+      #     regardless of -H — `--global` then reads/writes the wrong file
+      #     (observed: a stray /home/runner/.config/git/config tripped the
+      #     read side even when the write landed correctly).
       # Idempotent — a duplicate config key simply overwrites.
-      sudo -u "$AGENT_USER" git config --file "$GITCONFIG" \
-        "url.git@github.com:${org}/.insteadOf" \
-        "https://github.com/${org}/"
+      ( cd "$AGENT_HOME" && \
+        sudo -u "$AGENT_USER" git config --file "$GITCONFIG" \
+          "url.git@github.com:${org}/.insteadOf" \
+          "https://github.com/${org}/" )
       echo "✓ git insteadOf: https://github.com/${org}/ → git@github.com:${org}/"
     done <<< "$ORGS"
   fi
