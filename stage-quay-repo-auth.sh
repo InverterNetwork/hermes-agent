@@ -62,9 +62,11 @@ chown "$AGENT_USER:$AGENT_USER" "$KNOWN_HOSTS"
 chmod 644 "$KNOWN_HOSTS"
 
 # Fetch current github.com keys into a temp file; merge with existing.
+# stderr is left unredirected so a firewall/DNS/outbound-22 failure surfaces
+# directly to the operator instead of dying silently under `set -e`.
 GH_KEYS_TMP="$(mktemp)"
 trap 'rm -f "$GH_KEYS_TMP"' EXIT
-ssh-keyscan -t ed25519,rsa github.com 2>/dev/null > "$GH_KEYS_TMP"
+ssh-keyscan -t ed25519,rsa,ecdsa github.com > "$GH_KEYS_TMP"
 
 # Combine existing + new, deduplicate, write back as the agent user so
 # ownership stays correct even if root writes the temp file above.

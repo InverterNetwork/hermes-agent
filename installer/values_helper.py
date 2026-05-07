@@ -423,14 +423,15 @@ def cmd_list_repo_orgs(args: argparse.Namespace) -> int:
             )
             return 1
         parsed = urlparse(str(url))
-        if parsed.scheme not in ("http", "https") or parsed.netloc != "github.com":
+        if parsed.scheme != "https" or parsed.netloc != "github.com":
             sys.stderr.write(
                 f"values_helper.py: quay.repos[{i}].url={url!r} is not a GitHub HTTPS URL "
                 f"(expected https://github.com/<org>/<repo>)\n"
             )
             return 1
-        # Strip leading slash, optional trailing .git, take first path segment as org.
-        path_parts = parsed.path.lstrip("/").rstrip("/").replace(".git", "").split("/")
+        # Strip leading/trailing slash, drop trailing `.git` suffix only,
+        # take first path segment as org.
+        path_parts = parsed.path.strip("/").removesuffix(".git").split("/")
         if len(path_parts) < 2 or not path_parts[0]:
             sys.stderr.write(
                 f"values_helper.py: quay.repos[{i}].url={url!r} has no org/repo path\n"

@@ -434,6 +434,37 @@ key doesn't require re-typing the others. The next `quay-tick` run
 reads the file fresh via `EnvironmentFile=`, so there's nothing to
 restart.
 
+## Staging repo SSH auth
+
+`stage-quay-repo-auth.sh` (at the repo root) provisions the SSH material
+the agent user needs to clone (and quay needs to fetch) the repos listed
+under `quay.repos` in `deploy.values.yaml`. Run it once after first
+install, and again whenever a new repo is added under a previously unseen
+GitHub org:
+
+```sh
+sudo ./stage-quay-repo-auth.sh
+```
+
+What it does (idempotent):
+
+* Generates `~<agent>/.ssh/id_ed25519` if absent (no passphrase).
+* Pre-seeds `~<agent>/.ssh/known_hosts` with current `github.com` host
+  keys via `ssh-keyscan` (deduplicated against existing entries).
+* For each distinct GitHub org in `quay.repos[].url`, configures
+  `git config --global url.git@github.com:<org>/.insteadOf
+  https://github.com/<org>/` for the agent user — the values file
+  carries HTTPS URLs, but the bare clones authenticate over SSH using
+  the deploy key.
+* Prints the public key (`~<agent>/.ssh/id_ed25519.pub`) at the end.
+
+The operator's job: paste the printed public key into each repo's
+**Settings → Deploy keys → Add deploy key** UI on GitHub. Read-only is
+sufficient for v0 (quay only fetches; pushes happen via the GitHub App
+token wired up by the main installer); enable "Allow write access" only
+if a worker eventually needs to push from a bare clone, which is not the
+v0 flow.
+
 ## Logs
 
 ```sh

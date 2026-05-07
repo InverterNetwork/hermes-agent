@@ -629,6 +629,24 @@ class TestListRepoOrgs:
         assert r.returncode == 1
         assert "not a GitHub HTTPS URL" in r.stderr
 
+    def test_http_url_exits_nonzero(self, tmp_path: Path):
+        # Tightened from {http, https} to https-only: an http:// URL on a
+        # deploy-key staging path is almost certainly a misconfiguration.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: http://github.com/ExampleOrg/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-orgs")
+        assert r.returncode == 1
+        assert "not a GitHub HTTPS URL" in r.stderr
+
     def test_ssh_url_exits_nonzero(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
