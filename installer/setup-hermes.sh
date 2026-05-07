@@ -443,13 +443,17 @@ do_verify() {
     if [[ ! -d "$quay_dir" ]]; then
       v_drift "quay data dir" "missing: $quay_dir"
     else
-      local dmode downer_g
-      dmode="$(_mode "$quay_dir")"
-      downer_g="$(_owner "$quay_dir"):$(_group "$quay_dir")"
-      if [[ "$dmode" == "755" && "$downer_g" == "$agent_owner:$agent_group" ]]; then
-        v_ok "quay data dir: $dmode $downer_g"
+      # Owner-only, matching the agent-dir pattern at ~line 304. The data
+      # dir inherits a setgid bit from the 02775 parent ($HERMES_HOME), so
+      # exact-mode matching against 755 is broken on Linux even though
+      # `install -d -m 755` was used. The security-meaningful invariant
+      # is owner = agent (so quay can read/write), not the mode bits.
+      local downer
+      downer="$(_owner "$quay_dir")"
+      if [[ "$downer" == "$agent_owner" ]]; then
+        v_ok "quay data dir ownership: $downer"
       else
-        v_drift "quay data dir" "mode=$dmode owner=$downer_g (expected 755 $agent_owner:$agent_group)"
+        v_drift "quay data dir ownership" "expected $agent_owner, got $downer"
       fi
       local quay_cfg="$quay_dir/config.toml"
       if [[ ! -f "$quay_cfg" ]]; then
@@ -477,6 +481,7 @@ do_verify() {
     fi
     if [[ -n "$quay_repos_tsv" ]]; then
       local registered_ids=""
+      local list_failed=0
       if [[ -x "$quay_bin" && -d "$quay_dir" ]]; then
         # Same invocation pattern as install-time: prefix with sudo only
         # when we're root running as a different user; otherwise call
@@ -489,18 +494,15 @@ do_verify() {
         # bash 3.2 (macOS default) under set -u trips on "${arr[@]}" when
         # arr is empty; the +"${arr[@]}" guard expands to nothing in that
         # case rather than referencing an unbound element.
+        # Capture parse failure into list_failed instead of swallowing it
+        # — a binary that crashes on `repo list` would otherwise produce
+        # N misleading "not registered" drifts (one per quay.repos entry)
+        # when the real problem is a single broken pipeline.
         registered_ids="$(${cmd_prefix[@]+"${cmd_prefix[@]}"} env "QUAY_DATA_DIR=$quay_dir" "$quay_bin" repo list 2>/dev/null \
-          | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if isinstance(data, list):
-    for r in data:
-        if isinstance(r, dict) and r.get("id"):
-            print(r["id"])
-' 2>/dev/null || true)"
+          | python3 "$values_helper" parse-repo-list-ids 2>/dev/null)" || list_failed=1
+      fi
+      if [[ "$list_failed" -eq 1 ]]; then
+        v_drift "quay repo list" "non-list/non-JSON output (binary crash, data dir corruption, or format drift)"
       fi
       local repo_id repo_url repo_base repo_pkg repo_install bare bowner bare_origin
       while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
@@ -522,10 +524,15 @@ if isinstance(data, list):
             v_drift "quay repo $repo_id origin" "got '${bare_origin:-?}' (expected '$repo_url')"
           fi
         fi
-        if [[ -n "$registered_ids" ]] && grep -Fxq "$repo_id" <<<"$registered_ids"; then
-          v_ok "quay repo $repo_id registered"
-        else
-          v_drift "quay repo $repo_id" "not registered with quay"
+        # Skip the per-id registration sub-check when the list pipeline
+        # failed — the single named drift above already named the
+        # actionable problem.
+        if [[ "$list_failed" -eq 0 ]]; then
+          if [[ -n "$registered_ids" ]] && grep -Fxq "$repo_id" <<<"$registered_ids"; then
+            v_ok "quay repo $repo_id registered"
+          else
+            v_drift "quay repo $repo_id" "not registered with quay"
+          fi
         fi
       done <<<"$quay_repos_tsv"
     fi
@@ -1115,20 +1122,7 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
     QUAY_REGISTERED_IDS="$(
       sudo -u "$AGENT_USER" \
         env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
-        | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    sys.stderr.write(f"quay repo list: not valid JSON: {exc}\n")
-    sys.exit(2)
-if not isinstance(data, list):
-    sys.stderr.write(f"quay repo list: expected JSON array, got {type(data).__name__}\n")
-    sys.exit(2)
-for r in data:
-    if isinstance(r, dict) and r.get("id"):
-        print(r["id"])
-'
+        | python3 "$VALUES_HELPER" parse-repo-list-ids
     )"
 
     while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do

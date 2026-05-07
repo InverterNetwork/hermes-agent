@@ -456,3 +456,64 @@ class TestListRepos:
         r = _run(values, "list-repos")
         assert r.returncode == 0, r.stderr
         assert r.stdout.split("\t")[0] == good_id
+
+
+class TestParseRepoListIds:
+    """Direct coverage of `parse-repo-list-ids` — the subcommand both the
+    install-time and verify-time paths in setup-hermes.sh pipe `quay repo
+    list` output into. The field-name detail (real binary keys entries by
+    `repo_id`, not `id`) used to live duplicated across two bash heredocs;
+    centralising it here means a future format drift surfaces as a unit
+    test failure instead of a CI integration bug."""
+
+    def _run_parse(self, stdin: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(HELPER), "parse-repo-list-ids"],
+            input=stdin,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_extracts_repo_ids(self):
+        payload = json.dumps([
+            {"repo_id": "alpha", "repo_url": "https://example.com/a"},
+            {"repo_id": "beta", "repo_url": "https://example.com/b"},
+        ])
+        r = self._run_parse(payload)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["alpha", "beta"]
+
+    def test_empty_array_is_clean_exit(self):
+        r = self._run_parse("[]")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_skips_entries_without_repo_id(self):
+        payload = json.dumps([
+            {"repo_id": "ok"},
+            {"name": "no-repo-id-key"},
+            {"repo_id": ""},
+            "not-a-dict",
+        ])
+        r = self._run_parse(payload)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["ok"]
+
+    def test_non_json_input_exits_2(self):
+        r = self._run_parse("garbage not json")
+        assert r.returncode == 2
+        assert "not valid JSON" in r.stderr
+
+    def test_non_list_top_level_exits_2(self):
+        r = self._run_parse('{"repo_id": "single"}')
+        assert r.returncode == 2
+        assert "expected JSON array" in r.stderr
+
+    def test_rejects_id_field_not_repo_id(self):
+        """The bug PR #23 fixed: a parser that read `id` would silently
+        emit nothing on real binary output. Guard against regression by
+        asserting an `id`-keyed payload yields no rows."""
+        payload = json.dumps([{"id": "alpha", "url": "https://example.com/a"}])
+        r = self._run_parse(payload)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
