@@ -80,6 +80,17 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
   3. Optionally: add a `--check` mode to `stage-quay-env.sh` that detects `~hermes/.claude/auth.json` (or whatever the credential store is) and warns if both subscription auth and `ANTHROPIC_API_KEY` are present.
 - **Why:** Same flavour of operator-experience issue as entry #6 — the v0 design pushes auth onto the operator, but doesn't surface the choice clearly. Quay-side has nothing to do here; this is purely about the hermes-agent installer's UX.
 
+## 10. 🟡 `claude` CLI not installed on a fresh box
+
+- **Symptom:** `sudo -u hermes -H claude login` → `sudo: claude: command not found` on krustentier despite a clean `setup-hermes.sh` install.
+- **Root cause:** Apt-prep installs `python3.12-venv`, build deps, etc., but the Anthropic CLI is not in any apt repo and not part of `setup-hermes.sh`'s provisioning. The v0 design treats `claude` as an operator-installed prerequisite — but doesn't say so anywhere.
+- **Tonight's workaround:** Operator runs `curl -fsSL https://claude.ai/install.sh | bash` to install the binary, then `sudo -u hermes -H claude login` to authenticate.
+- **Locus of fix:** **hermes-agent.** Two options worth weighing:
+  1. Add a check in `setup-hermes.sh`: when `quay.version` is set and `quay.agent_invocation` references `claude`, refuse to install unless `claude` is on PATH. Cheap, fail-loud.
+  2. Document in `ops/README.md#quay-tick`: "before staging tokens, install `claude` via `curl -fsSL https://claude.ai/install.sh | bash` and run `sudo -u hermes -H claude login`." Pure runbook; no code change.
+  3. (Heavier) Have `setup-hermes.sh` install the binary if missing. Adds a third-party download to apt-prep, raises the supply-chain surface — probably not worth it for v0.
+- **Why:** Same family as #6 and #9 — the install path assumes operator already has the runtime tools, but doesn't signal which ones. Combining the three into a single hermes-agent PR (`stage-quay-repo-auth.sh` + ops/README "before you start" section) is probably the cleanest follow-up shape.
+
 ## 7. 🔵 `url.insteadOf` paste mangled by terminal line-wrap
 
 - **Symptom:** First attempt to set the rewrite silently no-op'd. SSH worked but bare-clone still hit HTTPS. Diagnosis (via direct SSH from the operator's Mac) showed `git config --get-regexp '^url\.'` empty and `~hermes/.gitconfig` lacked the `[url "git@github.com:InverterNetwork/"]` block.
