@@ -271,6 +271,19 @@ jobs:
 
           rm -f "$FIXTURE_YAML"
 
+      - name: hermes-env drop-in probe
+        run: |
+          set -euo pipefail
+          DROPIN=/etc/systemd/system/hermes-gateway.service.d/hermes-env.conf
+          if [[ ! -f "$DROPIN" ]]; then
+            echo "FAIL: hermes-env drop-in missing at $DROPIN"
+            sudo ls -la /etc/systemd/system/hermes-gateway.service.d/ 2>&1 || true
+            exit 1
+          fi
+          sudo grep -Fxq "EnvironmentFile=-/home/hermes/.hermes/auth/hermes.env" "$DROPIN" \
+            || { echo "FAIL: drop-in missing expected EnvironmentFile line"; sudo cat "$DROPIN"; exit 1; }
+          echo "hermes-env drop-in probe: OK"
+
       # `--verify` is intentionally not invoked here. It surfaces two
       # pre-existing CI-fixture drifts (rails egg-info group-writable
       # from `pip install -e`, and state origin pointing at a filesystem

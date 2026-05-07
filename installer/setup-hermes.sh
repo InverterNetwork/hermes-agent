@@ -1399,8 +1399,10 @@ fi
 # drop-in. See ops/README.md for the rationale.
 
 GATEWAY_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/slack-env.conf"
+GATEWAY_HERMES_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/hermes-env.conf"
 GATEWAY_DROPIN_DIR="/etc/systemd/system/hermes-gateway.service.d"
 GATEWAY_DROPIN_DST="$GATEWAY_DROPIN_DIR/slack-env.conf"
+GATEWAY_HERMES_DROPIN_DST="$GATEWAY_DROPIN_DIR/hermes-env.conf"
 GATEWAY_SLACK_ENV="$AUTH_DIR/slack.env"
 
 if [[ -f "$GATEWAY_DROPIN_SRC" && -x "$HERMES_BIN" ]]; then
@@ -1446,6 +1448,11 @@ EOF
     install -d -o root -g root -m 0755 "$GATEWAY_DROPIN_DIR"
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_DROPIN_DST"
+
+    echo "==> installing hermes-env drop-in at $GATEWAY_HERMES_DROPIN_DST"
+    sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
+
     systemctl daemon-reload
 
     if [[ -f "$GATEWAY_SLACK_ENV" ]]; then
