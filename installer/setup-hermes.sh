@@ -481,6 +481,7 @@ do_verify() {
     fi
     if [[ -n "$quay_repos_tsv" ]]; then
       local registered_ids=""
+      local list_failed=0
       if [[ -x "$quay_bin" && -d "$quay_dir" ]]; then
         # Same invocation pattern as install-time: prefix with sudo only
         # when we're root running as a different user; otherwise call
@@ -493,18 +494,26 @@ do_verify() {
         # bash 3.2 (macOS default) under set -u trips on "${arr[@]}" when
         # arr is empty; the +"${arr[@]}" guard expands to nothing in that
         # case rather than referencing an unbound element.
+        # Capture parse failure into list_failed instead of swallowing it
+        # — a binary that crashes on `repo list` would otherwise produce
+        # N misleading "not registered" drifts (one per quay.repos entry)
+        # when the real problem is a single broken pipeline.
         registered_ids="$(${cmd_prefix[@]+"${cmd_prefix[@]}"} env "QUAY_DATA_DIR=$quay_dir" "$quay_bin" repo list 2>/dev/null \
           | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
-if isinstance(data, list):
-    for r in data:
-        if isinstance(r, dict) and r.get("repo_id"):
-            print(r["repo_id"])
-' 2>/dev/null || true)"
+    sys.exit(2)
+if not isinstance(data, list):
+    sys.exit(2)
+for r in data:
+    if isinstance(r, dict) and r.get("repo_id"):
+        print(r["repo_id"])
+' 2>/dev/null)" || list_failed=1
+      fi
+      if [[ "$list_failed" -eq 1 ]]; then
+        v_drift "quay repo list" "non-list/non-JSON output (binary crash, data dir corruption, or format drift)"
       fi
       local repo_id repo_url repo_base repo_pkg repo_install bare bowner bare_origin
       while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
@@ -526,10 +535,15 @@ if isinstance(data, list):
             v_drift "quay repo $repo_id origin" "got '${bare_origin:-?}' (expected '$repo_url')"
           fi
         fi
-        if [[ -n "$registered_ids" ]] && grep -Fxq "$repo_id" <<<"$registered_ids"; then
-          v_ok "quay repo $repo_id registered"
-        else
-          v_drift "quay repo $repo_id" "not registered with quay"
+        # Skip the per-id registration sub-check when the list pipeline
+        # failed — the single named drift above already named the
+        # actionable problem.
+        if [[ "$list_failed" -eq 0 ]]; then
+          if [[ -n "$registered_ids" ]] && grep -Fxq "$repo_id" <<<"$registered_ids"; then
+            v_ok "quay repo $repo_id registered"
+          else
+            v_drift "quay repo $repo_id" "not registered with quay"
+          fi
         fi
       done <<<"$quay_repos_tsv"
     fi

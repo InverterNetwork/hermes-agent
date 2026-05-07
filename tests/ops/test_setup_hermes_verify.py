@@ -677,6 +677,24 @@ class TestSetupHermesVerifyQuay:
         assert f"[DRIFT] quay repo {quay_install['quay_repo_id']}" in result.stderr
         assert "not registered" in result.stderr
 
+    def test_quay_repo_list_parse_failure_is_named_drift(self, quay_install):
+        """A binary whose `repo list` returns non-JSON should produce ONE
+        named drift, not N misleading 'not registered' drifts. Catches
+        binary crashes / data-dir corruption / format drift early."""
+        quay_install["quay_bin"].write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [[ "$1" == "--version" ]]; then echo "{QUAY_VERSION.removeprefix("v")}+abc1234"; exit 0; fi\n'
+            f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo "garbage not json"; exit 0; fi\n'
+            "exit 0\n"
+        )
+        quay_install["quay_bin"].chmod(0o755)
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay repo list" in result.stderr
+        # Must NOT also produce the per-id "not registered" line — single
+        # named drift is the actionable signal.
+        assert "not registered with quay" not in result.stderr
+
     def test_quay_tick_timer_included_in_systemd_loop(self, quay_install):
         """When quay is enabled, the systemd loop must check quay-tick.timer
         too. Repoint the systemctl stub at one that returns inactive for
