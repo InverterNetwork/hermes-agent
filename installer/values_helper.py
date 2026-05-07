@@ -2,7 +2,7 @@
 """Read deploy.values.yaml and emit shell-friendly outputs.
 
 setup-hermes.sh shells out to this helper rather than parsing YAML in bash.
-Five subcommands:
+Six subcommands:
 
   get <key>                    — print scalar at dotted path (org.name) or a
                                   list joined by `--sep` (default ",").
@@ -16,6 +16,11 @@ Five subcommands:
   list-repos                   — emit one TSV line per quay.repos entry
                                   (id, url, base_branch, package_manager,
                                   install_cmd) for setup-hermes.sh to iterate.
+  parse-repo-list-ids          — read `quay repo list` JSON from stdin, emit
+                                  one repo_id per line. Single source of truth
+                                  for the field name on the consumer side.
+                                  Exits 2 with a stderr message on parse
+                                  failure (non-JSON / non-list shape).
 """
 
 from __future__ import annotations
@@ -350,6 +355,36 @@ def cmd_list_repos(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_parse_repo_list_ids(args: argparse.Namespace) -> int:
+    """Read `quay repo list` JSON from stdin, emit one repo_id per line.
+
+    Centralises the JSON shape contract — the real binary keys entries by
+    `repo_id` (not `id`), and that detail used to live duplicated across
+    the install-time and verify-time bash heredocs. Bringing it here means
+    one place to update if the format ever drifts, and direct unit-test
+    coverage of the parser.
+
+    Exit codes:
+      0  parsed cleanly (output may be empty if no repos are registered)
+      2  parse failure — non-JSON, or top level isn't a list
+    """
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"values_helper.py: quay repo list: not valid JSON: {exc}\n")
+        return 2
+    if not isinstance(data, list):
+        sys.stderr.write(
+            f"values_helper.py: quay repo list: expected JSON array, "
+            f"got {type(data).__name__}\n"
+        )
+        return 2
+    for r in data:
+        if isinstance(r, dict) and r.get("repo_id"):
+            sys.stdout.write(str(r["repo_id"]) + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -386,6 +421,12 @@ def main(argv: list[str] | None = None) -> int:
     p_list = sub.add_parser("list-repos",
                             help="emit TSV rows for quay.repos entries")
     p_list.set_defaults(func=cmd_list_repos)
+
+    p_parse = sub.add_parser(
+        "parse-repo-list-ids",
+        help="read `quay repo list` JSON from stdin; emit repo_id per line",
+    )
+    p_parse.set_defaults(func=cmd_parse_repo_list_ids)
 
     args = parser.parse_args(argv)
     return args.func(args)

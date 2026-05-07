@@ -499,18 +499,7 @@ do_verify() {
         # N misleading "not registered" drifts (one per quay.repos entry)
         # when the real problem is a single broken pipeline.
         registered_ids="$(${cmd_prefix[@]+"${cmd_prefix[@]}"} env "QUAY_DATA_DIR=$quay_dir" "$quay_bin" repo list 2>/dev/null \
-          | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception:
-    sys.exit(2)
-if not isinstance(data, list):
-    sys.exit(2)
-for r in data:
-    if isinstance(r, dict) and r.get("repo_id"):
-        print(r["repo_id"])
-' 2>/dev/null)" || list_failed=1
+          | python3 "$values_helper" parse-repo-list-ids 2>/dev/null)" || list_failed=1
       fi
       if [[ "$list_failed" -eq 1 ]]; then
         v_drift "quay repo list" "non-list/non-JSON output (binary crash, data dir corruption, or format drift)"
@@ -1133,20 +1122,7 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
     QUAY_REGISTERED_IDS="$(
       sudo -u "$AGENT_USER" \
         env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
-        | python3 -c '
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    sys.stderr.write(f"quay repo list: not valid JSON: {exc}\n")
-    sys.exit(2)
-if not isinstance(data, list):
-    sys.stderr.write(f"quay repo list: expected JSON array, got {type(data).__name__}\n")
-    sys.exit(2)
-for r in data:
-    if isinstance(r, dict) and r.get("repo_id"):
-        print(r["repo_id"])
-'
+        | python3 "$VALUES_HELPER" parse-repo-list-ids
     )"
 
     while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do

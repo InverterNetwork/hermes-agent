@@ -470,23 +470,34 @@ class TestSetupHermesVerify:
 QUAY_VERSION = "v0.1.0"  # tag-shaped, with leading v, as in deploy.values.yaml
 
 
-def _write_quay_stub(path: Path, version: str, registered_ids: list[str]) -> None:
+def _write_quay_stub(
+    path: Path,
+    version: str,
+    registered_ids: list[str],
+    repo_list_override: str | None = None,
+) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
     `version` is the tag-shaped pin (`v0.1.0`); the stub strips the leading
     `v` and appends a fake build SHA to mirror what the real binary emits
     (`${pkg.version}+${shortSHA}`, see scripts/embed.ts in lafawnduh1966/quay).
     The verify path strips the `v` from the pin before comparing, so the
-    test exercises that real format end-to-end."""
-    # Real binary keys this `repo_id`, not `id` — see lafawnduh1966/quay
-    # repo list output. The verify and install parsers both consume
-    # `repo_id`; the stub mirrors that shape.
-    repos_json = ",".join(f'{{"repo_id": "{i}"}}' for i in registered_ids)
+    test exercises that real format end-to-end.
+
+    `repo_list_override` lets a caller substitute the `repo list` payload
+    directly — useful for testing parse-failure paths with non-JSON output.
+    Real binary keys entries by `repo_id` (not `id`); the default branch
+    mirrors that shape."""
+    if repo_list_override is None:
+        repos_json = ",".join(f'{{"repo_id": "{i}"}}' for i in registered_ids)
+        repo_list_payload = f"[{repos_json}]"
+    else:
+        repo_list_payload = repo_list_override
     semver = version.removeprefix("v")
     path.write_text(
         "#!/usr/bin/env bash\n"
         f'if [[ "$1" == "--version" ]]; then echo "{semver}+abc1234"; exit 0; fi\n'
-        f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'[{repos_json}]\'; exit 0; fi\n'
+        f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'{repo_list_payload}\'; exit 0; fi\n'
         "exit 0\n"
     )
     path.chmod(0o755)
@@ -681,13 +692,12 @@ class TestSetupHermesVerifyQuay:
         """A binary whose `repo list` returns non-JSON should produce ONE
         named drift, not N misleading 'not registered' drifts. Catches
         binary crashes / data-dir corruption / format drift early."""
-        quay_install["quay_bin"].write_text(
-            "#!/usr/bin/env bash\n"
-            f'if [[ "$1" == "--version" ]]; then echo "{QUAY_VERSION.removeprefix("v")}+abc1234"; exit 0; fi\n'
-            f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo "garbage not json"; exit 0; fi\n'
-            "exit 0\n"
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [],
+            repo_list_override="garbage not json",
         )
-        quay_install["quay_bin"].chmod(0o755)
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] quay repo list" in result.stderr
