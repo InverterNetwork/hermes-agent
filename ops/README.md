@@ -491,8 +491,8 @@ needed there.
 `stage-quay-repo-auth.sh` (at the repo root) provisions the SSH material
 the agent user needs to clone (and quay needs to fetch) the repos listed
 under `quay.repos` in `deploy.values.yaml`. Run it once after first
-install, and again whenever a new repo is added under a previously unseen
-GitHub org:
+install, and again whenever a new repo is added (the rewrite scope is
+per-repo, so a new repo always needs a re-run):
 
 ```sh
 sudo ./stage-quay-repo-auth.sh
@@ -503,11 +503,15 @@ What it does (idempotent):
 * Generates `~<agent>/.ssh/id_ed25519` if absent (no passphrase).
 * Pre-seeds `~<agent>/.ssh/known_hosts` with current `github.com` host
   keys via `ssh-keyscan` (deduplicated against existing entries).
-* For each distinct GitHub org in `quay.repos[].url`, configures
-  `git config --global url.git@github.com:<org>/.insteadOf
-  https://github.com/<org>/` for the agent user — the values file
-  carries HTTPS URLs, but the bare clones authenticate over SSH using
-  the deploy key.
+* Migrates away any legacy org-wide
+  `url.git@github.com:<org>/.insteadOf` rewrite — see the warning
+  below — and writes one narrow per-repo rewrite per `quay.repos[]`
+  entry: `git config --global
+  url.git@github.com:<org>/<repo>.insteadOf
+  https://github.com/<org>/<repo>` for the agent user. The values
+  file carries HTTPS URLs; the bare clones authenticate over SSH
+  using the deploy key, and `insteadOf` longest-prefix-matches both
+  `…/<repo>` and `…/<repo>.git` clone forms.
 * Prints the public key (`~<agent>/.ssh/id_ed25519.pub`) at the end.
 
 The operator's job: paste the printed public key into each repo's
@@ -516,6 +520,19 @@ sufficient for v0 (quay only fetches; pushes happen via the GitHub App
 token wired up by the main installer); enable "Allow write access" only
 if a worker eventually needs to push from a bare clone, which is not the
 v0 flow.
+
+> ⚠ **Why per-repo, not per-org.** An older version of this script
+> wrote one rewrite per *org* (`url.git@github.com:<org>/.insteadOf
+> https://github.com/<org>/`). That captured **every** repo under
+> `<org>` on the host — including `hermes-state` and the fork itself,
+> which authenticate over HTTPS via the GitHub App credential helper,
+> not SSH. On krustentier this rewrote the `hermes-state` URL to SSH
+> and broke `hermes-sync` every tick with `Repository not found`,
+> because GitHub doesn't allow re-using the same key as a deploy key
+> on a second repo. Re-running the staging script on an affected host
+> migrates the legacy rewrite away automatically; `setup-hermes.sh
+> --verify` flags any host that still carries the broken form
+> (ITRY-1315).
 
 ## Logs
 

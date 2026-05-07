@@ -26,6 +26,13 @@ Seven subcommands:
                                   Accepts only HTTPS GitHub URLs; rejects
                                   anything else with a clear stderr message.
                                   Empty quay.repos → exit 0, no output.
+  list-repo-rewrites           — emit one TSV line per quay.repos entry
+                                  (<org>\\t<repo>) for narrow per-repo
+                                  url.insteadOf rewrites in
+                                  stage-quay-repo-auth.sh. Uses the same
+                                  HTTPS-GitHub validation as list-repo-orgs;
+                                  strips a trailing `.git` from the repo name.
+                                  Distinct (org, repo) pairs, first-seen order.
 """
 
 from __future__ import annotations
@@ -447,6 +454,66 @@ def cmd_list_repo_orgs(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_list_repo_rewrites(args: argparse.Namespace) -> int:
+    """Emit one TSV line per quay.repos entry (<org>\\t<repo>, first-seen order).
+
+    stage-quay-repo-auth.sh consumes this to write a narrow per-repo
+    `url.git@github.com:<org>/<repo>.insteadOf` rewrite. The org-wide
+    form (one rewrite for `<org>/`, no repo segment) was the original
+    design but it captured every InverterNetwork repo on the box —
+    including hermes-state, which authenticates over HTTPS via the
+    GitHub App credential helper. See ITRY-1315.
+
+    Same input contract as list-repo-orgs: HTTPS GitHub URLs only,
+    rejects anything else with a clear stderr message. A trailing
+    `.git` is stripped from the repo segment so the rewrite value
+    matches both `…/<repo>` and `…/<repo>.git` clone URLs (git
+    applies insteadOf by longest-prefix match).
+    """
+    data = _load(Path(args.values))
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+    repos = quay.get("repos")
+    if repos is None:
+        return 0
+    if not isinstance(repos, list):
+        sys.stderr.write("values_helper.py: quay.repos must be a list\n")
+        return 1
+
+    seen: set[tuple[str, str]] = set()
+    for i, entry in enumerate(repos):
+        if not isinstance(entry, dict):
+            sys.stderr.write(f"values_helper.py: quay.repos[{i}] must be a mapping\n")
+            return 1
+        url = entry.get("url")
+        if not url:
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].url is required\n"
+            )
+            return 1
+        parsed = urlparse(str(url))
+        if parsed.scheme != "https" or parsed.netloc != "github.com":
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].url={url!r} is not a GitHub HTTPS URL "
+                f"(expected https://github.com/<org>/<repo>)\n"
+            )
+            return 1
+        path_parts = parsed.path.strip("/").removesuffix(".git").split("/")
+        if len(path_parts) < 2 or not path_parts[0] or not path_parts[1]:
+            sys.stderr.write(
+                f"values_helper.py: quay.repos[{i}].url={url!r} has no org/repo path\n"
+            )
+            return 1
+        org, repo = path_parts[0], path_parts[1]
+        if (org, repo) in seen:
+            continue
+        seen.add((org, repo))
+        sys.stdout.write(f"{org}\t{repo}\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -495,6 +562,12 @@ def main(argv: list[str] | None = None) -> int:
         help="emit distinct GitHub org names from quay.repos[].url (first-seen order)",
     )
     p_orgs.set_defaults(func=cmd_list_repo_orgs)
+
+    p_rew = sub.add_parser(
+        "list-repo-rewrites",
+        help="emit <org>\\t<repo> per quay.repos entry for per-repo url.insteadOf rewrites",
+    )
+    p_rew.set_defaults(func=cmd_list_repo_rewrites)
 
     args = parser.parse_args(argv)
     return args.func(args)

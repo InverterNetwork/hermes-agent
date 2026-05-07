@@ -6,9 +6,16 @@
 # What it does:
 #   1. Generates ~hermes/.ssh/id_ed25519 if absent (no passphrase).
 #   2. Pre-seeds ~hermes/.ssh/known_hosts with github.com host keys.
-#   3. Reads distinct <org> prefixes from quay.repos[].url in VALUES_FILE
-#      and wires url.insteadOf git rewrites (HTTPS → SSH) for the agent user.
-#   4. Prints the public key so the operator can add it to each repo's
+#   3. Removes any legacy org-wide url.insteadOf rewrite
+#      (`url.git@github.com:<org>/.insteadOf`) — that form swallowed
+#      hermes-state and the fork on the same host, breaking hermes-sync
+#      on krustentier (ITRY-1315). The migration runs unconditionally.
+#   4. Reads quay.repos[] from VALUES_FILE and wires one narrow per-repo
+#      git rewrite (HTTPS → SSH) for the agent user — keyed on
+#      `url.git@github.com:<org>/<repo>.insteadOf` so hermes-state and
+#      other InverterNetwork repos keep using HTTPS via the GitHub App
+#      credential helper.
+#   5. Prints the public key so the operator can add it to each repo's
 #      GitHub deploy-key UI.
 #
 # Environment overrides (useful in CI):
@@ -73,42 +80,79 @@ ssh-keyscan -t ed25519,rsa,ecdsa github.com > "$GH_KEYS_TMP"
 sort -u "$KNOWN_HOSTS" "$GH_KEYS_TMP" | sudo -u "$AGENT_USER" tee "$KNOWN_HOSTS" > /dev/null
 echo "✓ updated $KNOWN_HOSTS"
 
-# ---------- url.insteadOf rewrites (HTTPS → SSH per org) ----------
-# Read distinct GitHub orgs from quay.repos[].url. A missing quay.version
-# or absent quay.repos block is fine — key + known_hosts are always useful,
-# but there's nothing to rewrite if no repos are configured.
+# ---------- url.insteadOf rewrites (HTTPS → SSH per repo) ----------
+# Two passes:
+#   1. MIGRATION: scan the agent's gitconfig for any legacy org-wide
+#      `url.git@github.com:<org>/.insteadOf` key and unset it. That form
+#      captured every InverterNetwork repo on the box (including hermes-state,
+#      which authenticates over HTTPS via the GitHub App credential helper),
+#      breaking hermes-sync on krustentier (ITRY-1315). The migration runs
+#      unconditionally — even if quay.repos is empty/absent — because the
+#      legacy entry is broken regardless of whether we're (re-)provisioning.
+#   2. INSTALL: write one narrow per-repo rewrite per quay.repos[] entry,
+#      keyed on `url.git@github.com:<org>/<repo>.insteadOf`. Git applies
+#      insteadOf by longest-prefix match, so the same key catches both
+#      `https://github.com/<org>/<repo>` and `…/<repo>.git` clone URLs.
+#
+# Two unrelated traps avoided in the git invocations below:
+#   * git always stats CWD as part of repo discovery (even with --file
+#     and --global). When CWD is outside the agent user's read scope
+#     (CI: $GITHUB_WORKSPACE owned by `runner`; on-box: any operator
+#     CWD they chose), the stat fails and git aborts. Subshell-cd to
+#     $AGENT_HOME so hermes inherits a CWD it can stat.
+#   * `--file` is used instead of `--global` because under sudo,
+#     $HOME and $XDG_CONFIG_HOME may point at the caller's home
+#     regardless of -H — `--global` then reads/writes the wrong file
+#     (observed: a stray /home/runner/.config/git/config tripped the
+#     read side even when the write landed correctly).
 
+GITCONFIG="$AGENT_HOME/.gitconfig"
+sudo -u "$AGENT_USER" touch "$GITCONFIG"
+
+# ---- Pass 1: migrate legacy org-wide rewrites ----
+# `--get-regexp` on the key namespace yields one line per matching key:
+# `<full-key> <value>`. We only need the keys, so awk pulls field 1.
+# The regex matches exactly the org-wide form: `<org>` segment followed
+# by a single trailing `/` (no embedded slash), then `.insteadof`. The
+# per-repo form (`<org>/<repo>.insteadof`) doesn't match because the
+# repo segment contains no further `/`. NB: git canonicalises the
+# variable name (`insteadOf` → `insteadof`) in `--get-regexp` output,
+# so the regex must use lowercase to match.
+LEGACY_KEYS="$( \
+  cd "$AGENT_HOME" && \
+  sudo -u "$AGENT_USER" git config --file "$GITCONFIG" --get-regexp \
+    '^url\.git@github\.com:[^/]+/\.insteadof$' 2>/dev/null \
+    | awk '{print $1}' \
+    || true \
+)"
+if [[ -n "$LEGACY_KEYS" ]]; then
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    ( cd "$AGENT_HOME" && \
+      sudo -u "$AGENT_USER" git config --file "$GITCONFIG" --unset-all "$key" )
+    echo "✓ migrated: removed legacy org-wide rewrite ($key)"
+  done <<< "$LEGACY_KEYS"
+fi
+
+# ---- Pass 2: write per-repo rewrites ----
 QUAY_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.version 2>/dev/null || true)"
 
 if [[ -z "$QUAY_VERSION" ]]; then
   echo "ℹ quay.version not set in $VALUES_FILE — skipping url.insteadOf rewrites"
 else
-  ORGS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repo-orgs)"
-  if [[ -z "$ORGS" ]]; then
+  REWRITES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repo-rewrites)"
+  if [[ -z "$REWRITES" ]]; then
     echo "ℹ no quay.repos entries found — skipping url.insteadOf rewrites"
   else
-    GITCONFIG="$AGENT_HOME/.gitconfig"
-    sudo -u "$AGENT_USER" touch "$GITCONFIG"
-    while IFS= read -r org; do
-      [[ -z "$org" ]] && continue
-      # Two unrelated traps avoided here:
-      #   * git always stats CWD as part of repo discovery (even with --file
-      #     and --global). When CWD is outside the agent user's read scope
-      #     (CI: $GITHUB_WORKSPACE owned by `runner`; on-box: any operator
-      #     CWD they chose), the stat fails and git aborts. Subshell-cd to
-      #     $AGENT_HOME so hermes inherits a CWD it can stat.
-      #   * `--file` is used instead of `--global` because under sudo,
-      #     $HOME and $XDG_CONFIG_HOME may point at the caller's home
-      #     regardless of -H — `--global` then reads/writes the wrong file
-      #     (observed: a stray /home/runner/.config/git/config tripped the
-      #     read side even when the write landed correctly).
-      # Idempotent — a duplicate config key simply overwrites.
+    while IFS=$'\t' read -r org repo; do
+      [[ -z "$org" || -z "$repo" ]] && continue
+      # Idempotent — `git config` overwrites a duplicate key.
       ( cd "$AGENT_HOME" && \
         sudo -u "$AGENT_USER" git config --file "$GITCONFIG" \
-          "url.git@github.com:${org}/.insteadOf" \
-          "https://github.com/${org}/" )
-      echo "✓ git insteadOf: https://github.com/${org}/ → git@github.com:${org}/"
-    done <<< "$ORGS"
+          "url.git@github.com:${org}/${repo}.insteadOf" \
+          "https://github.com/${org}/${repo}" )
+      echo "✓ git insteadOf: https://github.com/${org}/${repo} → git@github.com:${org}/${repo}"
+    done <<< "$REWRITES"
   fi
 fi
 

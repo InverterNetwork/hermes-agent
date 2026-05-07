@@ -139,6 +139,12 @@ def install(tmp_path: Path) -> dict:
     # the override so the auth-dir owner check has matching expectations.
     primary_group = grp.getgrgid(os.getegid()).gr_name
 
+    # Per-install isolated agent gitconfig path. Default behaviour: the
+    # file does not exist, so the gitconfig drift check (legacy org-wide
+    # url.insteadOf rewrite, ITRY-1315) silently skips. Tests exercising
+    # that check write content here before invoking verify.
+    agent_gitconfig = tmp_path / "agent-gitconfig"
+
     return {
         "tmp": tmp_path,
         "target": target,
@@ -150,6 +156,7 @@ def install(tmp_path: Path) -> dict:
         "group": primary_group,
         "bin": bin_dir,
         "systemctl_log": systemctl_log,
+        "agent_gitconfig": agent_gitconfig,
     }
 
 
@@ -161,6 +168,9 @@ def _run_verify(install: dict, *extra: str) -> subprocess.CompletedProcess:
     env["HERMES_VERIFY_EXPECT_RAILS_OWNER"] = install["user"]
     env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
     env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
+    # Pin the gitconfig drift check at the per-install fixture path so the
+    # developer's real ~/.gitconfig can't taint test results.
+    env["HERMES_VERIFY_AGENT_GITCONFIG"] = str(install["agent_gitconfig"])
     return subprocess.run(
         [
             "bash", str(SCRIPT),
@@ -443,6 +453,54 @@ class TestSetupHermesVerify:
         assert "[DRIFT] quay" not in result.stderr
         assert "quay-tick.timer" not in result.stdout
 
+    def test_legacy_org_wide_insteadof_rewrite_is_drift(self, install):
+        """`stage-quay-repo-auth.sh` previously wrote
+        `url.git@github.com:<org>/.insteadOf https://github.com/<org>/`.
+        That captured every InverterNetwork repo on the host (including
+        hermes-state, which authenticates over HTTPS via the GitHub App
+        credential helper) and broke hermes-sync on krustentier (ITRY-1315).
+        The script now writes per-repo rewrites and migrates the legacy
+        form away. Hosts that haven't re-run staging since the migration
+        landed will still carry the broken key — verify must catch it."""
+        gc = install["agent_gitconfig"]
+        gc.write_text(
+            "[url \"git@github.com:InverterNetwork/\"]\n"
+            "\tinsteadOf = https://github.com/InverterNetwork/\n"
+        )
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] agent gitconfig insteadOf scope" in result.stderr
+        # Drift line names the actual key so the operator knows which one
+        # to unset (or what to expect after re-running staging). git
+        # canonicalises the variable name to lowercase in --get-regexp
+        # output, so the drift line carries `.insteadof`, not `.insteadOf`.
+        assert "url.git@github.com:InverterNetwork/.insteadof" in result.stderr
+
+    def test_per_repo_insteadof_rewrite_passes(self, install):
+        """The new per-repo form is the post-migration steady state — verify
+        must accept it. Per-repo keys carry `<org>/<repo>` between the `:` and
+        `.insteadOf` (no trailing slash before `.insteadOf`), distinguishing
+        them from the legacy org-wide form."""
+        gc = install["agent_gitconfig"]
+        gc.write_text(
+            "[url \"git@github.com:InverterNetwork/test-factory-code\"]\n"
+            "\tinsteadOf = https://github.com/InverterNetwork/test-factory-code\n"
+        )
+        result = _run_verify(install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] agent gitconfig insteadOf scope: per-repo" in result.stdout
+
+    def test_missing_agent_gitconfig_is_silent(self, install):
+        """No gitconfig at all (fresh box, never staged) → check skips
+        silently. No [OK], no [DRIFT] — same convention as auth/ and
+        upstream-workspace/ when their artefacts are absent."""
+        # The fixture's default state is no file at install["agent_gitconfig"].
+        assert not install["agent_gitconfig"].exists()
+        result = _run_verify(install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "agent gitconfig insteadOf scope" not in result.stdout
+        assert "agent gitconfig insteadOf scope" not in result.stderr
+
     def test_summary_line_counts_match(self, install):
         """The closing line should report the same total/drift counts that
         match the [OK]/[DRIFT] lines emitted above it."""
@@ -606,6 +664,7 @@ def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
     env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
     env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
     env["HERMES_VERIFY_QUAY_BIN"] = str(install["quay_bin"])
+    env["HERMES_VERIFY_AGENT_GITCONFIG"] = str(install["agent_gitconfig"])
     return subprocess.run(
         [
             "bash", str(SCRIPT),

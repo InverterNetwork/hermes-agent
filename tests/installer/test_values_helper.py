@@ -689,3 +689,127 @@ class TestListRepoOrgs:
         r = _run(values, "list-repo-orgs")
         assert r.returncode == 0, r.stderr
         assert r.stdout.splitlines() == ["OrgB", "OrgA"]
+
+
+class TestListRepoRewrites:
+    """Per-repo (<org>\\t<repo>) emission for stage-quay-repo-auth.sh.
+
+    Mirrors list-repo-orgs URL validation; differs only in output shape.
+    See ITRY-1315 for why per-repo replaced the legacy per-org form.
+    """
+
+    def test_emits_org_repo_per_entry(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/InverterNetwork/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: beta\n"
+            "      url: https://github.com/AnotherOrg/beta\n"
+            "      base_branch: main\n"
+            "      package_manager: npm\n"
+            "      install_cmd: npm ci\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == [
+            "InverterNetwork\talpha",
+            "AnotherOrg\tbeta",
+        ]
+
+    def test_trailing_git_stripped(self, tmp_path: Path):
+        # `.git` suffix variations of the same clone URL should not surface
+        # in the rewrite — git applies insteadOf by longest-prefix match,
+        # so a value of `https://github.com/Org/repo` already covers both
+        # `…/repo` and `…/repo.git` clone forms.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/ExampleOrg/alpha.git\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["ExampleOrg\talpha"]
+
+    def test_dedup_preserves_first_seen(self, tmp_path: Path):
+        # Same (org, repo) twice (e.g. duplicate entry) emits once.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: a\n"
+            "      url: https://github.com/Org/repo\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "    - id: a-dup\n"
+            "      url: https://github.com/Org/repo.git\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == ["Org\trepo"]
+
+    def test_empty_repos_list_emits_nothing(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  repos: []\n", encoding="utf-8")
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_missing_repos_key_emits_nothing(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("quay:\n  version: v0.1.0\n", encoding="utf-8")
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == ""
+
+    def test_non_github_url_exits_nonzero(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://gitlab.com/Org/alpha\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 1
+        assert "not a GitHub HTTPS URL" in r.stderr
+
+    def test_url_without_repo_segment_exits_nonzero(self, tmp_path: Path):
+        # `https://github.com/Org/` (org but no repo) is a degenerate input
+        # that list-repo-rewrites cannot do anything useful with — fail loud
+        # rather than emit `<org>\t` and let bash interpret an empty repo
+        # field as a real entry.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  repos:\n"
+            "    - id: alpha\n"
+            "      url: https://github.com/Org/\n"
+            "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repo-rewrites")
+        assert r.returncode == 1
+        assert "no org/repo path" in r.stderr

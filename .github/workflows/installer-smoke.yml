@@ -208,13 +208,14 @@ jobs:
             echo "quay artefact probes: OK"
           '
 
-      - name: stage-quay-repo-auth.sh probe (key + known_hosts + insteadOf rewrite)
+      - name: stage-quay-repo-auth.sh probe (key + known_hosts + per-repo insteadOf)
         # The smoke-test's main values file has its quay.repos[].url rewritten
-        # to file:///... (file:// URLs are rejected by list-repo-orgs, which
-        # only accepts HTTPS GitHub URLs). Rather than restoring and re-patching
-        # the main values file, we write a tiny fixture YAML with a real GitHub-
-        # style URL and point the script at it via VALUES_FILE. The fixture URL
-        # won't be cloned — we're testing the auth wiring, not the clone step.
+        # to file:///... (file:// URLs are rejected by list-repo-rewrites,
+        # which only accepts HTTPS GitHub URLs). Rather than restoring and
+        # re-patching the main values file, we write a tiny fixture YAML with
+        # a real GitHub-style URL and point the script at it via VALUES_FILE.
+        # The fixture URL won't be cloned — we're testing the auth wiring,
+        # not the clone step.
         run: |
           FIXTURE_YAML=$(mktemp /tmp/quay-auth-fixture-XXXXXX.yaml)
           cat > "$FIXTURE_YAML" <<'YAML'
@@ -230,15 +231,25 @@ jobs:
           YAML
           sudo chmod 644 "$FIXTURE_YAML"
 
-          # Capture pubkey fingerprint before first run (key shouldn't exist yet).
+          # Pre-seed the legacy org-wide rewrite so this run also exercises
+          # the migration sweep (ITRY-1315). Real hosts on the older script
+          # will land in this state; fresh hosts won't, but the assertions
+          # below check both the per-repo line is present AND the org-wide
+          # one is gone — that holds in either entry path.
+          sudo -u hermes touch /home/hermes/.gitconfig
+          sudo -u hermes git config --file /home/hermes/.gitconfig \
+            "url.git@github.com:InverterNetwork/.insteadOf" \
+            "https://github.com/InverterNetwork/"
+
           sudo VALUES_FILE="$FIXTURE_YAML" \
             /srv/hermes/repos/hermes-agent/stage-quay-repo-auth.sh
 
           # Probe as hermes: key exists with correct mode, known_hosts seeded,
-          # insteadOf rewrite present for InverterNetwork. Read .gitconfig via
-          # --file (matching the script's write path) — using --global from
-          # under sudo runs into HOME/XDG_CONFIG_HOME inheritance that can
-          # silently target the wrong file.
+          # the per-repo rewrite is present, and the legacy org-wide rewrite
+          # has been migrated away. Read .gitconfig via --file (matching the
+          # script's write path) — using --global from under sudo runs into
+          # HOME/XDG_CONFIG_HOME inheritance that can silently target the
+          # wrong file.
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes
             cd "$T"  # git stats CWD even with --file; $GITHUB_WORKSPACE is unreadable to hermes
@@ -253,20 +264,43 @@ jobs:
             grep -q "github.com ssh-" "$T/.ssh/known_hosts" \
               || { echo "FAIL: known_hosts missing github.com keys"; exit 1; }
 
-            rewrite=$(git config --file "$T/.gitconfig" --get "url.git@github.com:InverterNetwork/.insteadOf" || true)
-            [[ "$rewrite" == "https://github.com/InverterNetwork/" ]] \
-              || { echo "FAIL: insteadOf rewrite missing or wrong: $rewrite"; cat "$T/.gitconfig" 2>&1 || true; exit 1; }
+            # Per-repo rewrite is present with the expected value.
+            rewrite=$(git config --file "$T/.gitconfig" --get "url.git@github.com:InverterNetwork/test-factory-code.insteadOf" || true)
+            [[ "$rewrite" == "https://github.com/InverterNetwork/test-factory-code" ]] \
+              || { echo "FAIL: per-repo insteadOf rewrite missing or wrong: $rewrite"; cat "$T/.gitconfig" 2>&1 || true; exit 1; }
 
-            echo "auth probes: key + known_hosts + insteadOf OK"
+            # Legacy org-wide rewrite is gone — migration sweep ran.
+            # (git canonicalises the variable name to lowercase `insteadof`
+            # in --get-regexp output, so the probe regex matches that form.)
+            legacy=$(git config --file "$T/.gitconfig" --get-regexp "^url\.git@github\.com:[^/]+/\.insteadof$" 2>/dev/null || true)
+            [[ -z "$legacy" ]] \
+              || { echo "FAIL: legacy org-wide rewrite still present: $legacy"; cat "$T/.gitconfig" 2>&1 || true; exit 1; }
+
+            echo "auth probes: key + known_hosts + per-repo insteadOf + legacy migrated OK"
           '
 
-          # Idempotency: capture pubkey sha256, re-run, assert it is unchanged.
+          # Idempotency: re-run, assert pubkey unchanged + the per-repo
+          # rewrite still resolves to the expected value + legacy key still
+          # absent. (Avoid byte-level .gitconfig SHA comparisons across
+          # re-runs — `git config --file` may touch whitespace even when
+          # the resulting key/value is identical, depending on the git
+          # version. The substantive invariant is that the per-repo line
+          # holds and the legacy org-wide line never comes back.)
           PUB_SHA_BEFORE=$(sudo -u hermes sha256sum /home/hermes/.ssh/id_ed25519.pub | awk '{print $1}')
           sudo VALUES_FILE="$FIXTURE_YAML" \
             /srv/hermes/repos/hermes-agent/stage-quay-repo-auth.sh
           PUB_SHA_AFTER=$(sudo -u hermes sha256sum /home/hermes/.ssh/id_ed25519.pub | awk '{print $1}')
           [[ "$PUB_SHA_BEFORE" == "$PUB_SHA_AFTER" ]] \
             || { echo "FAIL: pubkey changed on re-run (not idempotent)"; exit 1; }
+          sudo -u hermes bash -euo pipefail -c '
+            cd /home/hermes
+            rewrite=$(git config --file /home/hermes/.gitconfig --get "url.git@github.com:InverterNetwork/test-factory-code.insteadOf" || true)
+            [[ "$rewrite" == "https://github.com/InverterNetwork/test-factory-code" ]] \
+              || { echo "FAIL: per-repo rewrite missing after re-run: $rewrite"; exit 1; }
+            legacy=$(git config --file /home/hermes/.gitconfig --get-regexp "^url\.git@github\.com:[^/]+/\.insteadof$" 2>/dev/null || true)
+            [[ -z "$legacy" ]] \
+              || { echo "FAIL: legacy org-wide rewrite reappeared on re-run: $legacy"; exit 1; }
+          '
           echo "stage-quay-repo-auth.sh idempotency: OK"
 
           rm -f "$FIXTURE_YAML"

@@ -623,6 +623,33 @@ do_verify() {
     done
   fi
 
+  # ---- agent gitconfig: legacy org-wide insteadOf rewrite ----
+  # `stage-quay-repo-auth.sh` used to write `url.git@github.com:<org>/.insteadOf`
+  # (org-wide form). That captured every repo under <org> on the same host —
+  # including hermes-state, which authenticates over HTTPS via the GitHub App
+  # credential helper. The script now writes per-repo rewrites and migrates
+  # the legacy form away, but a host that hasn't re-run the staging script
+  # since the migration landed will still carry the broken key. Flag it.
+  # See ITRY-1315.
+  local agent_gitconfig="${HERMES_VERIFY_AGENT_GITCONFIG:-$AGENT_HOME/.gitconfig}"
+  if [[ -f "$agent_gitconfig" ]]; then
+    # Match exactly the org-wide form: `<org>` then a single trailing `/`,
+    # then `.insteadof`. Per-repo keys have `<org>/<repo>` (no trailing
+    # slash before `.insteadof`) and don't match. NB: git canonicalises
+    # the variable name (`insteadOf` → `insteadof`) in `--get-regexp`
+    # output, so the regex must use lowercase to match.
+    local legacy_keys
+    legacy_keys="$(git config --file "$agent_gitconfig" --get-regexp \
+      '^url\.git@github\.com:[^/]+/\.insteadof$' 2>/dev/null \
+      | awk '{print $1}' | tr '\n' ' ' | sed 's/ *$//' || true)"
+    if [[ -z "$legacy_keys" ]]; then
+      v_ok "agent gitconfig insteadOf scope: per-repo (no legacy org-wide rewrite)"
+    else
+      v_drift "agent gitconfig insteadOf scope" \
+        "legacy org-wide rewrite present: $legacy_keys (re-run stage-quay-repo-auth.sh)"
+    fi
+  fi
+
   echo "==> verify: $V_TOTAL checks, $V_DRIFT drift"
   [[ "$V_DRIFT" -eq 0 ]]
 }
