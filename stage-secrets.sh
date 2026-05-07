@@ -139,7 +139,7 @@ prompt_value LINEAR "$linear_label" "$linear_required" "$existing_linear" "" 1
 # Quay-only secrets, prompted only on quay-provisioned deployments
 if (( manage_quay )); then
   prompt_value ANTHROPIC  "ANTHROPIC_API_KEY (optional — leave blank if using \"claude login\" subscription auth)" 0 "$existing_anthropic"  "" 1
-  prompt_value QUAY_SLACK "SLACK_TOKEN (optional — quay slack adapter, disabled in v0)"                            0 "$existing_quay_slack" "" 1
+  prompt_value QUAY_SLACK "SLACK_TOKEN (optional — only consumed when adapters.slack.enabled=true in deploy.values.yaml)" 0 "$existing_quay_slack" "" 1
 fi
 
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
