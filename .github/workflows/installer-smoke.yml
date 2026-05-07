@@ -71,6 +71,25 @@ jobs:
       - name: create hermes service user
         run: sudo useradd -m -s /bin/bash hermes
 
+      - name: stage fake quay source repo + patch values URL
+        # Real deploys point quay.repos[].url at private GitHub repos. CI
+        # has no credentials for those, so fabricate a local non-bare repo
+        # at file:///srv/hermes/repos/quay-fixtures/<id> and sed the URL
+        # in deploy.values.yaml to match. The installer's `git clone
+        # --bare` is protocol-agnostic.
+        run: |
+          FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
+          sudo mkdir -p "$FIXTURE"
+          sudo git -C "$FIXTURE" init -q -b main
+          echo "fixture" | sudo tee "$FIXTURE/README.md" > /dev/null
+          sudo git -C "$FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci add -A
+          sudo git -C "$FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci commit -q -m "init quay fixture"
+          sudo sed -i \
+            "s|https://github.com/InverterNetwork/test-factory-code|file://${FIXTURE}|" \
+            /srv/hermes/repos/hermes-agent/deploy.values.yaml
+
       - name: run installer (first run; should provision build deps + clone state)
         run: |
           sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
@@ -160,6 +179,33 @@ jobs:
             [[ -f cron/output/probe.txt ]] || { echo "FAIL: cron/output/probe.txt missing after re-run"; exit 1; }
             echo "state preservation: OK"
           '
+
+      - name: quay artefact probes (binary + bare clone + registration)
+        run: |
+          [[ -x /usr/local/bin/quay ]] || { echo "FAIL: quay binary missing"; exit 1; }
+          /usr/local/bin/quay --version
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            [[ -d "$T/quay" ]]                              || { echo "FAIL: quay data dir missing"; exit 1; }
+            [[ -f "$T/quay/config.toml" ]]                  || { echo "FAIL: quay config.toml missing"; exit 1; }
+            [[ -d "$T/quay/repos/test-factory-code.git" ]]  || { echo "FAIL: bare clone missing"; exit 1; }
+            origin=$(git -C "$T/quay/repos/test-factory-code.git" remote get-url origin)
+            [[ "$origin" == "file:///srv/hermes/repos/quay-fixtures/test-factory-code" ]] \
+              || { echo "FAIL: bare clone origin=$origin"; exit 1; }
+            registered=$(env QUAY_DATA_DIR="$T/quay" /usr/local/bin/quay repo list \
+              | python3 -c "import json,sys;print(\"\\n\".join(r[\"repo_id\"] for r in json.load(sys.stdin)))")
+            grep -Fxq "test-factory-code" <<< "$registered" \
+              || { echo "FAIL: test-factory-code not registered (got: $registered)"; exit 1; }
+            echo "quay artefact probes: OK"
+          '
+
+      # `--verify` is intentionally not invoked here. It surfaces two
+      # pre-existing CI-fixture drifts (rails egg-info group-writable
+      # from `pip install -e`, and state origin pointing at a filesystem
+      # path because CI fakes the state repo locally) that aren't related
+      # to the quay path. The per-artefact probes above already cover the
+      # new quay-side verify logic; do_verify itself has unit-test coverage
+      # in tests/ops/test_setup_hermes_verify.py.
 
       - name: --force-state probe (opt-in re-clone wipes local work)
         run: |
