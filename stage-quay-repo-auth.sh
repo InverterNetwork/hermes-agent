@@ -87,16 +87,23 @@ else
   if [[ -z "$ORGS" ]]; then
     echo "ℹ no quay.repos entries found — skipping url.insteadOf rewrites"
   else
+    GITCONFIG="$AGENT_HOME/.gitconfig"
+    # Touch the file so `git config --file` has something to write to with
+    # the right ownership (otherwise git creates it as the invoking user,
+    # which is correct here, but explicit is friendlier).
+    sudo -u "$AGENT_USER" touch "$GITCONFIG"
     while IFS= read -r org; do
       [[ -z "$org" ]] && continue
-      # cd to $HOME before invoking git: with --global, git still walks up
-      # from CWD looking for a .git/ and stats every parent. If CWD is
-      # outside the agent user's read scope (CI runner: $GITHUB_WORKSPACE
-      # is owned by `runner`; on-box: any path the operator happens to
-      # invoke from), the stat fails before git realizes it's a global op.
+      # `--file` is used instead of `--global` to avoid git's HOME / XDG
+      # resolution: under sudo, $HOME and $XDG_CONFIG_HOME can point at the
+      # caller's home (depending on env_keep policy and -H), and `--global`
+      # then reads/writes the wrong file. Also bypasses the CWD repo-walk
+      # that bites when the operator's CWD is outside the agent user's
+      # read scope (e.g. $GITHUB_WORKSPACE on the CI runner).
       # Idempotent — a duplicate config key simply overwrites.
-      sudo -u "$AGENT_USER" -H sh -c 'cd && git config --global "$1" "$2"' \
-        _ "url.git@github.com:${org}/.insteadOf" "https://github.com/${org}/"
+      sudo -u "$AGENT_USER" git config --file "$GITCONFIG" \
+        "url.git@github.com:${org}/.insteadOf" \
+        "https://github.com/${org}/"
       echo "✓ git insteadOf: https://github.com/${org}/ → git@github.com:${org}/"
     done <<< "$ORGS"
   fi
