@@ -907,3 +907,39 @@ class TestParseRepoListIds:
         assert r.stdout == ""
 
 
+class TestParseTaskListCount:
+    """Direct coverage of `parse-task-list-count` — gates the stale
+    ~/.quay/ refusal in setup-hermes.sh on whether operator state is
+    present in the stale DB. Same exit-code contract as
+    parse-repo-list-ids: 2 on un-probeable input lets the bash caller
+    refuse-on-uncertainty without a sentinel value."""
+
+    def _run_parse(self, stdin: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(HELPER), "parse-task-list-count"],
+            input=stdin,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_counts_entries(self):
+        r = self._run_parse(json.dumps([{"task_id": "a"}, {"task_id": "b"}]))
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "2"
+
+    def test_empty_array_yields_zero(self):
+        r = self._run_parse("[]")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "0"
+
+    def test_non_json_input_exits_2(self):
+        r = self._run_parse("garbage not json")
+        assert r.returncode == 2
+        assert "not valid JSON" in r.stderr
+
+    def test_non_list_top_level_exits_2(self):
+        r = self._run_parse('{"task_id": "single"}')
+        assert r.returncode == 2
+        assert "expected JSON array" in r.stderr
+
+

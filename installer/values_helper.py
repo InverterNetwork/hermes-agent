@@ -42,6 +42,9 @@ Subcommands:
                                   for the field name on the consumer side.
                                   Exits 2 with a stderr message on parse
                                   failure (non-JSON / non-list shape).
+  parse-task-list-count        — read `quay task list` JSON from stdin, emit
+                                  the entry count to stdout. Same exit-code
+                                  contract as parse-repo-list-ids.
   validate-schema              — exit 0 if the repos[] schema is well-formed;
                                   exit 1 with the migration message if legacy
                                   `quay.repos[]` is present, or with the
@@ -758,6 +761,29 @@ def cmd_parse_repo_list_ids(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_parse_task_list_count(args: argparse.Namespace) -> int:
+    """Read `quay task list` JSON from stdin, print the entry count.
+
+    Exit codes match parse-repo-list-ids: 0 on a clean parse (count is
+    on stdout), 2 on non-JSON or non-list shape. The non-zero exit is
+    the signal the bash caller uses to refuse-on-uncertainty rather
+    than guessing about a probe-unreachable stale DB.
+    """
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"values_helper.py: quay task list: not valid JSON: {exc}\n")
+        return 2
+    if not isinstance(data, list):
+        sys.stderr.write(
+            f"values_helper.py: quay task list: expected JSON array, "
+            f"got {type(data).__name__}\n"
+        )
+        return 2
+    sys.stdout.write(f"{len(data)}\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -816,6 +842,12 @@ def main(argv: list[str] | None = None) -> int:
         help="read `quay repo list` JSON from stdin; emit repo_id per line",
     )
     p_parse.set_defaults(func=cmd_parse_repo_list_ids)
+
+    p_task = sub.add_parser(
+        "parse-task-list-count",
+        help="read `quay task list` JSON from stdin; print entry count",
+    )
+    p_task.set_defaults(func=cmd_parse_task_list_count)
 
     p_validate = sub.add_parser(
         "validate-schema",
