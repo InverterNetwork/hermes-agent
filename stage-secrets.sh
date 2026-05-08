@@ -18,6 +18,11 @@
 # (and the gateway restart) when the new content is byte-identical to
 # what's on disk.
 #
+# Non-secret values (SLACK_ALLOWED_USERS, …) are NOT prompted here. They
+# live in deploy.values.yaml and are rendered by setup-hermes.sh into
+# <AUTH_DIR>/gateway-runtime.env on every install — keeping operator
+# prompts focused on actual secrets and avoiding re-typing on rotations.
+#
 # Detection:
 #   - slack.env + hermes.env: always staged (the gateway is the core unit
 #     of every hermes-agent install; if it's currently disabled, the env
@@ -75,13 +80,11 @@ parse_existing_env() {
 
 existing_slack_bot=""
 existing_slack_app=""
-existing_slack_users=""
 existing_linear=""
 existing_anthropic=""
 
 parse_existing_env "$SLACK_ENV"  existing_slack_bot   SLACK_BOT_TOKEN
 parse_existing_env "$SLACK_ENV"  existing_slack_app   SLACK_APP_TOKEN
-parse_existing_env "$SLACK_ENV"  existing_slack_users SLACK_ALLOWED_USERS
 
 # LINEAR_API_KEY can pre-exist in either hermes.env or quay.env (or both
 # from a previous staging). Prefer hermes.env's value; fall back to
@@ -125,10 +128,13 @@ prompt_value() {
   done
 }
 
-# Slack — gateway transport
+# Slack — gateway transport. SLACK_ALLOWED_USERS is not prompted: it lives
+# in deploy.values.yaml (slack.runtime.allowed_users) and is rendered by
+# setup-hermes.sh into auth/gateway-runtime.env on every install. The list
+# is non-secret config; keeping it version-controlled means rotations and
+# fresh installs don't re-prompt for member IDs.
 prompt_value SLACK_BOT   "SLACK_BOT_TOKEN (xoxb-…)" 1 "$existing_slack_bot"   "xoxb-" 1
 prompt_value SLACK_APP   "SLACK_APP_TOKEN (xapp-…)" 1 "$existing_slack_app"   "xapp-" 1
-prompt_value SLACK_USERS "SLACK_ALLOWED_USERS (comma-separated U-IDs, blank = none)" 0 "$existing_slack_users" "" 0
 
 # Linear — required if quay is provisioned (it gates `quay enqueue
 # --linear-issue`); optional otherwise (gateway can skip the
@@ -171,11 +177,13 @@ write_env() {
   return 0
 }
 
-# slack.env
+# slack.env — secrets only. Hosts that previously staged a
+# SLACK_ALLOWED_USERS line drop it on the next re-run because the new
+# content no longer contains it; the gateway picks the list up from
+# auth/gateway-runtime.env via the z-runtime-env.conf drop-in instead
+# (the drop-in's own header documents why it sorts last).
 slack_content="SLACK_BOT_TOKEN=${SLACK_BOT}
 SLACK_APP_TOKEN=${SLACK_APP}"
-[[ -n "$SLACK_USERS" ]] && slack_content+="
-SLACK_ALLOWED_USERS=${SLACK_USERS}"
 write_env "$SLACK_ENV" "$slack_content" slack_changed
 
 # hermes.env (gateway-side LINEAR_API_KEY, when set)

@@ -44,10 +44,12 @@
 #
 # Auth: --auth-method app wires a GitHub App credential helper for state/, so
 # `git push` from the agent works without interactive auth. First-run requires
-# --app-id, --app-installation-id, and --app-key-path (path to the App's PEM
-# private key). Subsequent runs reuse the credentials persisted under
-# $TARGET/auth/. --auth-method none (the default) skips auth wiring and is
-# what CI uses with the local fixture.
+# --app-key-path (path to the App's PEM private key, the real secret). The
+# numeric App ID and installation ID default to deploy.values.yaml's
+# auth.github_app.{id, installation_id}; --app-id / --app-installation-id
+# are still honored as per-run overrides for staging. Subsequent runs reuse
+# the PEM persisted under $TARGET/auth/. --auth-method none (the default)
+# skips auth wiring and is what CI uses with the local fixture.
 
 set -euo pipefail
 
@@ -140,6 +142,15 @@ v_drift() {
   V_TOTAL=$((V_TOTAL + 1))
   V_DRIFT=$((V_DRIFT + 1))
   echo "[DRIFT] $1: $2" >&2
+}
+
+# Print the SHA-256 of $1, or empty when the file doesn't exist. Callers
+# capture before/after a write and compare; an absent-then-present file
+# (first install) reads as a mismatch and triggers downstream actions
+# (e.g. a gateway restart) just like a content change would.
+file_sha() {
+  [[ -f "$1" ]] || return 0
+  sha256sum "$1" | cut -d' ' -f1
 }
 
 # Cross-platform stat — GNU first, BSD fallback. The mode helper strips the
@@ -996,6 +1007,17 @@ else
   chmod 644 "$CONFIG_YAML_OUT"
 fi
 
+# model.* is rewritten on every run, even when the file above was preserved
+# — the helper docstring covers the rationale (silent `hermes auth add`
+# failures leaving the pin drifted).
+config_sha_pre="$(file_sha "$CONFIG_YAML_OUT")"
+echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  merge-config-model --out "$CONFIG_YAML_OUT"
+chown root:root "$CONFIG_YAML_OUT"
+chmod 644 "$CONFIG_YAML_OUT"
+[[ "$config_sha_pre" != "$(file_sha "$CONFIG_YAML_OUT")" ]] && GATEWAY_NEEDS_RESTART=1
+
 # ---------- venv (rails-class) ----------
 
 echo "==> building venv at $TARGET_DIR/hermes-agent/venv"
@@ -1016,29 +1038,55 @@ find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 
 # ---------- auth (root-owned dir, group-readable by agent) ----------
 # Stored under $TARGET/auth/:
-#   github-app.pem  — the GitHub App private key (mode 0640, root:hermes)
-#   github-app.env  — config consumed by hermes_github_token.py
+#   github-app.pem      — the GitHub App private key (mode 0640, root:hermes)
+#   github-app.env      — config consumed by hermes_github_token.py
+#   gateway-runtime.env — non-secret env vars derived from deploy.values.yaml
+#                         (SLACK_ALLOWED_USERS, …). Rewritten every run so
+#                         values.yaml stays the single source of truth.
+#   slack.env / hermes.env — staged out-of-band by stage-secrets.sh.
 #
-# auth/ is mode 0750 root:hermes — agent (group member) can read both files
-# but can't write them, and the rails (root) own provisioning. The token cache
-# lives in $TARGET/cache/ (agent-writable) so this dir stays read-only to it.
+# auth/ is mode 0750 root:hermes — agent (group member) can read every file
+# but can't write any of them, and the rails (root) own provisioning. The
+# token cache lives in $TARGET/cache/ (agent-writable) so this dir stays
+# read-only to it.
 
 AUTH_DIR="$TARGET_DIR/auth"
 GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
+GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
 TOKEN_HELPER_PY="$TARGET_DIR/hermes-agent/installer/hermes_github_token.py"
 VENV_PY="$TARGET_DIR/hermes-agent/venv/bin/python"
 HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 
+# auth/ is created here regardless of --auth-method because gateway-runtime.env
+# (values-derived, written below) lives in it. Strip setgid that propagates
+# from $TARGET_DIR's setgid bit on Linux (System V dir semantics) — auth/
+# has a strict mode-750 invariant, so files inside are explicitly chmod'd
+# without group inheritance. `install -m 0750` doesn't reliably clear the
+# bit on coreutils we've seen in CI; `g-s` is unambiguous.
+install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
+chmod g-s "$AUTH_DIR"
+
+# Values-derived runtime env file. Rewritten every run — values.yaml is the
+# source of truth; the file is a reflection. Operator hand-edits belong in
+# /etc/default/hermes-gateway, not here.
+#
+# GATEWAY_NEEDS_RESTART accumulates content drift across this and the two
+# other env-affecting writes below (config.yaml model merge, runtime-env
+# drop-in). systemd doesn't re-read EnvironmentFile= for a running process
+# on `daemon-reload`, so we have to restart explicitly when content
+# actually changed.
+GATEWAY_NEEDS_RESTART=0
+runtime_sha_pre="$(file_sha "$GATEWAY_RUNTIME_ENV")"
+echo "==> rendering $GATEWAY_RUNTIME_ENV from $VALUES_FILE"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  render-gateway-runtime-env --out "$GATEWAY_RUNTIME_ENV"
+chown root:"$AGENT_USER" "$GATEWAY_RUNTIME_ENV"
+chmod 0640 "$GATEWAY_RUNTIME_ENV"
+[[ "$runtime_sha_pre" != "$(file_sha "$GATEWAY_RUNTIME_ENV")" ]] && GATEWAY_NEEDS_RESTART=1
+
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
-  install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
-  # Strip setgid that propagates from $TARGET_DIR's setgid bit on Linux
-  # (System V dir semantics). auth/ has a strict mode-750 invariant —
-  # files inside are explicitly chmod'd, no need for group inheritance.
-  # `install -m 0750` doesn't reliably clear the bit on coreutils we've
-  # seen in CI; `g-s` is unambiguous.
-  chmod g-s "$AUTH_DIR"
 
   if [[ -n "$APP_KEY_PATH" ]]; then
     [[ -f "$APP_KEY_PATH" ]] \
@@ -1062,11 +1110,16 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
   chown root:"$AGENT_USER" "$GH_APP_KEY_DST"
   chmod 0640 "$GH_APP_KEY_DST"
 
-  # Persist App identity. APP_ID / APP_INSTALLATION_ID are required on first
-  # install; on re-runs we read whatever's in the existing env file unless the
-  # operator passed new values. Extract via awk rather than `source`, because
-  # `source` evaluates the values in our shell — `--app-id 'foo$(rm -rf /)'`
-  # would be game-over on the next install.
+  # Persist App identity. Resolution order: CLI flag > deploy.values.yaml >
+  # existing env file (legacy fallback for installs from before values.yaml
+  # carried these IDs). values.yaml is the durable home for the IDs (public
+  # identifiers — the PEM is the real secret); CLI flags stay as ad-hoc
+  # overrides for staging. Extract from the env file via awk rather than
+  # `source`, because `source` evaluates the values in our shell —
+  # `--app-id 'foo$(rm -rf /)'` would be game-over on the next install.
+  APP_ID="${APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.id 2>/dev/null || true)}"
+  APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.installation_id 2>/dev/null || true)}"
+  GH_API_BASE="${GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.api_base 2>/dev/null || true)}"
   if [[ -f "$GH_APP_ENV" ]]; then
     APP_ID="${APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$GH_APP_ENV")}"
     APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$GH_APP_ENV")}"
@@ -1577,9 +1630,12 @@ fi
 
 GATEWAY_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/slack-env.conf"
 GATEWAY_HERMES_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/hermes-env.conf"
+# z- prefix is load-order sensitive — see ops/hermes-gateway.service.d/z-runtime-env.conf.
+GATEWAY_RUNTIME_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/z-runtime-env.conf"
 GATEWAY_DROPIN_DIR="/etc/systemd/system/hermes-gateway.service.d"
 GATEWAY_DROPIN_DST="$GATEWAY_DROPIN_DIR/slack-env.conf"
 GATEWAY_HERMES_DROPIN_DST="$GATEWAY_DROPIN_DIR/hermes-env.conf"
+GATEWAY_RUNTIME_DROPIN_DST="$GATEWAY_DROPIN_DIR/z-runtime-env.conf"
 GATEWAY_SLACK_ENV="$AUTH_DIR/slack.env"
 
 if [[ -f "$GATEWAY_DROPIN_SRC" && -x "$HERMES_BIN" ]]; then
@@ -1630,10 +1686,34 @@ EOF
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
 
+    # First-time install of z-runtime-env.conf on an existing host counts as
+    # an env-source change for the running gateway — track it so the restart
+    # below picks up the new EnvironmentFile= line.
+    z_dropin_sha_pre="$(file_sha "$GATEWAY_RUNTIME_DROPIN_DST")"
+    echo "==> installing runtime-env drop-in at $GATEWAY_RUNTIME_DROPIN_DST"
+    sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_RUNTIME_DROPIN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_RUNTIME_DROPIN_DST"
+    [[ "$z_dropin_sha_pre" != "$(file_sha "$GATEWAY_RUNTIME_DROPIN_DST")" ]] && GATEWAY_NEEDS_RESTART=1
+
     systemctl daemon-reload
+
+    # Capture the gateway's pre-install activity so we can decide whether a
+    # restart is actually warranted. `enable --now` on an inactive unit
+    # starts it fresh with the new EnvironmentFile= already loaded — no
+    # restart needed. An already-active gateway picks up no env changes
+    # from `daemon-reload` alone (it only refreshes systemd's view of unit
+    # definitions, not the running process's environment), so we have to
+    # `try-restart` it explicitly when env/config content actually changed.
+    gateway_was_active=0
+    systemctl is-active hermes-gateway.service >/dev/null 2>&1 && gateway_was_active=1
 
     if [[ -f "$GATEWAY_SLACK_ENV" ]]; then
       systemctl enable --now hermes-gateway.service
+      if (( GATEWAY_NEEDS_RESTART && gateway_was_active )); then
+        echo "==> gateway env/config content changed; restarting hermes-gateway.service"
+        systemctl try-restart hermes-gateway.service
+        systemctl --no-pager --lines=0 status hermes-gateway.service || true
+      fi
     else
       echo "==> $GATEWAY_SLACK_ENV not staged; gateway unit installed but left disabled" >&2
       echo "    Stage the file with SLACK_BOT_TOKEN / SLACK_APP_TOKEN, then:" >&2

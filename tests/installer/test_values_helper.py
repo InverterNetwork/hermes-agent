@@ -193,6 +193,249 @@ class TestRenderRuntimeConfig:
         assert out.exists()
 
 
+class TestRenderGatewayRuntimeEnv:
+    def test_writes_slack_allowed_users(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_users:\n      - U01ABC2DEF\n      - U02GHI3JKL\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "SLACK_ALLOWED_USERS=U01ABC2DEF,U02GHI3JKL" in text
+
+    def test_empty_list_omits_line(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_users: []\n", encoding="utf-8"
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "SLACK_ALLOWED_USERS" not in text
+
+    def test_missing_slack_section_still_creates_file(self, tmp_path: Path):
+        # The installer chowns/chmods the output path right after; the helper
+        # must always create a file, even with nothing to seed.
+        values = tmp_path / "values.yaml"
+        values.write_text("org:\n  name: X\n", encoding="utf-8")
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert out.exists()
+        assert "SLACK_ALLOWED_USERS" not in out.read_text()
+
+    def test_rejects_value_with_whitespace(self, tmp_path: Path):
+        # Unquoted env-file lines silently truncate at whitespace; refuse to
+        # emit a file the runtime would misread.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_users:\n      - 'U bad has space'\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "whitespace" in r.stderr
+        assert not out.exists()
+
+    def test_rejects_non_list_allowed_users(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_users: 'U01ABC2DEF,U02GHI3JKL'\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "must be a list" in r.stderr
+
+    def test_writes_linear_team_env_vars(self, tmp_path: Path):
+        # linear.teams.<key> → LINEAR_TEAM_<KEY>
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "    aster: 11111111-2222-3333-4444-555555555555\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "LINEAR_TEAM_ITRY=28294e03-c1ce-4c2b-ba24-49e36179a321" in text
+        assert "LINEAR_TEAM_ASTER=11111111-2222-3333-4444-555555555555" in text
+
+    def test_skips_empty_team_value(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n  teams:\n    itry: \"\"\n    aster: ABC\n", encoding="utf-8"
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "LINEAR_TEAM_ITRY" not in text
+        assert "LINEAR_TEAM_ASTER=ABC" in text
+
+    def test_rejects_invalid_team_key(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n  teams:\n    '1bad': 28294e03-c1ce-4c2b-ba24-49e36179a321\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "is not a valid env-var suffix" in r.stderr
+
+    def test_rejects_non_mapping_teams(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n  teams:\n    - itry\n    - aster\n", encoding="utf-8"
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "linear.teams must be a mapping" in r.stderr
+
+    def test_always_rewrites_existing_file(self, tmp_path: Path):
+        # Unlike render-runtime-config, this output is a reflection of
+        # values.yaml; operator hand-edits don't survive.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_users:\n      - U01ABC2DEF\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        out.write_text("STALE_KEY=stale_value\n", encoding="utf-8")
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "STALE_KEY" not in text
+        assert "SLACK_ALLOWED_USERS=U01ABC2DEF" in text
+
+
+class TestMergeConfigModel:
+    def _seed_config(self, path: Path, body: str) -> None:
+        path.write_text(body, encoding="utf-8")
+
+    def test_sets_provider_in_existing_config(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  model_provider: openai-codex\n  model_base_url: \"\"\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config, "slack:\n  allowed_channels:\n    - C_HOME\n  require_mention: true\n"
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        # Other top-level keys preserved
+        assert loaded["slack"]["require_mention"] is True
+        assert loaded["slack"]["allowed_channels"] == ["C_HOME"]
+        # model.provider set, no base_url
+        assert loaded["model"]["provider"] == "openai-codex"
+        assert "base_url" not in loaded["model"]
+
+    def test_writes_base_url_when_set(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai\n"
+            "  model_base_url: https://proxy.example.com/v1\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["model"]["base_url"] == "https://proxy.example.com/v1"
+
+    def test_drops_stale_base_url_when_values_empty(self, tmp_path: Path):
+        # Operator removed the override from values.yaml — config.yaml's
+        # stale base_url must drop, otherwise the gateway keeps routing
+        # through the old endpoint.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  model_provider: openai\n  model_base_url: \"\"\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "model:\n"
+            "  default: claude-sonnet-4-5\n"
+            "  provider: stale\n"
+            "  base_url: https://stale.example.com/v1\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        # default preserved, provider replaced, base_url dropped
+        assert loaded["model"]["default"] == "claude-sonnet-4-5"
+        assert loaded["model"]["provider"] == "openai"
+        assert "base_url" not in loaded["model"]
+
+    def test_requires_gateway_model_provider(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: \"\"\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.model_provider is required" in r.stderr
+
+    def test_missing_config_is_error(self, tmp_path: Path):
+        # render-runtime-config seeds the file first; merging into a
+        # non-existent path would silently lose the slack block.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"  # never created
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "does not exist" in r.stderr
+        assert not config.exists()
+
+    def test_header_re_emitted_on_merge(self, tmp_path: Path):
+        # The round-trip strips comments; merge-config-model must re-emit
+        # the standard header so the file's intro text doesn't disappear
+        # after the first re-install (operators rely on the header to
+        # know what's preserved across runs and what isn't).
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        # Simulate a config.yaml that has lost its header (e.g. after a
+        # prior merge or hand-edit that stripped the seeded comment).
+        config.write_text("slack:\n  require_mention: true\n", encoding="utf-8")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        text = config.read_text()
+        assert text.startswith("# Seeded by setup-hermes.sh from deploy.values.yaml.")
+        # And the honest wording stuck.
+        assert "Operator-added top-level keys are preserved" in text
+        assert "YAML comments are not" in text
+
+    def test_invalid_yaml_in_config_is_error(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        config.write_text("not: valid: yaml: ::\n", encoding="utf-8")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "not valid YAML" in r.stderr
+
+
 class TestRenderQuayConfig:
     @pytest.fixture
     def quay_values(self, tmp_path: Path) -> Path:

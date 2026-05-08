@@ -117,28 +117,32 @@ jobs:
           # fixture and append the two new code-only entries to repos[].
           # Use python to round-trip through PyYAML so the structure stays
           # valid no matter where `quay:` lives relative to `repos:`.
-          sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE" <<'PY'
-import sys, yaml
-quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
-path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
-with open(path) as f:
-    data = yaml.safe_load(f)
-for entry in data.get("repos", []):
-    if entry.get("id") == "test-factory-code":
-        entry["url"] = f"file://{quay_fixture}"
-data["repos"].append({
-    "id": "code-only-fixture",
-    "url": f"file://{code_fixture}",
-    "base_branch": "main",
-})
-data["repos"].append({
-    "id": "non-default-branch-fixture",
-    "url": f"file://{dev_fixture}",
-    "base_branch": "develop",
-})
-with open(path, "w") as f:
-    yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
-PY
+          # The heredoc body is indented to keep the YAML `run: |` block
+          # scalar intact (a column-0 line would terminate it); `sed`
+          # strips the indent before Python sees it, so the script reads
+          # as column-0 module-level code.
+          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          import sys, yaml
+          quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
+          path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
+          with open(path) as f:
+              data = yaml.safe_load(f)
+          for entry in data.get("repos", []):
+              if entry.get("id") == "test-factory-code":
+                  entry["url"] = f"file://{quay_fixture}"
+          data["repos"].append({
+              "id": "code-only-fixture",
+              "url": f"file://{code_fixture}",
+              "base_branch": "main",
+          })
+          data["repos"].append({
+              "id": "non-default-branch-fixture",
+              "url": f"file://{dev_fixture}",
+              "base_branch": "develop",
+          })
+          with open(path, "w") as f:
+              yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+          PY
 
       - name: install claude shim (satisfies installer claude prerequisite check)
         # The installer (ITRY-1311) fails loud when quay.agent_invocation
@@ -156,6 +160,51 @@ PY
             --state /srv/hermes/repos/hermes-state \
             --user hermes \
             --git-identity-email didier@ci
+
+      - name: values-derived runtime config probe
+        # deploy.values.yaml is the source of truth for the gateway's model
+        # provider pin and for non-secret env vars (SLACK_ALLOWED_USERS,
+        # LINEAR_TEAM_<KEY>). setup-hermes.sh writes auth/gateway-runtime.env
+        # on every run (independent of --auth-method) and merges
+        # gateway.model_* into config.yaml. Both must land cleanly on first
+        # install and re-runs.
+        run: |
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+
+            # auth/gateway-runtime.env present, root:hermes 0640, agent-readable.
+            [[ -f "$T/auth/gateway-runtime.env" ]] \
+              || { echo "FAIL: $T/auth/gateway-runtime.env missing"; exit 1; }
+            mode=$(stat -c "%a" "$T/auth/gateway-runtime.env")
+            owner=$(stat -c "%U:%G" "$T/auth/gateway-runtime.env")
+            [[ "$mode" == "640" ]]               || { echo "FAIL: gateway-runtime.env mode=$mode"; exit 1; }
+            [[ "$owner" == "root:hermes" ]]      || { echo "FAIL: gateway-runtime.env owner=$owner"; exit 1; }
+
+            # LINEAR_TEAM_ITRY is in the fork values file — must round-trip.
+            grep -q "LINEAR_TEAM_ITRY=28294e03-c1ce-4c2b-ba24-49e36179a321" \
+              "$T/auth/gateway-runtime.env" \
+              || { echo "FAIL: LINEAR_TEAM_ITRY missing"; cat "$T/auth/gateway-runtime.env"; exit 1; }
+
+            # config.yaml carries the merged model.provider from values.yaml.
+            grep -Eq "^[[:space:]]*provider:[[:space:]]*openai-codex" \
+              "$T/config.yaml" \
+              || { echo "FAIL: model.provider not merged into config.yaml"; cat "$T/config.yaml"; exit 1; }
+
+            # And the runtime drop-in references the file. The `z-` prefix is
+            # load-order sensitive: systemd merges drop-ins in lexical order
+            # and the values.yaml-derived value must win on collision with a
+            # legacy SLACK_ALLOWED_USERS line in slack.env.
+            unitd=/etc/systemd/system/hermes-gateway.service.d
+            [[ -f "$unitd/z-runtime-env.conf" ]] \
+              || { echo "FAIL: z-runtime-env.conf drop-in missing"; ls -la "$unitd"; exit 1; }
+            grep -Fq "auth/gateway-runtime.env" "$unitd/z-runtime-env.conf" \
+              || { echo "FAIL: z-runtime-env.conf does not reference gateway-runtime.env"; cat "$unitd/z-runtime-env.conf"; exit 1; }
+            # Sort order assertion — last drop-in alphabetically must be ours.
+            last_dropin=$(ls "$unitd"/*.conf | sort | tail -n1)
+            [[ "$last_dropin" == "$unitd/z-runtime-env.conf" ]] \
+              || { echo "FAIL: z-runtime-env.conf does not sort last (got: $last_dropin)"; ls "$unitd"; exit 1; }
+            echo "values-derived runtime config probe: OK"
+          '
 
       - name: permission probes (rails read-only, state writable + git-aware)
         run: |

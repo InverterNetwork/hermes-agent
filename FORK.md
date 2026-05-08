@@ -16,11 +16,14 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instantiate this fork for a different org:
 
 1. Fork this repo (or clone + push to a new origin).
-2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `repos[]` (every entry produces a code mirror; entries with a `quay:` sub-block are additionally registered with quay), `quay.*` (set `quay.version` to a published `v*` tag to enable quay provisioning, or leave it empty to skip the quay binary + data dir entirely). Tokens never go here; they're staged at install time.
+2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `gateway.*` (LLM provider pin), `auth.github_app.*` (numeric IDs only — the PEM stays out-of-band), `linear.teams.*` (team UUIDs exposed as `LINEAR_TEAM_<KEY>`), `repos[]` (every entry produces a code mirror; entries with a `quay:` sub-block are additionally registered with quay), `quay.*` (set `quay.version` to a published `v*` tag to enable quay provisioning, or leave it empty to skip the quay binary + data dir entirely). Tokens never go here; they're staged at install time.
 3. Run `installer/setup-hermes.sh` on the target host. The installer:
    - reads `deploy.values.yaml` (override the path with `--values <file>` if needed),
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
    - seeds `<HERMES_HOME>/config.yaml` from `slack.runtime.*` on first install (preserved on re-runs — operator hand-edits survive),
+   - merges `gateway.model_provider` / `gateway.model_base_url` into `<HERMES_HOME>/config.yaml`'s `model:` block on every run (deterministic — no longer dependent on `hermes auth add`),
+   - rewrites `<HERMES_HOME>/auth/gateway-runtime.env` from `slack.runtime.allowed_users` and `linear.teams.*` on every run (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>` — non-secret, version-controlled, no operator re-typing on rotations),
+   - regenerates `<HERMES_HOME>/auth/github-app.env` from `auth.github_app.*` on every `--auth-method app` run; CLI flags (`--app-id`, `--app-installation-id`) stay as per-run overrides,
    - configures `git user.name` on agent commits to `org.agent_identity_name`.
 4. Stage all runtime secrets with `stage-secrets.sh` (interactive — writes `<HERMES_HOME>/auth/slack.env`, `auth/hermes.env`, and `auth/quay.env` in one pass). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, plus `LINEAR_API_KEY` when `quay.version` is set. `ANTHROPIC_API_KEY` is an optional quay-side prompt, skipped on Linear-only deployments. Re-runs preserve unchanged values; identical content skips the gateway restart.
 
@@ -67,18 +70,20 @@ For real deploys, the agent authenticates to GitHub as a dedicated App (one App 
 
 **Per-host install:**
 
+Populate `auth.github_app.id` and `auth.github_app.installation_id` in `deploy.values.yaml` once (numeric identifiers — not secrets), then:
+
 ```sh
 sudo ./installer/setup-hermes.sh \
   --fork  /srv/hermes/repos/hermes-agent \
   --state-url https://github.com/InverterNetwork/hermes-state.git \
   --user  hermes \
   --auth-method app \
-  --app-id <APP_ID> \
-  --app-installation-id <INSTALLATION_ID> \
   --app-key-path /root/<slug>.pem
 ```
 
-The installer copies the PEM into `$TARGET/auth/github-app.pem` (root:hermes 0640), persists the App + Installation IDs to `$TARGET/auth/github-app.env`, and configures a git credential helper inside `state/.git/config` scoped to `https://github.com`. Subsequent runs reuse the persisted credentials and only need `--auth-method app` to re-assert wiring.
+`--app-id` / `--app-installation-id` are still accepted as per-run overrides (e.g. swap to a staging App for one install) but no longer required when the values file carries them.
+
+The installer copies the PEM into `$TARGET/auth/github-app.pem` (root:hermes 0640), regenerates `$TARGET/auth/github-app.env` from `auth.github_app.*` on every run, and configures a git credential helper inside `state/.git/config` scoped to `https://github.com`. Subsequent runs reuse the persisted PEM and only need `--auth-method app` to re-assert wiring.
 
 Every run with `--auth-method app` ends with a live mint call (`hermes_github_token.py check`) to confirm the agent can actually authenticate to GitHub end-to-end. **This means re-installs require live `api.github.com` egress.** If GitHub is degraded or the host is offline, pass `--skip-auth-check` to skip the mint and still update the rails / state symlinks.
 
@@ -98,9 +103,10 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `sessions/`, `logs/`, `cache/` | `hermes:hermes` | 755 | local-only (gitignored content) |
 | `code/` | `hermes:hermes` | 755 | code mirrors root. One subdir per `repos[]` entry, each a working-tree clone refreshed by `hermes-code-sync` (5-min cadence). Read by the gateway when answering codebase questions in Slack. |
 | `quay/` | `hermes:hermes` | 755 | quay data dir (sqlite, worktrees, bare clones, logs); seeded `config.toml` lives inside, preserved across re-runs. Only present when `quay.version` is set in `deploy.values.yaml` |
-| `auth/` | `root:hermes` | 750 | App key + env config (only present with `--auth-method app`) |
-| `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent) |
-| `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path |
+| `auth/` | `root:hermes` | 750 | Staged secrets (`slack.env`, `hermes.env`, `quay.env`) and values-derived runtime config. Always present (created on every install). |
+| `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent). Only with `--auth-method app`. |
+| `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path. Regenerated from `auth.github_app.*` on every run. |
+| `auth/gateway-runtime.env` | `root:hermes` | 640 | Non-secret env vars from `deploy.values.yaml` (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten every run; do not hand-edit. |
 
 Agent writes through the symlinks land inside the `state/` working tree, where the auto-commit pipeline can pick them up.
 
