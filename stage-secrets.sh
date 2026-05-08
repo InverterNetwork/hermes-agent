@@ -20,7 +20,8 @@
 #
 # Non-secret values (SLACK_ALLOWED_USERS, …) are NOT prompted here. They
 # live in deploy.values.yaml and are rendered by setup-hermes.sh into
-# <AUTH_DIR>/gateway-runtime.env on every install. See ITRY-1319.
+# <AUTH_DIR>/gateway-runtime.env on every install — keeping operator
+# prompts focused on actual secrets and avoiding re-typing on rotations.
 #
 # Detection:
 #   - slack.env + hermes.env: always staged (the gateway is the core unit
@@ -127,10 +128,11 @@ prompt_value() {
   done
 }
 
-# Slack — gateway transport. SLACK_ALLOWED_USERS is no longer prompted: it
-# lives in deploy.values.yaml (slack.runtime.allowed_users) and is rendered
-# by setup-hermes.sh into auth/gateway-runtime.env on every install. See
-# ITRY-1319 — non-secret config that is version-controlled and reviewable.
+# Slack — gateway transport. SLACK_ALLOWED_USERS is not prompted: it lives
+# in deploy.values.yaml (slack.runtime.allowed_users) and is rendered by
+# setup-hermes.sh into auth/gateway-runtime.env on every install. The list
+# is non-secret config; keeping it version-controlled means rotations and
+# fresh installs don't re-prompt for member IDs.
 prompt_value SLACK_BOT   "SLACK_BOT_TOKEN (xoxb-…)" 1 "$existing_slack_bot"   "xoxb-" 1
 prompt_value SLACK_APP   "SLACK_APP_TOKEN (xapp-…)" 1 "$existing_slack_app"   "xapp-" 1
 
@@ -175,10 +177,13 @@ write_env() {
   return 0
 }
 
-# slack.env — secrets only. Re-runs after the ITRY-1319 migration drop the
-# legacy SLACK_ALLOWED_USERS line from existing files because the new
-# content no longer contains it; the gateway picks it up from
-# auth/gateway-runtime.env via the runtime-env.conf drop-in instead.
+# slack.env — secrets only. Hosts that previously staged a
+# SLACK_ALLOWED_USERS line drop it on the next re-run because the new
+# content no longer contains it; the gateway picks the list up from
+# auth/gateway-runtime.env via the z-runtime-env.conf drop-in instead.
+# Until the operator re-runs this script, the legacy line in slack.env is
+# shadowed by the values.yaml-derived value (z-runtime-env.conf sorts
+# after slack-env.conf, and systemd's last EnvironmentFile= wins).
 slack_content="SLACK_BOT_TOKEN=${SLACK_BOT}
 SLACK_APP_TOKEN=${SLACK_APP}"
 write_env "$SLACK_ENV" "$slack_content" slack_changed

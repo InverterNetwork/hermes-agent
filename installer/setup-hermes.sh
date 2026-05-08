@@ -1001,13 +1001,18 @@ fi
 # model.provider / model.base_url are merged from values.yaml on every run,
 # even when the file above was preserved. The CLI's `hermes auth add
 # openai-codex` writes the same keys but can fail silently when config.yaml
-# is root-owned (ITRY-1316), leaving the pin drifted from the deployment's
-# declared provider. This makes the values-driven write authoritative.
+# is root-owned, leaving the pin drifted from the deployment's declared
+# provider. The values-driven write here is authoritative regardless of
+# whether the CLI's update step succeeded.
+prev_config_sha=""
+[[ -f "$CONFIG_YAML_OUT" ]] && prev_config_sha="$(sha256sum "$CONFIG_YAML_OUT" | cut -d' ' -f1)"
 echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   merge-config-model --out "$CONFIG_YAML_OUT"
 chown root:root "$CONFIG_YAML_OUT"
 chmod 644 "$CONFIG_YAML_OUT"
+new_config_sha="$(sha256sum "$CONFIG_YAML_OUT" | cut -d' ' -f1)"
+[[ "$prev_config_sha" != "$new_config_sha" ]] && GATEWAY_NEEDS_RESTART=1
 
 # ---------- venv (rails-class) ----------
 
@@ -1061,11 +1066,25 @@ chmod g-s "$AUTH_DIR"
 # Values-derived runtime env file. Rewritten every run — values.yaml is the
 # source of truth; the file is a reflection. Operator hand-edits belong in
 # /etc/default/hermes-gateway, not here.
+#
+# Track content change vs. on-disk so we can drive the gateway-restart
+# decision below. systemd does not re-read EnvironmentFile= for an already-
+# active process on `daemon-reload`; without an explicit restart the new
+# values would sit on disk while the running gateway keeps the old env.
+GATEWAY_NEEDS_RESTART=0
+gateway_runtime_changed=0
+prev_runtime_sha=""
+[[ -f "$GATEWAY_RUNTIME_ENV" ]] && prev_runtime_sha="$(sha256sum "$GATEWAY_RUNTIME_ENV" | cut -d' ' -f1)"
 echo "==> rendering $GATEWAY_RUNTIME_ENV from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   render-gateway-runtime-env --out "$GATEWAY_RUNTIME_ENV"
 chown root:"$AGENT_USER" "$GATEWAY_RUNTIME_ENV"
 chmod 0640 "$GATEWAY_RUNTIME_ENV"
+new_runtime_sha="$(sha256sum "$GATEWAY_RUNTIME_ENV" | cut -d' ' -f1)"
+if [[ "$prev_runtime_sha" != "$new_runtime_sha" ]]; then
+  gateway_runtime_changed=1
+  GATEWAY_NEEDS_RESTART=1
+fi
 
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
@@ -1093,12 +1112,12 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
   chmod 0640 "$GH_APP_KEY_DST"
 
   # Persist App identity. Resolution order: CLI flag > deploy.values.yaml >
-  # existing env file (legacy fallback for installs that pre-date ITRY-1319).
-  # values.yaml is the durable home for these IDs (public identifiers — the
-  # PEM is the real secret); CLI flags stay as ad-hoc overrides for staging.
-  # Extract from the env file via awk rather than `source`, because `source`
-  # evaluates the values in our shell — `--app-id 'foo$(rm -rf /)'` would be
-  # game-over on the next install.
+  # existing env file (legacy fallback for installs from before values.yaml
+  # carried these IDs). values.yaml is the durable home for the IDs (public
+  # identifiers — the PEM is the real secret); CLI flags stay as ad-hoc
+  # overrides for staging. Extract from the env file via awk rather than
+  # `source`, because `source` evaluates the values in our shell —
+  # `--app-id 'foo$(rm -rf /)'` would be game-over on the next install.
   APP_ID="${APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.id 2>/dev/null || true)}"
   APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.installation_id 2>/dev/null || true)}"
   GH_API_BASE="${GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.api_base 2>/dev/null || true)}"
@@ -1612,11 +1631,12 @@ fi
 
 GATEWAY_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/slack-env.conf"
 GATEWAY_HERMES_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/hermes-env.conf"
-GATEWAY_RUNTIME_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/runtime-env.conf"
+# z- prefix is load-order sensitive — see ops/hermes-gateway.service.d/z-runtime-env.conf.
+GATEWAY_RUNTIME_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/z-runtime-env.conf"
 GATEWAY_DROPIN_DIR="/etc/systemd/system/hermes-gateway.service.d"
 GATEWAY_DROPIN_DST="$GATEWAY_DROPIN_DIR/slack-env.conf"
 GATEWAY_HERMES_DROPIN_DST="$GATEWAY_DROPIN_DIR/hermes-env.conf"
-GATEWAY_RUNTIME_DROPIN_DST="$GATEWAY_DROPIN_DIR/runtime-env.conf"
+GATEWAY_RUNTIME_DROPIN_DST="$GATEWAY_DROPIN_DIR/z-runtime-env.conf"
 GATEWAY_SLACK_ENV="$AUTH_DIR/slack.env"
 
 if [[ -f "$GATEWAY_DROPIN_SRC" && -x "$HERMES_BIN" ]]; then
@@ -1667,14 +1687,36 @@ EOF
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
 
+    # First-time install of z-runtime-env.conf on an existing host counts as
+    # an env-source change for the running gateway — track it so the restart
+    # below picks up the new EnvironmentFile= line.
+    prev_z_dropin_sha=""
+    [[ -f "$GATEWAY_RUNTIME_DROPIN_DST" ]] && prev_z_dropin_sha="$(sha256sum "$GATEWAY_RUNTIME_DROPIN_DST" | cut -d' ' -f1)"
     echo "==> installing runtime-env drop-in at $GATEWAY_RUNTIME_DROPIN_DST"
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_RUNTIME_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_RUNTIME_DROPIN_DST"
+    new_z_dropin_sha="$(sha256sum "$GATEWAY_RUNTIME_DROPIN_DST" | cut -d' ' -f1)"
+    [[ "$prev_z_dropin_sha" != "$new_z_dropin_sha" ]] && GATEWAY_NEEDS_RESTART=1
 
     systemctl daemon-reload
 
+    # Capture the gateway's pre-install activity so we can decide whether a
+    # restart is actually warranted. `enable --now` on an inactive unit
+    # starts it fresh with the new EnvironmentFile= already loaded — no
+    # restart needed. An already-active gateway picks up no env changes
+    # from `daemon-reload` alone (it only refreshes systemd's view of unit
+    # definitions, not the running process's environment), so we have to
+    # `try-restart` it explicitly when env/config content actually changed.
+    gateway_was_active=0
+    systemctl is-active hermes-gateway.service >/dev/null 2>&1 && gateway_was_active=1
+
     if [[ -f "$GATEWAY_SLACK_ENV" ]]; then
       systemctl enable --now hermes-gateway.service
+      if (( GATEWAY_NEEDS_RESTART && gateway_was_active )); then
+        echo "==> gateway env/config content changed; restarting hermes-gateway.service"
+        systemctl try-restart hermes-gateway.service
+        systemctl --no-pager --lines=0 status hermes-gateway.service || true
+      fi
     else
       echo "==> $GATEWAY_SLACK_ENV not staged; gateway unit installed but left disabled" >&2
       echo "    Stage the file with SLACK_BOT_TOKEN / SLACK_APP_TOKEN, then:" >&2

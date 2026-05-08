@@ -34,7 +34,8 @@
 #                                 merges this into config.yaml on every run,
 #                                 so a successful `hermes auth add` is no
 #                                 longer required to land the right pin
-#                                 (per ITRY-1316).
+#                                 (the CLI's config-update step can fail
+#                                 silently when config.yaml is root-owned).
 #   gateway.model_base_url     — optional override for the provider's default
 #                                 base URL. Leave empty to use the provider
 #                                 default; set only for self-hosted endpoints

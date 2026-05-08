@@ -25,8 +25,9 @@ Subcommands:
                                   values.yaml. Preserves every other top-
                                   level key. Run on every install so
                                   ``hermes auth add`` config-update
-                                  failures (ITRY-1316) can't leave the
-                                  provider pin drifted.
+                                  failures (it can fail silently when
+                                  config.yaml is root-owned) can't leave
+                                  the provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
   list-repos                   — emit one TSV line per repos[] entry
@@ -204,12 +205,28 @@ def cmd_render_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+# Header re-emitted on every config.yaml write (seeder *and* model merge) so
+# the file's contract matches reality. Operator-added top-level keys
+# survive across re-installs, but YAML comments (including this header)
+# don't — merge-config-model round-trips through PyYAML on every install,
+# which strips comments.
+_CONFIG_YAML_HEADER = (
+    "# Seeded by setup-hermes.sh from deploy.values.yaml.\n"
+    "# Operator-added top-level keys are preserved across re-installs,\n"
+    "# but YAML comments are not — model.* is rewritten on every run\n"
+    "# (round-trips the file). Prefer deploy.values.yaml for non-secret\n"
+    "# config knobs; edit known keys here only when they aren't yet\n"
+    "# values-driven.\n"
+)
+
+
 def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     """Seed <target>/config.yaml from slack.runtime.
 
     Idempotent: refuses to overwrite an existing file unless --force is
     passed. The installer relies on this so operator hand-edits to the live
-    config survive subsequent re-runs.
+    config survive subsequent re-runs (only model.* is later rewritten by
+    cmd_merge_config_model).
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -236,17 +253,13 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
         slack_block["channel_prompts"] = {str(k): str(v) for k, v in cp.items()}
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    header = (
-        "# Seeded by setup-hermes.sh from deploy.values.yaml on first install.\n"
-        "# Subsequent installer runs preserve this file — edit freely.\n"
-    )
     # Always write a file (even with an empty body) so setup-hermes.sh can
     # rely on the path existing for chown/chmod.
     if slack_block:
         body = yaml.safe_dump({"slack": slack_block}, sort_keys=False, default_flow_style=False)
     else:
         body = "# No recognized slack.runtime keys in deploy.values.yaml.\n"
-    out_path.write_text(header + body, encoding="utf-8")
+    out_path.write_text(_CONFIG_YAML_HEADER + body, encoding="utf-8")
     sys.stdout.write(f"wrote: {out_path}\n")
     return 0
 
@@ -258,8 +271,8 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     the ``model:`` block if missing), preserve every other top-level key.
     Run on every install so the gateway's provider pin matches what
     ``deploy.values.yaml`` declares — independent of whether
-    ``hermes auth add`` ran successfully (per ITRY-1316, it can fail
-    silently when the seeded config.yaml is root-owned).
+    ``hermes auth add`` ran successfully (it can fail silently when the
+    seeded config.yaml is root-owned).
 
     Roundtrips through PyYAML, so YAML-level comments inside config.yaml
     are not preserved (matching ``hermes_cli.config.save_config``'s existing
@@ -319,8 +332,14 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
         model_block.pop("base_url", None)
     existing["model"] = model_block
 
+    # Re-emit the standard header so the file's intro text doesn't quietly
+    # vanish after the first merge (the round-trip strips any prior
+    # comments). Keeps the operator-facing wording in sync with reality on
+    # every run. Note: comments operators add inside config.yaml are still
+    # not preserved — only this fixed leading block is.
     out_path.write_text(
-        yaml.safe_dump(existing, sort_keys=False, default_flow_style=False),
+        _CONFIG_YAML_HEADER
+        + yaml.safe_dump(existing, sort_keys=False, default_flow_style=False),
         encoding="utf-8",
     )
     sys.stdout.write(f"merged: {out_path} model.provider={provider}\n")

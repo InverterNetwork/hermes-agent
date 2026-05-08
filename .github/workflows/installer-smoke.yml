@@ -158,12 +158,12 @@ PY
             --git-identity-email didier@ci
 
       - name: values-derived runtime config probe
-        # ITRY-1319: deploy.values.yaml is now the source of truth for the
-        # gateway's model provider pin and for non-secret env vars
-        # (SLACK_ALLOWED_USERS, LINEAR_TEAM_<KEY>). setup-hermes.sh writes
-        # auth/gateway-runtime.env on every run (independent of --auth-method)
-        # and merges gateway.model_* into config.yaml. Both must land cleanly
-        # on first install and re-runs.
+        # deploy.values.yaml is the source of truth for the gateway's model
+        # provider pin and for non-secret env vars (SLACK_ALLOWED_USERS,
+        # LINEAR_TEAM_<KEY>). setup-hermes.sh writes auth/gateway-runtime.env
+        # on every run (independent of --auth-method) and merges
+        # gateway.model_* into config.yaml. Both must land cleanly on first
+        # install and re-runs.
         run: |
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes
@@ -186,12 +186,19 @@ PY
               "$T/config.yaml" \
               || { echo "FAIL: model.provider not merged into config.yaml"; cat "$T/config.yaml"; exit 1; }
 
-            # And the runtime drop-in references the file.
+            # And the runtime drop-in references the file. The `z-` prefix is
+            # load-order sensitive: systemd merges drop-ins in lexical order
+            # and the values.yaml-derived value must win on collision with a
+            # legacy SLACK_ALLOWED_USERS line in slack.env.
             unitd=/etc/systemd/system/hermes-gateway.service.d
-            [[ -f "$unitd/runtime-env.conf" ]] \
-              || { echo "FAIL: runtime-env.conf drop-in missing"; ls -la "$unitd"; exit 1; }
-            grep -Fq "auth/gateway-runtime.env" "$unitd/runtime-env.conf" \
-              || { echo "FAIL: runtime-env.conf does not reference gateway-runtime.env"; cat "$unitd/runtime-env.conf"; exit 1; }
+            [[ -f "$unitd/z-runtime-env.conf" ]] \
+              || { echo "FAIL: z-runtime-env.conf drop-in missing"; ls -la "$unitd"; exit 1; }
+            grep -Fq "auth/gateway-runtime.env" "$unitd/z-runtime-env.conf" \
+              || { echo "FAIL: z-runtime-env.conf does not reference gateway-runtime.env"; cat "$unitd/z-runtime-env.conf"; exit 1; }
+            # Sort order assertion — last drop-in alphabetically must be ours.
+            last_dropin=$(ls "$unitd"/*.conf | sort | tail -n1)
+            [[ "$last_dropin" == "$unitd/z-runtime-env.conf" ]] \
+              || { echo "FAIL: z-runtime-env.conf does not sort last (got: $last_dropin)"; ls "$unitd"; exit 1; }
             echo "values-derived runtime config probe: OK"
           '
 

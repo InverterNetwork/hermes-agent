@@ -407,6 +407,25 @@ class TestMergeConfigModel:
         assert "does not exist" in r.stderr
         assert not config.exists()
 
+    def test_header_re_emitted_on_merge(self, tmp_path: Path):
+        # The round-trip strips comments; merge-config-model must re-emit
+        # the standard header so the file's intro text doesn't disappear
+        # after the first re-install (operators rely on the header to
+        # know what's preserved across runs and what isn't).
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        # Simulate a config.yaml that has lost its header (e.g. after a
+        # prior merge or hand-edit that stripped the seeded comment).
+        config.write_text("slack:\n  require_mention: true\n", encoding="utf-8")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        text = config.read_text()
+        assert text.startswith("# Seeded by setup-hermes.sh from deploy.values.yaml.")
+        # And the honest wording stuck.
+        assert "Operator-added top-level keys are preserved" in text
+        assert "YAML comments are not" in text
+
     def test_invalid_yaml_in_config_is_error(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
