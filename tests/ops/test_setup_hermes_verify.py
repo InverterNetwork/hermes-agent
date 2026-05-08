@@ -106,6 +106,11 @@ def install(tmp_path: Path) -> dict:
     # RUNTIME_VERSION matches fork HEAD on a clean install.
     (target / "RUNTIME_VERSION").write_text(fork_sha)
 
+    # The fixture's actual owner is $USER, which the verify-side override
+    # treats as agent_owner — so a clean install passes.
+    (target / "config.yaml").write_text("model: {}\n")
+    (target / "config.yaml").chmod(0o644)
+
     # Stub systemctl in PATH bin so verify thinks the timers are loaded.
     # Verify invokes `systemctl show -p <Prop> --value <unit>` once per
     # property, so the stub returns a single value matching the requested
@@ -156,7 +161,11 @@ def install(tmp_path: Path) -> dict:
     }
 
 
-def _run_verify(install: dict, *extra: str) -> subprocess.CompletedProcess:
+def _run_verify(
+    install: dict,
+    *extra: str,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["PATH"] = f"{install['bin']}{os.pathsep}{env['PATH']}"
     # Test fixture can't chown to root, so tell verify to expect $USER on both
@@ -164,6 +173,8 @@ def _run_verify(install: dict, *extra: str) -> subprocess.CompletedProcess:
     env["HERMES_VERIFY_EXPECT_RAILS_OWNER"] = install["user"]
     env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
     env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.run(
         [
             "bash", str(SCRIPT),
@@ -274,6 +285,36 @@ class TestSetupHermesVerify:
         result = _run_verify(install)
         assert result.returncode == 1
         assert "[DRIFT] sessions" in result.stderr
+
+    def test_missing_config_yaml_is_drift(self, install):
+        """config.yaml is seeded by the installer on first run; absence
+        means a partial install and the gateway will crash on first start."""
+        (install["target"] / "config.yaml").unlink()
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] config.yaml" in result.stderr
+        assert "missing" in result.stderr
+
+    def test_root_owned_config_yaml_is_drift(self, install):
+        """Tests can't actually chown to root, so flip the verify-side
+        agent-owner override to a synthetic user — the fixture file
+        (owned by $USER) then mismatches and exercises the same code
+        path as a root-owned production install.
+        """
+        result = _run_verify(
+            install, env_overrides={"HERMES_VERIFY_EXPECT_AGENT_OWNER": "nobody"},
+        )
+        assert result.returncode == 1
+        assert "[DRIFT] config.yaml" in result.stderr
+        assert f"owner={install['user']}" in result.stderr
+        assert "expected 644 nobody" in result.stderr
+
+    def test_wrong_mode_config_yaml_is_drift(self, install):
+        (install["target"] / "config.yaml").chmod(0o600)
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] config.yaml" in result.stderr
+        assert "mode=600" in result.stderr
 
     def test_app_auth_clean_passes(self, install):
         """--auth-method app + every artefact in place → verify runs the

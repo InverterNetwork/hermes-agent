@@ -367,6 +367,22 @@ do_verify() {
     fi
   done
 
+  # ---- config.yaml ----
+  # Must be agent-writable — see seed block below for the full WHY.
+  local cfg="$target/config.yaml"
+  if [[ ! -f "$cfg" ]]; then
+    v_drift "config.yaml" "missing: $cfg"
+  else
+    local cmode cowner
+    cmode="$(_mode "$cfg")"
+    cowner="$(_owner "$cfg")"
+    if [[ "$cmode" == "644" && "$cowner" == "$agent_owner" ]]; then
+      v_ok "config.yaml: $cmode $cowner"
+    else
+      v_drift "config.yaml" "mode=$cmode owner=$cowner (expected 644 $agent_owner)"
+    fi
+  fi
+
   # ---- state symlinks ----
   local link tgt
   for d in skills memories cron; do
@@ -1003,8 +1019,6 @@ else
   echo "==> seeding $CONFIG_YAML_OUT from $VALUES_FILE"
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
     render-runtime-config --out "$CONFIG_YAML_OUT"
-  chown root:root "$CONFIG_YAML_OUT"
-  chmod 644 "$CONFIG_YAML_OUT"
 fi
 
 # model.* is rewritten on every run, even when the file above was preserved
@@ -1014,8 +1028,13 @@ config_sha_pre="$(file_sha "$CONFIG_YAML_OUT")"
 echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   merge-config-model --out "$CONFIG_YAML_OUT"
-chown root:root "$CONFIG_YAML_OUT"
-chmod 644 "$CONFIG_YAML_OUT"
+# config.yaml must be agent-writable: `hermes auth add` rewrites
+# model.provider after the OAuth flow, and `hermes model` does the same on
+# the interactive picker. Root-owned silently no-ops those writes.
+# merge-config-model always runs (even on preserved files), so this single
+# chown self-heals legacy root-owned hosts on the next install.
+chown "$AGENT_USER:$AGENT_USER" "$CONFIG_YAML_OUT"
+chmod 0644 "$CONFIG_YAML_OUT"
 [[ "$config_sha_pre" != "$(file_sha "$CONFIG_YAML_OUT")" ]] && GATEWAY_NEEDS_RESTART=1
 
 # ---------- venv (rails-class) ----------
