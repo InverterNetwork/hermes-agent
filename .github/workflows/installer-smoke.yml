@@ -117,28 +117,32 @@ jobs:
           # fixture and append the two new code-only entries to repos[].
           # Use python to round-trip through PyYAML so the structure stays
           # valid no matter where `quay:` lives relative to `repos:`.
-          sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE" <<'PY'
-import sys, yaml
-quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
-path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
-with open(path) as f:
-    data = yaml.safe_load(f)
-for entry in data.get("repos", []):
-    if entry.get("id") == "test-factory-code":
-        entry["url"] = f"file://{quay_fixture}"
-data["repos"].append({
-    "id": "code-only-fixture",
-    "url": f"file://{code_fixture}",
-    "base_branch": "main",
-})
-data["repos"].append({
-    "id": "non-default-branch-fixture",
-    "url": f"file://{dev_fixture}",
-    "base_branch": "develop",
-})
-with open(path, "w") as f:
-    yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
-PY
+          # The heredoc body is indented to keep the YAML `run: |` block
+          # scalar intact (a column-0 line would terminate it); `sed`
+          # strips the indent before Python sees it, so the script reads
+          # as column-0 module-level code.
+          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          import sys, yaml
+          quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
+          path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
+          with open(path) as f:
+              data = yaml.safe_load(f)
+          for entry in data.get("repos", []):
+              if entry.get("id") == "test-factory-code":
+                  entry["url"] = f"file://{quay_fixture}"
+          data["repos"].append({
+              "id": "code-only-fixture",
+              "url": f"file://{code_fixture}",
+              "base_branch": "main",
+          })
+          data["repos"].append({
+              "id": "non-default-branch-fixture",
+              "url": f"file://{dev_fixture}",
+              "base_branch": "develop",
+          })
+          with open(path, "w") as f:
+              yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+          PY
 
       - name: install claude shim (satisfies installer claude prerequisite check)
         # The installer (ITRY-1311) fails loud when quay.agent_invocation
