@@ -578,6 +578,49 @@ do_verify() {
         fi
       fi
     fi
+
+    # No verify-side check on ~/.quay/ presence: the quay binary
+    # re-creates that path as a workspace side effect on every
+    # invocation, even with QUAY_DATA_DIR pinned elsewhere, so any
+    # post-install snapshot finds it present again. Drift detection
+    # for ad-hoc adds lives in the install-time reconciler, which
+    # probes the dir's contents (registrations + tasks) rather than
+    # its existence — see installer/setup-hermes.sh →
+    # reconcile_stale_quay_dir.
+
+    # ---- operator-invocation glue ----
+    # Both paths are overridable so the test fixture can seed stubs in
+    # tmp dirs instead of writing under /usr/local/bin or /etc.
+    local quay_wrapper="${HERMES_VERIFY_QUAY_WRAPPER:-/usr/local/bin/quay-as-hermes}"
+    if [[ -x "$quay_wrapper" ]]; then
+      local wmode wowner
+      wmode="$(_mode "$quay_wrapper")"
+      wowner="$(_owner "$quay_wrapper")"
+      if [[ "$wmode" == "755" && "$wowner" == "$rails_owner" ]]; then
+        v_ok "quay-as-hermes wrapper: $wmode $wowner"
+      else
+        v_drift "quay-as-hermes wrapper" "mode=$wmode owner=$wowner (expected 755 $rails_owner)"
+      fi
+    else
+      v_drift "quay-as-hermes wrapper" "missing or non-executable: $quay_wrapper"
+    fi
+    local quay_profile="${HERMES_VERIFY_QUAY_PROFILE:-/etc/profile.d/quay-data-dir.sh}"
+    if [[ -f "$quay_profile" ]]; then
+      local pmode powner
+      pmode="$(_mode "$quay_profile")"
+      powner="$(_owner "$quay_profile")"
+      # Login shells source this; an agent-writable copy would let the
+      # agent override the canonical export with arbitrary env. Same
+      # owner/mode contract as the wrapper above (mode 644 instead of
+      # 755 — sourced, not executed).
+      if [[ "$pmode" == "644" && "$powner" == "$rails_owner" ]]; then
+        v_ok "quay profile.d drop-in: $pmode $powner"
+      else
+        v_drift "quay profile.d drop-in" "mode=$pmode owner=$powner (expected 644 $rails_owner)"
+      fi
+    else
+      v_drift "quay profile.d drop-in" "missing: $quay_profile"
+    fi
   fi
 
   # ---- per-entry code mirror checks + optional bare clone + registration ----
@@ -909,6 +952,35 @@ else
   install -o root -g root -m 0755 "$QUAY_TMP/$QUAY_ASSET" "$QUAY_BIN_DST"
   rm -rf "$QUAY_TMP"
   trap - EXIT
+fi
+
+# ---------- operator-invocation glue (wrapper + profile.d) ----------
+# Source files at ops/quay-as-hermes and ops/profile.d/quay-data-dir.sh
+# carry the rationale; this block is just the templated install pair.
+
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  QUAY_WRAPPER_SRC="$FORK_DIR/ops/quay-as-hermes"
+  if [[ -f "$QUAY_WRAPPER_SRC" ]]; then
+    echo "==> installing /usr/local/bin/quay-as-hermes wrapper"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        "$QUAY_WRAPPER_SRC" \
+      | install -o root -g root -m 0755 /dev/stdin /usr/local/bin/quay-as-hermes
+  else
+    echo "==> WARNING: $QUAY_WRAPPER_SRC missing; skipping quay-as-hermes wrapper" >&2
+  fi
+
+  QUAY_PROFILE_SRC="$FORK_DIR/ops/profile.d/quay-data-dir.sh"
+  if [[ -f "$QUAY_PROFILE_SRC" ]]; then
+    echo "==> installing /etc/profile.d/quay-data-dir.sh"
+    install -d -o root -g root -m 0755 /etc/profile.d
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        "$QUAY_PROFILE_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/profile.d/quay-data-dir.sh
+  else
+    echo "==> WARNING: $QUAY_PROFILE_SRC missing; skipping profile.d drop-in" >&2
+  fi
 fi
 
 # ---------- claude CLI prerequisite check ----------
@@ -1302,12 +1374,118 @@ install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$CODE_ROOT"
 
 ALL_REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
 
+# ---------- stale ~/.quay/ cleanup + drift refusal ----------
+# Empty/equivalent stale dirs are removed declaratively (configs-as-code,
+# no opt-in flag); stale dirs holding tasks or non-declared registrations
+# refuse the install with a remediation hint. Runs BEFORE any quay
+# invocation: the binary creates ~/.quay/ as a side effect (workspace
+# cache) even with QUAY_DATA_DIR set, so reconciling after a snapshot
+# would loop on freshly-side-effected state and risks corrupting
+# canonical when the post-install tick fires against a torn-down dir.
+
+reconcile_stale_quay_dir() {
+  local stale_dir="$AGENT_HOME/.quay"
+  # `rm -rf` on a symlink unlinks the link, not its target — safe even
+  # if an operator pointed it at the canonical dir as a workaround.
+  [[ -e "$stale_dir" || -L "$stale_dir" ]] || return 0
+
+  echo "==> detected stale $stale_dir (pre-wrapper ad-hoc invocations)"
+
+  # Symlinks (and any other non-directory) carry no independent state —
+  # just unlink.
+  if [[ ! -d "$stale_dir" || -L "$stale_dir" ]]; then
+    echo "==> $stale_dir is not a real data dir; removing"
+    rm -rf "$stale_dir"
+    return 0
+  fi
+
+  if [[ ! -f "$stale_dir/quay.db" ]]; then
+    echo "==> $stale_dir has no quay.db; removing"
+    rm -rf "$stale_dir"
+    return 0
+  fi
+
+  # Probe the stale DB via the binary, not raw SQLite — the schema is
+  # quay's to define, and the binary is the only thing that knows the
+  # current shape. Run as the agent (dir is agent-owned) with
+  # QUAY_DATA_DIR pinned to stale, so reads target THAT db. Both probes
+  # capture pipeline failure into probe_failed (refuse-on-uncertainty);
+  # the parser's stderr is intentionally not silenced so a future format
+  # drift surfaces a "values_helper.py: …" diagnostic to the operator.
+  local stale_repo_ids stale_task_count probe_failed=0
+  if ! stale_repo_ids="$(sudo -u "$AGENT_USER" \
+        env QUAY_DATA_DIR="$stale_dir" "$QUAY_BIN_DST" repo list 2>/dev/null \
+        | python3 "$VALUES_HELPER" parse-repo-list-ids)"; then
+    probe_failed=1
+    stale_repo_ids=""
+  fi
+  if ! stale_task_count="$(sudo -u "$AGENT_USER" \
+        env QUAY_DATA_DIR="$stale_dir" "$QUAY_BIN_DST" task list 2>/dev/null \
+        | python3 "$VALUES_HELPER" parse-task-list-count)"; then
+    probe_failed=1
+    stale_task_count=0
+  fi
+
+  # Expected = values-file repos[]. Configs-as-code: declared state is
+  # the source of truth, so stale ids outside it are undeclared ad-hoc
+  # adds the operator must reconcile (declare or discard) before we
+  # can safely remove the stale dir.
+  local expected_ids=""
+  [[ -n "$ALL_REPOS_TSV" ]] && expected_ids="$(cut -f1 <<<"$ALL_REPOS_TSV")"
+  local stale_extra_ids=""
+  while IFS= read -r sid; do
+    [[ -z "$sid" ]] && continue
+    grep -Fxq "$sid" <<<"$expected_ids" || stale_extra_ids+="$sid"$'\n'
+  done <<<"$stale_repo_ids"
+  stale_extra_ids="${stale_extra_ids%$'\n'}"
+
+  if [[ "$probe_failed" -eq 0 && "$stale_task_count" -eq 0 && -z "$stale_extra_ids" ]]; then
+    echo "==> $stale_dir is empty/equivalent to canonical; removing"
+    rm -rf "$stale_dir"
+    return 0
+  fi
+
+  {
+    echo "FAIL: $stale_dir holds data not accounted for in $TARGET_DIR/quay/."
+    if [[ "$probe_failed" -eq 1 ]]; then
+      echo "      could not probe stale DB via \`quay {repo,task} list\`"
+      echo "      (refuse-on-uncertainty: cannot safely drop unknown state)"
+    elif [[ "$stale_task_count" -gt 0 ]]; then
+      echo "      tasks in stale DB: $stale_task_count"
+    fi
+    if [[ -n "$stale_extra_ids" ]]; then
+      echo "      registrations in stale DB not declared in deploy.values.yaml repos[]"
+      echo "      and not present in canonical:"
+      while IFS= read -r sid; do
+        [[ -n "$sid" ]] && echo "        - $sid"
+      done <<<"$stale_extra_ids"
+    fi
+    echo
+    echo "      Inspect with the same env the stale dir was created against:"
+    echo "        sudo -u $AGENT_USER env QUAY_DATA_DIR=$stale_dir \\"
+    echo "          $QUAY_BIN_DST repo list"
+    echo "        sudo -u $AGENT_USER env QUAY_DATA_DIR=$stale_dir \\"
+    echo "          $QUAY_BIN_DST task list"
+    echo "      Then either declare the registrations in deploy.values.yaml"
+    echo "      repos[] (and let the next install pick them up), or discard"
+    echo "      them by removing $stale_dir, and re-run the installer."
+  } >&2
+  exit 1
+}
+
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  reconcile_stale_quay_dir
+fi
+
 # Snapshot quay's already-registered ids ONCE per install, before the
 # per-repo loop, so re-runs of `quay repo add` are no-ops. A fresh data
 # dir applies embedded migrations on first invocation and returns [];
 # parse failure aborts the install — silently treating it as "no
 # registrations" would re-invoke `quay repo add` on every re-run, which
-# is not documented as idempotent.
+# is not documented as idempotent. Runs AFTER reconcile_stale_quay_dir
+# because the binary creates ~/.quay/ as a side effect when invoked,
+# and we don't want our own snapshot to leave drift the next reconciler
+# pass would have to clean up.
 QUAY_REGISTERED_IDS=""
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   QUAY_REGISTERED_IDS="$(
