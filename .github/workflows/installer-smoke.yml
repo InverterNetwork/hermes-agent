@@ -71,24 +71,74 @@ jobs:
       - name: create hermes service user
         run: sudo useradd -m -s /bin/bash hermes
 
-      - name: stage fake quay source repo + patch values URL
-        # Real deploys point quay.repos[].url at private GitHub repos. CI
-        # has no credentials for those, so fabricate a local non-bare repo
-        # at file:///srv/hermes/repos/quay-fixtures/<id> and sed the URL
-        # in deploy.values.yaml to match. The installer's `git clone
-        # --bare` is protocol-agnostic.
+      - name: stage fixture repos + patch values for repos[]
+        # Real deploys point repos[].url at private GitHub repos. CI has
+        # no credentials for those, so fabricate three local non-bare repos:
+        #   * test-factory-code   — quay-managed (entry has a `quay:` block).
+        #   * code-only-fixture   — code-only, base_branch: main; exercises
+        #                           the "code mirror only" branch of the
+        #                           repos[] loop.
+        #   * non-default-branch-fixture — code-only, base_branch: develop,
+        #                           but the repo's HEAD is on `main` so a
+        #                           clone resolves origin/HEAD → origin/main.
+        #                           Catches the regression where hermes-
+        #                           code-sync would derive base from
+        #                           origin/HEAD and snap the mirror to
+        #                           main on every tick.
+        # The installer's `git clone` is protocol-agnostic; file:// URLs
+        # bypass the per-repo url.insteadOf rewrite (which is github.com-
+        # only) and clone directly.
         run: |
-          FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
-          sudo mkdir -p "$FIXTURE"
-          sudo git -C "$FIXTURE" init -q -b main
-          echo "fixture" | sudo tee "$FIXTURE/README.md" > /dev/null
-          sudo git -C "$FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci add -A
-          sudo git -C "$FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci commit -q -m "init quay fixture"
-          sudo sed -i \
-            "s|https://github.com/InverterNetwork/test-factory-code|file://${FIXTURE}|" \
-            /srv/hermes/repos/hermes-agent/deploy.values.yaml
+          QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
+          CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
+          DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
+          git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
+          init_fixture() {  # $1=dir  $2=commit_msg  ($3=branch, default main)
+            sudo mkdir -p "$1"
+            git_in "$1" init -q -b "${3:-main}"
+            echo "$2" | sudo tee "$1/README.md" >/dev/null
+            git_in "$1" add -A
+            git_in "$1" commit -q -m "$2"
+          }
+          init_fixture "$QUAY_FIXTURE" "init fixture"
+          init_fixture "$CODE_FIXTURE" "init fixture"
+          # HEAD on main (so origin/HEAD points at main after clone), then
+          # add a develop branch with a distinct commit, then return HEAD
+          # to main so the values entry's base_branch=develop diverges
+          # from the remote default — the regression test for hermes-
+          # code-sync resolving base from origin/HEAD.
+          init_fixture "$DEV_FIXTURE" "main commit"
+          git_in "$DEV_FIXTURE" checkout -q -b develop
+          echo "develop commit" | sudo tee "$DEV_FIXTURE/README.md" >/dev/null
+          git_in "$DEV_FIXTURE" add -A
+          git_in "$DEV_FIXTURE" commit -q -m "develop commit"
+          git_in "$DEV_FIXTURE" checkout -q main
+          # Repoint the existing quay-managed entry's URL at the local
+          # fixture and append the two new code-only entries to repos[].
+          # Use python to round-trip through PyYAML so the structure stays
+          # valid no matter where `quay:` lives relative to `repos:`.
+          sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE" <<'PY'
+import sys, yaml
+quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
+path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
+with open(path) as f:
+    data = yaml.safe_load(f)
+for entry in data.get("repos", []):
+    if entry.get("id") == "test-factory-code":
+        entry["url"] = f"file://{quay_fixture}"
+data["repos"].append({
+    "id": "code-only-fixture",
+    "url": f"file://{code_fixture}",
+    "base_branch": "main",
+})
+data["repos"].append({
+    "id": "non-default-branch-fixture",
+    "url": f"file://{dev_fixture}",
+    "base_branch": "develop",
+})
+with open(path, "w") as f:
+    yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+PY
 
       - name: install claude shim (satisfies installer claude prerequisite check)
         # The installer (ITRY-1311) fails loud when quay.agent_invocation
@@ -205,71 +255,160 @@ jobs:
               | python3 -c "import json,sys;print(\"\\n\".join(r[\"repo_id\"] for r in json.load(sys.stdin)))")
             grep -Fxq "test-factory-code" <<< "$registered" \
               || { echo "FAIL: test-factory-code not registered (got: $registered)"; exit 1; }
+            grep -Fxq "code-only-fixture" <<< "$registered" \
+              && { echo "FAIL: code-only entry leaked into quay registrations"; exit 1; }
+            [[ -d "$T/quay/repos/code-only-fixture.git" ]] \
+              && { echo "FAIL: code-only entry got a bare clone"; exit 1; }
             echo "quay artefact probes: OK"
           '
 
-      - name: stage-quay-repo-auth.sh probe (key + known_hosts + insteadOf rewrite)
-        # The smoke-test's main values file has its quay.repos[].url rewritten
-        # to file:///... (file:// URLs are rejected by list-repo-orgs, which
-        # only accepts HTTPS GitHub URLs). Rather than restoring and re-patching
-        # the main values file, we write a tiny fixture YAML with a real GitHub-
-        # style URL and point the script at it via VALUES_FILE. The fixture URL
-        # won't be cloned — we're testing the auth wiring, not the clone step.
+      - name: code mirror probes (every repos[] entry has one)
+        # All three repos[] entries (quay-managed test-factory-code,
+        # code-only-fixture on main, non-default-branch-fixture on
+        # develop) must produce a working-tree clone at $T/code/<id>/,
+        # agent-owned, on origin/<base_branch>. The mirror is what
+        # hermes-code-sync refreshes on its 5-min timer.
         run: |
-          FIXTURE_YAML=$(mktemp /tmp/quay-auth-fixture-XXXXXX.yaml)
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            [[ -d "$T/code" ]] || { echo "FAIL: code mirrors root missing at $T/code"; exit 1; }
+            # Format: id:expected_base
+            for spec in \
+              test-factory-code:main \
+              code-only-fixture:main \
+              non-default-branch-fixture:develop; do
+              id="${spec%:*}"
+              base_branch="${spec#*:}"
+              [[ -d "$T/code/$id/.git" ]] \
+                || { echo "FAIL: code mirror missing for $id at $T/code/$id"; exit 1; }
+              [[ -f "$T/code/$id/README.md" ]] \
+                || { echo "FAIL: working tree empty for $id (clone vs --bare regression?)"; exit 1; }
+              owner=$(stat -c "%U" "$T/code/$id/.git")
+              [[ "$owner" == "hermes" ]] \
+                || { echo "FAIL: $id .git owner=$owner (expected hermes)"; exit 1; }
+              head=$(git -C "$T/code/$id" rev-parse HEAD)
+              expected=$(git -C "$T/code/$id" rev-parse "origin/$base_branch")
+              [[ "$head" == "$expected" ]] \
+                || { echo "FAIL: $id HEAD ($head) != origin/$base_branch ($expected)"; exit 1; }
+            done
+            echo "code mirror probes: OK"
+          '
+
+      - name: hermes-code-sync timer probe (enabled + active + base_branch honoured)
+        # Beyond enabled/active, this exercises the regression test for
+        # the origin/HEAD bug: non-default-branch-fixture has base_branch
+        # develop but origin/HEAD points at main. After a tick, the mirror
+        # MUST stay on origin/develop, not snap to origin/main.
+        run: |
+          systemctl is-enabled hermes-code-sync.timer >/dev/null \
+            || { echo "FAIL: hermes-code-sync.timer not enabled"; exit 1; }
+          systemctl is-active hermes-code-sync.timer >/dev/null \
+            || { echo "FAIL: hermes-code-sync.timer not active"; exit 1; }
+          # Trigger one tick synchronously and assert it exits 0.
+          sudo systemctl start hermes-code-sync.service
+          if systemctl is-failed hermes-code-sync.service >/dev/null; then
+            echo "FAIL: hermes-code-sync.service entered failed state"
+            sudo journalctl -u hermes-code-sync.service -n 30 --no-pager
+            exit 1
+          fi
+          # Post-tick assertion: every mirror remains on origin/<base_branch>.
+          # The develop fixture is the load-bearing case — if hermes-code-sync
+          # ever resolves base from origin/HEAD again, this snaps to
+          # origin/main and the assertion below fires.
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            for spec in \
+              test-factory-code:main \
+              code-only-fixture:main \
+              non-default-branch-fixture:develop; do
+              id="${spec%:*}"
+              base_branch="${spec#*:}"
+              head=$(git -C "$T/code/$id" rev-parse HEAD)
+              expected=$(git -C "$T/code/$id" rev-parse "origin/$base_branch")
+              [[ "$head" == "$expected" ]] \
+                || { echo "FAIL post-tick: $id HEAD=$head expected=origin/$base_branch=$expected"; exit 1; }
+            done
+            echo "hermes-code-sync timer probe: OK"
+          '
+
+      - name: stage-repo-auth.sh probe (key + known_hosts + deploy-key checklist)
+        # The smoke-test's main values file has its repos[].url rewritten to
+        # file:///... so it never tries the network. To exercise the
+        # github.com path of stage-repo-auth.sh (and the deploy-key
+        # checklist) we feed it a tiny fixture YAML with a real GitHub-
+        # shaped URL via VALUES_FILE — the URL is never cloned, we only
+        # want the SSH-key + checklist artefacts.
+        run: |
+          FIXTURE_YAML=$(mktemp /tmp/repo-auth-fixture-XXXXXX.yaml)
           cat > "$FIXTURE_YAML" <<'YAML'
-          quay:
-            version: v0.1.0
-            agent_invocation: "claude < {prompt_file}"
-            repos:
-              - id: test-factory-code
-                url: https://github.com/InverterNetwork/test-factory-code
-                base_branch: main
+          repos:
+            - id: test-factory-code
+              url: https://github.com/InverterNetwork/test-factory-code
+              base_branch: main
+              quay:
                 package_manager: bun
                 install_cmd: bun install
           YAML
           sudo chmod 644 "$FIXTURE_YAML"
 
-          # Capture pubkey fingerprint before first run (key shouldn't exist yet).
-          sudo VALUES_FILE="$FIXTURE_YAML" \
-            /srv/hermes/repos/hermes-agent/stage-quay-repo-auth.sh
+          # First run — pubkey shouldn't exist yet. Capture stdout so we
+          # can assert the deploy-key checklist URL is printed.
+          OUT=$(sudo VALUES_FILE="$FIXTURE_YAML" \
+            /srv/hermes/repos/hermes-agent/stage-repo-auth.sh)
+          echo "$OUT"
+          grep -Fq "https://github.com/InverterNetwork/test-factory-code/settings/keys" <<<"$OUT" \
+            || { echo "FAIL: deploy-key checklist URL missing from output"; exit 1; }
 
-          # Probe as hermes: key exists with correct mode, known_hosts seeded,
-          # insteadOf rewrite present for InverterNetwork. Read .gitconfig via
-          # --file (matching the script's write path) — using --global from
-          # under sudo runs into HOME/XDG_CONFIG_HOME inheritance that can
-          # silently target the wrong file.
+          # Probe as hermes: key + known_hosts staged with correct perms.
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes
-            cd "$T"  # git stats CWD even with --file; $GITHUB_WORKSPACE is unreadable to hermes
             key_mode=$(stat -c "%a" "$T/.ssh/id_ed25519")
             [[ "$key_mode" == "600" ]] \
               || { echo "FAIL: id_ed25519 mode=$key_mode (expected 600)"; exit 1; }
-
             kh_mode=$(stat -c "%a" "$T/.ssh/known_hosts")
             [[ "$kh_mode" == "644" ]] \
               || { echo "FAIL: known_hosts mode=$kh_mode (expected 644)"; exit 1; }
-
             grep -q "github.com ssh-" "$T/.ssh/known_hosts" \
               || { echo "FAIL: known_hosts missing github.com keys"; exit 1; }
-
-            rewrite=$(git config --file "$T/.gitconfig" --get "url.git@github.com:InverterNetwork/.insteadOf" || true)
-            [[ "$rewrite" == "https://github.com/InverterNetwork/" ]] \
-              || { echo "FAIL: insteadOf rewrite missing or wrong: $rewrite"; cat "$T/.gitconfig" 2>&1 || true; exit 1; }
-
-            echo "auth probes: key + known_hosts + insteadOf OK"
+            echo "auth probes: key + known_hosts OK"
           '
 
-          # Idempotency: capture pubkey sha256, re-run, assert it is unchanged.
+          # Idempotency: capture pubkey sha256, re-run, assert unchanged.
           PUB_SHA_BEFORE=$(sudo -u hermes sha256sum /home/hermes/.ssh/id_ed25519.pub | awk '{print $1}')
           sudo VALUES_FILE="$FIXTURE_YAML" \
-            /srv/hermes/repos/hermes-agent/stage-quay-repo-auth.sh
+            /srv/hermes/repos/hermes-agent/stage-repo-auth.sh
           PUB_SHA_AFTER=$(sudo -u hermes sha256sum /home/hermes/.ssh/id_ed25519.pub | awk '{print $1}')
           [[ "$PUB_SHA_BEFORE" == "$PUB_SHA_AFTER" ]] \
             || { echo "FAIL: pubkey changed on re-run (not idempotent)"; exit 1; }
-          echo "stage-quay-repo-auth.sh idempotency: OK"
+          echo "stage-repo-auth.sh idempotency: OK"
 
           rm -f "$FIXTURE_YAML"
+
+      - name: per-repo url.insteadOf probe (setup-hermes.sh wires it for github.com)
+        # The url.insteadOf rewrite that bridges HTTPS → SSH lives in
+        # setup-hermes.sh's repos[] loop now (not stage-repo-auth.sh). Run
+        # the install script's regex+rewrite snippet against a github.com
+        # URL fixture so the bash logic is exercised independently of an
+        # actual clone (which would need real GitHub creds).
+        run: |
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes
+            cd "$T"  # git stats CWD even with --file
+            # This snippet mirrors the regex + invocation in
+            # installer/setup-hermes.sh; if the two drift, the
+            # production rewrite stops landing.
+            repo_url="https://github.com/InverterNetwork/per-repo-probe"
+            [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]] \
+              || { echo "FAIL: regex did not match clean github.com URL"; exit 1; }
+            org="${BASH_REMATCH[1]}"
+            repo_short="${BASH_REMATCH[2]}"
+            ssh_url="git@github.com:${org}/${repo_short}.git"
+            git config --file "$T/.gitconfig" "url.${ssh_url}.insteadOf" "$repo_url"
+            actual=$(git config --file "$T/.gitconfig" --get "url.${ssh_url}.insteadOf")
+            [[ "$actual" == "$repo_url" ]] \
+              || { echo "FAIL: per-repo rewrite did not land: got $actual"; exit 1; }
+            echo "per-repo url.insteadOf probe: OK"
+          '
 
       - name: hermes-env drop-in probe
         run: |

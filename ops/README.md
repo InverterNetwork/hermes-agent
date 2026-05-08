@@ -1,11 +1,17 @@
-# Operator runbook: hermes-sync + hermes-upstream-sync + hermes-gateway + quay-tick
+# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick
 
-Four units live here:
+Five units live here:
 
 * **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
   repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
   session-start snapshots synchronously; this timer ships those commits
   to the remote and pulls back any human edits.
+* **`hermes-code-sync`** — frequent (5-min) refresh of the agent's
+  read-only code mirrors at `~/.hermes/code/<id>/`. Each `repos[]` entry
+  in `deploy.values.yaml` produces one mirror; the timer fetches origin
+  and hard-resets to `origin/<base_branch>` on every tick, so the
+  gateway can grep/read up-to-date source when answering codebase
+  questions in Slack.
 * **`hermes-upstream-sync`** — weekly proposer that detects upstream
   hermes-agent commits and opens a PR for human review. Branch
   protection on `origin/main` enforces that the agent can't self-merge.
@@ -19,7 +25,8 @@ Four units live here:
   to advance queued tasks (claim → worker → submit-brief). Installed
   only when `quay.version` is pinned in `deploy.values.yaml`; the unit
   invokes `/usr/local/bin/quay` directly, with `QUAY_DATA_DIR` pointing
-  at `<HERMES_HOME>/quay/`.
+  at `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
+  carrying a `quay:` block.
 
 ## Files
 
@@ -28,6 +35,9 @@ Four units live here:
 | `ops/hermes-sync`                          | State-sync script. Installed to `/usr/local/sbin/hermes-sync`, root-owned. |
 | `ops/hermes-sync.service`                  | systemd service unit. `User=__AGENT_USER__` is templated by `setup-hermes.sh`. |
 | `ops/hermes-sync.timer`                    | systemd timer unit. 2-min cadence. |
+| `ops/hermes-code-sync`                     | Code-mirror refresh script. Installed to `/usr/local/sbin/hermes-code-sync`, root-owned. |
+| `ops/hermes-code-sync.service`             | systemd service unit. Same `User=` templating. |
+| `ops/hermes-code-sync.timer`               | systemd timer unit. 5-min cadence. |
 | `ops/hermes-upstream-sync`                 | Upstream-sync script. Installed to `/usr/local/sbin/hermes-upstream-sync`, root-owned. |
 | `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
@@ -244,16 +254,12 @@ contents:
 
 ```sh
 HERMES_STATE_DIR=/home/hermes/.hermes/state
-HOME=/home/hermes
 ```
 
 Override `HERMES_STATE_DIR` if the install lives outside the default
 layout. The script re-resolves on every invocation, so changes here take
-effect on the next tick.
-
-`HOME` is needed because git's credential helper resolves
-`~/.config/git/credentials` relative to `$HOME`, and systemd doesn't set
-`$HOME` by default.
+effect on the next tick. `HOME` is populated by systemd's `User=`
+directive from the agent's passwd entry — no need to set it here.
 
 ## Manual operations
 
@@ -488,14 +494,13 @@ needed there.
 
 ## Staging repo SSH auth
 
-`stage-quay-repo-auth.sh` (at the repo root) provisions the SSH material
-the agent user needs to clone (and quay needs to fetch) the repos listed
-under `quay.repos` in `deploy.values.yaml`. Run it once after first
-install, and again whenever a new repo is added under a previously unseen
-GitHub org:
+`stage-repo-auth.sh` (at the repo root) provisions the SSH material the
+agent user needs to clone (and quay needs to fetch) every entry under
+`repos[]` in `deploy.values.yaml`. Run it once after first install, and
+again whenever a new GitHub repo is added to `repos[]`:
 
 ```sh
-sudo ./stage-quay-repo-auth.sh
+sudo ./stage-repo-auth.sh
 ```
 
 What it does (idempotent):
@@ -503,19 +508,22 @@ What it does (idempotent):
 * Generates `~<agent>/.ssh/id_ed25519` if absent (no passphrase).
 * Pre-seeds `~<agent>/.ssh/known_hosts` with current `github.com` host
   keys via `ssh-keyscan` (deduplicated against existing entries).
-* For each distinct GitHub org in `quay.repos[].url`, configures
-  `git config --global url.git@github.com:<org>/.insteadOf
-  https://github.com/<org>/` for the agent user — the values file
-  carries HTTPS URLs, but the bare clones authenticate over SSH using
-  the deploy key.
-* Prints the public key (`~<agent>/.ssh/id_ed25519.pub`) at the end.
+* Prints the public key (`~<agent>/.ssh/id_ed25519.pub`) plus a
+  per-repo deploy-key URL checklist for every github.com entry under
+  `repos[]`.
+
+The url.insteadOf rewrites that bridge HTTPS values URLs to SSH
+transport are NOT done here — `setup-hermes.sh` wires them per-repo as
+part of its `repos[]` provisioning loop, so a deploy key registered on
+exactly the listed repos suffices (no org-wide rewrite that could fire
+for unrelated repos).
 
 The operator's job: paste the printed public key into each repo's
 **Settings → Deploy keys → Add deploy key** UI on GitHub. Read-only is
-sufficient for v0 (quay only fetches; pushes happen via the GitHub App
-token wired up by the main installer); enable "Allow write access" only
-if a worker eventually needs to push from a bare clone, which is not the
-v0 flow.
+sufficient for v0 (the agent only fetches; pushes against the state
+repo go via the GitHub App token wired up by the main installer);
+enable "Allow write access" only if a worker eventually needs to push
+from a clone, which is not the v0 flow.
 
 ## Logs
 
@@ -541,3 +549,117 @@ sudo -u <agent_user> env QUAY_DATA_DIR=<HERMES_HOME>/quay \
 sudo -u <agent_user> env QUAY_DATA_DIR=<HERMES_HOME>/quay \
   /usr/local/bin/quay task list
 ```
+
+---
+
+# Code mirrors (hermes-code-sync)
+
+Every entry under `repos[]` in `deploy.values.yaml` produces a
+working-tree code mirror at `<HERMES_HOME>/code/<id>/`, agent-owned. The
+gateway reads these when answering codebase questions in Slack — having
+a freshly-fetched local clone means an answer like "look in
+`gateway/slack.py` for the rate-limit logic" can be backed by a literal
+quote rather than a hallucinated function name.
+
+The mirrors are read-only from the gateway's perspective: any local
+divergence is wiped by the next `hermes-code-sync` tick, which hard-
+resets each mirror to `origin/<base_branch>`.
+
+## Schema
+
+```yaml
+repos:
+  # code-only mirror — gateway can grep/read; no worker spawns.
+  - id: ITRY-monorepo
+    url: https://github.com/InverterNetwork/ITRY-monorepo
+    base_branch: main
+
+  # quay-managed AND code-mirrored — presence of `quay:` block is the toggle.
+  - id: test-factory-code
+    url: https://github.com/InverterNetwork/test-factory-code
+    base_branch: main
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
+```
+
+Field invariants:
+
+* `id` matches `^[A-Za-z0-9_][A-Za-z0-9._-]*$` (alnum/./-/_, no path
+  separators, no leading dot/dash). The id lands in a filesystem path
+  on both the code-mirror (`code/<id>/`) and quay (`quay/repos/<id>.git`)
+  sides.
+* `url` is `https://github.com/<org>/<repo>` (no `.git` suffix). The
+  installer wires a per-repo `url.insteadOf` rewrite into
+  `~<agent>/.gitconfig` so cloning lands over SSH against the deploy
+  key. Non-github URLs (e.g. CI's `file://` fixtures) flow through
+  unchanged.
+* `base_branch` is required for every entry. The mirror is hard-reset
+  to `origin/<base_branch>` on every sync tick.
+* `quay:` is optional. Block-present-vs-absent IS the signal — there is
+  no separate `quay.enabled` flag. When present, must carry
+  `package_manager` and `install_cmd`.
+
+## ⚠ Secrets in code
+
+Anything in a code mirror is one Slack DM away from being quoted in a
+thread. **Don't add repos with secrets-in-code to `repos[]`.** The
+gateway's redaction story is per-message, not per-repo, and the mirror
+is the source it's quoting from. If a repo has historical secret
+material (committed `.env`, accidentally-pushed PEMs, vendored API
+keys), either rotate first or keep it out of `repos[]` until you have.
+
+## Cadence
+
+5-minute interval, set in `hermes-code-sync.timer`:
+
+```ini
+[Timer]
+OnUnitActiveSec=5min
+```
+
+Override the same way as the other timers:
+
+```sh
+sudo systemctl edit hermes-code-sync.timer
+```
+
+## Logs
+
+```sh
+sudo journalctl -u hermes-code-sync.service -f
+```
+
+A healthy tick:
+
+```
+hermes-code-sync[NNN]: [hermes-code-sync] synced 3 ok, 0 failed, 0 skipped
+```
+
+Per-repo failures don't fail the unit — the next tick retries:
+
+```
+hermes-code-sync[NNN]: [hermes-code-sync] WARN: ITRY-monorepo: git fetch failed
+hermes-code-sync[NNN]: [hermes-code-sync] synced 2 ok, 1 failed, 0 skipped
+```
+
+## Adding a repo
+
+1. Add the entry to `repos[]` in `deploy.values.yaml`.
+2. (Private GitHub repo only) Re-run `sudo ./stage-repo-auth.sh` to
+   refresh the deploy-key checklist, then register the printed public
+   key on the new repo's **Settings → Deploy keys** page.
+3. Re-run `sudo installer/setup-hermes.sh` — the new entry is provisioned
+   on the next pass (idempotent for existing entries).
+4. The next `hermes-code-sync` tick (within 5 min) keeps the mirror
+   fresh; force one immediately with
+   `sudo systemctl start hermes-code-sync.service`.
+
+## Removing a repo
+
+The installer does NOT auto-prune mirrors when an entry is removed from
+`repos[]` — destroying agent-owned data on a values-file edit is a
+default we don't want. Drop the entry, re-run the installer, then the
+operator removes the orphaned `<HERMES_HOME>/code/<id>/` (and, if
+applicable, `<HERMES_HOME>/quay/repos/<id>.git/` plus `quay repo
+remove --id <id>`) by hand.

@@ -313,20 +313,28 @@ class TestRenderQuayConfig:
 class TestListRepos:
     @pytest.fixture
     def repos_values(self, tmp_path: Path) -> Path:
+        # Mixed: one quay-managed entry, one code-only entry. The code-only
+        # entry must emit empty package_manager + install_cmd fields so
+        # setup-hermes.sh's loop can iterate a single 5-column TSV format
+        # for both.
         p = tmp_path / "values.yaml"
         p.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: https://github.com/example/alpha\n"
-            "      base_branch: main\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    quay:\n"
             "      package_manager: bun\n"
             "      install_cmd: bun install\n"
-            "    - id: beta\n"
-            "      url: https://github.com/example/beta\n"
-            "      base_branch: trunk\n"
+            "  - id: beta\n"
+            "    url: https://github.com/example/beta\n"
+            "    base_branch: trunk\n"
+            "    quay:\n"
             "      package_manager: npm\n"
-            "      install_cmd: npm ci --no-audit\n",
+            "      install_cmd: npm ci --no-audit\n"
+            "  - id: gamma\n"
+            "    url: https://github.com/example/gamma\n"
+            "    base_branch: main\n",
             encoding="utf-8",
         )
         return p
@@ -335,6 +343,18 @@ class TestListRepos:
         r = _run(repos_values, "list-repos")
         assert r.returncode == 0, r.stderr
         lines = r.stdout.splitlines()
+        # gamma is code-only — last two columns empty.
+        assert lines == [
+            "alpha\thttps://github.com/example/alpha\tmain\tbun\tbun install",
+            "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
+            "gamma\thttps://github.com/example/gamma\tmain\t\t",
+        ]
+
+    def test_quay_filter_excludes_code_only_entries(self, repos_values: Path):
+        r = _run(repos_values, "list-repos", "--quay")
+        assert r.returncode == 0, r.stderr
+        lines = r.stdout.splitlines()
+        # gamma (code-only) is filtered out under --quay.
         assert lines == [
             "alpha\thttps://github.com/example/alpha\tmain\tbun\tbun install",
             "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
@@ -347,16 +367,40 @@ class TestListRepos:
         assert r.returncode == 0, r.stderr
         assert r.stdout == ""
 
-    def test_missing_required_field_exits_nonzero(self, tmp_path: Path):
-        # Missing install_cmd — should fail loudly so an under-specified
-        # deploy.values.yaml doesn't silently skip the repo at install time.
+    def test_legacy_quay_repos_rejected_with_migration_hint(self, tmp_path: Path):
+        # Legacy `quay.repos[]` schema. The helper must surface a single,
+        # clearly-actionable migration error instead of silently honouring
+        # the old key and skipping the new top-level repos[] — which would
+        # let a stale values file install only the quay-managed entries
+        # while losing every code mirror.
         values = tmp_path / "values.yaml"
         values.write_text(
             "quay:\n"
+            "  version: v0.1.0\n"
             "  repos:\n"
             "    - id: alpha\n"
             "      url: https://github.com/example/alpha\n"
             "      base_branch: main\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "quay.repos[]` is no longer supported" in r.stderr
+        assert "top-level `repos[]`" in r.stderr
+
+    def test_missing_required_field_exits_nonzero(self, tmp_path: Path):
+        # Missing install_cmd inside the quay: block — should fail loudly
+        # so an under-specified deploy.values.yaml doesn't silently skip
+        # the entry at install time.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    quay:\n"
             "      package_manager: bun\n",
             encoding="utf-8",
         )
@@ -367,28 +411,39 @@ class TestListRepos:
     def test_empty_required_field_exits_nonzero(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            '    - id: ""\n'
-            "      url: https://github.com/example/alpha\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
+            "repos:\n"
+            '  - id: ""\n'
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n",
             encoding="utf-8",
         )
         r = _run(values, "list-repos")
         assert r.returncode == 1
         assert "id is required" in r.stderr
 
+    def test_quay_block_must_be_mapping_when_present(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    quay: oops\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1
+        assert "quay must be a mapping" in r.stderr
+
     def test_tab_in_field_exits_nonzero(self, tmp_path: Path):
         # A tab inside a field would silently corrupt the bash-side parse.
         values = tmp_path / "values.yaml"
         values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: https://github.com/example/alpha\n"
-            "      base_branch: main\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    quay:\n"
             "      package_manager: bun\n"
             '      install_cmd: "bun\tinstall"\n',
             encoding="utf-8",
@@ -400,11 +455,11 @@ class TestListRepos:
     def test_repos_must_be_a_list(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
-            "quay:\n  repos: not-a-list\n", encoding="utf-8"
+            "repos: not-a-list\n", encoding="utf-8"
         )
         r = _run(values, "list-repos")
         assert r.returncode == 1
-        assert "quay.repos must be a list" in r.stderr
+        assert "repos must be a list" in r.stderr
 
     @pytest.mark.parametrize(
         "bad_id",
@@ -423,13 +478,10 @@ class TestListRepos:
         # helper is the validation choke point.
         values = tmp_path / "values.yaml"
         values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            f"    - id: {bad_id!r}\n"
-            "      url: https://github.com/example/x\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
+            "repos:\n"
+            f"  - id: {bad_id!r}\n"
+            "    url: https://github.com/example/x\n"
+            "    base_branch: main\n",
             encoding="utf-8",
         )
         r = _run(values, "list-repos")
@@ -444,18 +496,111 @@ class TestListRepos:
     def test_id_shape_accepts_typical_values(self, tmp_path: Path, good_id: str):
         values = tmp_path / "values.yaml"
         values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            f"    - id: {good_id}\n"
-            "      url: https://github.com/example/x\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
+            "repos:\n"
+            f"  - id: {good_id}\n"
+            "    url: https://github.com/example/x\n"
+            "    base_branch: main\n",
             encoding="utf-8",
         )
         r = _run(values, "list-repos")
         assert r.returncode == 0, r.stderr
         assert r.stdout.split("\t")[0] == good_id
+
+    @pytest.mark.parametrize(
+        "bad_url",
+        [
+            "https://github.com/example/alpha.git",       # .git suffix
+            "https://github.com/example/alpha/",          # trailing slash + extra segs
+            "https://github.com/example",                 # missing repo segment
+            "http://github.com/example/alpha",            # http (not https)
+            "git@github.com:example/alpha.git",           # SCP-style SSH (empty netloc trap)
+            "git@github.com:example/alpha",               # SCP-style SSH, no .git
+            "ssh://git@github.com/example/alpha.git",     # explicit ssh:// scheme
+        ],
+    )
+    def test_github_url_shape_rejected(self, tmp_path: Path, bad_url: str):
+        # The per-repo url.insteadOf rewrite expects a clean
+        # `https://github.com/<org>/<repo>` prefix; anything else either
+        # fails to match or produces a broken rewrite. The helper is the
+        # validation choke point.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            f"    url: {bad_url}\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 1, r.stdout
+
+    @pytest.mark.parametrize(
+        "passthrough_url",
+        [
+            "file:///srv/hermes/repos/quay-fixtures/alpha",
+            "https://gitlab.com/example/alpha",
+            "https://gitlab.com/example/alpha.git",
+        ],
+    )
+    def test_non_github_urls_pass_through_unchecked(
+        self, tmp_path: Path, passthrough_url: str
+    ):
+        # CI fixtures use file:// URLs; public mirrors elsewhere use other
+        # hosts. The installer's url.insteadOf rewrite is github.com-only,
+        # so the helper has nothing to validate against on these URLs.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            f"    url: {passthrough_url}\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "list-repos")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split("\t")[1] == passthrough_url
+
+
+class TestValidateSchema:
+    """Direct coverage of `validate-schema` — setup-hermes.sh --verify
+    invokes it and prints the helper's stderr verbatim, so the error
+    messages are part of the public contract."""
+
+    def test_clean_schema_silent(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 0
+        assert r.stdout == ""
+        assert r.stderr == ""
+
+    def test_legacy_key_rejected(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  repos: []\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "quay.repos[]` is no longer supported" in r.stderr
+
+    def test_missing_required_field_named(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "base_branch is required" in r.stderr
 
 
 class TestParseRepoListIds:
@@ -519,173 +664,3 @@ class TestParseRepoListIds:
         assert r.stdout == ""
 
 
-class TestListRepoOrgs:
-    @pytest.fixture
-    def orgs_values(self, tmp_path: Path) -> Path:
-        p = tmp_path / "values.yaml"
-        p.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: https://github.com/InverterNetwork/alpha\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n"
-            "    - id: beta\n"
-            "      url: https://github.com/InverterNetwork/beta\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n"
-            "    - id: gamma\n"
-            "      url: https://github.com/AnotherOrg/gamma\n"
-            "      base_branch: main\n"
-            "      package_manager: npm\n"
-            "      install_cmd: npm ci\n",
-            encoding="utf-8",
-        )
-        return p
-
-    def test_emits_distinct_orgs_in_first_seen_order(self, orgs_values: Path):
-        r = _run(orgs_values, "list-repo-orgs")
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.splitlines() == ["InverterNetwork", "AnotherOrg"]
-
-    def test_single_org_emits_once(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: https://github.com/ExampleOrg/alpha\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.splitlines() == ["ExampleOrg"]
-
-    def test_trailing_git_stripped(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: https://github.com/ExampleOrg/alpha.git\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.strip() == "ExampleOrg"
-
-    def test_empty_repos_list_emits_nothing(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text("quay:\n  repos: []\n", encoding="utf-8")
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 0, r.stderr
-        assert r.stdout == ""
-
-    def test_missing_repos_key_emits_nothing(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text("quay:\n  version: v0.1.0\n", encoding="utf-8")
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 0, r.stderr
-        assert r.stdout == ""
-
-    def test_non_github_url_exits_nonzero(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: https://gitlab.com/ExampleOrg/alpha\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 1
-        assert "not a GitHub HTTPS URL" in r.stderr
-
-    def test_file_url_exits_nonzero(self, tmp_path: Path):
-        # CI patches the URL to file:///... — the subcommand must reject it cleanly.
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: file:///srv/hermes/repos/quay-fixtures/alpha\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 1
-        assert "not a GitHub HTTPS URL" in r.stderr
-
-    def test_http_url_exits_nonzero(self, tmp_path: Path):
-        # Tightened from {http, https} to https-only: an http:// URL on a
-        # deploy-key staging path is almost certainly a misconfiguration.
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: http://github.com/ExampleOrg/alpha\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 1
-        assert "not a GitHub HTTPS URL" in r.stderr
-
-    def test_ssh_url_exits_nonzero(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: alpha\n"
-            "      url: git@github.com:ExampleOrg/alpha.git\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 1
-        assert "not a GitHub HTTPS URL" in r.stderr
-
-    def test_deduplication_preserves_first_seen_order(self, tmp_path: Path):
-        # B, A, B → emit B then A (first-seen, not sorted)
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            "  repos:\n"
-            "    - id: r1\n"
-            "      url: https://github.com/OrgB/r1\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n"
-            "    - id: r2\n"
-            "      url: https://github.com/OrgA/r2\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n"
-            "    - id: r3\n"
-            "      url: https://github.com/OrgB/r3\n"
-            "      base_branch: main\n"
-            "      package_manager: bun\n"
-            "      install_cmd: bun install\n",
-            encoding="utf-8",
-        )
-        r = _run(values, "list-repo-orgs")
-        assert r.returncode == 0, r.stderr
-        assert r.stdout.splitlines() == ["OrgB", "OrgA"]

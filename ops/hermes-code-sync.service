@@ -1,0 +1,26 @@
+[Unit]
+Description=Hermes code-mirror refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the agent user — root invokes the unit, drops privilege via User=.
+# __AGENT_USER__ is substituted by setup-hermes.sh at install time so non-
+# default agent users get a correctly-targeted unit.
+User=__AGENT_USER__
+Group=__AGENT_USER__
+# Code root override (defaults to ~/.hermes/code inside the script).
+# Override in /etc/default/hermes-code-sync if the install lives elsewhere.
+EnvironmentFile=-/etc/default/hermes-code-sync
+ExecStart=/usr/local/sbin/hermes-code-sync
+# Per-repo failures already exit 0 from the script (they log WARN and
+# continue), so a non-zero exit here means the catastrophic case
+# (missing CODE_DIR, no repos found). Restart=no keeps the systemd
+# state honest — a real failure shows up in `systemctl list-units`
+# instead of being papered over by automatic restarts.
+Restart=no
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

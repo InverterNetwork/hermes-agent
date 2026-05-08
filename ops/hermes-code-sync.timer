@@ -1,0 +1,16 @@
+[Unit]
+Description=Run hermes-code-sync every 5 minutes
+
+[Timer]
+# Initial delay after boot to let the network settle.
+OnBootSec=60s
+# Cadence: 5 minutes between ticks. Independent of quay-tick (which keeps
+# bare clones fresh on its own cadence). Override in
+# /etc/systemd/system/hermes-code-sync.timer.d/override.conf to retune.
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=hermes-code-sync.service
+
+[Install]
+WantedBy=timers.target

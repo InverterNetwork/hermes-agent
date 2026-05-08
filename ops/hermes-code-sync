@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# hermes-code-sync — periodic refresh of the agent's code mirrors.
+#
+# For each entry in deploy.values.yaml's repos[], fetch origin and hard-
+# reset the working tree to origin/<base_branch>. base_branch is read
+# directly from values.yaml every tick — NOT from origin/HEAD, because
+# `git clone --branch <ref>` does NOT update origin/HEAD (only the local
+# checkout), so any entry whose base_branch differs from the GitHub
+# default branch would otherwise be silently snapped to the wrong branch
+# on every sync.
+#
+# Mirrors are read-only from the gateway's perspective (they're for
+# grep/answer-from-code, never an editable workspace), so a hard reset
+# is the right shape — any local divergence is unintentional and gets
+# discarded on the next tick.
+#
+# Failure modes:
+#   * per-repo fetch/reset failure → log a WARN, continue with the next
+#     repo. A single broken mirror (e.g. credential rotation pending,
+#     transient network blip) must not stop the rest of the fleet from
+#     refreshing.
+#   * unreadable $HERMES_CODE_DIR / missing values file or helper → die.
+#     The installer always provisions all three, so absence is real
+#     drift worth surfacing in `systemctl status`.
+#   * values_helper schema failure (legacy quay.repos[], bad URL shape)
+#     → die. Same posture as install-time.
+#
+# Usage:
+#   hermes-code-sync                                # uses defaults
+#   HERMES_CODE_DIR=/path HERMES_VALUES_FILE=/path/deploy.values.yaml \
+#     hermes-code-sync
+#
+set -u
+
+CODE_DIR="${HERMES_CODE_DIR:-$HOME/.hermes/code}"
+VALUES_FILE="${HERMES_VALUES_FILE:-$HOME/.hermes/hermes-agent/deploy.values.yaml}"
+VALUES_HELPER="${HERMES_VALUES_HELPER:-$HOME/.hermes/hermes-agent/installer/values_helper.py}"
+LOG_PREFIX="hermes-code-sync"
+
+log()  { printf '[%s] %s\n' "$LOG_PREFIX" "$*"; }
+warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
+die()  { printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
+
+[[ -d "$CODE_DIR" ]]      || die "no code root at $CODE_DIR (run setup-hermes.sh)"
+[[ -f "$VALUES_FILE" ]]   || die "values file missing at $VALUES_FILE"
+[[ -f "$VALUES_HELPER" ]] || die "values helper missing at $VALUES_HELPER"
+
+# Capture before the read loop; <() would mask helper non-zero exits.
+REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)" \
+  || die "values_helper.py list-repos failed (run it manually for the diagnostic)"
+
+ok=0
+skipped=0
+failed=0
+while IFS=$'\t' read -r repo_id _repo_url repo_base _repo_pkg _repo_install; do
+  [[ -z "$repo_id" ]] && continue
+  repo="$CODE_DIR/$repo_id"
+  if [[ ! -d "$repo/.git" ]]; then
+    warn "$repo_id: code mirror missing at $repo (run setup-hermes.sh)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if ! git -C "$repo" fetch origin --quiet --prune 2>/dev/null; then
+    warn "$repo_id: git fetch failed"
+    failed=$((failed + 1))
+    continue
+  fi
+  if ! git -C "$repo" reset --hard "origin/$repo_base" --quiet 2>/dev/null; then
+    warn "$repo_id: git reset --hard origin/$repo_base failed"
+    failed=$((failed + 1))
+    continue
+  fi
+  ok=$((ok + 1))
+done <<<"$REPOS_TSV"
+
+log "synced ${ok} ok, ${failed} failed, ${skipped} skipped"
+exit 0

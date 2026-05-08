@@ -21,6 +21,49 @@
 #                                 installer never overwrites a live config) so
 #                                 operator hand-edits survive.
 #
+#   repos                      — unified list of repos this deployment cares
+#                                 about. Every entry produces a code mirror
+#                                 (full working tree at <HERMES_HOME>/code/<id>/,
+#                                 agent-owned, refreshed by the hermes-code-sync
+#                                 timer) that the gateway can grep/read when
+#                                 answering codebase questions in Slack.
+#                                 Entries that ALSO carry a `quay:` block are
+#                                 additionally registered with quay (bare clone
+#                                 + `quay repo add`). The presence of the
+#                                 `quay:` block IS the toggle — there is no
+#                                 separate `enabled` flag.
+#                                 v0 limitation: each `url` must be reachable
+#                                 by the agent user. github.com URLs are
+#                                 bridged to SSH transport via per-repo
+#                                 url.insteadOf rewrites that the installer
+#                                 wires into ~<agent>/.gitconfig, so a deploy
+#                                 key on each repo is sufficient. The fork's
+#                                 GitHub App helper is scoped to hermes-agent
+#                                 + hermes-state and is NOT threaded into
+#                                 these clones.
+#   repos[].id                 — must match `^[A-Za-z0-9_][A-Za-z0-9._-]*$`
+#                                 (alnum/./-/_, no path separators, no leading
+#                                 dot or dash). The id lands in a filesystem
+#                                 path and (for quay-managed entries) a CLI
+#                                 flag.
+#   repos[].url                — HTTPS GitHub URL (https://github.com/<org>/<repo>),
+#                                 no `.git` suffix. The installer applies a
+#                                 per-repo url.insteadOf rewrite on first
+#                                 install so the agent's `git clone`/`fetch`
+#                                 lands over SSH against the deploy key, even
+#                                 though the values file documents HTTPS.
+#   repos[].base_branch        — required for every entry. The code mirror is
+#                                 hard-reset to origin/<base_branch> on every
+#                                 hermes-code-sync tick.
+#   repos[].quay               — OPTIONAL. Presence of the block opts the
+#                                 entry into quay management (bare clone at
+#                                 <HERMES_HOME>/quay/repos/<id>.git/ + `quay
+#                                 repo add`). When present, must carry
+#                                 `package_manager` and `install_cmd`. Absence
+#                                 of the block leaves the entry as a code
+#                                 mirror only (no quay registration, no
+#                                 worker spawn).
+#
 #   quay.version               — pinned quay release tag (e.g. "v0.1.0"), or
 #                                 empty to skip all quay provisioning. Empty
 #                                 lets a fork stage before a quay release is
@@ -28,28 +71,15 @@
 #                                 installer fetches quay-linux-<arch> from
 #                                 the matching GitHub Release and verifies it
 #                                 against SHA256SUMS; the pin is the security
-#                                 boundary.
+#                                 boundary. Must be set for any repos[] entry
+#                                 to be quay-managed; entries with a `quay:`
+#                                 block but no quay.version pin install as
+#                                 code-only with a one-line warning.
 #   quay.agent_invocation      — shell-command template the quay tick
 #                                 supervisor invokes for each task.
 #                                 {prompt_file} is the only placeholder;
 #                                 substituted with the path to the synthesized
 #                                 brief inside the worktree.
-#   quay.repos                 — list of repos quay manages. Each entry maps
-#                                 to `quay repo add` arguments and is backed
-#                                 by a bare clone provisioned at install time.
-#                                 v0 limitation: each `url` must be reachable
-#                                 by the agent user without further wiring —
-#                                 either a public HTTPS URL or a private repo
-#                                 the operator has pre-staged credentials for
-#                                 (SSH key in ~hermes/.ssh, or a global
-#                                 credential helper). The fork's GitHub App
-#                                 helper is scoped to hermes-agent +
-#                                 hermes-state and is NOT threaded into these
-#                                 clones.
-#   quay.repos[].id            — must match `^[A-Za-z0-9_][A-Za-z0-9._-]*$`
-#                                 (alnum/./-/_, no path separators, no leading
-#                                 dot or dash). The id lands in a filesystem
-#                                 path and a CLI flag.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
 #   quay.adapters.slack        — gates quay's slack adapter (waiting_human
@@ -89,6 +119,16 @@ slack:
     #     C01ABC: "Code review mode"
     channel_prompts: {}
 
+# Repos this deployment cares about. Every entry produces a code mirror;
+# entries with a `quay:` block are additionally registered with quay.
+repos:
+  - id: test-factory-code
+    url: https://github.com/InverterNetwork/test-factory-code
+    base_branch: main
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
+
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
   # provisioning entirely (data dir, config.toml, binary fetch); set once
@@ -98,14 +138,6 @@ quay:
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   agent_invocation: "claude --permission-mode bypassPermissions < {prompt_file}"
-  # Repos quay manages. Each entry is registered with `quay repo add` and
-  # backed by a bare clone at <repos_root>/<id>.git.
-  repos:
-    - id: test-factory-code
-      url: https://github.com/InverterNetwork/test-factory-code
-      base_branch: main
-      package_manager: bun
-      install_cmd: "bun install"
   adapters:
     linear:
       enabled: true
