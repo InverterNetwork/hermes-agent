@@ -1020,13 +1020,6 @@ else
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
     render-runtime-config --out "$CONFIG_YAML_OUT"
 fi
-# config.yaml must be agent-writable: `hermes auth add` rewrites
-# model.provider after the OAuth flow, and `hermes model` does the same on
-# the interactive picker. Root-owned silently no-ops those writes.
-# Re-asserted every run so legacy hosts seeded as root:root self-heal on the
-# next install (the body is never re-rendered, so operator hand-edits survive).
-chown "$AGENT_USER:$AGENT_USER" "$CONFIG_YAML_OUT"
-chmod 0644 "$CONFIG_YAML_OUT"
 
 # model.* is rewritten on every run, even when the file above was preserved
 # — the helper docstring covers the rationale (silent `hermes auth add`
@@ -1035,8 +1028,13 @@ config_sha_pre="$(file_sha "$CONFIG_YAML_OUT")"
 echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   merge-config-model --out "$CONFIG_YAML_OUT"
-chown root:root "$CONFIG_YAML_OUT"
-chmod 644 "$CONFIG_YAML_OUT"
+# config.yaml must be agent-writable: `hermes auth add` rewrites
+# model.provider after the OAuth flow, and `hermes model` does the same on
+# the interactive picker. Root-owned silently no-ops those writes.
+# merge-config-model always runs (even on preserved files), so this single
+# chown self-heals legacy root-owned hosts on the next install.
+chown "$AGENT_USER:$AGENT_USER" "$CONFIG_YAML_OUT"
+chmod 0644 "$CONFIG_YAML_OUT"
 [[ "$config_sha_pre" != "$(file_sha "$CONFIG_YAML_OUT")" ]] && GATEWAY_NEEDS_RESTART=1
 
 # ---------- venv (rails-class) ----------
