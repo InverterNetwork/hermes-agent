@@ -573,10 +573,15 @@ behaves the same as the wrapper. Both are installed by
 `setup-hermes.sh` on quay-enabled hosts.
 
 `setup-hermes.sh` also reconciles a stale `~<agent>/.quay/` on every
-re-run: empty / equivalent-to-canonical dirs are removed, and dirs
-holding tasks or registrations not declared in `deploy.values.yaml`
-fail the install with a remediation hint. `--verify` flags any
-presence of `~<agent>/.quay/` as drift.
+re-run, before any quay invocation: empty / equivalent-to-canonical
+dirs are removed, and dirs holding tasks or registrations not declared
+in `deploy.values.yaml` fail the install with a remediation hint.
+
+The quay binary itself re-creates `~<agent>/.quay/` as a workspace side
+effect even with `QUAY_DATA_DIR` pinned elsewhere, so `--verify` does
+not flag mere presence of that path — drift detection lives in the
+install-time reconciler, which probes the dir's contents (registrations
++ tasks) rather than its existence.
 
 ---
 

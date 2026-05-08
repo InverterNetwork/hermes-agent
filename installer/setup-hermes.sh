@@ -579,19 +579,14 @@ do_verify() {
       fi
     fi
 
-    # ---- stale ~/.quay/ drift ----
-    # Any presence of the agent's ~/.quay/ is drift: ad-hoc invocations
-    # that bypass the wrapper / profile.d export end up there silently.
-    # Surface separately from the canonical-data-dir checks so the
-    # remediation hint points at the right path; the install-side
-    # cleanup block reconciles it on the next run. Path-overridable for
-    # the test fixture (which can't legitimately mutate the real ~/.quay/).
-    local stale_quay_dir="${HERMES_VERIFY_STALE_QUAY_DIR:-$AGENT_HOME/.quay}"
-    if [[ -e "$stale_quay_dir" || -L "$stale_quay_dir" ]]; then
-      v_drift "stale quay data dir" "$stale_quay_dir present — re-run setup-hermes.sh to reconcile, or use /usr/local/bin/quay-as-hermes for ad-hoc invocations"
-    else
-      v_ok "no stale quay data dir at $stale_quay_dir"
-    fi
+    # No verify-side check on ~/.quay/ presence: the quay binary
+    # re-creates that path as a workspace side effect on every
+    # invocation, even with QUAY_DATA_DIR pinned elsewhere, so any
+    # post-install snapshot finds it present again. Drift detection
+    # for ad-hoc adds lives in the install-time reconciler, which
+    # probes the dir's contents (registrations + tasks) rather than
+    # its existence — see installer/setup-hermes.sh →
+    # reconcile_stale_quay_dir.
 
     # ---- operator-invocation glue ----
     # Both paths are overridable so the test fixture can seed stubs in
@@ -1379,41 +1374,25 @@ install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$CODE_ROOT"
 
 ALL_REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
 
-# Snapshot quay's already-registered ids ONCE per install, before the
-# per-repo loop, so re-runs of `quay repo add` are no-ops. A fresh data
-# dir applies embedded migrations on first invocation and returns [];
-# parse failure aborts the install — silently treating it as "no
-# registrations" would re-invoke `quay repo add` on every re-run, which
-# is not documented as idempotent.
-QUAY_REGISTERED_IDS=""
-if [[ "$QUAY_ENABLED" -eq 1 ]]; then
-  QUAY_REGISTERED_IDS="$(
-    sudo -u "$AGENT_USER" \
-      env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
-      | python3 "$VALUES_HELPER" parse-repo-list-ids
-  )"
-fi
-
 # ---------- stale ~/.quay/ cleanup + drift refusal ----------
 # Empty/equivalent stale dirs are removed declaratively (configs-as-code,
 # no opt-in flag); stale dirs holding tasks or non-declared registrations
-# refuse the install with a remediation hint.
+# refuse the install with a remediation hint. Runs BEFORE any quay
+# invocation: the binary creates ~/.quay/ as a side effect (workspace
+# cache) even with QUAY_DATA_DIR set, so reconciling after a snapshot
+# would loop on freshly-side-effected state and risks corrupting
+# canonical when the post-install tick fires against a torn-down dir.
 
 reconcile_stale_quay_dir() {
   local stale_dir="$AGENT_HOME/.quay"
-  # Symlinks are now also drift to be reconciled (matches the verify-side
-  # check at the top of the script): the wrapper + profile.d cover the
-  # cases an operator-side symlink workaround used to handle, so the
-  # symlink itself is obsolete state we can clean up. `rm -rf` on a
-  # symlink unlinks the link, not its target — safe even if it points
-  # at the canonical dir.
+  # `rm -rf` on a symlink unlinks the link, not its target — safe even
+  # if an operator pointed it at the canonical dir as a workaround.
   [[ -e "$stale_dir" || -L "$stale_dir" ]] || return 0
 
   echo "==> detected stale $stale_dir (pre-wrapper ad-hoc invocations)"
 
   # Symlinks (and any other non-directory) carry no independent state —
-  # just unlink. -h on rm is implicit; we use -rf for the dir branch
-  # below, but for the link/file branch a single rm is sufficient.
+  # just unlink.
   if [[ ! -d "$stale_dir" || -L "$stale_dir" ]]; then
     echo "==> $stale_dir is not a real data dir; removing"
     rm -rf "$stale_dir"
@@ -1447,11 +1426,12 @@ reconcile_stale_quay_dir() {
     stale_task_count=0
   fi
 
-  # Expected = values-file repos[] ∪ canonical's already-registered.
-  # Stale ids outside this set are undeclared ad-hoc adds.
+  # Expected = values-file repos[]. Configs-as-code: declared state is
+  # the source of truth, so stale ids outside it are undeclared ad-hoc
+  # adds the operator must reconcile (declare or discard) before we
+  # can safely remove the stale dir.
   local expected_ids=""
-  [[ -n "$ALL_REPOS_TSV" ]]         && expected_ids="$(cut -f1 <<<"$ALL_REPOS_TSV")"
-  [[ -n "$QUAY_REGISTERED_IDS" ]]   && expected_ids+=$'\n'"$QUAY_REGISTERED_IDS"
+  [[ -n "$ALL_REPOS_TSV" ]] && expected_ids="$(cut -f1 <<<"$ALL_REPOS_TSV")"
   local stale_extra_ids=""
   while IFS= read -r sid; do
     [[ -z "$sid" ]] && continue
@@ -1495,6 +1475,24 @@ reconcile_stale_quay_dir() {
 
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   reconcile_stale_quay_dir
+fi
+
+# Snapshot quay's already-registered ids ONCE per install, before the
+# per-repo loop, so re-runs of `quay repo add` are no-ops. A fresh data
+# dir applies embedded migrations on first invocation and returns [];
+# parse failure aborts the install — silently treating it as "no
+# registrations" would re-invoke `quay repo add` on every re-run, which
+# is not documented as idempotent. Runs AFTER reconcile_stale_quay_dir
+# because the binary creates ~/.quay/ as a side effect when invoked,
+# and we don't want our own snapshot to leave drift the next reconciler
+# pass would have to clean up.
+QUAY_REGISTERED_IDS=""
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  QUAY_REGISTERED_IDS="$(
+    sudo -u "$AGENT_USER" \
+      env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo list \
+      | python3 "$VALUES_HELPER" parse-repo-list-ids
+  )"
 fi
 
 if [[ -n "$ALL_REPOS_TSV" ]]; then
