@@ -45,9 +45,7 @@ die()  { printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
 [[ -f "$VALUES_FILE" ]]   || die "values file missing at $VALUES_FILE"
 [[ -f "$VALUES_HELPER" ]] || die "values helper missing at $VALUES_HELPER"
 
-# Capture into a variable so a helper-side schema error (legacy
-# quay.repos[], bad URL) bubbles up as a non-zero exit instead of being
-# swallowed by `done < <(...)`'s process-substitution exit code.
+# Capture before the read loop; <() would mask helper non-zero exits.
 REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)" \
   || die "values_helper.py list-repos failed (run it manually for the diagnostic)"
 

@@ -92,36 +92,27 @@ jobs:
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
-          for FIXTURE in "$QUAY_FIXTURE" "$CODE_FIXTURE"; do
-            sudo mkdir -p "$FIXTURE"
-            sudo git -C "$FIXTURE" init -q -b main
-            echo "fixture: ${FIXTURE##*/}" | sudo tee "$FIXTURE/README.md" > /dev/null
-            sudo git -C "$FIXTURE" \
-              -c user.email=ci@example.com -c user.name=ci add -A
-            sudo git -C "$FIXTURE" \
-              -c user.email=ci@example.com -c user.name=ci commit -q -m "init fixture"
-          done
-          # Non-default-branch fixture: HEAD on main (so origin/HEAD points
-          # at main), develop branch carries a distinct commit. The values
-          # entry pins base_branch=develop; the assertion is that the
-          # mirror sticks on develop after a sync tick.
-          sudo mkdir -p "$DEV_FIXTURE"
-          sudo git -C "$DEV_FIXTURE" init -q -b main
-          echo "main commit" | sudo tee "$DEV_FIXTURE/README.md" > /dev/null
-          sudo git -C "$DEV_FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci add -A
-          sudo git -C "$DEV_FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci commit -q -m "main commit"
-          sudo git -C "$DEV_FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci checkout -q -b develop
-          echo "develop commit" | sudo tee "$DEV_FIXTURE/README.md" > /dev/null
-          sudo git -C "$DEV_FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci add -A
-          sudo git -C "$DEV_FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci commit -q -m "develop commit"
-          # Move HEAD back to main so origin/HEAD = origin/main after clone.
-          sudo git -C "$DEV_FIXTURE" \
-            -c user.email=ci@example.com -c user.name=ci checkout -q main
+          git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
+          init_fixture() {  # $1=dir  $2=commit_msg  ($3=branch, default main)
+            sudo mkdir -p "$1"
+            git_in "$1" init -q -b "${3:-main}"
+            echo "$2" | sudo tee "$1/README.md" >/dev/null
+            git_in "$1" add -A
+            git_in "$1" commit -q -m "$2"
+          }
+          init_fixture "$QUAY_FIXTURE" "init fixture"
+          init_fixture "$CODE_FIXTURE" "init fixture"
+          # HEAD on main (so origin/HEAD points at main after clone), then
+          # add a develop branch with a distinct commit, then return HEAD
+          # to main so the values entry's base_branch=develop diverges
+          # from the remote default — the regression test for hermes-
+          # code-sync resolving base from origin/HEAD.
+          init_fixture "$DEV_FIXTURE" "main commit"
+          git_in "$DEV_FIXTURE" checkout -q -b develop
+          echo "develop commit" | sudo tee "$DEV_FIXTURE/README.md" >/dev/null
+          git_in "$DEV_FIXTURE" add -A
+          git_in "$DEV_FIXTURE" commit -q -m "develop commit"
+          git_in "$DEV_FIXTURE" checkout -q main
           # Repoint the existing quay-managed entry's URL at the local
           # fixture and append the two new code-only entries to repos[].
           # Use python to round-trip through PyYAML so the structure stays

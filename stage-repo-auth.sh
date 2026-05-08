@@ -78,12 +78,9 @@ sort -u "$KNOWN_HOSTS" "$GH_KEYS_TMP" | sudo -u "$AGENT_USER" tee "$KNOWN_HOSTS"
 echo "✓ updated $KNOWN_HOSTS"
 
 # ---------- Enumerate github.com repos for the deploy-key checklist ----------
-# Read every github.com URL out of repos[]; the agent needs the same key
-# registered on each repo (deploy keys are per-repo, not per-org). Capture
-# the helper's output into a variable instead of consuming via process
-# substitution — `done < <(...)` swallows the helper's non-zero exit, so
-# a schema error (legacy `quay.repos[]`, bad URL) would otherwise produce
-# a misleading "no repos to register" message after key staging.
+# Deploy keys are per-repo, not per-org, so the agent needs the same key
+# registered against every github.com URL in repos[]. Capture before the
+# read loop; <() would mask list-repos schema failures.
 
 REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
 

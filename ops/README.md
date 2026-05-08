@@ -254,16 +254,12 @@ contents:
 
 ```sh
 HERMES_STATE_DIR=/home/hermes/.hermes/state
-HOME=/home/hermes
 ```
 
 Override `HERMES_STATE_DIR` if the install lives outside the default
 layout. The script re-resolves on every invocation, so changes here take
-effect on the next tick.
-
-`HOME` is needed because git's credential helper resolves
-`~/.config/git/credentials` relative to `$HOME`, and systemd doesn't set
-`$HOME` by default.
+effect on the next tick. `HOME` is populated by systemd's `User=`
+directive from the agent's passwd entry — no need to set it here.
 
 ## Manual operations
 

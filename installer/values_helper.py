@@ -350,7 +350,7 @@ def _validate_repo_url(url: str, idx: int) -> str | None:
     # collects HTTPS github URLs, so accepting an SCP form here would
     # bypass the operator's per-repo key-registration step at clone
     # time.
-    if url.startswith("git@github.com:") or url.startswith("ssh://git@github.com/"):
+    if url.startswith(("git@github.com:", "ssh://git@github.com/")):
         return (
             f"repos[{idx}].url={url!r}: github.com URLs must be HTTPS "
             f"(use https://github.com/<org>/<repo>, not the SSH form)"
