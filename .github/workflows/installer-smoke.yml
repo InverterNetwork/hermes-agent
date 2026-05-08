@@ -216,8 +216,8 @@ jobs:
             if echo x > "$T/hermes-agent/probe.py" 2>/dev/null; then echo "FAIL: agent wrote rails hermes-agent/"; exit 1; fi
             if echo x > "$T/RUNTIME_VERSION" 2>/dev/null;       then echo "FAIL: agent wrote rails RUNTIME_VERSION"; exit 1; fi
 
-            # ITRY-1316: agent must be able to write config.yaml — root-
-            # owned silently no-ops `hermes auth add` and `hermes model`.
+            # Agent must be able to write config.yaml — root-owned
+            # silently no-ops `hermes auth add` and `hermes model`.
             [[ -f "$T/config.yaml" ]] || { echo "FAIL: $T/config.yaml missing post-install"; exit 1; }
             cfg_owner=$(stat -c "%U" "$T/config.yaml")
             [[ "$cfg_owner" == "hermes" ]] \

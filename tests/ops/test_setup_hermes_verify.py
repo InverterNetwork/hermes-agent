@@ -296,9 +296,9 @@ class TestSetupHermesVerify:
         assert "missing" in result.stderr
 
     def test_root_owned_config_yaml_is_drift(self, install):
-        """ITRY-1316: tests can't actually chown to root, so flip the
-        verify-side agent-owner override to a synthetic user — the fixture
-        file (owned by $USER) then mismatches and exercises the same code
+        """Tests can't actually chown to root, so flip the verify-side
+        agent-owner override to a synthetic user — the fixture file
+        (owned by $USER) then mismatches and exercises the same code
         path as a root-owned production install.
         """
         result = _run_verify(

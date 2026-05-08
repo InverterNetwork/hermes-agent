@@ -368,7 +368,7 @@ do_verify() {
   done
 
   # ---- config.yaml ----
-  # Must be agent-writable — see seed block below for the full WHY (ITRY-1316).
+  # Must be agent-writable — see seed block below for the full WHY.
   local cfg="$target/config.yaml"
   if [[ ! -f "$cfg" ]]; then
     v_drift "config.yaml" "missing: $cfg"
@@ -1022,7 +1022,7 @@ else
 fi
 # config.yaml must be agent-writable: `hermes auth add` rewrites
 # model.provider after the OAuth flow, and `hermes model` does the same on
-# the interactive picker. Root-owned silently no-ops those writes (ITRY-1316).
+# the interactive picker. Root-owned silently no-ops those writes.
 # Re-asserted every run so legacy hosts seeded as root:root self-heal on the
 # next install (the body is never re-rendered, so operator hand-edits survive).
 chown "$AGENT_USER:$AGENT_USER" "$CONFIG_YAML_OUT"
