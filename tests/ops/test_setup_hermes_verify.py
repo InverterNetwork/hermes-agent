@@ -714,13 +714,25 @@ class TestSetupHermesVerifyQuay:
         assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
         assert "[OK] no stale quay data dir at" in result.stdout
         assert "[OK] quay-as-hermes wrapper:" in result.stdout
-        assert "[OK] quay profile.d drop-in present" in result.stdout
+        assert "[OK] quay profile.d drop-in:" in result.stdout
 
     def test_stale_quay_data_dir_is_drift(self, quay_install):
         # Mimic the krustentier failure mode: a sudo-without-env invocation
         # left an empty ~/.quay/ behind. Verify must surface it so the
         # operator re-runs the installer to reconcile.
         quay_install["stale_quay_dir"].mkdir()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] stale quay data dir" in result.stderr
+
+    def test_stale_quay_dir_symlink_is_also_drift(self, quay_install):
+        # Symlink-shaped workarounds (operator pointed ~/.quay at the
+        # canonical dir to make naked `quay …` invocations work) used to
+        # be exempted on the install side and would never reconcile,
+        # leaving verify in permanent drift. The contract is now
+        # consistent: any presence at all — symlink included — is drift,
+        # and the install reconciler removes the link.
+        quay_install["stale_quay_dir"].symlink_to(quay_install["quay_dir"])
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] stale quay data dir" in result.stderr
@@ -733,6 +745,15 @@ class TestSetupHermesVerifyQuay:
 
     def test_missing_quay_profile_dropin_is_drift(self, quay_install):
         quay_install["quay_profile"].unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay profile.d drop-in" in result.stderr
+
+    def test_wrong_mode_quay_profile_dropin_is_drift(self, quay_install):
+        # Login shells source profile.d/*; an agent-writable copy would
+        # let the agent override the canonical export. Mode drift must
+        # be caught, not just absence.
+        quay_install["quay_profile"].chmod(0o664)
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] quay profile.d drop-in" in result.stderr

@@ -611,7 +611,18 @@ do_verify() {
     fi
     local quay_profile="${HERMES_VERIFY_QUAY_PROFILE:-/etc/profile.d/quay-data-dir.sh}"
     if [[ -f "$quay_profile" ]]; then
-      v_ok "quay profile.d drop-in present"
+      local pmode powner
+      pmode="$(_mode "$quay_profile")"
+      powner="$(_owner "$quay_profile")"
+      # Login shells source this; an agent-writable copy would let the
+      # agent override the canonical export with arbitrary env. Same
+      # owner/mode contract as the wrapper above (mode 644 instead of
+      # 755 — sourced, not executed).
+      if [[ "$pmode" == "644" && "$powner" == "$rails_owner" ]]; then
+        v_ok "quay profile.d drop-in: $pmode $powner"
+      else
+        v_drift "quay profile.d drop-in" "mode=$pmode owner=$powner (expected 644 $rails_owner)"
+      fi
     else
       v_drift "quay profile.d drop-in" "missing: $quay_profile"
     fi
@@ -1390,11 +1401,24 @@ fi
 
 reconcile_stale_quay_dir() {
   local stale_dir="$AGENT_HOME/.quay"
-  # `! -L` skips an operator symlink to the canonical dir — a working
-  # state, not drift.
-  [[ -d "$stale_dir" && ! -L "$stale_dir" ]] || return 0
+  # Symlinks are now also drift to be reconciled (matches the verify-side
+  # check at the top of the script): the wrapper + profile.d cover the
+  # cases an operator-side symlink workaround used to handle, so the
+  # symlink itself is obsolete state we can clean up. `rm -rf` on a
+  # symlink unlinks the link, not its target — safe even if it points
+  # at the canonical dir.
+  [[ -e "$stale_dir" || -L "$stale_dir" ]] || return 0
 
   echo "==> detected stale $stale_dir (pre-wrapper ad-hoc invocations)"
+
+  # Symlinks (and any other non-directory) carry no independent state —
+  # just unlink. -h on rm is implicit; we use -rf for the dir branch
+  # below, but for the link/file branch a single rm is sufficient.
+  if [[ ! -d "$stale_dir" || -L "$stale_dir" ]]; then
+    echo "==> $stale_dir is not a real data dir; removing"
+    rm -rf "$stale_dir"
+    return 0
+  fi
 
   if [[ ! -f "$stale_dir/quay.db" ]]; then
     echo "==> $stale_dir has no quay.db; removing"
@@ -1405,17 +1429,20 @@ reconcile_stale_quay_dir() {
   # Probe the stale DB via the binary, not raw SQLite — the schema is
   # quay's to define, and the binary is the only thing that knows the
   # current shape. Run as the agent (dir is agent-owned) with
-  # QUAY_DATA_DIR pinned to stale, so reads target THAT db.
-  _quay_against_stale() {
-    sudo -u "$AGENT_USER" \
-      env QUAY_DATA_DIR="$stale_dir" "$QUAY_BIN_DST" "$@"
-  }
-
+  # QUAY_DATA_DIR pinned to stale, so reads target THAT db. Both probes
+  # capture pipeline failure into probe_failed (refuse-on-uncertainty);
+  # the parser's stderr is intentionally not silenced so a future format
+  # drift surfaces a "values_helper.py: …" diagnostic to the operator.
   local stale_repo_ids stale_task_count probe_failed=0
-  stale_repo_ids="$(_quay_against_stale repo list 2>/dev/null \
-    | python3 "$VALUES_HELPER" parse-repo-list-ids 2>/dev/null || true)"
-  if ! stale_task_count="$(_quay_against_stale task list 2>/dev/null \
-        | python3 "$VALUES_HELPER" parse-task-list-count 2>/dev/null)"; then
+  if ! stale_repo_ids="$(sudo -u "$AGENT_USER" \
+        env QUAY_DATA_DIR="$stale_dir" "$QUAY_BIN_DST" repo list 2>/dev/null \
+        | python3 "$VALUES_HELPER" parse-repo-list-ids)"; then
+    probe_failed=1
+    stale_repo_ids=""
+  fi
+  if ! stale_task_count="$(sudo -u "$AGENT_USER" \
+        env QUAY_DATA_DIR="$stale_dir" "$QUAY_BIN_DST" task list 2>/dev/null \
+        | python3 "$VALUES_HELPER" parse-task-list-count)"; then
     probe_failed=1
     stale_task_count=0
   fi
@@ -1441,7 +1468,7 @@ reconcile_stale_quay_dir() {
   {
     echo "FAIL: $stale_dir holds data not accounted for in $TARGET_DIR/quay/."
     if [[ "$probe_failed" -eq 1 ]]; then
-      echo "      could not probe tasks via \`quay task list\` against stale DB"
+      echo "      could not probe stale DB via \`quay {repo,task} list\`"
       echo "      (refuse-on-uncertainty: cannot safely drop unknown state)"
     elif [[ "$stale_task_count" -gt 0 ]]; then
       echo "      tasks in stale DB: $stale_task_count"
