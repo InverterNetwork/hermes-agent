@@ -368,11 +368,11 @@ class TestListRepos:
         assert r.stdout == ""
 
     def test_legacy_quay_repos_rejected_with_migration_hint(self, tmp_path: Path):
-        # The pre-ITRY-1318 schema. The helper must surface a single,
+        # Legacy `quay.repos[]` schema. The helper must surface a single,
         # clearly-actionable migration error instead of silently honouring
-        # the old key and skipping the new top-level repos[] (which would
-        # let stale values files install only the quay-managed entries
-        # while losing every code mirror).
+        # the old key and skipping the new top-level repos[] — which would
+        # let a stale values file install only the quay-managed entries
+        # while losing every code mirror.
         values = tmp_path / "values.yaml"
         values.write_text(
             "quay:\n"
@@ -513,6 +513,9 @@ class TestListRepos:
             "https://github.com/example/alpha/",          # trailing slash + extra segs
             "https://github.com/example",                 # missing repo segment
             "http://github.com/example/alpha",            # http (not https)
+            "git@github.com:example/alpha.git",           # SCP-style SSH (empty netloc trap)
+            "git@github.com:example/alpha",               # SCP-style SSH, no .git
+            "ssh://git@github.com/example/alpha.git",     # explicit ssh:// scheme
         ],
     )
     def test_github_url_shape_rejected(self, tmp_path: Path, bad_url: str):

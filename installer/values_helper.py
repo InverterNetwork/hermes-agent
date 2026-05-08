@@ -343,12 +343,25 @@ def _validate_repo_url(url: str, idx: int) -> str | None:
     pass through unchecked — the installer only applies the SSH rewrite
     on github.com URLs anyway.
     """
+    # SCP-style URLs (`git@github.com:Org/repo.git`) parse with empty
+    # scheme + empty netloc, so `urlparse` would otherwise let them
+    # silently pass through to the "non-github" branch. Catch them
+    # explicitly: the deploy-key checklist in stage-repo-auth.sh only
+    # collects HTTPS github URLs, so accepting an SCP form here would
+    # bypass the operator's per-repo key-registration step at clone
+    # time.
+    if url.startswith("git@github.com:") or url.startswith("ssh://git@github.com/"):
+        return (
+            f"repos[{idx}].url={url!r}: github.com URLs must be HTTPS "
+            f"(use https://github.com/<org>/<repo>, not the SSH form)"
+        )
+
     parsed = urlparse(url)
     if parsed.scheme != "https" or parsed.netloc != "github.com":
         # Not a github.com HTTPS URL — caller decides whether that's OK
-        # in context. For github.com on http or ssh we still flag the
-        # mismatch; for unrelated hosts/schemes we let the URL through.
-        if parsed.netloc == "github.com" or parsed.netloc.endswith("@github.com"):
+        # in context. For github.com on http we still flag the mismatch;
+        # for unrelated hosts/schemes we let the URL through.
+        if parsed.netloc == "github.com":
             return (
                 f"repos[{idx}].url={url!r}: github.com URLs must be HTTPS "
                 f"(got scheme={parsed.scheme!r})"

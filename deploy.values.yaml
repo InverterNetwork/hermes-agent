@@ -71,8 +71,10 @@
 #                                 installer fetches quay-linux-<arch> from
 #                                 the matching GitHub Release and verifies it
 #                                 against SHA256SUMS; the pin is the security
-#                                 boundary. Required when any repos[] entry
-#                                 carries a `quay:` block.
+#                                 boundary. Must be set for any repos[] entry
+#                                 to be quay-managed; entries with a `quay:`
+#                                 block but no quay.version pin install as
+#                                 code-only with a one-line warning.
 #   quay.agent_invocation      — shell-command template the quay tick
 #                                 supervisor invokes for each task.
 #                                 {prompt_file} is the only placeholder;

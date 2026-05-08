@@ -73,18 +73,25 @@ jobs:
 
       - name: stage fixture repos + patch values for repos[]
         # Real deploys point repos[].url at private GitHub repos. CI has
-        # no credentials for those, so fabricate two local non-bare repos:
-        #   * test-factory-code  — quay-managed (entry has a `quay:` block)
-        #   * code-only-fixture  — code-only (no `quay:` block); exercises
-        #                          the unified repos[] loop's "always
-        #                          provision a code mirror, never a bare
-        #                          clone" branch.
+        # no credentials for those, so fabricate three local non-bare repos:
+        #   * test-factory-code   — quay-managed (entry has a `quay:` block).
+        #   * code-only-fixture   — code-only, base_branch: main; exercises
+        #                           the "code mirror only" branch of the
+        #                           repos[] loop.
+        #   * non-default-branch-fixture — code-only, base_branch: develop,
+        #                           but the repo's HEAD is on `main` so a
+        #                           clone resolves origin/HEAD → origin/main.
+        #                           Catches the regression where hermes-
+        #                           code-sync would derive base from
+        #                           origin/HEAD and snap the mirror to
+        #                           main on every tick.
         # The installer's `git clone` is protocol-agnostic; file:// URLs
         # bypass the per-repo url.insteadOf rewrite (which is github.com-
         # only) and clone directly.
         run: |
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
+          DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
           for FIXTURE in "$QUAY_FIXTURE" "$CODE_FIXTURE"; do
             sudo mkdir -p "$FIXTURE"
             sudo git -C "$FIXTURE" init -q -b main
@@ -94,13 +101,34 @@ jobs:
             sudo git -C "$FIXTURE" \
               -c user.email=ci@example.com -c user.name=ci commit -q -m "init fixture"
           done
+          # Non-default-branch fixture: HEAD on main (so origin/HEAD points
+          # at main), develop branch carries a distinct commit. The values
+          # entry pins base_branch=develop; the assertion is that the
+          # mirror sticks on develop after a sync tick.
+          sudo mkdir -p "$DEV_FIXTURE"
+          sudo git -C "$DEV_FIXTURE" init -q -b main
+          echo "main commit" | sudo tee "$DEV_FIXTURE/README.md" > /dev/null
+          sudo git -C "$DEV_FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci add -A
+          sudo git -C "$DEV_FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci commit -q -m "main commit"
+          sudo git -C "$DEV_FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci checkout -q -b develop
+          echo "develop commit" | sudo tee "$DEV_FIXTURE/README.md" > /dev/null
+          sudo git -C "$DEV_FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci add -A
+          sudo git -C "$DEV_FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci commit -q -m "develop commit"
+          # Move HEAD back to main so origin/HEAD = origin/main after clone.
+          sudo git -C "$DEV_FIXTURE" \
+            -c user.email=ci@example.com -c user.name=ci checkout -q main
           # Repoint the existing quay-managed entry's URL at the local
-          # fixture and append a code-only entry to repos[]. Use python
-          # to round-trip through PyYAML so the structure stays valid no
-          # matter where `quay:` lives relative to `repos:`.
-          sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" <<'PY'
+          # fixture and append the two new code-only entries to repos[].
+          # Use python to round-trip through PyYAML so the structure stays
+          # valid no matter where `quay:` lives relative to `repos:`.
+          sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE" <<'PY'
 import sys, yaml
-quay_fixture, code_fixture = sys.argv[1], sys.argv[2]
+quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
 path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
 with open(path) as f:
     data = yaml.safe_load(f)
@@ -111,6 +139,11 @@ data["repos"].append({
     "id": "code-only-fixture",
     "url": f"file://{code_fixture}",
     "base_branch": "main",
+})
+data["repos"].append({
+    "id": "non-default-branch-fixture",
+    "url": f"file://{dev_fixture}",
+    "base_branch": "develop",
 })
 with open(path, "w") as f:
     yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
@@ -239,15 +272,22 @@ PY
           '
 
       - name: code mirror probes (every repos[] entry has one)
-        # Both the quay-managed entry (test-factory-code) and the code-only
-        # entry (code-only-fixture) must produce a working-tree clone at
-        # $T/code/<id>/, agent-owned, on origin/<base_branch>. The mirror
-        # is what hermes-code-sync refreshes on its 5-min timer.
+        # All three repos[] entries (quay-managed test-factory-code,
+        # code-only-fixture on main, non-default-branch-fixture on
+        # develop) must produce a working-tree clone at $T/code/<id>/,
+        # agent-owned, on origin/<base_branch>. The mirror is what
+        # hermes-code-sync refreshes on its 5-min timer.
         run: |
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes
             [[ -d "$T/code" ]] || { echo "FAIL: code mirrors root missing at $T/code"; exit 1; }
-            for id in test-factory-code code-only-fixture; do
+            # Format: id:expected_base
+            for spec in \
+              test-factory-code:main \
+              code-only-fixture:main \
+              non-default-branch-fixture:develop; do
+              id="${spec%:*}"
+              base_branch="${spec#*:}"
               [[ -d "$T/code/$id/.git" ]] \
                 || { echo "FAIL: code mirror missing for $id at $T/code/$id"; exit 1; }
               [[ -f "$T/code/$id/README.md" ]] \
@@ -256,14 +296,18 @@ PY
               [[ "$owner" == "hermes" ]] \
                 || { echo "FAIL: $id .git owner=$owner (expected hermes)"; exit 1; }
               head=$(git -C "$T/code/$id" rev-parse HEAD)
-              base=$(git -C "$T/code/$id" rev-parse origin/main)
-              [[ "$head" == "$base" ]] \
-                || { echo "FAIL: $id HEAD ($head) != origin/main ($base)"; exit 1; }
+              expected=$(git -C "$T/code/$id" rev-parse "origin/$base_branch")
+              [[ "$head" == "$expected" ]] \
+                || { echo "FAIL: $id HEAD ($head) != origin/$base_branch ($expected)"; exit 1; }
             done
             echo "code mirror probes: OK"
           '
 
-      - name: hermes-code-sync timer probe (enabled + active)
+      - name: hermes-code-sync timer probe (enabled + active + base_branch honoured)
+        # Beyond enabled/active, this exercises the regression test for
+        # the origin/HEAD bug: non-default-branch-fixture has base_branch
+        # develop but origin/HEAD points at main. After a tick, the mirror
+        # MUST stay on origin/develop, not snap to origin/main.
         run: |
           systemctl is-enabled hermes-code-sync.timer >/dev/null \
             || { echo "FAIL: hermes-code-sync.timer not enabled"; exit 1; }
@@ -271,13 +315,30 @@ PY
             || { echo "FAIL: hermes-code-sync.timer not active"; exit 1; }
           # Trigger one tick synchronously and assert it exits 0.
           sudo systemctl start hermes-code-sync.service
-          if ! systemctl is-failed hermes-code-sync.service >/dev/null; then
-            echo "hermes-code-sync timer probe: OK"
-          else
+          if systemctl is-failed hermes-code-sync.service >/dev/null; then
             echo "FAIL: hermes-code-sync.service entered failed state"
             sudo journalctl -u hermes-code-sync.service -n 30 --no-pager
             exit 1
           fi
+          # Post-tick assertion: every mirror remains on origin/<base_branch>.
+          # The develop fixture is the load-bearing case — if hermes-code-sync
+          # ever resolves base from origin/HEAD again, this snaps to
+          # origin/main and the assertion below fires.
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+            for spec in \
+              test-factory-code:main \
+              code-only-fixture:main \
+              non-default-branch-fixture:develop; do
+              id="${spec%:*}"
+              base_branch="${spec#*:}"
+              head=$(git -C "$T/code/$id" rev-parse HEAD)
+              expected=$(git -C "$T/code/$id" rev-parse "origin/$base_branch")
+              [[ "$head" == "$expected" ]] \
+                || { echo "FAIL post-tick: $id HEAD=$head expected=origin/$base_branch=$expected"; exit 1; }
+            done
+            echo "hermes-code-sync timer probe: OK"
+          '
 
       - name: stage-repo-auth.sh probe (key + known_hosts + deploy-key checklist)
         # The smoke-test's main values file has its repos[].url rewritten to

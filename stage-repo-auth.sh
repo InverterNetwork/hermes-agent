@@ -79,9 +79,13 @@ echo "✓ updated $KNOWN_HOSTS"
 
 # ---------- Enumerate github.com repos for the deploy-key checklist ----------
 # Read every github.com URL out of repos[]; the agent needs the same key
-# registered on each repo (deploy keys are per-repo, not per-org). list-repos
-# rejects unmigrated `quay.repos[]` and bad URLs at this point, surfacing
-# schema problems before the operator pastes anything into GitHub.
+# registered on each repo (deploy keys are per-repo, not per-org). Capture
+# the helper's output into a variable instead of consuming via process
+# substitution — `done < <(...)` swallows the helper's non-zero exit, so
+# a schema error (legacy `quay.repos[]`, bad URL) would otherwise produce
+# a misleading "no repos to register" message after key staging.
+
+REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
 
 GITHUB_URLS=()
 while IFS=$'\t' read -r repo_id repo_url _rest; do
@@ -89,7 +93,7 @@ while IFS=$'\t' read -r repo_id repo_url _rest; do
   if [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]]; then
     GITHUB_URLS+=("$repo_url")
   fi
-done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)
+done <<<"$REPOS_TSV"
 
 # ---------- Print public key for deploy-key registration ----------
 
