@@ -11,6 +11,22 @@ Subcommands:
   render-runtime-config <out>  — write ~/.hermes/config.yaml from
                                   slack.runtime.*. Skips if <out> already
                                   exists, so operator hand-edits survive.
+  render-gateway-runtime-env <out>
+                                — write <auth>/gateway-runtime.env from
+                                  values.yaml. Holds non-secret env vars
+                                  derived from the values file
+                                  (SLACK_ALLOWED_USERS today). Always
+                                  rewrites — the file is a reflection of
+                                  values.yaml, not operator input.
+  merge-config-model <out>     — set <out>'s ``model.provider`` and
+                                  ``model.base_url`` from
+                                  ``gateway.model_provider`` /
+                                  ``gateway.model_base_url`` in
+                                  values.yaml. Preserves every other top-
+                                  level key. Run on every install so
+                                  ``hermes auth add`` config-update
+                                  failures (ITRY-1316) can't leave the
+                                  provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
   list-repos                   — emit one TSV line per repos[] entry
@@ -231,6 +247,166 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     else:
         body = "# No recognized slack.runtime keys in deploy.values.yaml.\n"
     out_path.write_text(header + body, encoding="utf-8")
+    sys.stdout.write(f"wrote: {out_path}\n")
+    return 0
+
+
+def cmd_merge_config_model(args: argparse.Namespace) -> int:
+    """Set ``model.provider`` / ``model.base_url`` in ``<out>`` from values.yaml.
+
+    Idempotent: read the existing config.yaml, overwrite the two keys (creating
+    the ``model:`` block if missing), preserve every other top-level key.
+    Run on every install so the gateway's provider pin matches what
+    ``deploy.values.yaml`` declares — independent of whether
+    ``hermes auth add`` ran successfully (per ITRY-1316, it can fail
+    silently when the seeded config.yaml is root-owned).
+
+    Roundtrips through PyYAML, so YAML-level comments inside config.yaml
+    are not preserved (matching ``hermes_cli.config.save_config``'s existing
+    behavior). Operator-added *keys* survive — only the model.provider and
+    model.base_url scalars are touched.
+    """
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+
+    gateway = data.get("gateway") or {}
+    if not isinstance(gateway, dict):
+        sys.stderr.write("values_helper.py: gateway must be a mapping\n")
+        return 1
+    provider = gateway.get("model_provider")
+    base_url = gateway.get("model_base_url")
+    if not isinstance(provider, str) or not provider:
+        sys.stderr.write(
+            "values_helper.py: gateway.model_provider is required (non-empty string)\n"
+        )
+        return 1
+    if base_url is not None and not isinstance(base_url, str):
+        sys.stderr.write(
+            "values_helper.py: gateway.model_base_url, if set, must be a string\n"
+        )
+        return 1
+
+    # Load existing config.yaml. Missing-file is an error — render-runtime-config
+    # is supposed to have run first; merging into a non-existent config would
+    # silently swallow the operator's slack block.
+    if not out_path.exists():
+        sys.stderr.write(
+            f"values_helper.py: {out_path} does not exist; "
+            "render-runtime-config must seed it before merge-config-model\n"
+        )
+        return 1
+    try:
+        existing = yaml.safe_load(out_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        sys.stderr.write(f"values_helper.py: {out_path} is not valid YAML: {exc}\n")
+        return 1
+    if not isinstance(existing, dict):
+        sys.stderr.write(
+            f"values_helper.py: {out_path} top level must be a mapping\n"
+        )
+        return 1
+
+    model_block = existing.get("model")
+    if not isinstance(model_block, dict):
+        model_block = {}
+    model_block["provider"] = provider
+    if base_url:
+        model_block["base_url"] = base_url
+    else:
+        # Empty/unset base_url means "use the provider's default". Drop any
+        # stale value so a values.yaml change to remove a CI-only override
+        # actually takes effect.
+        model_block.pop("base_url", None)
+    existing["model"] = model_block
+
+    out_path.write_text(
+        yaml.safe_dump(existing, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    sys.stdout.write(f"merged: {out_path} model.provider={provider}\n")
+    return 0
+
+
+_ENV_VALUE_BAD_CHARS = re.compile(r"[\s=\x00-\x1f\x7f]")
+
+
+def _env_safe(label: str, value: str) -> str:
+    """Reject values that would break ``KEY=value`` env-file parsing.
+
+    systemd's ``EnvironmentFile=`` treats each line as ``KEY=VALUE`` with no
+    shell quoting, and the gateway parses the same way. Whitespace, ``=``, and
+    control chars in a value would either silently truncate or get reinterpreted
+    on read, so we fail fast instead of emitting a file the runtime will
+    misread.
+    """
+    if _ENV_VALUE_BAD_CHARS.search(value):
+        sys.stderr.write(
+            f"values_helper.py: {label}={value!r} contains whitespace, '=', or "
+            "control characters — refusing to emit unquoted env-file line\n"
+        )
+        sys.exit(1)
+    return value
+
+
+def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
+    """Write ``<auth>/gateway-runtime.env`` from non-secret values.yaml fields.
+
+    Holds env vars the gateway needs at runtime that are non-secret, values-
+    derived config. Today: ``SLACK_ALLOWED_USERS`` from
+    ``slack.runtime.allowed_users``. Future migrations land more keys here
+    (``LINEAR_TEAM_ITRY`` etc.).
+
+    Always rewritten — values.yaml is the source of truth and the file is a
+    reflection. Operator hand-edits live in ``/etc/default/hermes-gateway``
+    or in actual secret files (``auth/slack.env``, ``auth/hermes.env``),
+    not here.
+    """
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+
+    lines: list[str] = [
+        "# Seeded by setup-hermes.sh from deploy.values.yaml on every run.",
+        "# Non-secret env vars derived from values.yaml; do not hand-edit",
+        "# (changes are wiped next install). Override via",
+        "# /etc/default/hermes-gateway instead.",
+    ]
+
+    runtime = (data.get("slack") or {}).get("runtime") or {}
+    if isinstance(runtime, dict):
+        au = runtime.get("allowed_users")
+        if au:
+            if not isinstance(au, list):
+                sys.stderr.write(
+                    "values_helper.py: slack.runtime.allowed_users must be a list\n"
+                )
+                return 1
+            joined = ",".join(_env_safe("slack.runtime.allowed_users[]", str(v)) for v in au)
+            lines.append(f"SLACK_ALLOWED_USERS={joined}")
+
+    # linear.teams.<key>: <uuid>  →  LINEAR_TEAM_<KEY>=<uuid>
+    # Lets skills (e.g. inverter-linear) reference team UUIDs by env var
+    # instead of hardcoding them. Adding a new team to values.yaml is enough
+    # to expose it to the gateway's environment on the next install.
+    teams = (data.get("linear") or {}).get("teams") or {}
+    if not isinstance(teams, dict):
+        sys.stderr.write("values_helper.py: linear.teams must be a mapping\n")
+        return 1
+    for raw_key, raw_val in teams.items():
+        key = str(raw_key)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key):
+            sys.stderr.write(
+                f"values_helper.py: linear.teams.{key!r} is not a valid env-var "
+                "suffix (must match [A-Za-z][A-Za-z0-9_]*)\n"
+            )
+            return 1
+        if raw_val is None or raw_val == "":
+            continue
+        env_key = f"LINEAR_TEAM_{key.upper()}"
+        env_val = _env_safe(f"linear.teams.{key}", str(raw_val))
+        lines.append(f"{env_key}={env_val}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     sys.stdout.write(f"wrote: {out_path}\n")
     return 0
 
@@ -588,6 +764,20 @@ def main(argv: list[str] | None = None) -> int:
     p_cfg.add_argument("--force", action="store_true",
                        help="overwrite an existing file")
     p_cfg.set_defaults(func=cmd_render_runtime_config)
+
+    p_runtime_env = sub.add_parser(
+        "render-gateway-runtime-env",
+        help="write <auth>/gateway-runtime.env (non-secret env vars from values.yaml)",
+    )
+    p_runtime_env.add_argument("--out", required=True, help="output env-file path")
+    p_runtime_env.set_defaults(func=cmd_render_gateway_runtime_env)
+
+    p_merge_model = sub.add_parser(
+        "merge-config-model",
+        help="set config.yaml's model.provider/base_url from values.yaml gateway.*",
+    )
+    p_merge_model.add_argument("--out", required=True, help="path to config.yaml to update")
+    p_merge_model.set_defaults(func=cmd_merge_config_model)
 
     p_quay = sub.add_parser("render-quay-config",
                             help="seed <target>/quay/config.toml from quay.*")

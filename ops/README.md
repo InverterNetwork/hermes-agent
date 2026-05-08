@@ -43,6 +43,7 @@ Five units live here:
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
 | `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-secrets.sh`. |
+| `ops/hermes-gateway.service.d/runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
 
@@ -473,11 +474,15 @@ Prompts (gateway side, always):
 
 * `SLACK_BOT_TOKEN` — required, `xoxb-…`.
 * `SLACK_APP_TOKEN` — required, `xapp-…`.
-* `SLACK_ALLOWED_USERS` — optional; comma-separated `U…` IDs the bot
-  responds to.
 * `LINEAR_API_KEY` — required when quay is provisioned, optional
   otherwise; gates `quay enqueue --linear-issue` and the gateway's
   linear-create skill.
+
+Non-secret runtime config (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …)
+is **not** prompted here. It lives in `deploy.values.yaml` and is rendered
+on every install into `<HERMES_HOME>/auth/gateway-runtime.env` by
+`setup-hermes.sh`. Edit the values file, re-run the installer, and
+`systemctl restart hermes-gateway.service` picks it up. See ITRY-1319.
 
 Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
 

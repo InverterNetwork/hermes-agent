@@ -157,6 +157,44 @@ PY
             --user hermes \
             --git-identity-email didier@ci
 
+      - name: values-derived runtime config probe
+        # ITRY-1319: deploy.values.yaml is now the source of truth for the
+        # gateway's model provider pin and for non-secret env vars
+        # (SLACK_ALLOWED_USERS, LINEAR_TEAM_<KEY>). setup-hermes.sh writes
+        # auth/gateway-runtime.env on every run (independent of --auth-method)
+        # and merges gateway.model_* into config.yaml. Both must land cleanly
+        # on first install and re-runs.
+        run: |
+          sudo -u hermes bash -euo pipefail -c '
+            T=/home/hermes/.hermes
+
+            # auth/gateway-runtime.env present, root:hermes 0640, agent-readable.
+            [[ -f "$T/auth/gateway-runtime.env" ]] \
+              || { echo "FAIL: $T/auth/gateway-runtime.env missing"; exit 1; }
+            mode=$(stat -c "%a" "$T/auth/gateway-runtime.env")
+            owner=$(stat -c "%U:%G" "$T/auth/gateway-runtime.env")
+            [[ "$mode" == "640" ]]               || { echo "FAIL: gateway-runtime.env mode=$mode"; exit 1; }
+            [[ "$owner" == "root:hermes" ]]      || { echo "FAIL: gateway-runtime.env owner=$owner"; exit 1; }
+
+            # LINEAR_TEAM_ITRY is in the fork values file — must round-trip.
+            grep -q "LINEAR_TEAM_ITRY=28294e03-c1ce-4c2b-ba24-49e36179a321" \
+              "$T/auth/gateway-runtime.env" \
+              || { echo "FAIL: LINEAR_TEAM_ITRY missing"; cat "$T/auth/gateway-runtime.env"; exit 1; }
+
+            # config.yaml carries the merged model.provider from values.yaml.
+            grep -Eq "^[[:space:]]*provider:[[:space:]]*openai-codex" \
+              "$T/config.yaml" \
+              || { echo "FAIL: model.provider not merged into config.yaml"; cat "$T/config.yaml"; exit 1; }
+
+            # And the runtime drop-in references the file.
+            unitd=/etc/systemd/system/hermes-gateway.service.d
+            [[ -f "$unitd/runtime-env.conf" ]] \
+              || { echo "FAIL: runtime-env.conf drop-in missing"; ls -la "$unitd"; exit 1; }
+            grep -Fq "auth/gateway-runtime.env" "$unitd/runtime-env.conf" \
+              || { echo "FAIL: runtime-env.conf does not reference gateway-runtime.env"; cat "$unitd/runtime-env.conf"; exit 1; }
+            echo "values-derived runtime config probe: OK"
+          '
+
       - name: permission probes (rails read-only, state writable + git-aware)
         run: |
           sudo -u hermes bash -euo pipefail -c '

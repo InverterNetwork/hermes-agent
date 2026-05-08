@@ -44,10 +44,12 @@
 #
 # Auth: --auth-method app wires a GitHub App credential helper for state/, so
 # `git push` from the agent works without interactive auth. First-run requires
-# --app-id, --app-installation-id, and --app-key-path (path to the App's PEM
-# private key). Subsequent runs reuse the credentials persisted under
-# $TARGET/auth/. --auth-method none (the default) skips auth wiring and is
-# what CI uses with the local fixture.
+# --app-key-path (path to the App's PEM private key, the real secret). The
+# numeric App ID and installation ID default to deploy.values.yaml's
+# auth.github_app.{id, installation_id}; --app-id / --app-installation-id
+# are still honored as per-run overrides for staging. Subsequent runs reuse
+# the PEM persisted under $TARGET/auth/. --auth-method none (the default)
+# skips auth wiring and is what CI uses with the local fixture.
 
 set -euo pipefail
 
@@ -996,6 +998,17 @@ else
   chmod 644 "$CONFIG_YAML_OUT"
 fi
 
+# model.provider / model.base_url are merged from values.yaml on every run,
+# even when the file above was preserved. The CLI's `hermes auth add
+# openai-codex` writes the same keys but can fail silently when config.yaml
+# is root-owned (ITRY-1316), leaving the pin drifted from the deployment's
+# declared provider. This makes the values-driven write authoritative.
+echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  merge-config-model --out "$CONFIG_YAML_OUT"
+chown root:root "$CONFIG_YAML_OUT"
+chmod 644 "$CONFIG_YAML_OUT"
+
 # ---------- venv (rails-class) ----------
 
 echo "==> building venv at $TARGET_DIR/hermes-agent/venv"
@@ -1016,29 +1029,46 @@ find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 
 # ---------- auth (root-owned dir, group-readable by agent) ----------
 # Stored under $TARGET/auth/:
-#   github-app.pem  — the GitHub App private key (mode 0640, root:hermes)
-#   github-app.env  — config consumed by hermes_github_token.py
+#   github-app.pem      — the GitHub App private key (mode 0640, root:hermes)
+#   github-app.env      — config consumed by hermes_github_token.py
+#   gateway-runtime.env — non-secret env vars derived from deploy.values.yaml
+#                         (SLACK_ALLOWED_USERS, …). Rewritten every run so
+#                         values.yaml stays the single source of truth.
+#   slack.env / hermes.env — staged out-of-band by stage-secrets.sh.
 #
-# auth/ is mode 0750 root:hermes — agent (group member) can read both files
-# but can't write them, and the rails (root) own provisioning. The token cache
-# lives in $TARGET/cache/ (agent-writable) so this dir stays read-only to it.
+# auth/ is mode 0750 root:hermes — agent (group member) can read every file
+# but can't write any of them, and the rails (root) own provisioning. The
+# token cache lives in $TARGET/cache/ (agent-writable) so this dir stays
+# read-only to it.
 
 AUTH_DIR="$TARGET_DIR/auth"
 GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
+GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
 TOKEN_HELPER_PY="$TARGET_DIR/hermes-agent/installer/hermes_github_token.py"
 VENV_PY="$TARGET_DIR/hermes-agent/venv/bin/python"
 HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 
+# auth/ is created here regardless of --auth-method because gateway-runtime.env
+# (values-derived, written below) lives in it. Strip setgid that propagates
+# from $TARGET_DIR's setgid bit on Linux (System V dir semantics) — auth/
+# has a strict mode-750 invariant, so files inside are explicitly chmod'd
+# without group inheritance. `install -m 0750` doesn't reliably clear the
+# bit on coreutils we've seen in CI; `g-s` is unambiguous.
+install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
+chmod g-s "$AUTH_DIR"
+
+# Values-derived runtime env file. Rewritten every run — values.yaml is the
+# source of truth; the file is a reflection. Operator hand-edits belong in
+# /etc/default/hermes-gateway, not here.
+echo "==> rendering $GATEWAY_RUNTIME_ENV from $VALUES_FILE"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  render-gateway-runtime-env --out "$GATEWAY_RUNTIME_ENV"
+chown root:"$AGENT_USER" "$GATEWAY_RUNTIME_ENV"
+chmod 0640 "$GATEWAY_RUNTIME_ENV"
+
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
-  install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
-  # Strip setgid that propagates from $TARGET_DIR's setgid bit on Linux
-  # (System V dir semantics). auth/ has a strict mode-750 invariant —
-  # files inside are explicitly chmod'd, no need for group inheritance.
-  # `install -m 0750` doesn't reliably clear the bit on coreutils we've
-  # seen in CI; `g-s` is unambiguous.
-  chmod g-s "$AUTH_DIR"
 
   if [[ -n "$APP_KEY_PATH" ]]; then
     [[ -f "$APP_KEY_PATH" ]] \
@@ -1062,11 +1092,16 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
   chown root:"$AGENT_USER" "$GH_APP_KEY_DST"
   chmod 0640 "$GH_APP_KEY_DST"
 
-  # Persist App identity. APP_ID / APP_INSTALLATION_ID are required on first
-  # install; on re-runs we read whatever's in the existing env file unless the
-  # operator passed new values. Extract via awk rather than `source`, because
-  # `source` evaluates the values in our shell — `--app-id 'foo$(rm -rf /)'`
-  # would be game-over on the next install.
+  # Persist App identity. Resolution order: CLI flag > deploy.values.yaml >
+  # existing env file (legacy fallback for installs that pre-date ITRY-1319).
+  # values.yaml is the durable home for these IDs (public identifiers — the
+  # PEM is the real secret); CLI flags stay as ad-hoc overrides for staging.
+  # Extract from the env file via awk rather than `source`, because `source`
+  # evaluates the values in our shell — `--app-id 'foo$(rm -rf /)'` would be
+  # game-over on the next install.
+  APP_ID="${APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.id 2>/dev/null || true)}"
+  APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.installation_id 2>/dev/null || true)}"
+  GH_API_BASE="${GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app.api_base 2>/dev/null || true)}"
   if [[ -f "$GH_APP_ENV" ]]; then
     APP_ID="${APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$GH_APP_ENV")}"
     APP_INSTALLATION_ID="${APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$GH_APP_ENV")}"
@@ -1577,9 +1612,11 @@ fi
 
 GATEWAY_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/slack-env.conf"
 GATEWAY_HERMES_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/hermes-env.conf"
+GATEWAY_RUNTIME_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/runtime-env.conf"
 GATEWAY_DROPIN_DIR="/etc/systemd/system/hermes-gateway.service.d"
 GATEWAY_DROPIN_DST="$GATEWAY_DROPIN_DIR/slack-env.conf"
 GATEWAY_HERMES_DROPIN_DST="$GATEWAY_DROPIN_DIR/hermes-env.conf"
+GATEWAY_RUNTIME_DROPIN_DST="$GATEWAY_DROPIN_DIR/runtime-env.conf"
 GATEWAY_SLACK_ENV="$AUTH_DIR/slack.env"
 
 if [[ -f "$GATEWAY_DROPIN_SRC" && -x "$HERMES_BIN" ]]; then
@@ -1629,6 +1666,10 @@ EOF
     echo "==> installing hermes-env drop-in at $GATEWAY_HERMES_DROPIN_DST"
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
+
+    echo "==> installing runtime-env drop-in at $GATEWAY_RUNTIME_DROPIN_DST"
+    sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_RUNTIME_DROPIN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_RUNTIME_DROPIN_DST"
 
     systemctl daemon-reload
 

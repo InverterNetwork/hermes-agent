@@ -20,6 +20,45 @@
 #                                 first install. Preserved across re-runs (the
 #                                 installer never overwrites a live config) so
 #                                 operator hand-edits survive.
+#   slack.runtime.allowed_users — Slack member IDs (U…) authorized to talk to
+#                                 the bot. Source of truth for the gateway's
+#                                 SLACK_ALLOWED_USERS env var; the installer
+#                                 writes a comma-joined value into
+#                                 <target>/auth/gateway-runtime.env on every
+#                                 run, so re-installs and rotations don't ask
+#                                 the operator to re-type the list.
+#
+#   gateway.model_provider     — provider key persisted into <target>/config.yaml
+#                                 under model.provider (e.g. "openai-codex",
+#                                 "anthropic", "openrouter"). The installer
+#                                 merges this into config.yaml on every run,
+#                                 so a successful `hermes auth add` is no
+#                                 longer required to land the right pin
+#                                 (per ITRY-1316).
+#   gateway.model_base_url     — optional override for the provider's default
+#                                 base URL. Leave empty to use the provider
+#                                 default; set only for self-hosted endpoints
+#                                 or routing through a gateway.
+#
+#   auth.github_app.id         — numeric GitHub App ID. Identifier (not a
+#                                 secret); committing here means re-installs
+#                                 stop asking for `--app-id`. The PEM private
+#                                 key is the actual secret and stays out-of-
+#                                 band (`--app-key-path`).
+#   auth.github_app.installation_id — numeric installation ID for the App's
+#                                 install in this org. Same identifier rules
+#                                 as `auth.github_app.id`.
+#   auth.github_app.api_base   — optional override of the GitHub API base URL
+#                                 (e.g. for GitHub Enterprise or a CI mock).
+#                                 Empty = production github.com.
+#
+#   linear.teams              — map of <team_key>: <team_uuid> exposed to the
+#                                 gateway as LINEAR_TEAM_<KEY> env vars
+#                                 (auth/gateway-runtime.env). Skills like
+#                                 inverter-linear reference these instead of
+#                                 hardcoding UUIDs, so re-templating for
+#                                 another team takes one entry here. Team
+#                                 UUIDs are identifiers, not secrets.
 #
 #   repos                      — unified list of repos this deployment cares
 #                                 about. Every entry produces a code mirror
@@ -96,6 +135,41 @@ org:
   name: Inverter
   agent_identity_name: didier
 
+gateway:
+  # LLM provider key the gateway pins to in <target>/config.yaml's model
+  # block. Merged from this file on every install — a failed
+  # `hermes auth add` config-update step no longer leaves the pin drifted.
+  # The OAuth/API-key flow is still out-of-band (`hermes auth add
+  # openai-codex` once for tokens), but the *config wiring* is values-
+  # driven.
+  model_provider: openai-codex
+  # Empty = use the provider's default endpoint. Set only for routing
+  # through a self-hosted gateway or an org-internal proxy.
+  model_base_url: ""
+
+auth:
+  # GitHub App used for the agent's git push back to hermes-state. IDs are
+  # public identifiers and live here; the PEM private key is the real
+  # secret and stays out-of-band (operator passes --app-key-path on
+  # install). On every run, setup-hermes.sh writes auth/github-app.env
+  # from these values, so re-installs stop asking for --app-id /
+  # --app-installation-id. Pass --app-id / --app-installation-id only to
+  # override per-run (e.g. swap to a staging App).
+  github_app:
+    id: ""              # set to the numeric App ID once known
+    installation_id: "" # set to the numeric installation ID once known
+    # Empty = production github.com. Set only for GitHub Enterprise or
+    # a CI mock endpoint.
+    api_base: ""
+
+linear:
+  # Linear team UUIDs exposed to the gateway as LINEAR_TEAM_<KEY> env vars
+  # (via auth/gateway-runtime.env). Used by skills/inverter-linear in
+  # hermes-state to avoid hardcoding the team UUID. Add other teams here
+  # by appending entries (e.g. `aster: <uuid>` → LINEAR_TEAM_ASTER).
+  teams:
+    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321
+
 slack:
   app:
     display_name: BabyDidier(dev)
@@ -104,6 +178,12 @@ slack:
     slash_command_name: lmdtfy
     slash_command_description: Let Me Didier That For You
   runtime:
+    # Slack member IDs (U…) authorized to talk to the bot. Comma-joined into
+    # SLACK_ALLOWED_USERS on every install via auth/gateway-runtime.env, so
+    # the operator stops re-typing this on re-runs/rotations. Empty list /
+    # unset disables the gate (bot accepts every authorized user — risky in
+    # public workspaces; keep populated for production).
+    allowed_users: []
     # If non-empty, the bot ONLY responds in these channels (whitelist).
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
