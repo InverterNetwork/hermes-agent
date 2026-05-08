@@ -180,10 +180,8 @@ write_env() {
 # slack.env — secrets only. Hosts that previously staged a
 # SLACK_ALLOWED_USERS line drop it on the next re-run because the new
 # content no longer contains it; the gateway picks the list up from
-# auth/gateway-runtime.env via the z-runtime-env.conf drop-in instead.
-# Until the operator re-runs this script, the legacy line in slack.env is
-# shadowed by the values.yaml-derived value (z-runtime-env.conf sorts
-# after slack-env.conf, and systemd's last EnvironmentFile= wins).
+# auth/gateway-runtime.env via the z-runtime-env.conf drop-in instead
+# (the drop-in's own header documents why it sorts last).
 slack_content="SLACK_BOT_TOKEN=${SLACK_BOT}
 SLACK_APP_TOKEN=${SLACK_APP}"
 write_env "$SLACK_ENV" "$slack_content" slack_changed

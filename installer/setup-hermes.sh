@@ -144,6 +144,15 @@ v_drift() {
   echo "[DRIFT] $1: $2" >&2
 }
 
+# Print the SHA-256 of $1, or empty when the file doesn't exist. Callers
+# capture before/after a write and compare; an absent-then-present file
+# (first install) reads as a mismatch and triggers downstream actions
+# (e.g. a gateway restart) just like a content change would.
+file_sha() {
+  [[ -f "$1" ]] || return 0
+  sha256sum "$1" | cut -d' ' -f1
+}
+
 # Cross-platform stat — GNU first, BSD fallback. The mode helper strips the
 # leading zero so callers can compare against "750"/"640" string-style.
 _owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null; }
@@ -998,21 +1007,16 @@ else
   chmod 644 "$CONFIG_YAML_OUT"
 fi
 
-# model.provider / model.base_url are merged from values.yaml on every run,
-# even when the file above was preserved. The CLI's `hermes auth add
-# openai-codex` writes the same keys but can fail silently when config.yaml
-# is root-owned, leaving the pin drifted from the deployment's declared
-# provider. The values-driven write here is authoritative regardless of
-# whether the CLI's update step succeeded.
-prev_config_sha=""
-[[ -f "$CONFIG_YAML_OUT" ]] && prev_config_sha="$(sha256sum "$CONFIG_YAML_OUT" | cut -d' ' -f1)"
+# model.* is rewritten on every run, even when the file above was preserved
+# — the helper docstring covers the rationale (silent `hermes auth add`
+# failures leaving the pin drifted).
+config_sha_pre="$(file_sha "$CONFIG_YAML_OUT")"
 echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   merge-config-model --out "$CONFIG_YAML_OUT"
 chown root:root "$CONFIG_YAML_OUT"
 chmod 644 "$CONFIG_YAML_OUT"
-new_config_sha="$(sha256sum "$CONFIG_YAML_OUT" | cut -d' ' -f1)"
-[[ "$prev_config_sha" != "$new_config_sha" ]] && GATEWAY_NEEDS_RESTART=1
+[[ "$config_sha_pre" != "$(file_sha "$CONFIG_YAML_OUT")" ]] && GATEWAY_NEEDS_RESTART=1
 
 # ---------- venv (rails-class) ----------
 
@@ -1067,24 +1071,19 @@ chmod g-s "$AUTH_DIR"
 # source of truth; the file is a reflection. Operator hand-edits belong in
 # /etc/default/hermes-gateway, not here.
 #
-# Track content change vs. on-disk so we can drive the gateway-restart
-# decision below. systemd does not re-read EnvironmentFile= for an already-
-# active process on `daemon-reload`; without an explicit restart the new
-# values would sit on disk while the running gateway keeps the old env.
+# GATEWAY_NEEDS_RESTART accumulates content drift across this and the two
+# other env-affecting writes below (config.yaml model merge, runtime-env
+# drop-in). systemd doesn't re-read EnvironmentFile= for a running process
+# on `daemon-reload`, so we have to restart explicitly when content
+# actually changed.
 GATEWAY_NEEDS_RESTART=0
-gateway_runtime_changed=0
-prev_runtime_sha=""
-[[ -f "$GATEWAY_RUNTIME_ENV" ]] && prev_runtime_sha="$(sha256sum "$GATEWAY_RUNTIME_ENV" | cut -d' ' -f1)"
+runtime_sha_pre="$(file_sha "$GATEWAY_RUNTIME_ENV")"
 echo "==> rendering $GATEWAY_RUNTIME_ENV from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   render-gateway-runtime-env --out "$GATEWAY_RUNTIME_ENV"
 chown root:"$AGENT_USER" "$GATEWAY_RUNTIME_ENV"
 chmod 0640 "$GATEWAY_RUNTIME_ENV"
-new_runtime_sha="$(sha256sum "$GATEWAY_RUNTIME_ENV" | cut -d' ' -f1)"
-if [[ "$prev_runtime_sha" != "$new_runtime_sha" ]]; then
-  gateway_runtime_changed=1
-  GATEWAY_NEEDS_RESTART=1
-fi
+[[ "$runtime_sha_pre" != "$(file_sha "$GATEWAY_RUNTIME_ENV")" ]] && GATEWAY_NEEDS_RESTART=1
 
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
@@ -1690,13 +1689,11 @@ EOF
     # First-time install of z-runtime-env.conf on an existing host counts as
     # an env-source change for the running gateway — track it so the restart
     # below picks up the new EnvironmentFile= line.
-    prev_z_dropin_sha=""
-    [[ -f "$GATEWAY_RUNTIME_DROPIN_DST" ]] && prev_z_dropin_sha="$(sha256sum "$GATEWAY_RUNTIME_DROPIN_DST" | cut -d' ' -f1)"
+    z_dropin_sha_pre="$(file_sha "$GATEWAY_RUNTIME_DROPIN_DST")"
     echo "==> installing runtime-env drop-in at $GATEWAY_RUNTIME_DROPIN_DST"
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_RUNTIME_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_RUNTIME_DROPIN_DST"
-    new_z_dropin_sha="$(sha256sum "$GATEWAY_RUNTIME_DROPIN_DST" | cut -d' ' -f1)"
-    [[ "$prev_z_dropin_sha" != "$new_z_dropin_sha" ]] && GATEWAY_NEEDS_RESTART=1
+    [[ "$z_dropin_sha_pre" != "$(file_sha "$GATEWAY_RUNTIME_DROPIN_DST")" ]] && GATEWAY_NEEDS_RESTART=1
 
     systemctl daemon-reload
 
