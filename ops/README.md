@@ -46,6 +46,8 @@ Five units live here:
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
+| `ops/quay-as-hermes`                       | Operator wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR` so ad-hoc `quay …` lands in the same dir the tick writes to. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
 
@@ -547,14 +549,34 @@ Force a tick:
 sudo systemctl start quay-tick.service
 ```
 
-Inspect what quay knows about:
+Inspect what quay knows about — use the wrapper, not the binary
+directly:
 
 ```sh
-sudo -u <agent_user> env QUAY_DATA_DIR=<HERMES_HOME>/quay \
-  /usr/local/bin/quay repo list
-sudo -u <agent_user> env QUAY_DATA_DIR=<HERMES_HOME>/quay \
-  /usr/local/bin/quay task list
+sudo /usr/local/bin/quay-as-hermes repo list
+sudo /usr/local/bin/quay-as-hermes task list
 ```
+
+Why a wrapper instead of `sudo -u <agent> /usr/local/bin/quay …`? Sudo
+strips the environment by default, so `QUAY_DATA_DIR` doesn't survive
+the privilege drop, and quay's config-resolution order falls back to
+`~<agent>/.quay/config.toml` — a parallel SQLite + repos dir that
+diverges silently from what the systemd tick writes to. The wrapper is
+a thin `exec sudo -u <agent> env QUAY_DATA_DIR=<HERMES_HOME>/quay
+/usr/local/bin/quay "$@"` so all ad-hoc invocations land in the same
+DB the tick uses.
+
+For interactive sessions (`sudo -u <agent> -i`, `su - <agent>`), the
+profile.d drop-in at `/etc/profile.d/quay-data-dir.sh` exports
+`QUAY_DATA_DIR` automatically, so `quay …` typed at a login shell
+behaves the same as the wrapper. Both are installed by
+`setup-hermes.sh` on quay-enabled hosts.
+
+`setup-hermes.sh` also reconciles a stale `~<agent>/.quay/` on every
+re-run: empty / equivalent-to-canonical dirs are removed, and dirs
+holding tasks or registrations not declared in `deploy.values.yaml`
+fail the install with a remediation hint. `--verify` flags any
+presence of `~<agent>/.quay/` as drift.
 
 ---
 

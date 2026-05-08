@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# quay-as-hermes — sanctioned operator path for ad-hoc quay invocations.
+#
+# Direct `sudo -u __AGENT_USER__ /usr/local/bin/quay …` strips
+# QUAY_DATA_DIR, so quay's config-resolution order falls back to
+# ~/.quay/config.toml — a parallel SQLite + repos dir under the agent's
+# home that diverges silently from what the systemd tick writes to.
+# This wrapper pins the data dir explicitly, so manual `repo add`,
+# `task list`, `enqueue`, etc. land in the same place as the unit.
+#
+# __AGENT_USER__ and __TARGET_DIR__ are substituted by setup-hermes.sh
+# at install time, matching the quay-tick.service template pattern.
+exec sudo -u __AGENT_USER__ \
+     env QUAY_DATA_DIR=__TARGET_DIR__/quay \
+     /usr/local/bin/quay "$@"

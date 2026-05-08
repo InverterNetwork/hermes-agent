@@ -548,7 +548,7 @@ def _write_quay_stub(
 
 
 @pytest.fixture
-def quay_install(install: dict) -> dict:
+def quay_install(install: dict, tmp_path: Path) -> dict:
     """Extend the base install fixture with quay artefacts on disk + a values
     file pinned to QUAY_VERSION + a stubbed `quay` binary on PATH-redirect."""
     fork = install["fork"]
@@ -648,12 +648,32 @@ def quay_install(install: dict) -> dict:
         py_shim.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} "$@"\n')
         py_shim.chmod(0o755)
 
+    # Operator-invocation glue: wrapper at /usr/local/bin/quay-as-hermes
+    # and login-shell drop-in at /etc/profile.d/quay-data-dir.sh in prod.
+    # The test fixture redirects both via HERMES_VERIFY_QUAY_WRAPPER /
+    # HERMES_VERIFY_QUAY_PROFILE so we can poke at them without touching
+    # /usr/local/bin or /etc on the dev machine.
+    quay_wrapper = bin_dir / "quay-as-hermes"
+    quay_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n")
+    quay_wrapper.chmod(0o755)
+    quay_profile = bin_dir / "quay-data-dir.sh"
+    quay_profile.write_text("# stub\n")
+    quay_profile.chmod(0o644)
+
+    # Stale ~/.quay/ probe: redirect to a tmp path so we never touch the
+    # developer's real home dir. Default state is "no stale dir" — tests
+    # that assert the drift path mkdir() it explicitly.
+    stale_quay_dir = tmp_path / "stale-quay"
+
     install["values_file"] = fork / "deploy.values.yaml"
     install["quay_dir"] = quay_dir
     install["quay_bin"] = quay_stub
     install["quay_repo_id"] = repo_id
     install["quay_repo_url"] = repo_url
     install["quay_bare"] = bare
+    install["quay_wrapper"] = quay_wrapper
+    install["quay_profile"] = quay_profile
+    install["stale_quay_dir"] = stale_quay_dir
     return install
 
 
@@ -664,6 +684,9 @@ def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
     env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
     env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
     env["HERMES_VERIFY_QUAY_BIN"] = str(install["quay_bin"])
+    env["HERMES_VERIFY_QUAY_WRAPPER"] = str(install["quay_wrapper"])
+    env["HERMES_VERIFY_QUAY_PROFILE"] = str(install["quay_profile"])
+    env["HERMES_VERIFY_STALE_QUAY_DIR"] = str(install["stale_quay_dir"])
     return subprocess.run(
         [
             "bash", str(SCRIPT),
@@ -689,6 +712,30 @@ class TestSetupHermesVerifyQuay:
         assert f"[OK] quay repo {quay_install['quay_repo_id']} ownership:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} origin:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
+        assert "[OK] no stale quay data dir at" in result.stdout
+        assert "[OK] quay-as-hermes wrapper:" in result.stdout
+        assert "[OK] quay profile.d drop-in present" in result.stdout
+
+    def test_stale_quay_data_dir_is_drift(self, quay_install):
+        # Mimic the krustentier failure mode: a sudo-without-env invocation
+        # left an empty ~/.quay/ behind. Verify must surface it so the
+        # operator re-runs the installer to reconcile.
+        quay_install["stale_quay_dir"].mkdir()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] stale quay data dir" in result.stderr
+
+    def test_missing_quay_wrapper_is_drift(self, quay_install):
+        quay_install["quay_wrapper"].unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay-as-hermes wrapper" in result.stderr
+
+    def test_missing_quay_profile_dropin_is_drift(self, quay_install):
+        quay_install["quay_profile"].unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay profile.d drop-in" in result.stderr
 
     def test_missing_quay_binary_is_drift(self, quay_install):
         quay_install["quay_bin"].unlink()
