@@ -493,7 +493,7 @@ Test fixture:
 
 ---
 
-## 10. 🟡 Worker exits silently inside quay's tmux spawn (0-byte session log) [ITRY-1349]
+## 10. 🟡 Worker exits silently inside quay's tmux spawn (0-byte session log) [AST-100]
 
 - **Symptom:** Every claude worker spawned by `quay tick` for ITRY-1327
   on krustentier exits within ~60s producing **zero bytes** in
@@ -526,7 +526,7 @@ Test fixture:
   bytes), same OS user, same `~/.claude/.credentials.json`, same
   `claude --version` (2.1.132). End-to-end auth model verified
   working in the manual case.
-- **Hypotheses to investigate (ITRY-1349):**
+- **Hypotheses to investigate (AST-100):**
   1. Tmux server env propagation race — claude's blocker artifact
      from earlier reported "no `GH_TOKEN` set", but `env`-dump probes
      into a fresh tmux pane show `GH_TOKEN` propagating fine.
@@ -538,15 +538,20 @@ Test fixture:
   4. Systemd cgroup reaping of tmux descendants when `quay-tick.service`
      (`Type=oneshot`) exits.
 - **Locus of fix:** **quay** (worker spawn substrate). Filed as
-  [ITRY-1349](https://linear.app/inverter/issue/ITRY-1349) (priority
-  High). Recommended next step in the body: wire
-  `claude --debug --debug-file <path>` into agent_invocation
-  temporarily and diff debug logs between quay-spawn and manual-spawn
-  for the divergence point.
+  [AST-100](https://linear.app/aster69/issue/AST-100) (priority High,
+  Bug). Originally opened as ITRY-1349 in iTRY's tracker by mistake;
+  re-filed in Aster (the canonical tracker for quay-side bugs) and
+  the iTRY ticket canceled with a redirect comment. Recommended next
+  step in the AST-100 body: wire `claude --debug --debug-file <path>`
+  into `agent_invocation` temporarily and diff debug logs between
+  quay-spawn and manual-spawn for the divergence point. Cross-linked
+  to [AST-93](https://linear.app/aster69/issue/AST-93)'s observability
+  children (AST-95 `exit_code`/`exit_signal`, AST-97 `tool_trace`)
+  whose presence would make this triage nearly free.
 - **Workaround for v0.1.x:** None on the operator side. The end-to-end
   auth + worker logic is functionally validated via the manual probe;
   for a deployment to drive itself without operator intervention,
-  ITRY-1349 needs to land.
+  AST-100 needs to land.
 
 ---
 
@@ -560,7 +565,7 @@ The v0.1.0 worker-pipeline test against ITRY-1327 on krustentier is
 | `quay enqueue --linear-issue` (Linear adapter, brief synth) | ✅ | task `a1c4e61f` enqueued, brief artifact captured |
 | Worktree creation + `bun install` bootstrap | ✅ | node_modules present in worktree |
 | Tmux session spawn | ✅ | Pane created with `pipe-pane` log sink |
-| Worker (claude) executes the brief | ✅ via manual probe; ❌ via quay's spawn | PR #1 opened in manual repro; quay-spawn → ITRY-1349 |
+| Worker (claude) executes the brief | ✅ via manual probe; ❌ via quay's spawn | PR #1 opened in manual repro; quay-spawn → AST-100 |
 | `git push` over HTTPS+App credential helper | ✅ | PR #1's commit `137a753` pushed |
 | `gh pr create` via App-installation token | ✅ | PR #1 opened by `app/didier-runtime` |
 | Quay classifier sees PR exists, transitions correctly | ✅ | `action: "no_progress"` (correct: PR exists, this attempt didn't push) |
@@ -569,7 +574,7 @@ The v0.1.0 worker-pipeline test against ITRY-1327 on krustentier is
 **Open follow-ups filed:**
 - [ITRY-1346](https://linear.app/inverter/issue/ITRY-1346) (Medium) — declarative `bun` provisioning in `setup-hermes.sh`.
 - [ITRY-1348](https://linear.app/inverter/issue/ITRY-1348) (High) — installer's stale `url.insteadOf` unset has a `.git`-suffix mismatch.
-- [ITRY-1349](https://linear.app/inverter/issue/ITRY-1349) (High) — claude worker exits silently inside quay's tmux spawn (the only thing between us and a fully autonomous green run).
+- [AST-100](https://linear.app/aster69/issue/AST-100) (High) — claude worker exits silently inside quay's tmux spawn (the only thing between us and a fully autonomous green run). Originally filed as ITRY-1349 in iTRY by mistake; canceled and refiled in Aster.
 
 **What's already shipped during the test:**
 - v0.1.1 (AST-85 / AST-86 / AST-89, Linear+Slack adapter spawn fixes).
