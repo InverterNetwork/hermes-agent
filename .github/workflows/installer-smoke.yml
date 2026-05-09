@@ -396,10 +396,16 @@ jobs:
         # checklist) we feed it a tiny fixture YAML with a real GitHub-
         # shaped URL via VALUES_FILE — the URL is never cloned, we only
         # want the SSH-key + checklist artefacts.
+        # The fixture mixes a code-only entry (deploy-key URL must appear)
+        # with a quay-managed entry (URL must NOT appear — that path uses
+        # the App credential helper, not a deploy key).
         run: |
           FIXTURE_YAML=$(mktemp /tmp/repo-auth-fixture-XXXXXX.yaml)
           cat > "$FIXTURE_YAML" <<'YAML'
           repos:
+            - id: code-only-fixture
+              url: https://github.com/InverterNetwork/code-only-fixture
+              base_branch: main
             - id: test-factory-code
               url: https://github.com/InverterNetwork/test-factory-code
               base_branch: main
@@ -410,12 +416,15 @@ jobs:
           sudo chmod 644 "$FIXTURE_YAML"
 
           # First run — pubkey shouldn't exist yet. Capture stdout so we
-          # can assert the deploy-key checklist URL is printed.
+          # can assert the bifurcated checklist behavior.
           OUT=$(sudo VALUES_FILE="$FIXTURE_YAML" \
             /srv/hermes/repos/hermes-agent/stage-repo-auth.sh)
           echo "$OUT"
+          grep -Fq "https://github.com/InverterNetwork/code-only-fixture/settings/keys" <<<"$OUT" \
+            || { echo "FAIL: code-only deploy-key checklist URL missing"; exit 1; }
           grep -Fq "https://github.com/InverterNetwork/test-factory-code/settings/keys" <<<"$OUT" \
-            || { echo "FAIL: deploy-key checklist URL missing from output"; exit 1; }
+            && { echo "FAIL: quay-managed entry leaked into deploy-key checklist"; exit 1; } \
+            || true
 
           # Probe as hermes: key + known_hosts staged with correct perms.
           sudo -u hermes bash -euo pipefail -c '
@@ -442,30 +451,48 @@ jobs:
 
           rm -f "$FIXTURE_YAML"
 
-      - name: per-repo url.insteadOf probe (setup-hermes.sh wires it for github.com)
+      - name: per-repo url.insteadOf probe (setup-hermes.sh writes for code-only, unsets for quay-managed)
         # The url.insteadOf rewrite that bridges HTTPS → SSH lives in
         # setup-hermes.sh's repos[] loop now (not stage-repo-auth.sh). Run
-        # the install script's regex+rewrite snippet against a github.com
-        # URL fixture so the bash logic is exercised independently of an
-        # actual clone (which would need real GitHub creds).
+        # the install script's regex + write + unset snippets against a
+        # github.com URL fixture so the bash logic is exercised independently
+        # of an actual clone (which would need real GitHub creds). Covers
+        # both branches of the bifurcation: write for code-only entries,
+        # unset for quay-managed entries (the upgrade-path fix that strips
+        # stale rewrites left by pre-consolidation installs).
         run: |
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes
             cd "$T"  # git stats CWD even with --file
-            # This snippet mirrors the regex + invocation in
-            # installer/setup-hermes.sh; if the two drift, the
-            # production rewrite stops landing.
             repo_url="https://github.com/InverterNetwork/per-repo-probe"
             [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]] \
               || { echo "FAIL: regex did not match clean github.com URL"; exit 1; }
             org="${BASH_REMATCH[1]}"
             repo_short="${BASH_REMATCH[2]}"
             ssh_url="git@github.com:${org}/${repo_short}.git"
+
+            # Write branch (code-only entry).
             git config --file "$T/.gitconfig" "url.${ssh_url}.insteadOf" "$repo_url"
             actual=$(git config --file "$T/.gitconfig" --get "url.${ssh_url}.insteadOf")
             [[ "$actual" == "$repo_url" ]] \
               || { echo "FAIL: per-repo rewrite did not land: got $actual"; exit 1; }
-            echo "per-repo url.insteadOf probe: OK"
+
+            # Unset branch (quay-managed entry: clears stale rewrite from a
+            # pre-consolidation install). First call removes the entry; a
+            # second call must succeed too (exit 5 = key absent) so re-runs
+            # of the installer are idempotent.
+            unset_rc=0
+            git config --file "$T/.gitconfig" --unset-all "url.${ssh_url}.insteadOf" || unset_rc=$?
+            (( unset_rc == 0 )) \
+              || { echo "FAIL: first unset-all returned $unset_rc"; exit 1; }
+            unset_rc=0
+            git config --file "$T/.gitconfig" --unset-all "url.${ssh_url}.insteadOf" || unset_rc=$?
+            (( unset_rc == 5 )) \
+              || { echo "FAIL: second unset-all returned $unset_rc (expected 5)"; exit 1; }
+            git config --file "$T/.gitconfig" --get "url.${ssh_url}.insteadOf" \
+              && { echo "FAIL: rewrite still present after unset-all"; exit 1; } \
+              || true
+            echo "per-repo url.insteadOf probe: OK (write + unset paths)"
           '
 
       - name: hermes-env drop-in probe
