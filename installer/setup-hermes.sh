@@ -1582,9 +1582,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
     if [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
       org="${BASH_REMATCH[1]}"
       repo_short="${BASH_REMATCH[2]}"
-      ssh_url="git@github.com:${org}/${repo_short}.git"
       sudo -u "$AGENT_USER" touch "$AGENT_GITCONFIG"
       if [[ -z "$repo_pkg" ]]; then
+        ssh_url="git@github.com:${org}/${repo_short}.git"
         ( cd "$AGENT_HOME" && \
           sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
             "url.${ssh_url}.insteadOf" "$repo_url" )

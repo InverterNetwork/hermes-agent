@@ -78,40 +78,53 @@ def test_installer_unsets_url_insteadof_somewhere():
         "installer must clear stale url.<ssh>.insteadOf for upgraded quay-managed entries"
 
 
-def test_installer_unset_covers_both_suffix_variants(tmp_path):
-    """Pre-consolidation installs wrote the rewrite key WITHOUT a .git
-    suffix; the current write branch uses .git. The unset path must clear
-    both shapes — otherwise the suffix mismatch silently no-ops (exit 5)
-    and the stale rewrite keeps shadowing the App credential helper. This
-    test runs the same suffix-iterating loop the installer uses against a
-    no-suffix fixture (the krustentier upgrade shape).
+def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
+    """Documents the git semantics the installer's suffix-iterating loop
+    relies on: `git config --unset-all` matches the stored key VERBATIM,
+    so unsetting `url.<ssh>.insteadOf` with `.git` does NOT touch a key
+    stored without `.git` (and vice versa) — that mismatch returns exit 5
+    and leaves the stale rewrite in place. This is the failure mode that
+    bit pre-consolidation hosts when the installer constructed the lookup
+    key with the wrong suffix.
+
+    Note: this test does not invoke the installer. The static guard below
+    + the installer-smoke per-repo probe cover that the script actually
+    iterates both shapes. This one pins the underlying git behavior, so a
+    future git release that quietly normalized suffixes (which would make
+    the loop redundant) would surface here.
     """
     gitconfig = tmp_path / ".gitconfig"
     org = "InverterNetwork"
     repo_short = "test-factory-code"
     repo_url = f"https://github.com/{org}/{repo_short}"
     no_suffix_key = f"url.git@github.com:{org}/{repo_short}.insteadOf"
+    dot_git_key = f"url.git@github.com:{org}/{repo_short}.git.insteadOf"
 
     subprocess.run(
         ["git", "config", "--file", str(gitconfig), no_suffix_key, repo_url],
         check=True,
     )
 
-    # Mirror the installer's loop: try both suffix variants, treating
-    # exit 5 (key absent) as success.
-    for suffix in ("", ".git"):
-        ssh_url = f"git@github.com:{org}/{repo_short}{suffix}"
-        result = subprocess.run(
-            ["git", "config", "--file", str(gitconfig),
-             "--unset-all", f"url.{ssh_url}.insteadOf"],
-            capture_output=True, text=True,
-        )
-        assert result.returncode in (0, 5), (
-            f"unset for suffix {suffix!r} returned {result.returncode}: {result.stderr}"
-        )
+    # Cross-suffix unset must NOT clear the no-suffix entry — that
+    # silent exit-5 is the failure mode the suffix-iterating loop fixes.
+    cross = subprocess.run(
+        ["git", "config", "--file", str(gitconfig), "--unset-all", dot_git_key],
+        capture_output=True, text=True,
+    )
+    assert cross.returncode == 5, (
+        f"expected exit 5 (key absent) for cross-suffix unset, got {cross.returncode}"
+    )
+    assert subprocess.run(
+        ["git", "config", "--file", str(gitconfig), "--get", no_suffix_key],
+        capture_output=True, text=True,
+    ).stdout.strip() == repo_url, "no-suffix entry must survive a .git-suffix unset"
 
-    # Stale rewrite must be gone after the loop — proves the no-suffix
-    # variant of the unset call is the one that did the work.
+    # Same-suffix unset clears it; a follow-up unset is a no-op (exit 5).
+    same = subprocess.run(
+        ["git", "config", "--file", str(gitconfig), "--unset-all", no_suffix_key],
+        capture_output=True, text=True,
+    )
+    assert same.returncode == 0, f"same-suffix unset failed: {same.stderr}"
     assert subprocess.run(
         ["git", "config", "--file", str(gitconfig), "--get", no_suffix_key],
         capture_output=True, text=True,
