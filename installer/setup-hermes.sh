@@ -638,6 +638,55 @@ do_verify() {
     else
       v_drift "quay profile.d drop-in" "missing: $quay_profile"
     fi
+
+    # ---- runtime managers (bun, ...) ----
+    # For every distinct repos[].quay.package_manager, confirm the rails-class
+    # binary at /usr/local/bin/<name> is present, root:root 0755, and reports
+    # a version that contains the quay.runtime_managers.<name>.version pin.
+    # Same shape as the quay binary version probe above — substring match
+    # absorbs build suffixes the upstream binary may emit.
+    local declared_pkg_managers=()
+    if [[ -n "$repos_tsv" ]]; then
+      while IFS=$'\t' read -r _ _ _ rt_pkg _; do
+        [[ -z "$rt_pkg" ]] && continue
+        # Dedupe — repos[] may declare bun on N entries.
+        if ! printf '%s\n' "${declared_pkg_managers[@]+"${declared_pkg_managers[@]}"}" \
+              | grep -Fxq "$rt_pkg"; then
+          declared_pkg_managers+=("$rt_pkg")
+        fi
+      done <<<"$repos_tsv"
+    fi
+    local rt_install_dir="${HERMES_VERIFY_RUNTIME_DIR:-/usr/local/bin}"
+    local rt_name rt_pin rt_path rt_mode rt_owner rt_actual
+    for rt_name in "${declared_pkg_managers[@]+"${declared_pkg_managers[@]}"}"; do
+      rt_path="$rt_install_dir/$rt_name"
+      rt_pin="$(python3 "$values_helper" --values "$values_file" \
+        get "quay.runtime_managers.$rt_name.version" 2>/dev/null || true)"
+      if [[ -z "$rt_pin" ]]; then
+        v_drift "runtime manager $rt_name" \
+          "no quay.runtime_managers.$rt_name.version pin in $values_file"
+        continue
+      fi
+      if [[ ! -x "$rt_path" ]]; then
+        v_drift "runtime manager $rt_name" "missing or non-executable: $rt_path"
+        continue
+      fi
+      rt_mode="$(_mode "$rt_path")"
+      rt_owner="$(_owner "$rt_path")"
+      if [[ "$rt_mode" == "755" && "$rt_owner" == "$rails_owner" ]]; then
+        v_ok "runtime manager $rt_name: $rt_mode $rt_owner"
+      else
+        v_drift "runtime manager $rt_name" \
+          "mode=$rt_mode owner=$rt_owner (expected 755 $rails_owner)"
+      fi
+      rt_actual="$("$rt_path" --version 2>/dev/null | head -n1 || true)"
+      if [[ -n "$rt_actual" ]] && grep -Fq "$rt_pin" <<<"$rt_actual"; then
+        v_ok "runtime manager $rt_name version: $rt_actual"
+      else
+        v_drift "runtime manager $rt_name version" \
+          "got '${rt_actual:-?}' (expected to contain '$rt_pin')"
+      fi
+    done
   fi
 
   # ---- per-entry code mirror checks + optional bare clone + registration ----
@@ -1043,6 +1092,13 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
     echo "==> WARNING: $QUAY_PROFILE_SRC missing; skipping profile.d drop-in" >&2
   fi
 fi
+
+# ---------- runtime managers (bun, ...) ----------
+# Ensure each repos[].quay.package_manager binary is on PATH before quay's
+# bootstrap shells out to install_cmd via /bin/sh -c (minimal PATH; no
+# shell profile sourced). No-op when no package_manager is declared.
+PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+  ensure-runtimes --values "$VALUES_FILE"
 
 # ---------- claude CLI prerequisite check ----------
 # Fail loud here (before any user-side provisioning) rather than letting

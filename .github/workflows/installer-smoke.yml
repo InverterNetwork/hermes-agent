@@ -297,6 +297,34 @@ jobs:
             echo "state preservation: OK"
           '
 
+      - name: runtime manager probes (bun pinned + on PATH for /bin/sh)
+        # repos[].quay.package_manager: bun → installer must drop bun at
+        # /usr/local/bin/bun root:root 0755 with the pinned version, so
+        # quay's `/bin/sh -c install_cmd` (minimal PATH) finds it. The
+        # SHA pin in deploy.values.yaml is the security boundary; this
+        # probe asserts the install-time fetch + verify + extract worked.
+        run: |
+          set -euo pipefail
+          [[ -x /usr/local/bin/bun ]] || { echo "FAIL: bun binary missing at /usr/local/bin/bun"; exit 1; }
+          mode=$(stat -c "%a" /usr/local/bin/bun)
+          owner=$(stat -c "%U:%G" /usr/local/bin/bun)
+          [[ "$mode" == "755" ]]          || { echo "FAIL: bun mode=$mode (expected 755)"; exit 1; }
+          [[ "$owner" == "root:root" ]]   || { echo "FAIL: bun owner=$owner (expected root:root)"; exit 1; }
+          # Substring match — same shape as the quay binary version probe;
+          # bun's --version output is just the semver string today, but
+          # absorbing future build suffixes is cheap.
+          pin=$(python3 /srv/hermes/repos/hermes-agent/installer/values_helper.py \
+            --values /srv/hermes/repos/hermes-agent/deploy.values.yaml \
+            get quay.runtime_managers.bun.version)
+          actual=$(/usr/local/bin/bun --version 2>&1 | head -n1)
+          [[ "$actual" == *"$pin"* ]] \
+            || { echo "FAIL: bun --version='$actual' does not contain pin '$pin'"; exit 1; }
+          # /bin/sh -c is what quay's bootstrap uses; assert bun is reachable
+          # there (PATH must contain /usr/local/bin without sourcing a profile).
+          /bin/sh -c 'command -v bun >/dev/null' \
+            || { echo "FAIL: bun not on PATH for /bin/sh -c (quay bootstrap will fail)"; exit 1; }
+          echo "runtime manager probes: OK (bun ${actual})"
+
       - name: quay artefact probes (binary + bare clone + registration)
         run: |
           [[ -x /usr/local/bin/quay ]] || { echo "FAIL: quay binary missing"; exit 1; }
