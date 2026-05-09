@@ -589,8 +589,8 @@ do_verify() {
     # reconcile_stale_quay_dir.
 
     # ---- operator-invocation glue ----
-    # Both paths are overridable so the test fixture can seed stubs in
-    # tmp dirs instead of writing under /usr/local/bin or /etc.
+    # All three paths are overridable so the test fixture can seed stubs
+    # in tmp dirs instead of writing under /usr/local/{bin,sbin} or /etc.
     local quay_wrapper="${HERMES_VERIFY_QUAY_WRAPPER:-/usr/local/bin/quay-as-hermes}"
     if [[ -x "$quay_wrapper" ]]; then
       local wmode wowner
@@ -603,6 +603,23 @@ do_verify() {
       fi
     else
       v_drift "quay-as-hermes wrapper" "missing or non-executable: $quay_wrapper"
+    fi
+    local quay_runner="${HERMES_VERIFY_QUAY_RUNNER:-/usr/local/sbin/quay-tick-runner}"
+    if [[ -x "$quay_runner" ]]; then
+      local rmode rowner
+      rmode="$(_mode "$quay_runner")"
+      rowner="$(_owner "$quay_runner")"
+      # Same 755 root contract as the operator wrapper above — the unit's
+      # ExecStart= dispatches through this script as the agent user;
+      # an agent-writable copy would let the agent shim arbitrary code
+      # into every tick.
+      if [[ "$rmode" == "755" && "$rowner" == "$rails_owner" ]]; then
+        v_ok "quay-tick-runner: $rmode $rowner"
+      else
+        v_drift "quay-tick-runner" "mode=$rmode owner=$rowner (expected 755 $rails_owner)"
+      fi
+    else
+      v_drift "quay-tick-runner" "missing or non-executable: $quay_runner"
     fi
     local quay_profile="${HERMES_VERIFY_QUAY_PROFILE:-/etc/profile.d/quay-data-dir.sh}"
     if [[ -f "$quay_profile" ]]; then
@@ -1776,9 +1793,10 @@ fi
 # ---------- quay-tick ----------
 # Periodic supervisor that drives queued quay tasks forward (claim →
 # worker → submit-brief). Same install model as hermes-sync — sed-
-# templated unit, /etc/default/ env preserved across re-runs. The unit
-# itself runs `/usr/local/bin/quay tick` directly, so unlike hermes-sync
-# there's no companion script under /usr/local/sbin.
+# templated unit, /etc/default/ env preserved across re-runs, plus a
+# companion script at /usr/local/sbin/quay-tick-runner that mints
+# $GH_TOKEN before exec'ing `quay tick` so the worker pipeline's `gh`
+# calls authenticate against the App identity.
 #
 # Skipped entirely when quay isn't enabled — see the binary block at the
 # top of the script.

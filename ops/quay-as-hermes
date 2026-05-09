@@ -14,12 +14,19 @@
 # silently when it can't, and falls back to ~/.quay/ — defeating the
 # QUAY_DATA_DIR pin above. `/` is universally readable.
 #
-# We also source __TARGET_DIR__/auth/quay.env so adapter tokens
+# We also load __TARGET_DIR__/auth/quay.env so adapter tokens
 # (LINEAR_API_KEY, SLACK_TOKEN, …) reach ad-hoc invocations the same way
 # they reach the systemd tick — without this, operator commands like
-# `enqueue --linear-issue` fail despite the unit working fine. `set -a`
-# auto-exports each KEY=VAL parsed from the file; the `[ -r … ]` guard
-# keeps the wrapper usable on fresh installs that haven't run
+# `enqueue --linear-issue` fail despite the unit working fine.
+#
+# The load uses a strict KEY=VAL parser rather than shell `.` so
+# semantics match systemd's EnvironmentFile= (which never expands shell
+# metacharacters). A future env file containing `$(…)` in a value would
+# execute as the agent user under `set -a; . file` but land as a
+# literal under systemd; aligning the two parsers keeps that surface
+# closed. Skips comment lines, blank lines, and any key outside
+# [A-Z0-9_] (matches systemd's allowed key shape). The `[ -r … ]`
+# guard keeps the wrapper usable on fresh installs that haven't run
 # stage-secrets.sh yet.
 #
 # Finally, mint $GH_TOKEN from the GitHub App helper so any operator
@@ -35,17 +42,27 @@ exec sudo -u __AGENT_USER__ \
      env QUAY_DATA_DIR=__TARGET_DIR__/quay HERMES_HOME=__TARGET_DIR__ \
      sh -c '
 cd /
-set -a
-[ -r __TARGET_DIR__/auth/quay.env ] && . __TARGET_DIR__/auth/quay.env
-set +a
+ENV_FILE=__TARGET_DIR__/auth/quay.env
+if [ -r "$ENV_FILE" ]; then
+  while IFS="=" read -r key value || [ -n "$key" ]; do
+    case "$key" in
+      ""|[0-9]*|*[!A-Z0-9_]*) continue ;;
+    esac
+    export "$key=$value"
+  done < "$ENV_FILE"
+fi
 if [ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
   PY=__TARGET_DIR__/hermes-agent/venv/bin/python
   HELPER=__TARGET_DIR__/hermes-agent/installer/hermes_github_token.py
-  if [ -x "$PY" ] && [ -f "$HELPER" ]; then
-    # `timeout 30` caps the worst-case mint at the shell layer, matching
-    # quay-tick-runner. An operator command stays interactive even if
-    # the App API hangs at the TCP/TLS layer.
-    token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ] && export GH_TOKEN="$token"
+  if [ ! -x "$PY" ] || [ ! -f "$HELPER" ]; then
+    printf "[quay-as-hermes] WARN: token helper not found at %s; running quay without \$GH_TOKEN\n" "$HELPER" >&2
+  # `timeout 30` caps the worst-case mint at the shell layer, matching
+  # quay-tick-runner. An operator command stays interactive even if the
+  # App API hangs at the TCP/TLS layer.
+  elif token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ]; then
+    export GH_TOKEN="$token"
+  else
+    printf "[quay-as-hermes] WARN: token mint failed; running quay without \$GH_TOKEN\n" >&2
   fi
 fi
 exec /usr/local/bin/quay "$@"

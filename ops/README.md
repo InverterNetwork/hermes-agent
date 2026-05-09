@@ -24,8 +24,10 @@ Five units live here:
 * **`quay-tick`** — frequent (1-min) supervisor that runs `quay tick`
   to advance queued tasks (claim → worker → submit-brief). Installed
   only when `quay.version` is pinned in `deploy.values.yaml`; the unit
-  invokes `/usr/local/bin/quay` directly, with `QUAY_DATA_DIR` pointing
-  at `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
+  invokes `/usr/local/sbin/quay-tick-runner`, a thin wrapper that mints
+  a fresh `$GH_TOKEN` from the GitHub App helper before `exec`'ing
+  `/usr/local/bin/quay tick`. `QUAY_DATA_DIR` points at
+  `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
   carrying a `quay:` block.
 
 ## Files
@@ -594,10 +596,14 @@ Why a wrapper instead of `sudo -u <agent> /usr/local/bin/quay …`? Sudo
 strips the environment by default, so `QUAY_DATA_DIR` doesn't survive
 the privilege drop, and quay's config-resolution order falls back to
 `~<agent>/.quay/config.toml` — a parallel SQLite + repos dir that
-diverges silently from what the systemd tick writes to. The wrapper is
-a thin `exec sudo -u <agent> env QUAY_DATA_DIR=<HERMES_HOME>/quay
-/usr/local/bin/quay "$@"` so all ad-hoc invocations land in the same
-DB the tick uses.
+diverges silently from what the systemd tick writes to. The wrapper
+drops privilege via `sudo -u <agent>`, pins `QUAY_DATA_DIR` and
+`HERMES_HOME`, sources `<HERMES_HOME>/auth/quay.env` for adapter
+tokens (LINEAR_API_KEY, SLACK_TOKEN, …), and mints `$GH_TOKEN` from
+the GitHub App helper before `exec`'ing `/usr/local/bin/quay "$@"`.
+That way ad-hoc operator invocations land in the same DB the tick
+uses *and* hit the same auth identity for any `gh` call quay shells
+out to (enqueue's PR-existence pre-flight, review-pr, …).
 
 For interactive sessions (`sudo -u <agent> -i`, `su - <agent>`), the
 profile.d drop-in at `/etc/profile.d/quay-data-dir.sh` exports
