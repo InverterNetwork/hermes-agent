@@ -1,13 +1,6 @@
-"""Schema-validation tests for ``installer/hermes_installer/config.py``.
-
-The contract:
-* ``required_runtime_managers`` returns the pin set when repos[] declares
-  package_manager(s) that all have matching ``quay.runtime_managers.<name>``
-  entries.
-* Missing pins exit non-zero with a diagnostic naming the offending entries.
-* Invalid pins (wrong SHA shape, missing version) also exit non-zero.
-* No declared package_managers → empty result, no diagnostic.
-"""
+"""Tests for ``required_runtime_managers``: walks repos[].quay.package_manager
+and looks each up in quay.runtime_managers.<name>, exiting non-zero with an
+operator-actionable diagnostic on missing/invalid pins."""
 
 from __future__ import annotations
 
@@ -82,8 +75,6 @@ class TestRequiredRuntimeManagers:
         assert excinfo.value.code == 1
         err = capsys.readouterr().err
         assert "bun" in err
-        # Operator-actionable message — names the values-file path the
-        # operator must edit, not just "missing".
         assert "quay.runtime_managers.bun" in err
 
     def test_invalid_sha_shape_exits(self, capsys):

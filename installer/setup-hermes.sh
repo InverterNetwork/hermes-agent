@@ -1094,23 +1094,11 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
 fi
 
 # ---------- runtime managers (bun, ...) ----------
-# When any repos[].quay.package_manager is set, ensure the matching
-# runtime-manager binary is on PATH before quay's bootstrap shells out
-# to install_cmd via /bin/sh -c (minimal PATH; no shell profile).
-# Driven by the Python install-side package; first foothold of the bash →
-# Python migration of setup-hermes.sh.
-
-_pkg_managers=()
-while IFS=$'\t' read -r _ _ _ repo_pkg _; do
-  [[ -z "$repo_pkg" ]] && continue
-  _pkg_managers+=("$repo_pkg")
-done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos 2>/dev/null || true)
-
-if (( ${#_pkg_managers[@]} > 0 )); then
-  echo "==> ensuring runtime managers (declared by repos[]: ${_pkg_managers[*]})"
-  PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
-    ensure-runtimes --values "$VALUES_FILE"
-fi
+# Ensure each repos[].quay.package_manager binary is on PATH before quay's
+# bootstrap shells out to install_cmd via /bin/sh -c (minimal PATH; no
+# shell profile sourced). No-op when no package_manager is declared.
+PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+  ensure-runtimes --values "$VALUES_FILE"
 
 # ---------- claude CLI prerequisite check ----------
 # Fail loud here (before any user-side provisioning) rather than letting

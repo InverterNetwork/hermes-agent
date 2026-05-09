@@ -1,15 +1,11 @@
 """Pinned-binary install machinery for runtime managers (bun, ...).
 
 Each entry in ``_RECIPES`` knows how to turn a version pin into a download
-URL and where in the extracted archive its executable lives. ``ensure_runtime``
-fetches the upstream zip, verifies the SHA256 against the values-file pin,
-extracts the binary, and atomically installs it root:root 0755 at the
-target path. Idempotent — if the binary at the target path is already at
-the pinned version, no-op.
-
-The recipe shape is deliberately minimal: ``(url_template, archive_member)``.
-Adding pnpm/npm/yarn is a single new entry; adding a non-zip archive
-(tarball) is one extra branch in ``_extract_member``.
+URL and where in the extracted archive its executable lives.
+``ensure_runtime`` fetches the upstream zip, verifies the SHA256 against
+the values-file pin, extracts the binary, and atomically installs it
+root:root 0755 at the target path. Idempotent — a binary already at the
+pinned version is a no-op.
 """
 
 from __future__ import annotations
@@ -55,17 +51,17 @@ def ensure_runtimes(
         return
     install_dir.mkdir(parents=True, exist_ok=True)
     for name in sorted(pins):
-        pin = pins[name]
-        recipe = _RECIPES.get(name)
-        if recipe is None:
-            fail(
-                f"no install recipe for runtime manager {name!r}; "
-                f"add a _Recipe entry to installer/hermes_installer/runtimes.py"
-            )
-        ensure_runtime(pin, recipe, install_dir / name)
+        ensure_runtime(pins[name], install_dir / name)
 
 
-def ensure_runtime(pin: RuntimeManagerPin, recipe: _Recipe, install_path: Path) -> None:
+def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
+    recipe = _RECIPES.get(pin.name)
+    if recipe is None:
+        fail(
+            f"no install recipe for runtime manager {pin.name!r}; "
+            f"add a _Recipe entry to installer/hermes_installer/runtimes.py"
+        )
+
     if _binary_at_pinned_version(install_path, pin.version):
         info(f"{pin.name} {pin.version} already at {install_path}; no-op")
         return
@@ -114,10 +110,8 @@ def ensure_runtime(pin: RuntimeManagerPin, recipe: _Recipe, install_path: Path) 
 def _atomic_install(src: Path, dst: Path) -> None:
     """Stage next to ``dst`` then ``os.replace`` so a torn write never leaves
     a half-installed binary. ``os.replace`` is atomic on POSIX when source
-    and destination share a filesystem; staging in the same dir as ``dst``
-    guarantees that.
+    and destination share a filesystem; staging in the same dir guarantees that.
     """
-    dst.parent.mkdir(parents=True, exist_ok=True)
     staged = dst.with_name(dst.name + ".hermes-staging")
     try:
         shutil.copy2(src, staged)
@@ -125,21 +119,17 @@ def _atomic_install(src: Path, dst: Path) -> None:
         try:
             os.chown(staged, 0, 0)
         except PermissionError:
-            # Tests run as a non-root user with --skip-root-check; preserving
-            # the staging chown for prod is enough.
+            # Tests run non-root with --skip-root-check; chown only matters in prod.
             pass
         os.replace(staged, dst)
-    finally:
-        if staged.exists():
-            staged.unlink(missing_ok=True)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
 
 
 def _binary_at_pinned_version(install_path: Path, pinned_version: str) -> bool:
-    """Substring-match ``<binary> --version`` against the pin.
-
-    Mirrors the quay verify-path probe (setup-hermes.sh line ~542): a
-    substring check absorbs `+commit-sha` build suffixes that bun/quay
-    sometimes emit, and still fires on actual mismatch.
+    """Substring-match ``<binary> --version`` against the pin — absorbs
+    `+commit-sha` build suffixes that the upstream binary may emit.
     """
     if not install_path.exists():
         return False
