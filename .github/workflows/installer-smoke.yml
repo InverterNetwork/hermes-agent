@@ -492,7 +492,25 @@ jobs:
             git config --file "$T/.gitconfig" --get "url.${ssh_url}.insteadOf" \
               && { echo "FAIL: rewrite still present after unset-all"; exit 1; } \
               || true
-            echo "per-repo url.insteadOf probe: OK (write + unset paths)"
+
+            # Migration shape: pre-consolidation installs wrote the rewrite
+            # key WITHOUT the .git suffix. Seed that shape and exercise the
+            # installer-style suffix-iterating loop — a single-shape unset
+            # would silently no-op (exit 5) and leave the rewrite to shadow
+            # the App credential helper at clone time.
+            no_suffix_url="git@github.com:${org}/${repo_short}"
+            git config --file "$T/.gitconfig" "url.${no_suffix_url}.insteadOf" "$repo_url"
+            for migration_suffix in "" ".git"; do
+              probe_url="git@github.com:${org}/${repo_short}${migration_suffix}"
+              unset_rc=0
+              git config --file "$T/.gitconfig" --unset-all "url.${probe_url}.insteadOf" || unset_rc=$?
+              (( unset_rc == 0 || unset_rc == 5 )) \
+                || { echo "FAIL: migration unset suffix=${migration_suffix} returned $unset_rc"; exit 1; }
+            done
+            git config --file "$T/.gitconfig" --get "url.${no_suffix_url}.insteadOf" \
+              && { echo "FAIL: no-suffix rewrite still present after suffix-iterating unset"; exit 1; } \
+              || true
+            echo "per-repo url.insteadOf probe: OK (write + unset + migration shapes)"
           '
 
       - name: hermes-env drop-in probe
