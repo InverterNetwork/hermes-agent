@@ -14,8 +14,36 @@
 # silently when it can't, and falls back to ~/.quay/ — defeating the
 # QUAY_DATA_DIR pin above. `/` is universally readable.
 #
+# We also source __TARGET_DIR__/auth/quay.env so adapter tokens
+# (LINEAR_API_KEY, SLACK_TOKEN, …) reach ad-hoc invocations the same way
+# they reach the systemd tick — without this, operator commands like
+# `enqueue --linear-issue` fail despite the unit working fine. `set -a`
+# auto-exports each KEY=VAL parsed from the file; the `[ -r … ]` guard
+# keeps the wrapper usable on fresh installs that haven't run
+# stage-secrets.sh yet.
+#
+# Finally, mint $GH_TOKEN from the GitHub App helper so any operator
+# command that shells out to `gh` (enqueue's PR-existence pre-flight,
+# review-pr, …) authenticates against the same identity as the systemd
+# tick. Mirrors ops/quay-tick-runner and ops/hermes-upstream-sync's
+# preamble. Permissive on helper failure: missing PEM or transient mint
+# error → exec without $GH_TOKEN and let quay's auth-error surface.
+#
 # __AGENT_USER__ and __TARGET_DIR__ are substituted by setup-hermes.sh
 # at install time, matching the quay-tick.service template pattern.
 exec sudo -u __AGENT_USER__ \
-     env QUAY_DATA_DIR=__TARGET_DIR__/quay \
-     sh -c 'cd / && exec /usr/local/bin/quay "$@"' -- "$@"
+     env QUAY_DATA_DIR=__TARGET_DIR__/quay HERMES_HOME=__TARGET_DIR__ \
+     sh -c '
+cd /
+set -a
+[ -r __TARGET_DIR__/auth/quay.env ] && . __TARGET_DIR__/auth/quay.env
+set +a
+if [ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+  PY=__TARGET_DIR__/hermes-agent/venv/bin/python
+  HELPER=__TARGET_DIR__/hermes-agent/installer/hermes_github_token.py
+  if [ -x "$PY" ] && [ -f "$HELPER" ]; then
+    token=$("$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ] && export GH_TOKEN="$token"
+  fi
+fi
+exec /usr/local/bin/quay "$@"
+' -- "$@"

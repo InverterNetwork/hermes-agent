@@ -44,9 +44,10 @@ Five units live here:
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
 | `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
-| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. |
+| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
+| `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
-| `ops/quay-as-hermes`                       | Operator wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR` so ad-hoc `quay …` lands in the same dir the tick writes to. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/quay-as-hermes`                       | Operator wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
@@ -431,6 +432,35 @@ and `claude login` was also done), the env var silently overrides the login.
 Operators expect "blank = use subscription" — rotate or clear a stale key
 before relying on subscription auth.
 
+## GitHub auth
+
+Quay's enqueue pre-flight (`gh pr list --head quay/<id>`), the worker's
+`gh pr create`, and `quay review-pr` all need HTTPS auth against GitHub.
+The `hermes` user's deploy key covers `git push`, not the API.
+
+`quay-tick-runner` mints a short-lived GitHub App installation token at
+the top of every tick (via `installer/hermes_github_token.py mint`) and
+exports it as `$GH_TOKEN`. Both `gh` and `git push` over HTTPS read from
+that env var, so a single fresh token covers every API call the tick or
+its worker makes. The cache (5-min refresh margin) absorbs intra-tick
+churn; long-running worker subprocesses (>55 min) eventually inherit a
+stale env value — see the upstream-sync section above for the helper's
+override variables.
+
+The `quay-as-hermes` operator wrapper does the same mint inline so
+ad-hoc invocations (`quay-as-hermes enqueue --linear-issue …`) auth
+against the same identity as the tick.
+
+The App needs read-write access to **Contents** and **Pull requests** on
+every repo with a `quay:` block in `deploy.values.yaml`. Adding a new
+quay-managed repo is a one-time GitHub-side step: open the App's
+Configure page on github.com and add the repo to its installation. Mint
+keeps working unchanged.
+
+If `gh pr list` returns 404/403 even with `$GH_TOKEN` set, the App is
+authenticated but lacks scope on the target repo — the fix is on
+GitHub, not in this codebase.
+
 ## Cadence
 
 1-minute interval, set in `quay-tick.timer`:
@@ -448,10 +478,13 @@ sudo systemctl edit quay-tick.timer
 
 ## Environment
 
-The unit runs `/usr/local/bin/quay tick` with:
+The unit runs `/usr/local/sbin/quay-tick-runner` (which `exec`s
+`/usr/local/bin/quay tick` after minting `$GH_TOKEN`) with:
 
 * `QUAY_DATA_DIR=<HERMES_HOME>/quay` — pinned by `Environment=` on the
   unit so the runtime path lives in exactly one place.
+* `HERMES_HOME=<HERMES_HOME>` — pinned on the unit so the GH-token helper
+  finds `auth/github-app.{pem,env}` regardless of how the unit is invoked.
 * `<HERMES_HOME>/auth/quay.env` — adapter tokens (`LINEAR_API_KEY` etc.),
   staged out-of-band by `stage-secrets.sh`. The `EnvironmentFile=` line
   is prefixed with `-` so the unit starts even before tokens are staged
