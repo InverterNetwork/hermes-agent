@@ -42,7 +42,10 @@ if [ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
   PY=__TARGET_DIR__/hermes-agent/venv/bin/python
   HELPER=__TARGET_DIR__/hermes-agent/installer/hermes_github_token.py
   if [ -x "$PY" ] && [ -f "$HELPER" ]; then
-    token=$("$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ] && export GH_TOKEN="$token"
+    # `timeout 30` caps the worst-case mint at the shell layer, matching
+    # quay-tick-runner. An operator command stays interactive even if
+    # the App API hangs at the TCP/TLS layer.
+    token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ] && export GH_TOKEN="$token"
   fi
 fi
 exec /usr/local/bin/quay "$@"
