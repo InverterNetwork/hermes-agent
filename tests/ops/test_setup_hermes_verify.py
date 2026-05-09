@@ -515,6 +515,10 @@ class TestSetupHermesVerify:
 
 
 QUAY_VERSION = "v0.1.0"  # tag-shaped, with leading v, as in deploy.values.yaml
+BUN_VERSION = "1.3.9"
+BUN_LINUX_X64_SHA256 = (
+    "4680e80e44e32aa718560ceae85d22ecfbf2efb8f3641782e35e4b7efd65a1aa"
+)
 
 
 def _write_quay_stub(
@@ -596,6 +600,10 @@ def quay_install(install: dict) -> dict:
         "quay:\n"
         f"  version: \"{QUAY_VERSION}\"\n"
         "  agent_invocation: \"claude < {prompt_file}\"\n"
+        "  runtime_managers:\n"
+        "    bun:\n"
+        f"      version: \"{BUN_VERSION}\"\n"
+        f"      linux_x64_sha256: \"{BUN_LINUX_X64_SHA256}\"\n"
         "  adapters:\n"
         "    linear:\n"
         "      enabled: true\n"
@@ -667,6 +675,16 @@ def quay_install(install: dict) -> dict:
     quay_profile.write_text("# stub\n")
     quay_profile.chmod(0o644)
 
+    # Stubbed bun binary at HERMES_VERIFY_RUNTIME_DIR/bun — verify mirrors
+    # the install-time `--version` substring probe against the values pin.
+    bun_stub = bin_dir / "bun"
+    bun_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == "--version" ]]; then echo "{BUN_VERSION}"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    bun_stub.chmod(0o755)
+
     install["values_file"] = fork / "deploy.values.yaml"
     install["quay_dir"] = quay_dir
     install["quay_bin"] = quay_stub
@@ -676,6 +694,7 @@ def quay_install(install: dict) -> dict:
     install["quay_wrapper"] = quay_wrapper
     install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
+    install["bun_bin"] = bun_stub
     return install
 
 
@@ -689,6 +708,7 @@ def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
     env["HERMES_VERIFY_QUAY_WRAPPER"] = str(install["quay_wrapper"])
     env["HERMES_VERIFY_QUAY_RUNNER"] = str(install["quay_runner"])
     env["HERMES_VERIFY_QUAY_PROFILE"] = str(install["quay_profile"])
+    env["HERMES_VERIFY_RUNTIME_DIR"] = str(install["bin"])
     return subprocess.run(
         [
             "bash", str(SCRIPT),

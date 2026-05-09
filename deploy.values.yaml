@@ -130,6 +130,19 @@
 #                                 to be quay-managed; entries with a `quay:`
 #                                 block but no quay.version pin install as
 #                                 code-only with a one-line warning.
+#   quay.runtime_managers      — pinned package-manager / runtime binaries the
+#                                 installer must guarantee on PATH before quay
+#                                 bootstraps a worktree (`/bin/sh -c install_cmd`
+#                                 uses a minimal PATH and won't pick up shell
+#                                 profile installs). Each `repos[].quay.package_manager`
+#                                 must have a matching key here with `version`
+#                                 and `linux_x64_sha256`; the installer fetches
+#                                 the upstream zip, verifies the SHA, and
+#                                 installs the binary to `/usr/local/bin/<name>`
+#                                 (root:root 0755). The SHA pin is the security
+#                                 boundary. Idempotent: a binary already at the
+#                                 pinned version is a no-op; a wrong version is
+#                                 replaced atomically.
 #   quay.agent_invocation      — shell-command template the quay tick
 #                                 supervisor invokes for each task.
 #                                 {prompt_file} is the only placeholder;
@@ -236,6 +249,15 @@ quay:
   # `-p` (--print) is required for non-interactive batch mode: without it,
   # claude in stdin-piped mode reads the prompt and exits without acting.
   agent_invocation: "claude -p --permission-mode bypassPermissions < {prompt_file}"
+  # Pinned runtime managers the installer must guarantee on PATH before
+  # quay bootstraps a worktree. Keys must match every distinct
+  # `repos[].quay.package_manager` value in this file. linux_x64_sha256
+  # is the upstream zip's SHA256 (oven-sh publishes SHASUMS256.txt
+  # alongside the release); the installer refuses to proceed on mismatch.
+  runtime_managers:
+    bun:
+      version: "1.3.9"
+      linux_x64_sha256: "4680e80e44e32aa718560ceae85d22ecfbf2efb8f3641782e35e4b7efd65a1aa"
   adapters:
     linear:
       enabled: true
