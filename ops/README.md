@@ -438,7 +438,10 @@ before relying on subscription auth.
 
 Quay's enqueue pre-flight (`gh pr list --head quay/<id>`), the worker's
 `gh pr create`, and `quay review-pr` all need HTTPS auth against GitHub.
-The `hermes` user's deploy key covers `git push`, not the API.
+For quay-managed entries the App credential helper persisted into each
+clone's `.git/config` covers `git push`; for code-only entries the
+`hermes` user's deploy key covers `git push`. Neither covers the API —
+that's `$GH_TOKEN`'s job, below.
 
 `quay-tick-runner` mints a short-lived GitHub App installation token at
 the top of every tick (via `installer/hermes_github_token.py mint`) and
@@ -663,9 +666,12 @@ Field invariants:
   separators, no leading dot/dash). The id lands in a filesystem path
   on both the code-mirror (`code/<id>/`) and quay (`quay/repos/<id>.git`)
   sides.
-* `url` is `https://github.com/<org>/<repo>` (no `.git` suffix). The
-  installer wires a per-repo `url.insteadOf` rewrite into
-  `~<agent>/.gitconfig` so cloning lands over SSH against the deploy
+* `url` is `https://github.com/<org>/<repo>` (no `.git` suffix). For
+  code-only entries the installer wires a per-repo `url.insteadOf`
+  rewrite into `~<agent>/.gitconfig` so cloning lands over SSH against
+  the deploy key. For quay-managed entries (entries with a `quay:`
+  block) the URL is used as-is over HTTPS — clones carry the App
+  credential helper in their `.git/config`, no SSH rewrite or deploy
   key. Non-github URLs (e.g. CI's `file://` fixtures) flow through
   unchanged.
 * `base_branch` is required for every entry. The mirror is hard-reset

@@ -358,8 +358,9 @@ class TestSetupHermesVerify:
         assert "[DRIFT] state credential helper" in result.stderr
 
     def test_app_auth_helper_failure_is_drift(self, install):
-        """Replace the token helper with one that exits 2 on `check` — verify
-        must report the drift instead of swallowing the failure."""
+        """Replace the token helper with one that exits 2 (mint produces no
+        token) — verify must report the drift instead of swallowing the
+        failure."""
         target = install["target"]
         auth = target / "auth"
         auth.mkdir(mode=0o750); auth.chmod(0o750)  # clear setgid inherited from setgid parent on Linux

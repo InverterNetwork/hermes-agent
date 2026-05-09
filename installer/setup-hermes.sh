@@ -785,6 +785,9 @@ do_verify() {
       fi
 
       # Uses curl (not gh) so verify has no dependency on a gh install.
+      # Auth header flows in through `curl --config -` via printf (a bash
+      # builtin, no separate process), so $app_token never lands in any
+      # argv visible through /proc/<pid>/cmdline.
       if [[ -n "$app_token" && -n "$repos_tsv" ]]; then
         local gh_api_base_v="${GH_API_BASE:-https://api.github.com}"
         local scope_id scope_url scope_pkg scope_base scope_install http_code
@@ -792,11 +795,12 @@ do_verify() {
           [[ -z "$scope_id" || -z "$scope_pkg" ]] && continue
           [[ "$scope_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]] || continue
           local api_url="${gh_api_base_v}/repos/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-          http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $app_token" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$api_url" 2>/dev/null || echo 000)"
+          http_code="$(printf 'header = "Authorization: Bearer %s"\n' "$app_token" \
+            | curl -sS -o /dev/null -w '%{http_code}' \
+              --config - \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$api_url" 2>/dev/null || echo 000)"
           if [[ "$http_code" == "200" ]]; then
             v_ok "App scope $scope_id: HTTP 200"
           else
@@ -907,14 +911,14 @@ VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
 # clone/push; SSH deploy-key rewrites are skipped for those entries. Fail fast
 # before any provisioning so the operator doesn't half-install with an auth
 # model that can't push.
-_quay_gh_bad_ids=()
+_quay_gh_ids=()
 while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
   [[ -z "$repo_id" || -z "$repo_pkg" ]] && continue
   [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]] || continue
-  _quay_gh_bad_ids+=("$repo_id")
+  _quay_gh_ids+=("$repo_id")
 done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos 2>/dev/null || true)
-if (( ${#_quay_gh_bad_ids[@]} > 0 )) && [[ "$AUTH_METHOD" != "app" ]]; then
-  echo "FAIL: repos[] has quay-managed github.com entries (${_quay_gh_bad_ids[*]}) but --auth-method app was not passed." >&2
+if (( ${#_quay_gh_ids[@]} > 0 )) && [[ "$AUTH_METHOD" != "app" ]]; then
+  echo "FAIL: repos[] has quay-managed github.com entries (${_quay_gh_ids[*]}) but --auth-method app was not passed." >&2
   echo "      These entries clone over HTTPS using the GitHub App credential helper." >&2
   echo "      Re-run with --auth-method app and the usual --app-* flags." >&2
   exit 2
@@ -1575,14 +1579,24 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
     #   * `--file` is used instead of `--global` because under sudo,
     #     $HOME and $XDG_CONFIG_HOME may point at the caller's home
     #     regardless of -H — `--global` then reads/writes the wrong file.
-    if [[ -z "$repo_pkg" && "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+    if [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
       org="${BASH_REMATCH[1]}"
       repo_short="${BASH_REMATCH[2]}"
       ssh_url="git@github.com:${org}/${repo_short}.git"
       sudo -u "$AGENT_USER" touch "$AGENT_GITCONFIG"
-      ( cd "$AGENT_HOME" && \
-        sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
-          "url.${ssh_url}.insteadOf" "$repo_url" )
+      if [[ -z "$repo_pkg" ]]; then
+        ( cd "$AGENT_HOME" && \
+          sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
+            "url.${ssh_url}.insteadOf" "$repo_url" )
+      else
+        # Strip any legacy SSH rewrite from earlier installs — git applies
+        # url.insteadOf before credential lookup, so a stale rewrite would
+        # silently shadow the App helper and keep pushing via the deploy key.
+        # Exit code 5 = "key not present"; treat as already-clean.
+        ( cd "$AGENT_HOME" && \
+          sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
+            --unset-all "url.${ssh_url}.insteadOf" 2>/dev/null || true )
+      fi
     fi
 
     # ---- code mirror at $TARGET/code/<id>/ ----
