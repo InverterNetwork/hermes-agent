@@ -768,18 +768,41 @@ do_verify() {
     elif [[ ! -x "$venv_py" ]]; then
       v_drift "token helper" "missing venv python at $venv_py"
     else
-      local rc=0
-      if [[ "$(id -un)" == "$agent_owner" ]]; then
-        env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
-      elif [[ "$(id -u)" -eq 0 ]]; then
-        sudo -u "$agent_owner" env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
-      else
-        env "HERMES_HOME=$target" "$venv_py" "$helper_py" check >/dev/null 2>&1 || rc=$?
+      # `mint` doubles as the smoke check (succeeds iff a token can be
+      # obtained) AND produces the token for the App-scope check below —
+      # one subprocess instead of `check` then `mint`.
+      local agent_cmd_prefix=()
+      if [[ "$(id -u)" -eq 0 && "$(id -un)" != "$agent_owner" ]]; then
+        agent_cmd_prefix=(sudo -u "$agent_owner")
       fi
-      if [[ "$rc" -eq 0 ]]; then
+      local app_token
+      app_token="$(${agent_cmd_prefix[@]+"${agent_cmd_prefix[@]}"} \
+        env "HERMES_HOME=$target" "$venv_py" "$helper_py" mint 2>/dev/null || true)"
+      if [[ -n "$app_token" ]]; then
         v_ok "token helper check passes"
       else
-        v_drift "token helper check" "exited $rc"
+        v_drift "token helper check" "mint failed"
+      fi
+
+      # Uses curl (not gh) so verify has no dependency on a gh install.
+      if [[ -n "$app_token" && -n "$repos_tsv" ]]; then
+        local gh_api_base_v="${GH_API_BASE:-https://api.github.com}"
+        local scope_id scope_url scope_pkg scope_base scope_install http_code
+        while IFS=$'\t' read -r scope_id scope_url scope_base scope_pkg scope_install; do
+          [[ -z "$scope_id" || -z "$scope_pkg" ]] && continue
+          [[ "$scope_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]] || continue
+          local api_url="${gh_api_base_v}/repos/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+          http_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $app_token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_url" 2>/dev/null || echo 000)"
+          if [[ "$http_code" == "200" ]]; then
+            v_ok "App scope $scope_id: HTTP 200"
+          else
+            v_drift "App scope $scope_id" "$api_url returned HTTP $http_code"
+          fi
+        done <<<"$repos_tsv"
       fi
     fi
   fi
@@ -879,6 +902,23 @@ VALUES_FILE="${VALUES_FILE:-$FORK_DIR/deploy.values.yaml}"
 VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
 [[ -f "$VALUES_HELPER" ]] \
   || { echo "values helper missing at $VALUES_HELPER" >&2; exit 1; }
+
+# quay-managed github.com entries require the App credential helper for HTTPS
+# clone/push; SSH deploy-key rewrites are skipped for those entries. Fail fast
+# before any provisioning so the operator doesn't half-install with an auth
+# model that can't push.
+_quay_gh_bad_ids=()
+while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
+  [[ -z "$repo_id" || -z "$repo_pkg" ]] && continue
+  [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]] || continue
+  _quay_gh_bad_ids+=("$repo_id")
+done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos 2>/dev/null || true)
+if (( ${#_quay_gh_bad_ids[@]} > 0 )) && [[ "$AUTH_METHOD" != "app" ]]; then
+  echo "FAIL: repos[] has quay-managed github.com entries (${_quay_gh_bad_ids[*]}) but --auth-method app was not passed." >&2
+  echo "      These entries clone over HTTPS using the GitHub App credential helper." >&2
+  echo "      Re-run with --auth-method app and the usual --app-* flags." >&2
+  exit 2
+fi
 
 if [[ -z "$GIT_IDENTITY_NAME" ]]; then
   GIT_IDENTITY_NAME="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get org.agent_identity_name)"
@@ -1381,10 +1421,15 @@ fi
 # $TARGET/code/<id>/. Entries with a `quay:` block additionally get a
 # bare clone + `quay repo add` registration when quay is enabled; a
 # `quay:` block with quay disabled produces a code mirror plus a warning.
-# Per-repo url.insteadOf rewrites land in ~hermes/.gitconfig, scoped to
-# the specific values URL — github.com URLs clone over SSH against the
-# deploy keys staged by stage-repo-auth.sh; non-github URLs (CI's file://
-# fixtures, public mirrors) clone as-is.
+#
+# Auth bifurcation:
+#   quay-managed github.com entries — clones go over HTTPS with the App
+#     credential helper (-c credential.https://github.com.helper=…) so
+#     the App's GitHub UI repo scope is the only operator-side toggle;
+#     no url.insteadOf rewrite or deploy key required.
+#   code-only entries (no quay: block) — per-repo url.insteadOf rewrites
+#     land in ~hermes/.gitconfig, bridging the HTTPS values URL to SSH
+#     against the deploy keys staged by stage-repo-auth.sh.
 
 CODE_ROOT="$TARGET_DIR/code"
 install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$CODE_ROOT"
@@ -1518,10 +1563,10 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
   while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
     [[ -z "$repo_id" ]] && continue
 
-    # ---- per-repo url.insteadOf rewrite (github.com only) ----
-    # Match the exact `https://github.com/<org>/<repo>` shape the values
-    # helper validates. Anything else (file://, non-github HTTPS) flows
-    # through unchanged; the agent inherits the OS-level git defaults.
+    # ---- per-repo url.insteadOf rewrite (code-only github.com entries) ----
+    # quay-managed github.com entries skip the SSH rewrite and use the App
+    # credential helper instead. For code-only entries the rewrite bridges
+    # the HTTPS values URL to SSH against the deploy key.
     # Two unrelated traps avoided:
     #   * git always stats CWD as part of repo discovery (even with --file
     #     and --global). When CWD is outside the agent user's read scope,
@@ -1530,7 +1575,7 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
     #   * `--file` is used instead of `--global` because under sudo,
     #     $HOME and $XDG_CONFIG_HOME may point at the caller's home
     #     regardless of -H — `--global` then reads/writes the wrong file.
-    if [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+    if [[ -z "$repo_pkg" && "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
       org="${BASH_REMATCH[1]}"
       repo_short="${BASH_REMATCH[2]}"
       ssh_url="git@github.com:${org}/${repo_short}.git"
@@ -1547,8 +1592,21 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
       echo "==> code mirror $repo_id present at $code_dir (preserving)"
     else
       echo "==> cloning $repo_url into $code_dir"
-      sudo -u "$AGENT_USER" \
-        git clone --quiet --branch "$repo_base" "$repo_url" "$code_dir"
+      if [[ -n "$repo_pkg" && -n "$GIT_CRED_HELPER" && "$repo_url" =~ ^https://github\.com/ ]]; then
+        sudo -u "$AGENT_USER" \
+          env HERMES_HOME="$TARGET_DIR" \
+          git -c "credential.https://github.com.helper=$GIT_CRED_HELPER" \
+            clone --quiet --branch "$repo_base" "$repo_url" "$code_dir"
+      else
+        sudo -u "$AGENT_USER" \
+          git clone --quiet --branch "$repo_base" "$repo_url" "$code_dir"
+      fi
+    fi
+    # Persist the credential helper into the code mirror's .git/config for
+    # subsequent fetches by the hermes-code-sync timer.
+    if [[ -n "$repo_pkg" && -n "$GIT_CRED_HELPER" && "$repo_url" =~ ^https://github\.com/ ]]; then
+      sudo -u "$AGENT_USER" git -C "$code_dir" \
+        config credential.https://github.com.helper "$GIT_CRED_HELPER"
     fi
 
     # ---- bare clone + quay registration (entries with `quay:` block) ----
@@ -1562,8 +1620,21 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
           echo "==> quay bare clone $repo_id present (preserving)"
         else
           echo "==> cloning $repo_url into $bare"
-          sudo -u "$AGENT_USER" \
-            git clone --quiet --bare "$repo_url" "$bare"
+          if [[ -n "$GIT_CRED_HELPER" && "$repo_url" =~ ^https://github\.com/ ]]; then
+            sudo -u "$AGENT_USER" \
+              env HERMES_HOME="$TARGET_DIR" \
+              git -c "credential.https://github.com.helper=$GIT_CRED_HELPER" \
+                clone --quiet --bare "$repo_url" "$bare"
+          else
+            sudo -u "$AGENT_USER" \
+              git clone --quiet --bare "$repo_url" "$bare"
+          fi
+        fi
+        # Persist the credential helper into the bare clone's config so
+        # worker git push from worktrees authenticates without per-spawn env.
+        if [[ -n "$GIT_CRED_HELPER" && "$repo_url" =~ ^https://github\.com/ ]]; then
+          sudo -u "$AGENT_USER" git -C "$bare" \
+            config credential.https://github.com.helper "$GIT_CRED_HELPER"
         fi
 
         if grep -Fxq "$repo_id" <<<"$QUAY_REGISTERED_IDS"; then

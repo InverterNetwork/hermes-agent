@@ -70,12 +70,14 @@ def install(tmp_path: Path) -> dict:
     (rails / "venv" / "bin").mkdir(parents=True)
     (rails / "SOUL.md").write_text("seed\n")
     (rails / "SOUL.md").chmod(0o644)
-    # Helper + venv python: the helper is a stub that succeeds on `check`.
+    # Helper + venv python: the helper stub prints a fake token on `mint`
+    # (verify's smoke-check + App-scope check both consume `mint` output).
     helper = rails / "installer" / "hermes_github_token.py"
     helper.write_text(
         "#!/usr/bin/env python3\n"
         "import sys\n"
-        "if len(sys.argv) > 1 and sys.argv[1] == 'check':\n"
+        "if len(sys.argv) > 1 and sys.argv[1] == 'mint':\n"
+        "    print('ghs_stub_token')\n"
         "    sys.exit(0)\n"
         "sys.exit(2)\n"
     )
@@ -648,14 +650,18 @@ def quay_install(install: dict) -> dict:
         py_shim.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} "$@"\n')
         py_shim.chmod(0o755)
 
-    # Operator-invocation glue: wrapper at /usr/local/bin/quay-as-hermes
-    # and login-shell drop-in at /etc/profile.d/quay-data-dir.sh in prod.
-    # The test fixture redirects both via HERMES_VERIFY_QUAY_WRAPPER /
-    # HERMES_VERIFY_QUAY_PROFILE so we can poke at them without touching
-    # /usr/local/bin or /etc on the dev machine.
+    # Operator-invocation glue: wrapper at /usr/local/bin/quay-as-hermes,
+    # tick runner at /usr/local/sbin/quay-tick-runner, and login-shell
+    # drop-in at /etc/profile.d/quay-data-dir.sh in prod.
+    # The test fixture redirects all three via env-var overrides so we can
+    # poke at them without touching /usr/local/bin, /usr/local/sbin, or
+    # /etc on the dev machine.
     quay_wrapper = bin_dir / "quay-as-hermes"
     quay_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n")
     quay_wrapper.chmod(0o755)
+    quay_runner = bin_dir / "quay-tick-runner"
+    quay_runner.write_text("#!/usr/bin/env bash\nexit 0\n")
+    quay_runner.chmod(0o755)
     quay_profile = bin_dir / "quay-data-dir.sh"
     quay_profile.write_text("# stub\n")
     quay_profile.chmod(0o644)
@@ -667,6 +673,7 @@ def quay_install(install: dict) -> dict:
     install["quay_repo_url"] = repo_url
     install["quay_bare"] = bare
     install["quay_wrapper"] = quay_wrapper
+    install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
     return install
 
@@ -679,6 +686,7 @@ def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
     env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
     env["HERMES_VERIFY_QUAY_BIN"] = str(install["quay_bin"])
     env["HERMES_VERIFY_QUAY_WRAPPER"] = str(install["quay_wrapper"])
+    env["HERMES_VERIFY_QUAY_RUNNER"] = str(install["quay_runner"])
     env["HERMES_VERIFY_QUAY_PROFILE"] = str(install["quay_profile"])
     return subprocess.run(
         [

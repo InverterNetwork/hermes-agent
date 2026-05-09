@@ -46,6 +46,13 @@
 #                                 stop asking for `--app-id`. The PEM private
 #                                 key is the actual secret and stays out-of-
 #                                 band (`--app-key-path`).
+#                                 The App's repository scope (configured in
+#                                 the GitHub UI under the App's installation
+#                                 settings) is what authorizes the agent's
+#                                 reads and writes against repos[].quay-managed
+#                                 entries (code mirror clones + bare clone
+#                                 pushes), in addition to the hermes-state
+#                                 push the App already fronted.
 #   auth.github_app.installation_id — numeric installation ID for the App's
 #                                 install in this org. Same identifier rules
 #                                 as `auth.github_app.id`.
@@ -72,26 +79,34 @@
 #                                 + `quay repo add`). The presence of the
 #                                 `quay:` block IS the toggle — there is no
 #                                 separate `enabled` flag.
-#                                 v0 limitation: each `url` must be reachable
-#                                 by the agent user. github.com URLs are
-#                                 bridged to SSH transport via per-repo
-#                                 url.insteadOf rewrites that the installer
-#                                 wires into ~<agent>/.gitconfig, so a deploy
-#                                 key on each repo is sufficient. The fork's
-#                                 GitHub App helper is scoped to hermes-agent
-#                                 + hermes-state and is NOT threaded into
-#                                 these clones.
+#                                 Auth is bifurcated by entry type:
+#                                   quay-managed entries (with `quay:` block):
+#                                     code mirror + bare clone both clone over
+#                                     HTTPS using a per-repo git credential
+#                                     helper that calls the GitHub App. The
+#                                     App's repository scope (GitHub UI) is the
+#                                     only operator-side toggle — no deploy key
+#                                     or url.insteadOf rewrite required. The
+#                                     same App already fronts hermes-state push.
+#                                   code-only entries (no `quay:` block):
+#                                     github.com URLs are bridged to SSH
+#                                     transport via per-repo url.insteadOf
+#                                     rewrites that the installer wires into
+#                                     ~<agent>/.gitconfig; a deploy key on each
+#                                     repo (staged by stage-repo-auth.sh) is
+#                                     the credential.
 #   repos[].id                 — must match `^[A-Za-z0-9_][A-Za-z0-9._-]*$`
 #                                 (alnum/./-/_, no path separators, no leading
 #                                 dot or dash). The id lands in a filesystem
 #                                 path and (for quay-managed entries) a CLI
 #                                 flag.
 #   repos[].url                — HTTPS GitHub URL (https://github.com/<org>/<repo>),
-#                                 no `.git` suffix. The installer applies a
-#                                 per-repo url.insteadOf rewrite on first
-#                                 install so the agent's `git clone`/`fetch`
-#                                 lands over SSH against the deploy key, even
-#                                 though the values file documents HTTPS.
+#                                 no `.git` suffix. For quay-managed entries
+#                                 the URL is used as-is (HTTPS, App credential
+#                                 helper); for code-only entries the installer
+#                                 applies a per-repo url.insteadOf rewrite so
+#                                 `git clone`/`fetch` lands over SSH against
+#                                 the deploy key.
 #   repos[].base_branch        — required for every entry. The code mirror is
 #                                 hard-reset to origin/<base_branch> on every
 #                                 hermes-code-sync tick.

@@ -538,9 +538,9 @@ needed there.
 ## Staging repo SSH auth
 
 `stage-repo-auth.sh` (at the repo root) provisions the SSH material the
-agent user needs to clone (and quay needs to fetch) every entry under
-`repos[]` in `deploy.values.yaml`. Run it once after first install, and
-again whenever a new GitHub repo is added to `repos[]`:
+agent user needs to clone `repos[]` entries that **don't** carry a
+`quay:` block (code-only entries). Run it once after first install, and
+again whenever a new code-only GitHub repo is added to `repos[]`:
 
 ```sh
 sudo ./stage-repo-auth.sh
@@ -552,21 +552,23 @@ What it does (idempotent):
 * Pre-seeds `~<agent>/.ssh/known_hosts` with current `github.com` host
   keys via `ssh-keyscan` (deduplicated against existing entries).
 * Prints the public key (`~<agent>/.ssh/id_ed25519.pub`) plus a
-  per-repo deploy-key URL checklist for every github.com entry under
-  `repos[]`.
+  per-repo deploy-key URL checklist for every **code-only** github.com
+  entry under `repos[]`. quay-managed entries (those with a `quay:`
+  block) are excluded — they authenticate via the GitHub App credential
+  helper; the App's repository scope (GitHub UI) is the source of truth
+  for those, not a deploy key.
 
 The url.insteadOf rewrites that bridge HTTPS values URLs to SSH
 transport are NOT done here — `setup-hermes.sh` wires them per-repo as
-part of its `repos[]` provisioning loop, so a deploy key registered on
-exactly the listed repos suffices (no org-wide rewrite that could fire
-for unrelated repos).
+part of its `repos[]` provisioning loop (code-only entries only), so a
+deploy key registered on exactly the listed code-only repos suffices.
 
-The operator's job: paste the printed public key into each repo's
-**Settings → Deploy keys → Add deploy key** UI on GitHub. Read-only is
-sufficient for v0 (the agent only fetches; pushes against the state
-repo go via the GitHub App token wired up by the main installer);
-enable "Allow write access" only if a worker eventually needs to push
-from a clone, which is not the v0 flow.
+The operator's job for code-only entries: paste the printed public key
+into each repo's **Settings → Deploy keys → Add deploy key** UI on
+GitHub. Read-only is sufficient (the agent only fetches; pushes against
+the state repo go via the GitHub App token wired up by the main
+installer). For quay-managed entries, grant the App access via the
+App's installation settings instead — no deploy key step needed.
 
 ## Logs
 
@@ -718,9 +720,15 @@ hermes-code-sync[NNN]: [hermes-code-sync] synced 2 ok, 1 failed, 0 skipped
 ## Adding a repo
 
 1. Add the entry to `repos[]` in `deploy.values.yaml`.
-2. (Private GitHub repo only) Re-run `sudo ./stage-repo-auth.sh` to
-   refresh the deploy-key checklist, then register the printed public
-   key on the new repo's **Settings → Deploy keys** page.
+2. Auth setup depends on the entry type:
+   - **quay-managed** (entry carries a `quay:` block): grant the GitHub
+     App access to the new repo via the App's installation settings in
+     the GitHub UI. No deploy key or `stage-repo-auth.sh` step needed —
+     the App's repo scope is the source of truth.
+   - **code-only** (no `quay:` block, private GitHub repo): re-run
+     `sudo ./stage-repo-auth.sh` to refresh the deploy-key checklist,
+     then register the printed public key on the new repo's
+     **Settings → Deploy keys** page.
 3. Re-run `sudo installer/setup-hermes.sh` — the new entry is provisioned
    on the next pass (idempotent for existing entries).
 4. The next `hermes-code-sync` tick (within 5 min) keeps the mirror

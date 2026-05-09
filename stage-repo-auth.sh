@@ -6,14 +6,17 @@
 # What it does:
 #   1. Generates ~hermes/.ssh/id_ed25519 if absent (no passphrase).
 #   2. Pre-seeds ~hermes/.ssh/known_hosts with github.com host keys.
-#   3. Prints the public key plus a checklist of github.com repos[] entries
-#      the operator needs to register the key against (Settings → Deploy
-#      keys → Add deploy key, on each repo).
+#   3. Prints the public key plus a checklist of code-only github.com
+#      repos[] entries the operator needs to register the key against
+#      (Settings → Deploy keys → Add deploy key, on each repo).
+#      quay-managed entries (those with a quay: block) are excluded — they
+#      authenticate via the GitHub App credential helper, not SSH deploy keys.
 #
 # The url.insteadOf rewrites that bridge HTTPS values URLs to SSH transport
 # are NOT done here — setup-hermes.sh wires them per-repo as part of its
-# repos[] provisioning loop. This script only handles the key material the
-# agent needs before clone-time auth can succeed.
+# repos[] provisioning loop (code-only entries only). This script only
+# handles the key material code-only entries need before clone-time auth
+# can succeed.
 #
 # Environment overrides (useful in CI):
 #   AGENT_USER   — defaults to hermes
@@ -77,18 +80,23 @@ ssh-keyscan -t ed25519,rsa,ecdsa github.com > "$GH_KEYS_TMP"
 sort -u "$KNOWN_HOSTS" "$GH_KEYS_TMP" | sudo -u "$AGENT_USER" tee "$KNOWN_HOSTS" > /dev/null
 echo "✓ updated $KNOWN_HOSTS"
 
-# ---------- Enumerate github.com repos for the deploy-key checklist ----------
-# Deploy keys are per-repo, not per-org, so the agent needs the same key
-# registered against every github.com URL in repos[]. Capture before the
-# read loop; <() would mask list-repos schema failures.
+# ---------- Enumerate code-only github.com repos for the deploy-key checklist ----------
+# Deploy keys are needed only for code-only entries (no quay: block). quay-managed
+# entries authenticate via the GitHub App credential helper — no deploy key required.
+# Capture before the read loop; <() would mask list-repos schema failures.
 
 REPOS_TSV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos)"
 
 GITHUB_URLS=()
-while IFS=$'\t' read -r repo_id repo_url _rest; do
+HAS_QUAY_GITHUB=0
+while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg _rest; do
   [[ -z "$repo_id" ]] && continue
   if [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]]; then
-    GITHUB_URLS+=("$repo_url")
+    if [[ -z "$repo_pkg" ]]; then
+      GITHUB_URLS+=("$repo_url")
+    else
+      HAS_QUAY_GITHUB=1
+    fi
   fi
 done <<<"$REPOS_TSV"
 
@@ -96,7 +104,11 @@ done <<<"$REPOS_TSV"
 
 echo ""
 if (( ${#GITHUB_URLS[@]} == 0 )); then
-  echo "ℹ No github.com entries in repos[] — public key staged but no repos to register against."
+  if [[ "$HAS_QUAY_GITHUB" -eq 1 ]]; then
+    echo "ℹ All github.com repos[] entries are quay-managed; deploy keys are no longer required for those — App scope is the source of truth. Public key staged for code-only entries / future use."
+  else
+    echo "ℹ No github.com entries in repos[] — public key staged but no repos to register against."
+  fi
 else
   echo "Add this public key to each repo's deploy-key UI (Settings → Deploy keys → Add deploy key):"
   for url in "${GITHUB_URLS[@]}"; do
