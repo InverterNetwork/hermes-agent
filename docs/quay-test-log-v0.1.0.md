@@ -402,3 +402,82 @@ Test fixture:
   `quay.runtime_managers.bun` pin in `deploy.values.yaml`, mirrored by
   `setup-hermes.sh` with SHA verification (same security boundary as
   `quay.version`).
+
+---
+
+## 8. ✅ Worker exits silently — `claude` needs `-p` for non-interactive mode [PR #41]
+
+- **Symptom:** First three quay-spawned attempts on the v0.1.2 +
+  `bun`-on-host build all transitioned `queued` → `running` → `queued`
+  with `event_type: crashed`, `.quay-session.log` always 0 bytes, no
+  remote progress, no blocker file. Pattern:
+  ```
+  spawned 18:04:51 → crashed 18:05:51   (60s, 0B log)
+  spawned 18:06:51 → crashed 18:07:55   (64s, 0B log)
+  spawned 18:08:55 → crashed 18:09:57   (62s, 0B log)
+  ```
+- **Root cause:** `quay.agent_invocation` was
+  `claude --permission-mode bypassPermissions < {prompt_file}` —
+  missing `-p` / `--print`. Without it, claude in stdin-piped mode
+  reads the prompt and exits immediately without acting; the tmux
+  pane dies, quay's classifier sees no progress and no blocker, and
+  schedules a crash retry.
+- **Verified empirically:**
+  ```
+  echo "Reply with PONG" | claude -p   # → "PONG" (~3s)
+  echo "Reply with PONG" | claude       # → no output, immediate exit
+  ```
+- **Locus of fix:** **hermes-agent** — one-line change in
+  `deploy.values.yaml` to `claude -p --permission-mode bypassPermissions
+  < {prompt_file}`.
+- **Configs-as-code rail validation:** Tested by deleting the seeded
+  `~hermes/.hermes/quay/config.toml` on krustentier and re-running
+  `setup-hermes.sh`. Installer detected absence and re-rendered from
+  values.yaml, producing a config.toml with the correct `-p`
+  invocation and an unchanged `[adapters.linear]` block. Single source
+  of truth holds; deleting the artifact = re-render-from-values is the
+  canonical operator escape hatch when seeded files drift.
+- **Resolved 2026-05-09:** PR #41 merged to main. Pulled on
+  krustentier, wiped + re-rendered config.toml, re-ran installer.
+
+## 9. 🟡 Worker push fails: deploy key is read-only; `GH_TOKEN` not in pane env [ITRY-1347]
+
+- **Symptom:** With v0.1.2 + `bun` + `-p` fix in place, attempt #4
+  (the first attempt on the corrected build) ran for ~64s, made the
+  ITRY-1327 code change locally (commit `d9aad5f`,
+  `console.log("Ran ans werk!");`), but failed at the push/PR step
+  and wrote `.quay-blocked.md`:
+  > *"The SSH key is read-only — `git push` fails with 'The key you are
+  > authenticating with has been marked as read only'. `gh auth status`
+  > reports 'You are not logged into any GitHub hosts.'. No `GH_TOKEN` /
+  > `GITHUB_TOKEN` is set in the environment."*
+- **Two distinct gaps surfaced:**
+  1. **Push transport:** Hermes' `~/.gitconfig` rewrites
+     `https://github.com/InverterNetwork/test-factory-code` to
+     `git@github.com:InverterNetwork/test-factory-code` via
+     `url.insteadOf`. Push goes over SSH and uses the per-repo deploy
+     key, which is **read-only**. The `didier-runtime` GitHub App
+     *already* has `Read & write` on this repo via its installation
+     scope (verified in the App settings UI on github.com), but
+     nothing in the worker codepath consumes that — the App-token rail
+     and the deploy-key rail are bifurcated.
+  2. **`GH_TOKEN` propagation gap:** PR #40 (ITRY-1345 fix) mints
+     `GH_TOKEN` in `quay-tick-runner` before `exec`ing `quay tick`;
+     verified working via `set -x` trace
+     (`token=ghs_9N0d…` exported correctly). The token reaches the
+     `quay tick` process and the tmux server (verified by spawning a
+     test pane that printed `GH_TOKEN=<set>` from `env`). But claude
+     in the *worker* pane reports `no GH_TOKEN set` — propagation is
+     dropping the var somewhere between the runner-mint and the
+     respawn-pane step. Possibly the tmux server is reusing a stale
+     env from an earlier non-mint context, or the pane respawn
+     scrubs env. Needs more digging.
+- **Locus of fix:** **hermes-agent**, both gaps. Filed as
+  [ITRY-1347](https://linear.app/inverter/issue/ITRY-1347) (High):
+  consolidate `repos[].quay`-managed entries onto the App-token rail
+  end-to-end — drop the deploy-key + `url.insteadOf` SSH rewrite,
+  wire HTTPS push to consume the minted `GH_TOKEN` (credential
+  helper or `gh auth setup-git`). Resolves both gaps simultaneously
+  by collapsing the two auth surfaces into one.
+- **Workaround:** None on the operator side without restructuring
+  the worker auth path. Pausing the test here pending ITRY-1347.
