@@ -1582,9 +1582,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
     if [[ "$repo_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
       org="${BASH_REMATCH[1]}"
       repo_short="${BASH_REMATCH[2]}"
-      ssh_url="git@github.com:${org}/${repo_short}.git"
       sudo -u "$AGENT_USER" touch "$AGENT_GITCONFIG"
       if [[ -z "$repo_pkg" ]]; then
+        ssh_url="git@github.com:${org}/${repo_short}.git"
         ( cd "$AGENT_HOME" && \
           sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
             "url.${ssh_url}.insteadOf" "$repo_url" )
@@ -1594,14 +1594,21 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
         # the App helper and keep pushing via the deploy key. Exit 5 =
         # "key not present"; anything else is a real failure (perm denied,
         # malformed gitconfig) and shouldn't be swallowed.
-        unset_rc=0
-        ( cd "$AGENT_HOME" && \
-          sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
-            --unset-all "url.${ssh_url}.insteadOf" ) || unset_rc=$?
-        if (( unset_rc != 0 && unset_rc != 5 )); then
-          echo "FAIL: clearing stale url.insteadOf for $repo_id failed (git config exit $unset_rc)" >&2
-          exit 1
-        fi
+        # Try both suffix variants — the pre-consolidation installer wrote
+        # the rewrite key without `.git`, while the current write branch
+        # uses `.git`. git accepts either form on read, so a single shape
+        # would silently no-op against the other.
+        for unset_suffix in "" ".git"; do
+          unset_ssh_url="git@github.com:${org}/${repo_short}${unset_suffix}"
+          unset_rc=0
+          ( cd "$AGENT_HOME" && \
+            sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
+              --unset-all "url.${unset_ssh_url}.insteadOf" ) || unset_rc=$?
+          if (( unset_rc != 0 && unset_rc != 5 )); then
+            echo "FAIL: clearing stale url.insteadOf for $repo_id (key url.${unset_ssh_url}.insteadOf) failed (git config exit $unset_rc)" >&2
+            exit 1
+          fi
+        done
       fi
     fi
 
