@@ -157,7 +157,7 @@ def _binary_at_pinned_version(install_path: Path, pinned_version: str) -> bool:
     if not (st.st_mode & stat.S_IXUSR):
         return False
     if os.geteuid() == 0:
-        if st.st_uid != 0 or (st.st_mode & 0o777) != 0o755:
+        if st.st_uid != 0 or st.st_gid != 0 or (st.st_mode & 0o777) != 0o755:
             return False
     try:
         out = subprocess.run(

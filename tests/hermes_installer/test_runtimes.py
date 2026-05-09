@@ -174,6 +174,42 @@ class TestEnsureRuntime:
         ensure_runtime(pin, install_path)
         assert called["urlretrieve"], "wrong-owner binary should trigger re-install"
 
+    def test_root_with_wrong_group_triggers_reinstall(
+        self, tmp_path: Path, fake_bun_zip, patch_urlretrieve, monkeypatch
+    ):
+        # Tests can't make a file root:non-root in the filesystem, so
+        # synthesize the stat result. Forging the gid alone (uid=0, mode=0755)
+        # exercises the gid limb of the strict-state check in isolation.
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        _, sha = fake_bun_zip
+        pin = RuntimeManagerPin(name="bun", version="1.3.9", linux_x64_sha256=sha)
+        install_path = tmp_path / "bin" / "bun"
+        install_path.parent.mkdir()
+        install_path.write_text(fake_bun_script("1.3.9"))
+        os.chmod(install_path, 0o755)
+        real_stat = install_path.stat()
+        forged = os.stat_result(
+            (real_stat.st_mode, real_stat.st_ino, real_stat.st_dev,
+             real_stat.st_nlink, 0, 1000, real_stat.st_size,
+             real_stat.st_atime, real_stat.st_mtime, real_stat.st_ctime)
+        )
+        target = str(install_path)
+        original_stat = Path.stat
+        monkeypatch.setattr(
+            Path, "stat",
+            lambda self, *a, **kw: forged if str(self) == target else original_stat(self, *a, **kw),
+        )
+
+        called: dict[str, bool] = {"urlretrieve": False}
+
+        def _track(url, dst):
+            called["urlretrieve"] = True
+            patch_urlretrieve(url, dst)
+
+        monkeypatch.setattr(runtimes.urllib.request, "urlretrieve", _track)
+        ensure_runtime(pin, install_path)
+        assert called["urlretrieve"], "non-root group should trigger re-install"
+
     def test_root_with_wrong_mode_triggers_reinstall(
         self, tmp_path: Path, fake_bun_zip, patch_urlretrieve, monkeypatch
     ):
