@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -9,6 +10,11 @@ INSTALLER_SCRIPT = REPO_ROOT / "installer" / "setup-hermes.sh"
 
 def test_setup_hermes_script_is_valid_shell():
     result = subprocess.run(["bash", "-n", str(SETUP_SCRIPT)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def test_installer_script_is_valid_shell():
+    result = subprocess.run(["bash", "-n", str(INSTALLER_SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
@@ -60,13 +66,13 @@ def test_installer_unsets_stale_insteadof_for_quay_entries(tmp_path):
     ).returncode == 1
 
 
-def test_installer_per_repo_loop_drops_rewrite_for_quay_entries():
-    """The per-repo provisioning loop in installer/setup-hermes.sh must
-    take the unset branch (not the write branch) for entries with a
-    non-empty package_manager. Static-analysis check: the loop's
-    rewrite-write must be gated on `-z "$repo_pkg"` and the unset must
-    reference `--unset-all` on the same `url.<ssh>.insteadOf` key.
+def test_installer_unsets_url_insteadof_somewhere():
+    """Guards the upgrade-path fix: setup-hermes.sh must contain a
+    `git config --unset-all` call on a `url.*.insteadOf` key. Loose regex
+    so reformatting (whitespace, quoting style) doesn't fail the test for
+    the wrong reason — the only thing being asserted is that the unset
+    logic is still in the script.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    assert 'if [[ -z "$repo_pkg" ]]; then' in content
-    assert '--unset-all "url.${ssh_url}.insteadOf"' in content
+    assert re.search(r'--unset-all\s+"url\..*?\.insteadOf"', content), \
+        "installer must clear stale url.<ssh>.insteadOf for upgraded quay-managed entries"

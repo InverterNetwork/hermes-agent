@@ -1589,13 +1589,19 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
           sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
             "url.${ssh_url}.insteadOf" "$repo_url" )
       else
-        # Strip any legacy SSH rewrite from earlier installs — git applies
-        # url.insteadOf before credential lookup, so a stale rewrite would
-        # silently shadow the App helper and keep pushing via the deploy key.
-        # Exit code 5 = "key not present"; treat as already-clean.
+        # git applies url.insteadOf before credential lookup, so a stale
+        # rewrite from a pre-consolidation install would silently shadow
+        # the App helper and keep pushing via the deploy key. Exit 5 =
+        # "key not present"; anything else is a real failure (perm denied,
+        # malformed gitconfig) and shouldn't be swallowed.
+        unset_rc=0
         ( cd "$AGENT_HOME" && \
           sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
-            --unset-all "url.${ssh_url}.insteadOf" 2>/dev/null || true )
+            --unset-all "url.${ssh_url}.insteadOf" ) || unset_rc=$?
+        if (( unset_rc != 0 && unset_rc != 5 )); then
+          echo "FAIL: clearing stale url.insteadOf for $repo_id failed (git config exit $unset_rc)" >&2
+          exit 1
+        fi
       fi
     fi
 
