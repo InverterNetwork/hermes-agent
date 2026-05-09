@@ -481,3 +481,109 @@ Test fixture:
   by collapsing the two auth surfaces into one.
 - **Workaround:** None on the operator side without restructuring
   the worker auth path. Pausing the test here pending ITRY-1347.
+- **Resolved 2026-05-09:** ITRY-1347 (PR #42) merged + ITRY-1348
+  followup filed/worked-around. After installer re-run + manual
+  unset of stale `url.insteadOf` in `~hermes/.gitconfig`, the
+  HTTPS+App credential helper path is end-to-end validated:
+  - `git push` over HTTPS via the credential helper succeeds —
+    PR #1 on test-factory-code was opened by `app/didier-runtime`
+    (verified via `gh pr view 1 --json author`).
+  - `gh pr list --head quay/ITRY-1327` with a minted `GH_TOKEN`
+    returns the PR, so quay's `prExistsForBranch` path works.
+
+---
+
+## 10. 🟡 Worker exits silently inside quay's tmux spawn (0-byte session log) [ITRY-1349]
+
+- **Symptom:** Every claude worker spawned by `quay tick` for ITRY-1327
+  on krustentier exits within ~60s producing **zero bytes** in
+  `.quay-session.log`, no `.quay-blocked.md`, no commit, no push. Same
+  pattern as entry #8 was *before* the `-p` fix — but agent_invocation
+  now has `-p` (verified live in `~hermes/.hermes/quay/config.toml`).
+  Pattern from the v0.1.2 + ITRY-1347 build:
+  ```
+  spawned 20:29:31 → crashed 20:30:33   (62s, 0B log)
+  spawned 20:31:34 → crashed 20:32:35   (61s, 0B log)
+  spawned 20:33:35 → crashed 20:34:38   (63s, 0B log)
+  spawned 20:35:41 → no_progress 20:36:41 (PR existed by then, from manual probe)
+  spawned 20:37:43 → no_progress (budget exhausted)
+  ```
+- **Manual reproduction works.** Replicating quay's exact spawn
+  choreography by hand (`tmux new-session -d -s … cat; pipe-pane -o;
+  respawn-pane -k -c <worktree> -t <session>:0.0 "exec sh -c
+  '<agent_invocation>'"`) against the same worktree, with the same
+  `claude -p --permission-mode bypassPermissions < .quay-prompt.md`
+  invocation, succeeds end-to-end:
+  - claude makes the code edit, commits (`137a753 ITRY-1327: Update
+    hello.ts copy to "Ran ans werk!"`)
+  - pushes the branch via HTTPS+App credential helper
+  - opens PR #1 on test-factory-code (created by `app/didier-runtime`)
+  - exits cleanly, ~55s total
+  - session log gets ~380 bytes (claude's final `-p` summary)
+- **What's verified the same** between quay-spawn and manual-spawn:
+  same agent_invocation string, same tmux choreography (each step
+  shellQuote-equivalent), same worktree, same `.quay-prompt.md` (1965
+  bytes), same OS user, same `~/.claude/.credentials.json`, same
+  `claude --version` (2.1.132). End-to-end auth model verified
+  working in the manual case.
+- **Hypotheses to investigate (ITRY-1349):**
+  1. Tmux server env propagation race — claude's blocker artifact
+     from earlier reported "no `GH_TOKEN` set", but `env`-dump probes
+     into a fresh tmux pane show `GH_TOKEN` propagating fine.
+     Possibly a stale tmux server reused across ticks with stale env.
+  2. Claude credential-refresh race on the shared
+     `~/.claude/.credentials.json` between concurrent processes.
+  3. Pipe-pane / respawn-pane subtle interaction (signal delivery,
+     pane lifetime).
+  4. Systemd cgroup reaping of tmux descendants when `quay-tick.service`
+     (`Type=oneshot`) exits.
+- **Locus of fix:** **quay** (worker spawn substrate). Filed as
+  [ITRY-1349](https://linear.app/inverter/issue/ITRY-1349) (priority
+  High). Recommended next step in the body: wire
+  `claude --debug --debug-file <path>` into agent_invocation
+  temporarily and diff debug logs between quay-spawn and manual-spawn
+  for the divergence point.
+- **Workaround for v0.1.x:** None on the operator side. The end-to-end
+  auth + worker logic is functionally validated via the manual probe;
+  for a deployment to drive itself without operator intervention,
+  ITRY-1349 needs to land.
+
+---
+
+## End-of-test summary (2026-05-09 20:42 UTC)
+
+The v0.1.0 worker-pipeline test against ITRY-1327 on krustentier is
+**complete with caveats**. End-to-end coverage achieved:
+
+| Pipeline stage | Status | Validated by |
+|---|---|---|
+| `quay enqueue --linear-issue` (Linear adapter, brief synth) | ✅ | task `a1c4e61f` enqueued, brief artifact captured |
+| Worktree creation + `bun install` bootstrap | ✅ | node_modules present in worktree |
+| Tmux session spawn | ✅ | Pane created with `pipe-pane` log sink |
+| Worker (claude) executes the brief | ✅ via manual probe; ❌ via quay's spawn | PR #1 opened in manual repro; quay-spawn → ITRY-1349 |
+| `git push` over HTTPS+App credential helper | ✅ | PR #1's commit `137a753` pushed |
+| `gh pr create` via App-installation token | ✅ | PR #1 opened by `app/didier-runtime` |
+| Quay classifier sees PR exists, transitions correctly | ✅ | `action: "no_progress"` (correct: PR exists, this attempt didn't push) |
+| `quay review-pr <pr-url>` | ⏸ | Spec marked "Draft, not locked" — not yet implemented in v0.1.x |
+
+**Open follow-ups filed:**
+- [ITRY-1346](https://linear.app/inverter/issue/ITRY-1346) (Medium) — declarative `bun` provisioning in `setup-hermes.sh`.
+- [ITRY-1348](https://linear.app/inverter/issue/ITRY-1348) (High) — installer's stale `url.insteadOf` unset has a `.git`-suffix mismatch.
+- [ITRY-1349](https://linear.app/inverter/issue/ITRY-1349) (High) — claude worker exits silently inside quay's tmux spawn (the only thing between us and a fully autonomous green run).
+
+**What's already shipped during the test:**
+- v0.1.1 (AST-85 / AST-86 / AST-89, Linear+Slack adapter spawn fixes).
+- v0.1.2 (AST-88 / ITRY-1344 / ITRY-1334 reconciler).
+- PR #38 (operator wrapper cwd / silent-fallback fix).
+- PR #40 (App-token mint preamble for tick + wrapper).
+- PR #41 (`-p` flag for non-interactive claude — entry #8).
+- PR #42 / ITRY-1347 (consolidate quay-managed repos onto App-token rail — entry #9).
+
+**Test fixture artifact:**
+- PR #1 on `InverterNetwork/test-factory-code` left open as the
+  end-to-end demonstration of the worker prompt + auth path.
+  Operator may merge or close at discretion; not load-bearing for
+  any quay state going forward.
+
+**Quay task `a1c4e61f-1ec9-420d-8976-b5a891e863f2`** is in the
+`cancelled` state on krustentier; no live retries pending.
