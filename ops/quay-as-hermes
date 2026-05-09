@@ -8,8 +8,14 @@
 # This wrapper pins the data dir explicitly, so manual `repo add`,
 # `task list`, `enqueue`, etc. land in the same place as the unit.
 #
+# `cd /` is required because sudo inherits the caller's cwd by default;
+# from the canonical `ssh <host>; sudo …` flow that's /root (mode 0750,
+# unreadable to the agent user). Quay stats its cwd at startup, fails
+# silently when it can't, and falls back to ~/.quay/ — defeating the
+# QUAY_DATA_DIR pin above. `/` is universally readable.
+#
 # __AGENT_USER__ and __TARGET_DIR__ are substituted by setup-hermes.sh
 # at install time, matching the quay-tick.service template pattern.
 exec sudo -u __AGENT_USER__ \
      env QUAY_DATA_DIR=__TARGET_DIR__/quay \
-     /usr/local/bin/quay "$@"
+     sh -c 'cd / && exec /usr/local/bin/quay "$@"' -- "$@"
