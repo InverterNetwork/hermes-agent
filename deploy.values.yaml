@@ -218,7 +218,9 @@ quay:
   version: "v0.1.2"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
-  agent_invocation: "claude --permission-mode bypassPermissions < {prompt_file}"
+  # `-p` (--print) is required for non-interactive batch mode: without it,
+  # claude in stdin-piped mode reads the prompt and exits without acting.
+  agent_invocation: "claude -p --permission-mode bypassPermissions < {prompt_file}"
   adapters:
     linear:
       enabled: true
