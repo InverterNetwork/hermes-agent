@@ -66,6 +66,14 @@ def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
         info(f"{pin.name} {pin.version} already at {install_path}; no-op")
         return
 
+    arch = _host_arch()
+    if arch != "x86_64":
+        fail(
+            f"{pin.name} {pin.version}: only linux-x86_64 is supported today "
+            f"(host reports {arch!r}). Add a linux_<arch>_sha256 pin in "
+            "deploy.values.yaml and an arch-aware recipe in runtimes.py to extend."
+        )
+
     url = recipe.url_template.format(version=pin.version)
     info(f"installing {pin.name} {pin.version} → {install_path}")
     info(f"  fetching {url}")
@@ -127,14 +135,30 @@ def _atomic_install(src: Path, dst: Path) -> None:
         raise
 
 
+def _host_arch() -> str:
+    return os.uname().machine
+
+
 def _binary_at_pinned_version(install_path: Path, pinned_version: str) -> bool:
     """Substring-match ``<binary> --version`` against the pin — absorbs
     `+commit-sha` build suffixes that the upstream binary may emit.
+
+    When running as root, also require the safe-install contract
+    (root:root 0755). A binary at the pinned version with the wrong owner
+    or mode might have been swapped by an agent-writable predecessor; its
+    bytes are no longer trustworthy, so a chmod-back is unsafe — force a
+    re-download + SHA verify by returning False here. The strict check is
+    bypassed when not running as root because tests can't make files
+    root-owned.
     """
     if not install_path.exists():
         return False
-    if not (install_path.stat().st_mode & stat.S_IXUSR):
+    st = install_path.stat()
+    if not (st.st_mode & stat.S_IXUSR):
         return False
+    if os.geteuid() == 0:
+        if st.st_uid != 0 or (st.st_mode & 0o777) != 0o755:
+            return False
     try:
         out = subprocess.run(
             [str(install_path), "--version"],

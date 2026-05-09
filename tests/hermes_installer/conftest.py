@@ -37,6 +37,13 @@ def build_bun_zip(out_dir: Path, version: str) -> tuple[Path, str]:
     return zip_path, sha
 
 
+@pytest.fixture(autouse=True)
+def _force_x86_64_arch(monkeypatch):
+    """Default to ``x86_64`` so tests pass on Apple Silicon dev hosts.
+    Tests that exercise the arch-rejection path re-monkeypatch."""
+    monkeypatch.setattr(runtimes, "_host_arch", lambda: "x86_64")
+
+
 @pytest.fixture
 def fake_bun_zip(tmp_path: Path) -> tuple[Path, str]:
     """Pre-built bun-shaped zip + its SHA256."""

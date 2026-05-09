@@ -1,5 +1,5 @@
-"""Stderr-friendly fail, root-check, and ``==>`` headers that match the
-bash conventions during the bash → Python transition."""
+"""Stderr-friendly fail, root-check, and ``==>`` headers that match
+``setup-hermes.sh``'s output convention."""
 
 from __future__ import annotations
 
