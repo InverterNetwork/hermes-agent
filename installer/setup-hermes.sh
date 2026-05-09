@@ -1789,13 +1789,7 @@ QUAY_TICK_RUNNER_DST="/usr/local/sbin/quay-tick-runner"
 
 if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" && -f "$QUAY_TICK_RUNNER_SRC" ]]; then
   echo "==> installing quay-tick-runner at $QUAY_TICK_RUNNER_DST"
-  # Templates the same __AGENT_USER__ / __TARGET_DIR__ markers as the
-  # unit, even though the runner doesn't currently use them — keeps the
-  # install pipeline uniform if the script ever needs install-time pinning.
-  sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
-      -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
-      "$QUAY_TICK_RUNNER_SRC" \
-    | install -o root -g root -m 0755 /dev/stdin "$QUAY_TICK_RUNNER_DST"
+  install -o root -g root -m 0755 "$QUAY_TICK_RUNNER_SRC" "$QUAY_TICK_RUNNER_DST"
 
   install -d -o root -g root -m 0755 /etc/default
   if [[ -f /etc/default/quay-tick ]]; then

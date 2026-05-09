@@ -25,20 +25,31 @@ set -u
 LOG_PREFIX="quay-tick-runner"
 warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
 
-if [[ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
-  HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-  HERMES_TOKEN_HELPER="${HERMES_TOKEN_HELPER:-$HERMES_HOME/hermes-agent/installer/hermes_github_token.py}"
-  HERMES_TOKEN_PYTHON="${HERMES_TOKEN_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
-  if [[ -x "$HERMES_TOKEN_PYTHON" && -f "$HERMES_TOKEN_HELPER" ]]; then
-    if token="$(HERMES_HOME="$HERMES_HOME" "$HERMES_TOKEN_PYTHON" "$HERMES_TOKEN_HELPER" mint 2>/dev/null)" \
-         && [[ -n "$token" ]]; then
-      export GH_TOKEN="$token"
-    else
-      warn "token mint failed; running tick without \$GH_TOKEN"
-    fi
-  else
-    warn "token helper not found at $HERMES_TOKEN_HELPER; running tick without \$GH_TOKEN"
-  fi
-fi
+mint_gh_token() {
+  [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] && return 0
 
+  local home="${HERMES_HOME:-$HOME/.hermes}"
+  local helper="${HERMES_TOKEN_HELPER:-$home/hermes-agent/installer/hermes_github_token.py}"
+  local py="${HERMES_TOKEN_PYTHON:-$home/hermes-agent/venv/bin/python}"
+
+  if [[ ! -x "$py" || ! -f "$helper" ]]; then
+    warn "token helper not found at $helper; running tick without \$GH_TOKEN"
+    return 0
+  fi
+
+  # `timeout 30` makes the worst-case mint latency legible at the bash
+  # layer — a future bump to the helper's internal HTTP_TIMEOUT_S
+  # shouldn't silently extend our tick startup. 30s is well under the
+  # unit's TimeoutStartSec=600 but tight enough that a wedged DNS / TLS
+  # handshake doesn't waste a full tick.
+  local token
+  if ! token="$(timeout 30 env HERMES_HOME="$home" "$py" "$helper" mint 2>/dev/null)" \
+       || [[ -z "$token" ]]; then
+    warn "token mint failed; running tick without \$GH_TOKEN"
+    return 0
+  fi
+  export GH_TOKEN="$token"
+}
+
+mint_gh_token
 exec /usr/local/bin/quay tick "$@"
