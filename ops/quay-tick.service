@@ -12,8 +12,11 @@ User=__AGENT_USER__
 Group=__AGENT_USER__
 # QUAY_DATA_DIR pins the data dir (sqlite, worktrees, repo bare clones,
 # logs) — set here rather than in config.toml so the runtime path lives
-# in exactly one place that the installer can reason about.
+# in exactly one place that the installer can reason about. HERMES_HOME
+# tells the GH-token helper (invoked by quay-tick-runner before each
+# tick) which install root to read auth/github-app.{pem,env} from.
 Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
+Environment=HERMES_HOME=__TARGET_DIR__
 # Adapter tokens (LINEAR_API_KEY etc.) live in auth/quay.env, written by
 # stage-secrets.sh out-of-band. Leading `-` makes the file optional so
 # the unit starts even before tokens are staged: a tick without a Linear
@@ -22,7 +25,11 @@ EnvironmentFile=-__TARGET_DIR__/auth/quay.env
 # Operator overrides (cadence retunes, ad-hoc env vars). Preserved
 # across installer re-runs — same /etc/default/ pattern as hermes-sync.
 EnvironmentFile=-/etc/default/quay-tick
-ExecStart=/usr/local/bin/quay tick
+# quay-tick-runner mints $GH_TOKEN from the installer's GitHub App helper
+# (matching ops/hermes-upstream-sync's preamble), then execs `quay tick`.
+# Without this, the worker pipeline's `gh pr list/create` calls fail for
+# lack of HTTPS auth — the deploy keys cover git push, not the API.
+ExecStart=/usr/local/sbin/quay-tick-runner
 # A single bad tick should not lock the timer out forever. Restart=no
 # keeps the systemd state honest — failures show up in `systemctl
 # list-units`.
