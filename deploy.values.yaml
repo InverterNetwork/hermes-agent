@@ -118,6 +118,18 @@
 #                                 of the block leaves the entry as a code
 #                                 mirror only (no quay registration, no
 #                                 worker spawn).
+#   repos[].quay.tags          — OPTIONAL per-repo tag vocabulary, namespace
+#                                 → list of allowed values. Reconciled into
+#                                 quay via `quay repo apply-tags --from -`
+#                                 on every install (declarative replace —
+#                                 dropping a namespace from values clears it
+#                                 in quay). Namespace charset `[a-z0-9]+` (no
+#                                 dashes — quay splits ticket tags on the
+#                                 first dash); value charset `[a-z0-9-]+`.
+#                                 Per-repo presence of any vocab is the
+#                                 opt-in signal: quay's validator switches
+#                                 from charset-only to namespace enforcement
+#                                 the moment any per-repo entry exists.
 #
 #   quay.version               — pinned quay release tag (e.g. "v0.1.0"), or
 #                                 empty to skip all quay provisioning. Empty
@@ -150,6 +162,17 @@
 #                                 brief inside the worktree.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
+#   quay.tag_namespaces        — OPTIONAL deployment-level tag vocabulary
+#                                 merged into every per-repo vocab at
+#                                 ticket-validate time. Each namespace takes
+#                                 `values: [...]` and optional `required:
+#                                 bool`; `required: true` forces every
+#                                 ticket against an enforced repo to carry
+#                                 at least one tag from that namespace.
+#                                 Reconciled via `quay tags apply-deployment
+#                                 --from -` once per install (declarative
+#                                 replace — dropping a namespace clears it).
+#                                 Same charset rules as repos[].quay.tags.
 #   quay.adapters.slack        — gates quay's slack adapter (waiting_human
 #                                 thread posts + reply ingestion + enqueue-time
 #                                 brief enrichment). Adapter code is built

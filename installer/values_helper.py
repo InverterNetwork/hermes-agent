@@ -50,7 +50,21 @@ Subcommands:
                                   `quay.repos[]` is present, or with the
                                   field-level error otherwise. Used by
                                   setup-hermes.sh --verify so the legacy-key
-                                  rejection lives in one place.
+                                  rejection lives in one place. Also walks
+                                  per-repo `quay.tags` and deployment-level
+                                  `quay.tag_namespaces` so a malformed vocab
+                                  block fails at verify-time, not mid-install.
+  get-repo-tags <repo_id>      — emit per-repo tag vocab as JSON shaped for
+                                  `quay repo apply-tags --from -`. Bare-list
+                                  per-repo shape is wrapped as
+                                  `{values: [...], required: false}`.
+                                  Empty/absent `tags:` block emits
+                                  `{"namespaces": {}}` (explicit-clear
+                                  payload — strict reconciliation).
+  get-deployment-tags          — emit deployment tag vocab as JSON shaped for
+                                  `quay tags apply-deployment --from -`.
+                                  Reads `quay.tag_namespaces`. Same
+                                  explicit-clear semantics on empty/absent.
 
 Legacy `quay.repos[]` is rejected on every subcommand that touches the repo
 list — migrate the block to top-level `repos[]` (with the per-entry
@@ -687,6 +701,233 @@ def cmd_list_repos(args: argparse.Namespace) -> int:
     return 0
 
 
+# Quay's tag-vocab charsets. Namespace is `[a-z0-9]+` with no dash because
+# the validator splits ticket tags on the first `-` (`area-pricing` →
+# namespace=`area`, value=`pricing`); a dashed namespace would be
+# unaddressable from a ticket tag. Value is the legacy ticket-tag charset.
+_TAG_NS_RE = re.compile(r"^[a-z0-9]+$")
+_TAG_VALUE_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+def _validate_repo_tags_block(
+    label: str, block: Any,
+) -> tuple[dict[str, list[str]] | None, str | None]:
+    """Validate a per-repo ``tags:`` sub-block.
+
+    Per-repo shape is the bare-list form:
+
+        tags:
+          area: [factory-deployment, solidity-tests]
+          risk: [reentrancy]
+
+    Returns ``(parsed, None)`` on success with namespaces sorted and
+    each value list de-duplicated and sorted (so the JSON the helper
+    emits is deterministic — `setup-hermes.sh --verify` does a string
+    compare against ``quay repo get-tags``, which itself sorts).
+    Returns ``(None, error_message)`` on validation failure.
+    """
+    if block is None:
+        return {}, None
+    if not isinstance(block, dict):
+        return None, f"{label} must be a mapping"
+    out: dict[str, list[str]] = {}
+    for ns_raw, values_raw in block.items():
+        ns = str(ns_raw)
+        if not _TAG_NS_RE.match(ns):
+            return None, (
+                f"{label}.{ns!r}: namespace must match {_TAG_NS_RE.pattern} "
+                f"(no dashes — the validator splits tags on the first dash)"
+            )
+        if not isinstance(values_raw, list):
+            return None, (
+                f"{label}.{ns}: must be a list of values "
+                f"(got {type(values_raw).__name__})"
+            )
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for j, v in enumerate(values_raw):
+            if not isinstance(v, str):
+                return None, (
+                    f"{label}.{ns}[{j}]: must be a string "
+                    f"(got {type(v).__name__})"
+                )
+            if not _TAG_VALUE_RE.match(v):
+                return None, (
+                    f"{label}.{ns}[{j}]={v!r}: must match {_TAG_VALUE_RE.pattern}"
+                )
+            if v in seen:
+                return None, f"{label}.{ns}: duplicate value {v!r}"
+            seen.add(v)
+            cleaned.append(v)
+        cleaned.sort()
+        out[ns] = cleaned
+    return dict(sorted(out.items())), None
+
+
+def _validate_tag_namespaces_block(
+    block: Any,
+) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
+    """Validate the deployment-level ``quay.tag_namespaces:`` block.
+
+    Deployment shape is the full envelope:
+
+        tag_namespaces:
+          task-type:
+            required: true
+            values: [bugfix, new-feature]
+          risk:
+            values: [pii]
+
+    Per-namespace ``required`` defaults to ``false`` when omitted.
+    ``required: true`` with an empty/absent ``values:`` is rejected
+    locally — quay's apply-deployment rejects it too, but failing at
+    schema-validate time gives the operator a single error rather than
+    a partial install. Returns ``(parsed, None)`` on success or
+    ``(None, error)`` on failure. Sorting matches
+    ``_validate_repo_tags_block``.
+    """
+    label = "quay.tag_namespaces"
+    if block is None:
+        return {}, None
+    if not isinstance(block, dict):
+        return None, f"{label} must be a mapping"
+    out: dict[str, dict[str, Any]] = {}
+    for ns_raw, spec in block.items():
+        ns = str(ns_raw)
+        if not _TAG_NS_RE.match(ns):
+            return None, (
+                f"{label}.{ns!r}: namespace must match {_TAG_NS_RE.pattern}"
+            )
+        if not isinstance(spec, dict):
+            return None, (
+                f"{label}.{ns}: must be a mapping with `values:` "
+                f"(and optional `required:`); got {type(spec).__name__}"
+            )
+        unknown = set(spec.keys()) - {"required", "values"}
+        if unknown:
+            return None, (
+                f"{label}.{ns}: unknown key(s) {sorted(unknown)!r} "
+                f"(allowed: required, values)"
+            )
+        required_raw = spec.get("required", False)
+        if not isinstance(required_raw, bool):
+            return None, (
+                f"{label}.{ns}.required: must be a bool "
+                f"(got {type(required_raw).__name__})"
+            )
+        values_raw = spec.get("values", [])
+        if not isinstance(values_raw, list):
+            return None, (
+                f"{label}.{ns}.values: must be a list "
+                f"(got {type(values_raw).__name__})"
+            )
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for j, v in enumerate(values_raw):
+            if not isinstance(v, str):
+                return None, (
+                    f"{label}.{ns}.values[{j}]: must be a string "
+                    f"(got {type(v).__name__})"
+                )
+            if not _TAG_VALUE_RE.match(v):
+                return None, (
+                    f"{label}.{ns}.values[{j}]={v!r}: must match {_TAG_VALUE_RE.pattern}"
+                )
+            if v in seen:
+                return None, f"{label}.{ns}.values: duplicate value {v!r}"
+            seen.add(v)
+            cleaned.append(v)
+        cleaned.sort()
+        if required_raw and not cleaned:
+            return None, (
+                f"{label}.{ns}: required=true with no values is rejected by "
+                f"`quay tags apply-deployment` (would emit TAG_REQUIRED_MISSING "
+                f"on every validation with no satisfying tag possible)"
+            )
+        out[ns] = {"values": cleaned, "required": required_raw}
+    return dict(sorted(out.items())), None
+
+
+def _emit_apply_payload(namespaces: dict[str, dict[str, Any]]) -> str:
+    """Render a ``namespaces`` dict in the JSON shape ``quay … apply-tags
+    --from -`` and ``quay tags apply-deployment --from -`` accept.
+
+    ``json.dumps`` with ``sort_keys=True`` is deterministic over insertion
+    order, which matters because verify-path drift checks string-compare
+    against ``quay … get-tags`` / ``quay tags get-deployment`` (both of
+    which themselves sort). An empty namespaces dict round-trips to
+    ``{"namespaces": {}}`` — the explicit "clear" payload.
+    """
+    return json.dumps({"namespaces": namespaces}, sort_keys=True) + "\n"
+
+
+def cmd_get_repo_tags(args: argparse.Namespace) -> int:
+    """Emit per-repo tag vocab as JSON for ``quay repo apply-tags --from -``.
+
+    Reads ``repos[].quay.tags`` for the entry whose id matches
+    ``--repo``. Per-repo shape is the bare-list form, so each namespace
+    list is wrapped as ``{"values": [...], "required": false}`` to
+    match the upstream apply payload — the per-repo path doesn't
+    surface a per-repo `required` flag in v0 (deployment-level
+    requireds are the load-bearing case; per-repo-only requireds are
+    rare enough to defer).
+
+    Exit codes:
+      0  emitted JSON (may be ``{"namespaces": {}}`` when the repo has
+         no `tags:` block — that's the explicit-clear payload upstream
+         expects to revert the repo to unconfigured).
+      1  unknown repo id, or schema validation failed.
+    """
+    data = _load(Path(args.values))
+    entries = _iter_repos(data)
+    target: dict | None = None
+    for entry in entries:
+        if isinstance(entry, dict) and str(entry.get("id", "")) == args.repo:
+            target = entry
+            break
+    if target is None:
+        sys.stderr.write(
+            f"values_helper.py: repos[].id={args.repo!r} not found in "
+            f"{args.values}\n"
+        )
+        return 1
+    quay_block = target.get("quay")
+    tags_block = quay_block.get("tags") if isinstance(quay_block, dict) else None
+    parsed, err = _validate_repo_tags_block(
+        f"repos[].quay.tags (id={args.repo})", tags_block,
+    )
+    if err is not None:
+        sys.stderr.write(f"values_helper.py: {err}\n")
+        return 1
+    namespaces: dict[str, dict[str, Any]] = {
+        ns: {"values": values, "required": False}
+        for ns, values in (parsed or {}).items()
+    }
+    sys.stdout.write(_emit_apply_payload(namespaces))
+    return 0
+
+
+def cmd_get_deployment_tags(args: argparse.Namespace) -> int:
+    """Emit deployment tag vocab as JSON for ``quay tags apply-deployment``.
+
+    Reads ``quay.tag_namespaces``. Empty / absent block emits
+    ``{"namespaces": {}}`` — the explicit-clear payload that reverts
+    the deployment vocab. Strict reconciliation: dropping a namespace
+    from values flows through to a removal in quay.
+    """
+    data = _load(Path(args.values))
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+    parsed, err = _validate_tag_namespaces_block(quay.get("tag_namespaces"))
+    if err is not None:
+        sys.stderr.write(f"values_helper.py: {err}\n")
+        return 1
+    sys.stdout.write(_emit_apply_payload(parsed or {}))
+    return 0
+
+
 def cmd_validate_schema(args: argparse.Namespace) -> int:
     # Single source of truth for the repos[] schema check, called from
     # setup-hermes.sh's verify path so the legacy-key migration message
@@ -728,6 +969,19 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
                         f"when the `quay:` block is present\n"
                     )
                     return 1
+            _, tags_err = _validate_repo_tags_block(
+                f"repos[{i}].quay.tags", quay_block.get("tags"),
+            )
+            if tags_err is not None:
+                sys.stderr.write(f"values_helper.py: {tags_err}\n")
+                return 1
+
+    quay_top = data.get("quay")
+    if isinstance(quay_top, dict):
+        _, ns_err = _validate_tag_namespaces_block(quay_top.get("tag_namespaces"))
+        if ns_err is not None:
+            sys.stderr.write(f"values_helper.py: {ns_err}\n")
+            return 1
     return 0
 
 
@@ -854,6 +1108,19 @@ def main(argv: list[str] | None = None) -> int:
         help="validate repos[] schema (rejects legacy quay.repos[]); silent on success",
     )
     p_validate.set_defaults(func=cmd_validate_schema)
+
+    p_repo_tags = sub.add_parser(
+        "get-repo-tags",
+        help="emit per-repo tag vocab JSON for `quay repo apply-tags --from -`",
+    )
+    p_repo_tags.add_argument("repo", help="repos[].id to look up")
+    p_repo_tags.set_defaults(func=cmd_get_repo_tags)
+
+    p_dep_tags = sub.add_parser(
+        "get-deployment-tags",
+        help="emit deployment tag vocab JSON for `quay tags apply-deployment --from -`",
+    )
+    p_dep_tags.set_defaults(func=cmd_get_deployment_tags)
 
     args = parser.parse_args(argv)
     return args.func(args)

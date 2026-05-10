@@ -15,6 +15,7 @@ parity with the bash original — verify never imports the helper in-process.
 from __future__ import annotations
 
 import grp
+import json
 import os
 import pwd
 import re
@@ -59,6 +60,7 @@ class _State:
     values_file: Path
     values_helper: Path
     quay_version: str
+    quay_tags_supported: bool = False
     total: int = 0
     drift: int = 0
 
@@ -665,6 +667,196 @@ def _quay_registered_ids(s: _State) -> tuple[str, bool]:
     return ids.strip(), False
 
 
+def _normalize_namespaces(raw: object) -> tuple[dict | None, str | None]:
+    """Canonical shape for tag-vocab drift compare.
+
+    Accepts the ``namespaces`` field from either ``quay … get-tags`` (live)
+    or ``values_helper.py get-…-tags`` (desired). Returns
+    ``({ns: {"values": sorted([...]), "required": bool}}, None)`` on
+    success so the two sides string-compare equal even if upstream
+    enumeration order drifts. Returns ``(None, reason)`` on shape
+    failure — the verifier MUST surface malformed live state as drift,
+    so coercing strings/bools (a 'false' string silently → True) would
+    mask exactly the kind of regression this check exists to catch.
+    """
+    if not isinstance(raw, dict):
+        return None, f"top level is not a mapping ({type(raw).__name__})"
+    out: dict[str, dict] = {}
+    for k_raw, spec in raw.items():
+        if not isinstance(k_raw, str):
+            return None, f"namespace key {k_raw!r} is not a string"
+        if not isinstance(spec, dict):
+            return None, f"namespace {k_raw!r} entry is not a mapping"
+        values_raw = spec.get("values")
+        if not isinstance(values_raw, list):
+            return None, f"namespace {k_raw!r}.values is not a list"
+        for j, v in enumerate(values_raw):
+            if not isinstance(v, str):
+                return None, (
+                    f"namespace {k_raw!r}.values[{j}] is not a string "
+                    f"({type(v).__name__})"
+                )
+        required_raw = spec.get("required", False)
+        if not isinstance(required_raw, bool):
+            return None, (
+                f"namespace {k_raw!r}.required is not a bool "
+                f"({type(required_raw).__name__})"
+            )
+        out[k_raw] = {"values": sorted(values_raw), "required": required_raw}
+    return dict(sorted(out.items())), None
+
+
+def _quay_get_namespaces(
+    s: _State, *args: str,
+) -> tuple[dict | None, str | None]:
+    """Run ``quay …`` and extract a normalised ``namespaces`` dict.
+
+    ``args`` is the verb tail (``"repo", "get-tags", repo_id`` or
+    ``"tags", "get-deployment"``). Returns ``(namespaces, None)`` on
+    success or ``(None, reason)`` distinguishing the four failure
+    modes (subprocess error, JSON-decode error, non-dict top level,
+    namespaces shape mismatch) so the drift line names the actual
+    cause — operators chasing a missing binary, a quay crash, and a
+    JSON-shape regression all need different signals.
+    """
+    rc, out, errs = _run([
+        *_sudo_prefix_for(s.agent_owner),
+        "env", f"QUAY_DATA_DIR={s.args.target / 'quay'}",
+        s.quay_bin, *args,
+    ])
+    if rc != 0:
+        # Trim to one line — multi-line stderr would derail the [DRIFT] format.
+        head = (errs or "").strip().splitlines()
+        detail = head[0] if head else f"exit {rc}"
+        return None, f"quay {' '.join(args)} failed: {detail}"
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return None, f"quay {' '.join(args)}: invalid JSON ({exc.msg})"
+    if not isinstance(data, dict):
+        return None, (
+            f"quay {' '.join(args)}: top level is not a JSON object "
+            f"({type(data).__name__})"
+        )
+    namespaces, err = _normalize_namespaces(data.get("namespaces"))
+    if err is not None:
+        return None, f"quay {' '.join(args)}: {err}"
+    return namespaces, None
+
+
+def _values_get_namespaces(
+    s: _State, *args: str,
+) -> tuple[dict | None, str | None]:
+    """Run ``values_helper.py …`` and extract a normalised ``namespaces``
+    dict. ``args`` is the subcommand and any positional flags
+    (``"get-repo-tags", repo_id`` / ``"get-deployment-tags"``)."""
+    rc, out, errs = _values_helper_run(
+        s.values_helper, *args, values_file=s.values_file,
+    )
+    if rc != 0:
+        head = (errs or "").strip().splitlines()
+        detail = head[0] if head else f"exit {rc}"
+        return None, f"values_helper.py {' '.join(args)} failed: {detail}"
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return None, f"values_helper.py {' '.join(args)}: invalid JSON ({exc.msg})"
+    if not isinstance(data, dict):
+        return None, (
+            f"values_helper.py {' '.join(args)}: top level is not a JSON "
+            f"object ({type(data).__name__})"
+        )
+    namespaces, err = _normalize_namespaces(data.get("namespaces"))
+    if err is not None:
+        return None, f"values_helper.py {' '.join(args)}: {err}"
+    return namespaces, None
+
+
+def _diff_namespaces(live: dict, desired: dict) -> list[str]:
+    """One line per drift-add / drift-remove / value-add / value-remove /
+    required-flip. The `live={…} expected={…}` JSON-blob form is
+    unreadable past two namespaces; this lets an operator see at a
+    glance which knob is wrong without mentally diffing two payloads.
+    Returns ``[]`` when the two sides agree."""
+    lines: list[str] = []
+    live_keys = set(live.keys())
+    desired_keys = set(desired.keys())
+    for ns in sorted(desired_keys - live_keys):
+        lines.append(f"+ namespace `{ns}` in values, missing in live")
+    for ns in sorted(live_keys - desired_keys):
+        lines.append(f"- namespace `{ns}` in live, missing in values")
+    for ns in sorted(live_keys & desired_keys):
+        lv = set(live[ns]["values"])
+        dv = set(desired[ns]["values"])
+        added = sorted(dv - lv)
+        removed = sorted(lv - dv)
+        if added:
+            lines.append(f"~ {ns}: values added in values: {added}")
+        if removed:
+            lines.append(f"~ {ns}: values present in live, missing in values: {removed}")
+        if live[ns]["required"] != desired[ns]["required"]:
+            lines.append(
+                f"~ {ns}.required: live={live[ns]['required']} "
+                f"expected={desired[ns]['required']}"
+            )
+    return lines
+
+
+def _check_repo_tag_vocab(s: _State, repo_id: str) -> None:
+    """Drift check for per-repo tag vocab. Compares the live state from
+    ``quay repo get-tags <id>`` against the desired state emitted by
+    ``values_helper get-repo-tags <id>``. Either side unreadable → drift
+    line that names the failing source so the operator knows which
+    surface to look at."""
+    label = f"quay repo {repo_id} tag vocab"
+    live, live_err = _quay_get_namespaces(s, "repo", "get-tags", repo_id)
+    desired, desired_err = _values_get_namespaces(s, "get-repo-tags", repo_id)
+    if live_err is not None:
+        s.v_drift(label, live_err)
+        return
+    if desired_err is not None:
+        s.v_drift(label, desired_err)
+        return
+    assert live is not None and desired is not None  # narrow for mypy
+    if live == desired:
+        s.v_ok(label)
+        return
+    diffs = _diff_namespaces(live, desired)
+    s.v_drift(label, diffs[0] if diffs else "shapes differ")
+    for extra in diffs[1:]:
+        # Subsequent lines under the same drift subject — surface them so the
+        # operator can read the full picture without re-running the helpers.
+        # Each extra line counts as part of the same drift, not a new one.
+        print(f"        {extra}", file=s.err, flush=True)
+
+
+def _check_deployment_tag_vocab(s: _State) -> None:
+    """Drift check for deployment tag vocab. Gated on quay.version being
+    set AND the binary supporting the `tags` noun (matches the
+    install-time capability probe in setup-hermes.sh — otherwise
+    `tags get-deployment` exits non-zero and would surface as
+    spurious drift on a perfectly valid pre-tag-vocab install)."""
+    if not s.quay_version or not s.quay_tags_supported:
+        return
+    label = "quay deployment tag vocab"
+    live, live_err = _quay_get_namespaces(s, "tags", "get-deployment")
+    desired, desired_err = _values_get_namespaces(s, "get-deployment-tags")
+    if live_err is not None:
+        s.v_drift(label, live_err)
+        return
+    if desired_err is not None:
+        s.v_drift(label, desired_err)
+        return
+    assert live is not None and desired is not None
+    if live == desired:
+        s.v_ok(label)
+        return
+    diffs = _diff_namespaces(live, desired)
+    s.v_drift(label, diffs[0] if diffs else "shapes differ")
+    for extra in diffs[1:]:
+        print(f"        {extra}", file=s.err, flush=True)
+
+
 def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
     """Per-entry code mirror checks + optional bare clone + registration.
 
@@ -725,6 +917,15 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
             if not list_failed:
                 if repo_id in registered_set:
                     s.v_ok(f"quay repo {repo_id} registered")
+                    # Tag-vocab drift only makes sense for an actually-
+                    # registered repo AND a binary that supports the
+                    # `tags` noun; `quay repo get-tags` on a missing id
+                    # exits with `unknown_repo`, and on a pre-tag-vocab
+                    # binary it'd be `unknown_command`. Either would
+                    # surface as a spurious "could not read live state"
+                    # line, so gate at the call site.
+                    if s.quay_tags_supported:
+                        _check_repo_tag_vocab(s, repo_id)
                 else:
                     s.v_drift(f"quay repo {repo_id}", "not registered with quay")
         elif repo_pkg and not s.quay_version:
@@ -905,6 +1106,24 @@ def run(
     if values_file.is_file() and values_helper.is_file():
         quay_version = _values_get(values_file, values_helper, "quay.version")
 
+    quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
+
+    # Capability probe — mirrors the install-time gate in setup-hermes.sh.
+    # `quay tags --help` returns 0 only when the tag-vocab noun is
+    # registered; older quay binaries return non-zero,
+    # and the tag-vocab drift checks would otherwise fire spurious
+    # "could not read live state" lines on a perfectly valid pre-tag-vocab
+    # install. Only probes when quay is enabled and the binary exists.
+    quay_tags_supported = False
+    if quay_version and Path(quay_bin).is_file():
+        target_quay = args.target / "quay"
+        rc, _, _ = _run([
+            *_sudo_prefix_for(agent_owner),
+            "env", f"QUAY_DATA_DIR={target_quay}",
+            quay_bin, "tags", "--help",
+        ])
+        quay_tags_supported = (rc == 0)
+
     s = _State(
         args=args,
         out=out,
@@ -912,7 +1131,7 @@ def run(
         rails_owner=rails_owner,
         agent_owner=agent_owner,
         agent_group=agent_group,
-        quay_bin=os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay",
+        quay_bin=quay_bin,
         quay_wrapper=os.environ.get("HERMES_VERIFY_QUAY_WRAPPER") or "/usr/local/bin/quay-as-hermes",
         quay_runner=os.environ.get("HERMES_VERIFY_QUAY_RUNNER") or "/usr/local/sbin/quay-tick-runner",
         quay_profile=os.environ.get("HERMES_VERIFY_QUAY_PROFILE") or "/etc/profile.d/quay-data-dir.sh",
@@ -920,6 +1139,7 @@ def run(
         values_file=values_file,
         values_helper=values_helper,
         quay_version=quay_version,
+        quay_tags_supported=quay_tags_supported,
     )
 
     print(
@@ -954,6 +1174,7 @@ def run(
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
     _check_per_entry_repos(s, repos_tsv)
+    _check_deployment_tag_vocab(s)
     _check_systemd(s)
     if app_auth_expected:
         _check_token_helper(s, repos_tsv)
