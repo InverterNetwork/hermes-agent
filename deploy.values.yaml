@@ -304,7 +304,7 @@ quay:
   # via `quay tags apply-deployment` once per install — dropping a
   # namespace clears it.
   tag_namespaces:
-    task-type:
+    task:
       required: true
       values:
         - bugfix
