@@ -130,6 +130,10 @@ def install(tmp_path: Path) -> dict:
     (target / "config.yaml").write_text("model: {}\n")
     (target / "config.yaml").chmod(0o644)
 
+    # Rails-mode 0640; verify expects it present even when empty.
+    (target / "gateway-org-defaults.md").write_text("")
+    (target / "gateway-org-defaults.md").chmod(0o640)
+
     # Stub systemctl in PATH bin so verify thinks the timers are loaded.
     # Verify batches `systemctl show -p A -p B -p C --value <unit>` and
     # expects newline-separated values in the requested order — same wire
