@@ -260,18 +260,34 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+      # Per-repo tag vocab. Reconciled into quay via `quay repo apply-tags`
+      # on every install — declarative replace, dropping a namespace clears
+      # it. Presence of any vocab here flips quay's validator from
+      # charset-only to namespace enforcement for tickets targeting this
+      # repo (deployment-required namespaces below still apply on top).
+      tags:
+        area:
+          - copy
+          - script-output
+          - dependency
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.1.2"
+  version: "v0.1.3"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
-  # `-p` (--print) is required for non-interactive batch mode: without it,
-  # claude in stdin-piped mode reads the prompt and exits without acting.
-  agent_invocation: "claude -p --permission-mode bypassPermissions < {prompt_file}"
+  # `--output-format json` puts claude into non-interactive print mode
+  # (subsumes `-p`) and emits the per-attempt usage/cost envelope on
+  # stdout; redirected to .quay-usage.json so quay can ingest it as a
+  # `usage` artifact (AST-96).
+  # `--debug --debug-file .quay-tool-trace.log` streams every tool call
+  # (Bash/Read/Write/Edit + MCP) to a worktree-local file, ingested as a
+  # `tool_trace` artifact (AST-97). This is the highest-signal data for
+  # prompt iteration and would have made AST-100 triage nearly free.
+  agent_invocation: "claude --permission-mode bypassPermissions --output-format json --debug --debug-file .quay-tool-trace.log < {prompt_file} > .quay-usage.json"
   # Pinned runtime managers the installer must guarantee on PATH before
   # quay bootstraps a worktree. Keys must match every distinct
   # `repos[].quay.package_manager` value in this file. linux_x64_sha256
@@ -281,6 +297,22 @@ quay:
     bun:
       version: "1.3.9"
       linux_x64_sha256: "4680e80e44e32aa718560ceae85d22ecfbf2efb8f3641782e35e4b7efd65a1aa"
+  # Deployment-level tag vocabulary, merged into every per-repo vocab at
+  # ticket-validate time. `required: true` forces every ticket against an
+  # enforced repo to carry at least one value from that namespace; per-repo
+  # vocab cannot un-require a namespace marked required here. Reconciled
+  # via `quay tags apply-deployment` once per install — dropping a
+  # namespace clears it.
+  tag_namespaces:
+    task-type:
+      required: true
+      values:
+        - bugfix
+        - new-feature
+        - refactor
+        - dep-upgrade
+        - chore
+        - config
   adapters:
     linear:
       enabled: true
