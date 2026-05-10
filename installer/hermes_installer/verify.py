@@ -78,16 +78,27 @@ class _State:
 # ---------------------------------------------------------------------------
 
 
-def _stat_info(path: Path) -> tuple[str, str, str] | None:
-    """One stat → (mode, owner, group) where mode matches bash's ``_mode``
-    helper (octal, leading zero stripped: ``"750"`` / ``"2775"``). Returns
-    ``None`` when the path can't be stat'd; missing pwd/grp entries become
-    empty strings (preserves the bash behavior of treating an unknown UID
-    as no-name)."""
+def _run(
+    cmd: list[str], *, timeout: float = 30, input: str | None = None,
+) -> tuple[int, str, str]:
+    """Subprocess shim with the verify-wide error contract: capture text,
+    never raise on non-zero, swallow OSError/SubprocessError into
+    ``(1, "", "")`` so callers can branch on rc without try/except."""
     try:
-        st = path.stat()
-    except OSError:
-        return None
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            timeout=timeout, input=input,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except (OSError, subprocess.SubprocessError):
+        return 1, "", ""
+
+
+def _info_from_st(st: os.stat_result) -> tuple[str, str, str]:
+    """Format ``(mode, owner, group)`` from a fresh stat result. Mode matches
+    bash's ``_mode`` helper (octal, leading zero stripped: ``"750"`` /
+    ``"2775"``); missing pwd/grp entries become empty strings (preserves the
+    bash behavior of treating an unknown UID as no-name)."""
     mode = format(st.st_mode & 0o7777, "o")
     try:
         owner = pwd.getpwuid(st.st_uid).pw_name
@@ -98,6 +109,15 @@ def _stat_info(path: Path) -> tuple[str, str, str] | None:
     except KeyError:
         group = ""
     return mode, owner, group
+
+
+def _stat_info(path: Path) -> tuple[str, str, str] | None:
+    """One stat → ``(mode, owner, group)``, or ``None`` on stat failure."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return _info_from_st(st)
 
 
 def _owner(path: Path) -> str:
@@ -137,35 +157,29 @@ def _git_as_owner(repo: Path, *args: str) -> tuple[int, str, str]:
 
     Returns (returncode, stdout, stderr)."""
     owner = _owner(repo / ".git") or _owner(repo)
-    cmd = [*_sudo_prefix_for(owner), "git", "-C", str(repo), *args]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=30,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except (OSError, subprocess.SubprocessError):
-        return 1, "", ""
+    return _run([*_sudo_prefix_for(owner), "git", "-C", str(repo), *args])
+
+
+def _git_str(repo: Path, *args: str) -> str:
+    """``_git_as_owner`` + ``out.strip() if rc == 0 else ""`` — the
+    rc-then-strip-or-empty pattern that wraps every stored-value git probe."""
+    rc, out, _ = _git_as_owner(repo, *args)
+    return out.strip() if rc == 0 else ""
 
 
 def _first_line_on_success(cmd: list[str], timeout: float = 10) -> str:
     """Run ``cmd``, return its first stdout line on success or ''.
     Used for ``--version`` substring probes against pinned versions."""
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
+    rc, out, _ = _run(cmd, timeout=timeout)
+    if rc != 0:
         return ""
-    if proc.returncode != 0:
-        return ""
-    return (proc.stdout.splitlines() or [""])[0]
+    return (out.splitlines() or [""])[0]
 
 
 def _git_config_get(repo: Path, *args: str) -> str:
     """Read a stored git config value (literal — sidesteps insteadOf rewrites)
     via ``_git_as_owner``. Returns '' on missing key or git failure."""
-    rc, out, _ = _git_as_owner(repo, "config", "--get", *args)
-    return out.strip() if rc == 0 else ""
+    return _git_str(repo, "config", "--get", *args)
 
 
 def _v_check_clone_basics(
@@ -230,14 +244,10 @@ def _check_mode_owner(
 def _values_get(values_file: Path, values_helper: Path, dotted: str) -> str:
     if not values_file.is_file() or not values_helper.is_file():
         return ""
-    try:
-        proc = subprocess.run(
-            ["python3", str(values_helper), "--values", str(values_file), "get", dotted],
-            capture_output=True, text=True, check=False, timeout=30,
-        )
-        return proc.stdout.strip() if proc.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    rc, out, _ = _run(
+        ["python3", str(values_helper), "--values", str(values_file), "get", dotted],
+    )
+    return out.strip() if rc == 0 else ""
 
 
 def _values_helper_run(
@@ -249,13 +259,7 @@ def _values_helper_run(
     if values_file is not None:
         cmd += ["--values", str(values_file)]
     cmd += list(args)
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=60,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except (OSError, subprocess.SubprocessError):
-        return 1, "", ""
+    return _run(cmd, timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -403,14 +407,12 @@ def _check_state_repo(s: _State, app_auth_expected: bool) -> None:
     for k in ("user.name", "user.email"):
         # `--local` so we only read this repo's own config — accepting global
         # values would mask drift after a `git config --unset`.
-        rc, out, _ = _git_as_owner(state, "config", "--local", k)
-        val = out.strip() if rc == 0 else ""
+        val = _git_str(state, "config", "--local", k)
         if val:
             s.v_ok(f"state git {k}: {val}")
         else:
             s.v_drift(f"state git {k}", "not configured")
-    rc, out, _ = _git_as_owner(state, "remote", "get-url", "origin")
-    origin_url = out.strip() if rc == 0 else ""
+    origin_url = _git_str(state, "remote", "get-url", "origin")
     if not origin_url:
         s.v_drift("state origin", "not configured")
     elif re.match(r"^(https?://|ssh://|git://|git@)", origin_url):
@@ -441,10 +443,7 @@ def _check_runtime_version(s: _State) -> None:
         return
     rv = rv_path.read_text().strip()
     if (fork / ".git").is_dir():
-        rc, out, _ = _git_as_owner(
-            fork, "describe", "--always", "--dirty", "--abbrev=40",
-        )
-        fork_sha = out.strip() if rc == 0 else ""
+        fork_sha = _git_str(fork, "describe", "--always", "--dirty", "--abbrev=40")
         if fork_sha and rv == fork_sha:
             s.v_ok(f"RUNTIME_VERSION matches fork HEAD: {rv}")
         else:
@@ -517,16 +516,13 @@ def _executable_info(path: Path) -> tuple[str, str, str] | None:
     """Like ``_stat_info`` but returns ``None`` for non-regular or
     non-executable files — caller treats that as a "missing or
     non-executable" drift, distinct from a stat-failed missing-file drift."""
-    info = _stat_info(path)
-    if info is None:
-        return None
     try:
         st = path.stat()
     except OSError:
         return None
     if not stat.S_ISREG(st.st_mode) or not (st.st_mode & 0o111):
         return None
-    return info
+    return _info_from_st(st)
 
 
 def _check_version_pin(
@@ -583,7 +579,6 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
                 s, "quay config.toml", _stat_info(quay_cfg), "644", s.agent_owner,
             )
 
-    # Operator-invocation glue
     for label, raw_path in (
         ("quay-as-hermes wrapper", s.quay_wrapper),
         ("quay-tick-runner", s.quay_runner),
@@ -604,7 +599,6 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
             "644", s.rails_owner,
         )
 
-    # Runtime managers (bun, ...) — every distinct repos[].quay.package_manager.
     declared: list[str] = []
     for _id, _url, _base, rt_pkg, _install in _parse_repos_tsv(repos_tsv):
         if rt_pkg and rt_pkg not in declared:
@@ -643,26 +637,19 @@ def _quay_registered_ids(s: _State) -> tuple[str, bool]:
         and (target / "quay").is_dir()
     ):
         return "", False
-    cmd = [
+    rc1, repo_list_out, _ = _run([
         *_sudo_prefix_for(s.agent_owner),
         "env", f"QUAY_DATA_DIR={target / 'quay'}", str(quay_bin), "repo", "list",
-    ]
-    try:
-        proc1 = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=30,
-        )
-        if proc1.returncode != 0:
-            return "", True
-        proc2 = subprocess.run(
-            ["python3", str(s.values_helper), "parse-repo-list-ids"],
-            input=proc1.stdout, capture_output=True, text=True,
-            check=False, timeout=30,
-        )
-        if proc2.returncode != 0:
-            return "", True
-        return proc2.stdout.strip(), False
-    except (OSError, subprocess.SubprocessError):
+    ])
+    if rc1 != 0:
         return "", True
+    rc2, ids, _ = _run(
+        ["python3", str(s.values_helper), "parse-repo-list-ids"],
+        input=repo_list_out,
+    )
+    if rc2 != 0:
+        return "", True
+    return ids.strip(), False
 
 
 def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
@@ -699,11 +686,13 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
             )
             # HEAD must be on origin/<base_branch>. hermes-code-sync hard-resets
             # to origin/<base> every tick; mismatch means the timer hasn't run
-            # since install, itself worth surfacing.
-            rc1, out1, _ = _git_as_owner(code_dir, "rev-parse", "HEAD")
-            mhead = out1.strip() if rc1 == 0 else ""
-            rc2, out2, _ = _git_as_owner(code_dir, "rev-parse", f"origin/{repo_base}")
-            expected_head = out2.strip() if rc2 == 0 else ""
+            # since install, itself worth surfacing. `git rev-parse` accepts
+            # both refs in one invocation and emits them newline-separated.
+            sha_lines = _git_str(
+                code_dir, "rev-parse", "HEAD", f"origin/{repo_base}",
+            ).splitlines()
+            mhead = sha_lines[0].strip() if len(sha_lines) >= 1 else ""
+            expected_head = sha_lines[1].strip() if len(sha_lines) >= 2 else ""
             if mhead and expected_head and mhead == expected_head:
                 s.v_ok(f"code mirror {repo_id} at origin/{repo_base}")
             else:
@@ -746,20 +735,17 @@ def _check_systemd(s: _State) -> None:
         # Batch the three property reads into a single `systemctl show` —
         # the binary returns them newline-separated in request order, so
         # one subprocess replaces three.
-        try:
-            proc = subprocess.run(
-                [
-                    "systemctl", "show",
-                    "-p", "ActiveState",
-                    "-p", "LoadState",
-                    "-p", "UnitFileState",
-                    "--value", u,
-                ],
-                capture_output=True, text=True, check=False, timeout=10,
-            )
-            lines = proc.stdout.splitlines() if proc.returncode == 0 else []
-        except (OSError, subprocess.SubprocessError):
-            lines = []
+        rc, show_out, _ = _run(
+            [
+                "systemctl", "show",
+                "-p", "ActiveState",
+                "-p", "LoadState",
+                "-p", "UnitFileState",
+                "--value", u,
+            ],
+            timeout=10,
+        )
+        lines = show_out.splitlines() if rc == 0 else []
         lines += [""] * (3 - len(lines))
         active, load, unitfile = lines[0].strip(), lines[1].strip(), lines[2].strip()
         if active == "active" and load == "loaded" and unitfile == "enabled":
@@ -805,17 +791,11 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
     # `mint` doubles as the smoke check (succeeds iff a token can be obtained)
     # AND produces the token for the App-scope check below — one subprocess
     # instead of `check` then `mint`.
-    cmd = [
+    rc, mint_out, _ = _run([
         *_sudo_prefix_for(s.agent_owner),
         "env", f"HERMES_HOME={target}", str(venv_py), str(helper_py), "mint",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=30,
-        )
-        app_token = proc.stdout.strip() if proc.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
-        app_token = ""
+    ])
+    app_token = mint_out.strip() if rc == 0 else ""
     if app_token:
         s.v_ok("token helper check passes")
     else:
@@ -834,23 +814,18 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
             if not m:
                 continue
             api_url = f"{gh_api_base}/repos/{m.group(1)}/{m.group(2)}"
-            config_input = f'header = "Authorization: Bearer {app_token}"\n'
-            try:
-                proc = subprocess.run(
-                    [
-                        "curl", "-sS", "-o", "/dev/null",
-                        "-w", "%{http_code}",
-                        "--config", "-",
-                        "-H", "Accept: application/vnd.github+json",
-                        "-H", "X-GitHub-Api-Version: 2022-11-28",
-                        api_url,
-                    ],
-                    input=config_input,
-                    capture_output=True, text=True, check=False, timeout=30,
-                )
-                http_code = (proc.stdout or "").strip() or "000"
-            except (OSError, subprocess.SubprocessError):
-                http_code = "000"
+            _rc, code_out, _ = _run(
+                [
+                    "curl", "-sS", "-o", "/dev/null",
+                    "-w", "%{http_code}",
+                    "--config", "-",
+                    "-H", "Accept: application/vnd.github+json",
+                    "-H", "X-GitHub-Api-Version: 2022-11-28",
+                    api_url,
+                ],
+                input=f'header = "Authorization: Bearer {app_token}"\n',
+            )
+            http_code = code_out.strip() or "000"
             if http_code == "200":
                 s.v_ok(f"App scope {scope_id}: HTTP 200")
             else:
@@ -865,8 +840,7 @@ def _check_upstream_workspace(s: _State) -> None:
     if not (ws / ".git").is_dir():
         return
     for rname in ("origin", "upstream"):
-        rc, out, _ = _git_as_owner(ws, "remote", "get-url", rname)
-        url = out.strip() if rc == 0 else ""
+        url = _git_str(ws, "remote", "get-url", rname)
         if not url:
             s.v_drift(f"upstream-workspace {rname}", "not configured")
         elif (

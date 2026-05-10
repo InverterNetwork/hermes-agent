@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import pwd
 import sys
 from pathlib import Path
 
@@ -89,8 +90,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "verify":
-        import pwd
-
         try:
             agent_pw = pwd.getpwnam(args.user)
         except KeyError:
