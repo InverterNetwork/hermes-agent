@@ -5,6 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# A tick spawns a detached tmux server (`tmux new-session -d`) for each
+# worker. systemd's default KillMode=control-group SIGKILLs every
+# process in the unit's cgroup when ExecStart returns — including the
+# tmux server we just forked off, before pipe-pane has flushed the first
+# byte and before the wrapper writes .quay-exit-code. Limiting kill
+# scope to the ExecStart process leaves detached children (tmux server
+# + pane shell + claude) alone so workers actually run to completion.
+KillMode=process
 # User/Group and the target-dir-derived paths below are substituted by
 # setup-hermes.sh at install time, so non-default --user / --target
 # values get a correctly-targeted unit (matches hermes-sync).
