@@ -89,10 +89,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "verify":
+        import pwd
+
+        try:
+            agent_pw = pwd.getpwnam(args.user)
+        except KeyError:
+            print(f"agent user '{args.user}' does not exist", file=sys.stderr)
+            return 1
+        target = args.target or Path(agent_pw.pw_dir) / ".hermes"
         return run_verify(
             VerifyArgs(
                 fork=args.fork,
-                target=args.target,
+                target=target,
                 user=args.user,
                 auth_method=args.auth_method,
                 quiet=args.quiet,

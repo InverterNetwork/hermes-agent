@@ -22,9 +22,9 @@ import shutil
 import stat
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Iterable
+from typing import IO
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +35,8 @@ from typing import IO, Iterable
 @dataclass(frozen=True)
 class VerifyArgs:
     fork: Path
+    target: Path
     user: str
-    target: Path | None = None
     auth_method: str = "none"
     quiet: bool = False
     values: Path | None = None
@@ -78,50 +78,66 @@ class _State:
 # ---------------------------------------------------------------------------
 
 
-def _owner(path: Path) -> str:
-    """Return the username owning ``path``, or '' if path can't be stat'd."""
+def _stat_info(path: Path) -> tuple[str, str, str] | None:
+    """One stat → (mode, owner, group) where mode matches bash's ``_mode``
+    helper (octal, leading zero stripped: ``"750"`` / ``"2775"``). Returns
+    ``None`` when the path can't be stat'd; missing pwd/grp entries become
+    empty strings (preserves the bash behavior of treating an unknown UID
+    as no-name)."""
     try:
-        return pwd.getpwuid(path.stat().st_uid).pw_name
-    except (FileNotFoundError, KeyError, PermissionError, OSError):
-        return ""
+        st = path.stat()
+    except OSError:
+        return None
+    mode = format(st.st_mode & 0o7777, "o")
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = ""
+    try:
+        group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        group = ""
+    return mode, owner, group
+
+
+def _owner(path: Path) -> str:
+    info = _stat_info(path)
+    return info[1] if info else ""
 
 
 def _group(path: Path) -> str:
-    try:
-        return grp.getgrgid(path.stat().st_gid).gr_name
-    except (FileNotFoundError, KeyError, PermissionError, OSError):
-        return ""
+    info = _stat_info(path)
+    return info[2] if info else ""
 
 
 def _mode(path: Path) -> str:
-    """Return mode as the bash ``_mode`` helper does — octal string with the
-    setuid/setgid/sticky high bits and the leading zero stripped (so callers
-    compare against ``"750"``/``"2775"`` directly)."""
+    info = _stat_info(path)
+    return info[0] if info else ""
+
+
+def _current_user_name() -> str:
     try:
-        m = path.stat().st_mode & 0o7777
-    except (FileNotFoundError, PermissionError, OSError):
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
         return ""
-    return format(m, "o")
+
+
+def _sudo_prefix_for(target_user: str) -> list[str]:
+    """``["sudo", "-u", target_user]`` when running as root and not already
+    that user; ``[]`` otherwise. Mirrors the bash drop-privs guard."""
+    if target_user and os.geteuid() == 0 and _current_user_name() != target_user:
+        return ["sudo", "-u", target_user]
+    return []
 
 
 def _git_as_owner(repo: Path, *args: str) -> tuple[int, str, str]:
     """Run ``git -C repo args``; when running as root and the repo is owned by
     a different user, drop privileges via ``sudo -u <owner>`` to sidestep
-    git's ``safe.directory`` guard. Mirrors the bash helper.
+    git's ``safe.directory`` guard.
 
     Returns (returncode, stdout, stderr)."""
-    git_dir = repo / ".git"
-    owner = _owner(git_dir) or _owner(repo)
-    try:
-        cur = pwd.getpwuid(os.geteuid()).pw_name
-    except KeyError:
-        cur = ""
-    if not owner or cur == owner:
-        cmd = ["git", "-C", str(repo), *args]
-    elif os.geteuid() == 0:
-        cmd = ["sudo", "-u", owner, "git", "-C", str(repo), *args]
-    else:
-        cmd = ["git", "-C", str(repo), *args]
+    owner = _owner(repo / ".git") or _owner(repo)
+    cmd = [*_sudo_prefix_for(owner), "git", "-C", str(repo), *args]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=30,
@@ -129,6 +145,20 @@ def _git_as_owner(repo: Path, *args: str) -> tuple[int, str, str]:
         return proc.returncode, proc.stdout, proc.stderr
     except (OSError, subprocess.SubprocessError):
         return 1, "", ""
+
+
+def _first_line_on_success(cmd: list[str], timeout: float = 10) -> str:
+    """Run ``cmd``, return its first stdout line on success or ''.
+    Used for ``--version`` substring probes against pinned versions."""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout.splitlines() or [""])[0]
 
 
 def _git_config_get(repo: Path, *args: str) -> str:
@@ -155,6 +185,39 @@ def _v_check_clone_basics(
         s.v_drift(
             f"{label} origin",
             f"got '{origin or '?'}' (expected '{expected_url}')",
+        )
+
+
+def _check_mode_owner(
+    s: _State,
+    label: str,
+    info: tuple[str, str, str] | None,
+    expected_mode: str,
+    expected_owner: str,
+    expected_group: str | None = None,
+) -> None:
+    """Emit ``[OK] {label}: {mode} {owner[:group]}`` or the matching drift.
+
+    Pass the result of ``_stat_info(path)`` as ``info``; ``None`` means the
+    path can't be stat'd and is reported as drift (callers that need a more
+    specific message — "missing or non-executable" — should branch before
+    calling this)."""
+    if info is None:
+        s.v_drift(label, "stat failed")
+        return
+    mode, owner, group = info
+    if expected_group is not None:
+        owner_disp = f"{owner}:{group}"
+        expected_disp = f"{expected_owner}:{expected_group}"
+    else:
+        owner_disp = owner
+        expected_disp = expected_owner
+    if mode == expected_mode and owner_disp == expected_disp:
+        s.v_ok(f"{label}: {mode} {owner_disp}")
+    else:
+        s.v_drift(
+            label,
+            f"mode={mode} owner={owner_disp} (expected {expected_mode} {expected_disp})",
         )
 
 
@@ -208,20 +271,14 @@ def _check_target(s: _State) -> bool:
         return False
     s.v_ok(f"target dir present: {target}")
 
-    # Target dir mode + group ownership: HERMES_HOME must be root:agent 02775
-    # (setgid). Drift here silently breaks the gateway: without g+w the
-    # runtime can't create gateway.lock / gateway.pid / platforms/, and
-    # without setgid+group those files won't inherit the hermes group.
-    tmode = _mode(target)
-    towner_g = f"{_owner(target)}:{_group(target)}"
-    expected_owner_group = f"{s.rails_owner}:{s.agent_group}"
-    if tmode == "2775" and towner_g == expected_owner_group:
-        s.v_ok(f"target dir: {tmode} {towner_g}")
-    else:
-        s.v_drift(
-            "target dir",
-            f"mode={tmode} owner={towner_g} (expected 2775 {expected_owner_group})",
-        )
+    # HERMES_HOME must be root:agent 02775 (setgid). Drift here silently
+    # breaks the gateway: without g+w the runtime can't create
+    # gateway.lock / gateway.pid / platforms/, and without setgid+group
+    # those files won't inherit the hermes group.
+    _check_mode_owner(
+        s, "target dir", _stat_info(target),
+        "2775", s.rails_owner, s.agent_group,
+    )
     return True
 
 
@@ -272,16 +329,10 @@ def _check_auth(s: _State, app_auth_expected: bool) -> None:
         s.v_drift("auth dir", f"missing: {auth_dir} (required by --auth-method app)")
 
     if auth_present:
-        mode = _mode(auth_dir)
-        owner_g = f"{_owner(auth_dir)}:{_group(auth_dir)}"
-        expected = f"{s.rails_owner}:{s.agent_group}"
-        if mode == "750" and owner_g == expected:
-            s.v_ok(f"auth dir: {mode} {owner_g}")
-        else:
-            s.v_drift(
-                "auth dir",
-                f"mode={mode} owner={owner_g} (expected 750 {expected})",
-            )
+        _check_mode_owner(
+            s, "auth dir", _stat_info(auth_dir),
+            "750", s.rails_owner, s.agent_group,
+        )
 
     # Required artefacts under app auth — list explicitly so a missing file is
     # named in the drift line, instead of relying on the glob below to find it.
@@ -294,10 +345,8 @@ def _check_auth(s: _State, app_auth_expected: bool) -> None:
                 )
 
     if auth_present:
-        # Sorted glob so iteration order is deterministic across runs.
-        for f in sorted(list(auth_dir.glob("*.pem")) + list(auth_dir.glob("*.env"))):
-            if not f.exists():
-                continue
+        # Sorted so iteration order is deterministic across runs.
+        for f in sorted([*auth_dir.glob("*.pem"), *auth_dir.glob("*.env")]):
             fm = _mode(f)
             if fm == "640":
                 s.v_ok(f"auth file {f.name}: {fm}")
@@ -324,15 +373,7 @@ def _check_config_yaml(s: _State) -> None:
     if not cfg.is_file():
         s.v_drift("config.yaml", f"missing: {cfg}")
         return
-    cmode = _mode(cfg)
-    cowner = _owner(cfg)
-    if cmode == "644" and cowner == s.agent_owner:
-        s.v_ok(f"config.yaml: {cmode} {cowner}")
-    else:
-        s.v_drift(
-            "config.yaml",
-            f"mode={cmode} owner={cowner} (expected 644 {s.agent_owner})",
-        )
+    _check_mode_owner(s, "config.yaml", _stat_info(cfg), "644", s.agent_owner)
 
 
 def _check_state_symlinks(s: _State) -> None:
@@ -472,6 +513,35 @@ def _parse_repos_tsv(tsv: str) -> list[tuple[str, str, str, str, str]]:
     return rows
 
 
+def _executable_info(path: Path) -> tuple[str, str, str] | None:
+    """Like ``_stat_info`` but returns ``None`` for non-regular or
+    non-executable files — caller treats that as a "missing or
+    non-executable" drift, distinct from a stat-failed missing-file drift."""
+    info = _stat_info(path)
+    if info is None:
+        return None
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or not (st.st_mode & 0o111):
+        return None
+    return info
+
+
+def _check_version_pin(
+    s: _State, label: str, bin_path: Path, pin: str,
+) -> None:
+    """Substring-match ``<bin> --version`` against ``pin``. Used by the quay
+    binary and runtime-manager checks; both binaries may emit build-suffixed
+    versions like ``0.1.0+abc1234`` or ``1.3.9+commit``."""
+    actual = _first_line_on_success([str(bin_path), "--version"])
+    if actual and pin in actual:
+        s.v_ok(f"{label}: {actual}")
+    else:
+        s.v_drift(label, f"got '{actual or '?'}' (expected to contain '{pin}')")
+
+
 def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
     """All quay-binary, data-dir, operator-glue, and runtime-manager checks
     that gate on quay.version being non-empty."""
@@ -479,40 +549,19 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
     quay_dir = target / "quay"
 
     quay_bin = Path(s.quay_bin)
-    if not (quay_bin.is_file() and os.access(quay_bin, os.X_OK)):
+    quay_bin_info = _executable_info(quay_bin)
+    if quay_bin_info is None:
         s.v_drift("quay binary", f"missing or non-executable: {quay_bin}")
     else:
-        qmode = _mode(quay_bin)
-        qowner = _owner(quay_bin)
-        if qmode == "755" and qowner == s.rails_owner:
-            s.v_ok(f"quay binary: {qmode} {qowner}")
-        else:
-            s.v_drift(
-                "quay binary",
-                f"mode={qmode} owner={qowner} (expected 755 {s.rails_owner})",
-            )
-        try:
-            proc = subprocess.run(
-                [str(quay_bin), "--version"],
-                capture_output=True, text=True, check=False, timeout=10,
-            )
-            actual_version = (proc.stdout.splitlines() or [""])[0] if proc.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            actual_version = ""
+        _check_mode_owner(s, "quay binary", quay_bin_info, "755", s.rails_owner)
         # quay.version is a git tag (`v0.1.0`); the binary embeds
         # `${pkg.version}+${shortSHA}` (`0.1.0+abc1234`) — no `v` prefix.
         # Strip the leading `v` from the pin for the substring compare so a
         # clean release-built binary doesn't fire false drift.
-        pin_semver = s.quay_version.removeprefix("v")
-        if actual_version and pin_semver in actual_version:
-            s.v_ok(f"quay binary version: {actual_version}")
-        else:
-            s.v_drift(
-                "quay binary version",
-                f"got '{actual_version or '?'}' (expected to contain '{pin_semver}')",
-            )
+        _check_version_pin(
+            s, "quay binary version", quay_bin, s.quay_version.removeprefix("v"),
+        )
 
-    # Data dir + config.toml
     if not quay_dir.is_dir():
         s.v_drift("quay data dir", f"missing: {quay_dir}")
     else:
@@ -530,60 +579,30 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
         if not quay_cfg.is_file():
             s.v_drift("quay config.toml", f"missing: {quay_cfg}")
         else:
-            cmode = _mode(quay_cfg)
-            cowner = _owner(quay_cfg)
-            if cmode == "644" and cowner == s.agent_owner:
-                s.v_ok(f"quay config.toml: {cmode} {cowner}")
-            else:
-                s.v_drift(
-                    "quay config.toml",
-                    f"mode={cmode} owner={cowner} (expected 644 {s.agent_owner})",
-                )
+            _check_mode_owner(
+                s, "quay config.toml", _stat_info(quay_cfg), "644", s.agent_owner,
+            )
 
     # Operator-invocation glue
-    quay_wrapper = Path(s.quay_wrapper)
-    if quay_wrapper.is_file() and os.access(quay_wrapper, os.X_OK):
-        wmode = _mode(quay_wrapper)
-        wowner = _owner(quay_wrapper)
-        if wmode == "755" and wowner == s.rails_owner:
-            s.v_ok(f"quay-as-hermes wrapper: {wmode} {wowner}")
+    for label, raw_path in (
+        ("quay-as-hermes wrapper", s.quay_wrapper),
+        ("quay-tick-runner", s.quay_runner),
+    ):
+        p = Path(raw_path)
+        info = _executable_info(p)
+        if info is None:
+            s.v_drift(label, f"missing or non-executable: {p}")
         else:
-            s.v_drift(
-                "quay-as-hermes wrapper",
-                f"mode={wmode} owner={wowner} (expected 755 {s.rails_owner})",
-            )
-    else:
-        s.v_drift(
-            "quay-as-hermes wrapper", f"missing or non-executable: {quay_wrapper}",
-        )
-
-    quay_runner = Path(s.quay_runner)
-    if quay_runner.is_file() and os.access(quay_runner, os.X_OK):
-        rmode = _mode(quay_runner)
-        rowner = _owner(quay_runner)
-        if rmode == "755" and rowner == s.rails_owner:
-            s.v_ok(f"quay-tick-runner: {rmode} {rowner}")
-        else:
-            s.v_drift(
-                "quay-tick-runner",
-                f"mode={rmode} owner={rowner} (expected 755 {s.rails_owner})",
-            )
-    else:
-        s.v_drift("quay-tick-runner", f"missing or non-executable: {quay_runner}")
+            _check_mode_owner(s, label, info, "755", s.rails_owner)
 
     quay_profile = Path(s.quay_profile)
-    if quay_profile.is_file():
-        pmode = _mode(quay_profile)
-        powner = _owner(quay_profile)
-        if pmode == "644" and powner == s.rails_owner:
-            s.v_ok(f"quay profile.d drop-in: {pmode} {powner}")
-        else:
-            s.v_drift(
-                "quay profile.d drop-in",
-                f"mode={pmode} owner={powner} (expected 644 {s.rails_owner})",
-            )
-    else:
+    if not quay_profile.is_file():
         s.v_drift("quay profile.d drop-in", f"missing: {quay_profile}")
+    else:
+        _check_mode_owner(
+            s, "quay profile.d drop-in", _stat_info(quay_profile),
+            "644", s.rails_owner,
+        )
 
     # Runtime managers (bun, ...) — every distinct repos[].quay.package_manager.
     declared: list[str] = []
@@ -593,6 +612,7 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
     rt_install_dir = Path(s.runtime_dir)
     for rt_name in declared:
         rt_path = rt_install_dir / rt_name
+        label = f"runtime manager {rt_name}"
         rt_pin = _values_get(
             s.values_file,
             s.values_helper,
@@ -600,40 +620,16 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
         )
         if not rt_pin:
             s.v_drift(
-                f"runtime manager {rt_name}",
+                label,
                 f"no quay.runtime_managers.{rt_name}.version pin in {s.values_file}",
             )
             continue
-        if not (rt_path.is_file() and os.access(rt_path, os.X_OK)):
-            s.v_drift(
-                f"runtime manager {rt_name}",
-                f"missing or non-executable: {rt_path}",
-            )
+        rt_info = _executable_info(rt_path)
+        if rt_info is None:
+            s.v_drift(label, f"missing or non-executable: {rt_path}")
             continue
-        rt_mode = _mode(rt_path)
-        rt_owner = _owner(rt_path)
-        if rt_mode == "755" and rt_owner == s.rails_owner:
-            s.v_ok(f"runtime manager {rt_name}: {rt_mode} {rt_owner}")
-        else:
-            s.v_drift(
-                f"runtime manager {rt_name}",
-                f"mode={rt_mode} owner={rt_owner} (expected 755 {s.rails_owner})",
-            )
-        try:
-            proc = subprocess.run(
-                [str(rt_path), "--version"],
-                capture_output=True, text=True, check=False, timeout=10,
-            )
-            rt_actual = (proc.stdout.splitlines() or [""])[0] if proc.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            rt_actual = ""
-        if rt_actual and rt_pin in rt_actual:
-            s.v_ok(f"runtime manager {rt_name} version: {rt_actual}")
-        else:
-            s.v_drift(
-                f"runtime manager {rt_name} version",
-                f"got '{rt_actual or '?'}' (expected to contain '{rt_pin}')",
-            )
+        _check_mode_owner(s, label, rt_info, "755", s.rails_owner)
+        _check_version_pin(s, f"{label} version", rt_path, rt_pin)
 
 
 def _quay_registered_ids(s: _State) -> tuple[str, bool]:
@@ -643,19 +639,12 @@ def _quay_registered_ids(s: _State) -> tuple[str, bool]:
     quay_bin = Path(s.quay_bin)
     if not (
         s.quay_version
-        and quay_bin.is_file() and os.access(quay_bin, os.X_OK)
+        and _executable_info(quay_bin) is not None
         and (target / "quay").is_dir()
     ):
         return "", False
-    cmd_prefix: list[str] = []
-    try:
-        cur = pwd.getpwuid(os.geteuid()).pw_name
-    except KeyError:
-        cur = ""
-    if os.geteuid() == 0 and cur != s.agent_owner:
-        cmd_prefix = ["sudo", "-u", s.agent_owner]
     cmd = [
-        *cmd_prefix,
+        *_sudo_prefix_for(s.agent_owner),
         "env", f"QUAY_DATA_DIR={target / 'quay'}", str(quay_bin), "repo", "list",
     ]
     try:
@@ -698,7 +687,6 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
     for repo_id, repo_url, repo_base, repo_pkg, _install in _parse_repos_tsv(repos_tsv):
         if not repo_id:
             continue
-        # Code mirror checks (every entry)
         code_dir = code_root / repo_id
         if not (code_dir / ".git").is_dir():
             s.v_drift(
@@ -724,7 +712,6 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
                     f"HEAD={mhead or '?'} expected origin/{repo_base}={expected_head or '?'}",
                 )
 
-        # Quay-side checks
         if repo_pkg and s.quay_version:
             bare = target / "quay" / "repos" / f"{repo_id}.git"
             if not bare.is_dir():
@@ -756,18 +743,25 @@ def _check_systemd(s: _State) -> None:
     if s.quay_version:
         timers.append("quay-tick.timer")
     for u in timers:
-        def show(prop: str) -> str:
-            try:
-                proc = subprocess.run(
-                    ["systemctl", "show", "-p", prop, "--value", u],
-                    capture_output=True, text=True, check=False, timeout=10,
-                )
-                return proc.stdout.strip() if proc.returncode == 0 else ""
-            except (OSError, subprocess.SubprocessError):
-                return ""
-        active = show("ActiveState")
-        load = show("LoadState")
-        unitfile = show("UnitFileState")
+        # Batch the three property reads into a single `systemctl show` —
+        # the binary returns them newline-separated in request order, so
+        # one subprocess replaces three.
+        try:
+            proc = subprocess.run(
+                [
+                    "systemctl", "show",
+                    "-p", "ActiveState",
+                    "-p", "LoadState",
+                    "-p", "UnitFileState",
+                    "--value", u,
+                ],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            lines = proc.stdout.splitlines() if proc.returncode == 0 else []
+        except (OSError, subprocess.SubprocessError):
+            lines = []
+        lines += [""] * (3 - len(lines))
+        active, load, unitfile = lines[0].strip(), lines[1].strip(), lines[2].strip()
         if active == "active" and load == "loaded" and unitfile == "enabled":
             s.v_ok(f"{u}: active loaded enabled")
         else:
@@ -811,15 +805,8 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
     # `mint` doubles as the smoke check (succeeds iff a token can be obtained)
     # AND produces the token for the App-scope check below — one subprocess
     # instead of `check` then `mint`.
-    cmd_prefix: list[str] = []
-    try:
-        cur = pwd.getpwuid(os.geteuid()).pw_name
-    except KeyError:
-        cur = ""
-    if os.geteuid() == 0 and cur != s.agent_owner:
-        cmd_prefix = ["sudo", "-u", s.agent_owner]
     cmd = [
-        *cmd_prefix,
+        *_sudo_prefix_for(s.agent_owner),
         "env", f"HERMES_HOME={target}", str(venv_py), str(helper_py), "mint",
     ]
     try:
@@ -915,23 +902,6 @@ def run(
             file=err,
         )
         return 2
-
-    # Agent user must exist (verify needs the home for default --target).
-    try:
-        agent_pw = pwd.getpwnam(args.user)
-    except KeyError:
-        print(f"agent user '{args.user}' does not exist", file=err)
-        return 1
-    target = args.target if args.target is not None else Path(agent_pw.pw_dir) / ".hermes"
-    args = VerifyArgs(
-        fork=args.fork,
-        target=target,
-        user=args.user,
-        auth_method=args.auth_method,
-        quiet=args.quiet,
-        values=args.values,
-        gh_api_base=args.gh_api_base,
-    )
 
     # Test-fixture overrides match the bash internal env-vars.
     rails_owner = os.environ.get("HERMES_VERIFY_EXPECT_RAILS_OWNER") or "root"
