@@ -108,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
 
-    return 2
+    raise AssertionError(f"unreachable: argparse should have rejected cmd={args.cmd!r}")
 
 
 if __name__ == "__main__":

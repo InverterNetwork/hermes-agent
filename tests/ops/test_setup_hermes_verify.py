@@ -320,6 +320,21 @@ class TestSetupHermesVerify:
         assert result.returncode == 1
         assert "[DRIFT] rails perms" in result.stderr
 
+    def test_rails_root_group_writable_is_drift(self, install):
+        """Bash `find $rails ...` includes $rails itself; the Python port
+        must too. A group-writable rails root lets a writable principal
+        replace entries under the root-owned tree even if every file
+        underneath is mode 0644."""
+        install["rails"].chmod(0o775)
+        try:
+            result = _run_verify(install)
+        finally:
+            # Restore so other tests in the same fixture aren't affected
+            # (pytest tmp_path is per-test, but defensive).
+            install["rails"].chmod(0o755)
+        assert result.returncode == 1
+        assert "[DRIFT] rails perms" in result.stderr
+
     def test_rails_symlinks_do_not_trip_perms_check(self, install):
         """Symlinks always have mode lrwxrwxrwx — naive `find -perm -g+w`
         flags them as writable. The check must skip symlinks because their

@@ -167,12 +167,14 @@ def _git_str(repo: Path, *args: str) -> str:
     return out.strip() if rc == 0 else ""
 
 
-def _first_line_on_success(cmd: list[str], timeout: float = 10) -> str:
-    """Run ``cmd``, return its first stdout line on success or ''.
-    Used for ``--version`` substring probes against pinned versions."""
-    rc, out, _ = _run(cmd, timeout=timeout)
-    if rc != 0:
-        return ""
+def _first_stdout_line(cmd: list[str], timeout: float = 10) -> str:
+    """Run ``cmd``, return its first stdout line — regardless of exit code.
+
+    Mirrors the bash ``$bin --version 2>/dev/null | head -n1 || true`` shape
+    used for ``--version`` probes: a binary that prints its version then exits
+    non-zero (rare, but legal) still surfaces the version string to the
+    substring compare."""
+    _rc, out, _ = _run(cmd, timeout=timeout)
     return (out.splitlines() or [""])[0]
 
 
@@ -302,7 +304,18 @@ def _check_rails(s: _State) -> None:
     # they're always lrwxrwxrwx and would trip a naive perm check even though
     # their effective writability comes from the target. The venv ships
     # several (lib64 → lib, bin/python → python3.12).
+    #
+    # Includes the rails root itself — `os.walk` does not yield the start
+    # path in dirnames/filenames, but `find $rails ...` does, so a g+w on
+    # $rails would slip through verify even though it lets a writable
+    # principal replace entries under the root-owned tree.
     bad: list[str] = []
+    try:
+        root_st = os.lstat(rails)
+        if root_st.st_mode & 0o022:
+            bad.append(str(rails))
+    except OSError:
+        pass
     for dirpath, dirnames, filenames in os.walk(rails, followlinks=False):
         for name in dirnames + filenames:
             if len(bad) >= 3:
@@ -407,7 +420,7 @@ def _check_state_repo(s: _State, app_auth_expected: bool) -> None:
     for k in ("user.name", "user.email"):
         # `--local` so we only read this repo's own config — accepting global
         # values would mask drift after a `git config --unset`.
-        val = _git_str(state, "config", "--local", k)
+        val = _git_config_get(state, "--local", k)
         if val:
             s.v_ok(f"state git {k}: {val}")
         else:
@@ -531,7 +544,7 @@ def _check_version_pin(
     """Substring-match ``<bin> --version`` against ``pin``. Used by the quay
     binary and runtime-manager checks; both binaries may emit build-suffixed
     versions like ``0.1.0+abc1234`` or ``1.3.9+commit``."""
-    actual = _first_line_on_success([str(bin_path), "--version"])
+    actual = _first_stdout_line([str(bin_path), "--version"])
     if actual and pin in actual:
         s.v_ok(f"{label}: {actual}")
     else:
