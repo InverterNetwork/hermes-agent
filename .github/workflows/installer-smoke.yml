@@ -554,13 +554,50 @@ jobs:
             || { echo "FAIL: drop-in missing expected EnvironmentFile line"; sudo cat "$DROPIN"; exit 1; }
           echo "hermes-env drop-in probe: OK"
 
-      # `--verify` is intentionally not invoked here. It surfaces two
-      # pre-existing CI-fixture drifts (rails egg-info group-writable
-      # from `pip install -e`, and state origin pointing at a filesystem
-      # path because CI fakes the state repo locally) that aren't related
-      # to the quay path. The per-artefact probes above already cover the
-      # new quay-side verify logic; do_verify itself has unit-test coverage
-      # in tests/ops/test_setup_hermes_verify.py.
+      - name: --verify post-install (catch regressions in verify itself)
+        # Running `--verify` against the rendered install catches drift in
+        # the verify path before it ships. Without this gate, regressions
+        # like positional parsing of `systemctl show` only surface on-host,
+        # post-merge.
+        #
+        # Three drifts are tolerated and asserted-to-exist as the expected
+        # CI envelope:
+        #   * rails perms — `pip install -e .` leaves egg-info entries
+        #     group/world-writable; CI-only fixture artefact.
+        #   * state origin — CI fakes the state repo as a filesystem path;
+        #     real installs clone github.com.
+        #   * quay binary version — quay's binary embeds package.json's
+        #     `0.1.0` instead of the `v0.1.3` git tag pinned in
+        #     deploy.values.yaml. Tolerated until quay bumps package.json.
+        #
+        # Anything outside that envelope is a regression and fails the gate.
+        # The closing sanity loop also fails if any known label disappears
+        # from output (e.g. quay's binary self-reports the pinned version)
+        # so the filter doesn't rot into a silent pass-through.
+        run: |
+          set -euo pipefail
+          sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh --verify \
+            --fork /srv/hermes/repos/hermes-agent \
+            --target /home/hermes/.hermes \
+            --user hermes \
+            > verify.out 2> verify.err || true
+          echo "=== verify stdout (OK lines) ==="
+          cat verify.out
+          echo "=== verify stderr (DRIFT lines) ==="
+          cat verify.err
+          unexpected=$(grep '^\[DRIFT\]' verify.err \
+            | grep -Ev '^\[DRIFT\] (rails perms|state origin|quay binary version):' \
+            || true)
+          if [[ -n "$unexpected" ]]; then
+            echo "FAIL: --verify reported drift outside the known CI envelope:"
+            echo "$unexpected"
+            exit 1
+          fi
+          for label in 'rails perms' 'state origin' 'quay binary version'; do
+            grep -q "^\[DRIFT\] ${label}:" verify.err \
+              || { echo "FAIL: expected known drift '${label}' missing from --verify output (filter likely stale; remove it from the grep -Ev list)"; exit 1; }
+          done
+          echo "--verify probe: OK (only known drifts present)"
 
       - name: --force-state probe (opt-in re-clone wipes local work)
         run: |
