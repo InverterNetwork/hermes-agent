@@ -21,6 +21,7 @@ import getpass
 import grp
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -627,6 +628,8 @@ def _write_quay_stub(
     version: str,
     registered_ids: list[str],
     repo_list_override: str | None = None,
+    repo_tags: dict[str, dict] | None = None,
+    deployment_tags: dict | None = None,
 ) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
@@ -639,18 +642,58 @@ def _write_quay_stub(
     `repo_list_override` lets a caller substitute the `repo list` payload
     directly — useful for testing parse-failure paths with non-JSON output.
     Real binary keys entries by `repo_id` (not `id`); the default branch
-    mirrors that shape."""
+    mirrors that shape.
+
+    `repo_tags` maps repo_id → ``{namespaces: {...}}`` JSON for the `repo
+    get-tags <id>` reply. Missing keys default to ``{namespaces: {}}``,
+    which is what an unconfigured repo emits and matches a fresh
+    `apply-tags` clear. `deployment_tags` is the same shape for the
+    `tags get-deployment` reply (sans the `repo_id` envelope —
+    upstream wraps it as ``{scope: "deployment", namespaces: {...}}``)."""
+    import json as _json
     if repo_list_override is None:
         repos_json = ",".join(f'{{"repo_id": "{i}"}}' for i in registered_ids)
         repo_list_payload = f"[{repos_json}]"
     else:
         repo_list_payload = repo_list_override
     semver = version.removeprefix("v")
+
+    # Default unconfigured-vocab payload for repos / deployment that the
+    # caller didn't explicitly populate. The shape matches what a clean
+    # install emits and lets pre-existing tests round-trip without drift
+    # on the new tag-vocab checks.
+    repo_tags_map = repo_tags or {}
+    repo_tags_cases: list[str] = []
+    for rid in registered_ids:
+        payload = repo_tags_map.get(rid) or {"namespaces": {}}
+        envelope = {"repo_id": rid, **payload}
+        repo_tags_cases.append(
+            f'  "{rid}") echo {_json.dumps(_json.dumps(envelope))}; exit 0 ;;'
+        )
+    repo_tags_default = (
+        '  *) echo \'{"error":"unknown_repo"}\' >&2; exit 1 ;;'
+    )
+    repo_tags_block = (
+        'if [[ "$1" == "repo" && "$2" == "get-tags" ]]; then\n'
+        '  case "$3" in\n'
+        + "\n".join(repo_tags_cases + [repo_tags_default])
+        + "\n  esac\nfi\n"
+    )
+    deployment_envelope = {
+        "scope": "deployment",
+        **(deployment_tags or {"namespaces": {}}),
+    }
+    deployment_block = (
+        'if [[ "$1" == "tags" && "$2" == "get-deployment" ]]; then '
+        f"echo {_json.dumps(_json.dumps(deployment_envelope))}; exit 0; fi\n"
+    )
     path.write_text(
         "#!/usr/bin/env bash\n"
         f'if [[ "$1" == "--version" ]]; then echo "{semver}+abc1234"; exit 0; fi\n'
         f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'{repo_list_payload}\'; exit 0; fi\n'
-        "exit 0\n"
+        + repo_tags_block
+        + deployment_block
+        + "exit 0\n"
     )
     path.chmod(0o755)
 
@@ -997,3 +1040,231 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] quay-tick.timer" in result.stderr
+
+
+class TestSetupHermesVerifyTagVocab:
+    """Drift detection for `repos[].quay.tags` and `quay.tag_namespaces`.
+
+    The strict-reconciliation contract is the load-bearing piece: values
+    is the source of truth, anything in quay not in values is drift.
+    Each test starts from `quay_install` (clean install, no tag vocab on
+    either side) and pokes one side of the comparison."""
+
+    def _patch_repo_tags(self, install: dict, body: str) -> None:
+        """Insert ``body`` (already 6-space indented) into the repo's
+        `quay:` sub-block. Anchored on the fixture's `install_cmd:` line
+        so the new block lands at the right depth — naive append at EOF
+        would attach to the deployment-level `quay:` instead."""
+        anchor = "      install_cmd: \"bun install\"\n"
+        text = install["values_file"].read_text()
+        assert anchor in text, "fixture shape changed; update _patch_repo_tags anchor"
+        install["values_file"].write_text(text.replace(anchor, anchor + body))
+
+    def _patch_deployment_tags(self, install: dict, body: str) -> None:
+        """Insert ``body`` (already 2-space indented) into the top-level
+        `quay:` block. Anchored on the `version:` line for the same
+        reason as `_patch_repo_tags`."""
+        anchor_re = re.compile(r"^  version: \"v[0-9.]+\"\n", re.MULTILINE)
+        text = install["values_file"].read_text()
+        new, n = anchor_re.subn(lambda m: m.group(0) + body, text, count=1)
+        assert n == 1, "fixture shape changed; update _patch_deployment_tags anchor"
+        install["values_file"].write_text(new)
+
+    def test_clean_install_no_tag_vocab_is_ok(self, quay_install):
+        # Baseline: with no tags configured anywhere, both checks must
+        # pass — empty live state matches empty desired state.
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        repo_id = quay_install["quay_repo_id"]
+        assert f"[OK] quay repo {repo_id} tag vocab" in result.stdout
+        assert "[OK] quay deployment tag vocab" in result.stdout
+
+    def test_per_repo_drift_add_in_values_surfaces(self, quay_install):
+        # values.yaml gains a tag namespace; live quay still empty → drift.
+        self._patch_repo_tags(
+            quay_install,
+            "      tags:\n"
+            "        area: [bonding-curve]\n",
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        repo_id = quay_install["quay_repo_id"]
+        assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
+
+    def test_per_repo_drift_remove_from_values_surfaces(self, quay_install):
+        # Inverse: values has no tags, live quay does → drift. This is the
+        # removal path the ticket flagged as load-bearing — strict
+        # reconciliation MUST surface what setup-hermes.sh would clear on
+        # the next install run.
+        repo_id = quay_install["quay_repo_id"]
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            repo_tags={
+                repo_id: {
+                    "namespaces": {
+                        "area": {"values": ["bonding-curve"], "required": False},
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
+
+    def test_per_repo_drift_value_mismatch_surfaces(self, quay_install):
+        # Both sides have the namespace but with different values → drift.
+        repo_id = quay_install["quay_repo_id"]
+        self._patch_repo_tags(
+            quay_install,
+            "      tags:\n"
+            "        area: [bonding-curve]\n",
+        )
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            repo_tags={
+                repo_id: {
+                    "namespaces": {
+                        "area": {"values": ["vesting"], "required": False},
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
+        # The drift line carries both sides so the operator can diff
+        # them at a glance.
+        assert "vesting" in result.stderr
+        assert "bonding-curve" in result.stderr
+
+    def test_per_repo_match_is_ok(self, quay_install):
+        # End-to-end positive: values + live state agree, including
+        # value sort order independence.
+        repo_id = quay_install["quay_repo_id"]
+        self._patch_repo_tags(
+            quay_install,
+            "      tags:\n"
+            "        area: [vesting, bonding-curve]\n",  # unsorted in values
+        )
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            repo_tags={
+                repo_id: {
+                    # Live state sorted (matches what real quay emits) —
+                    # normalisation must compare equal regardless.
+                    "namespaces": {
+                        "area": {
+                            "values": ["bonding-curve", "vesting"],
+                            "required": False,
+                        },
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert f"[OK] quay repo {repo_id} tag vocab" in result.stdout
+
+    def test_deployment_drift_add_in_values_surfaces(self, quay_install):
+        self._patch_deployment_tags(
+            quay_install,
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      values: [pii]\n",
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay deployment tag vocab" in result.stderr
+
+    def test_deployment_drift_remove_from_values_surfaces(self, quay_install):
+        repo_id = quay_install["quay_repo_id"]
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            deployment_tags={
+                "namespaces": {
+                    "tasktype": {
+                        "values": ["bugfix"],
+                        "required": True,
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay deployment tag vocab" in result.stderr
+
+    def test_deployment_required_flag_drift_surfaces(self, quay_install):
+        # Same values, same namespace; only the `required` flag differs.
+        # Strict reconciliation must catch this — `required: true` vs
+        # `false` is the difference between every ticket needing a
+        # tasktype tag and none needing one.
+        repo_id = quay_install["quay_repo_id"]
+        self._patch_deployment_tags(
+            quay_install,
+            "  tag_namespaces:\n"
+            "    tasktype:\n"
+            "      required: true\n"
+            "      values: [bugfix]\n",
+        )
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            deployment_tags={
+                "namespaces": {
+                    "tasktype": {
+                        "values": ["bugfix"],
+                        "required": False,
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay deployment tag vocab" in result.stderr
+
+    def test_deployment_match_is_ok(self, quay_install):
+        repo_id = quay_install["quay_repo_id"]
+        self._patch_deployment_tags(
+            quay_install,
+            "  tag_namespaces:\n"
+            "    tasktype:\n"
+            "      required: true\n"
+            "      values: [bugfix, refactor]\n",
+        )
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            deployment_tags={
+                "namespaces": {
+                    "tasktype": {
+                        "values": ["bugfix", "refactor"],
+                        "required": True,
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] quay deployment tag vocab" in result.stdout
+
+    def test_unregistered_repo_skips_tag_vocab_check(self, quay_install):
+        # `quay repo get-tags` on an unregistered id exits with
+        # `unknown_repo`; running the tag-vocab check there would surface
+        # as spurious drift. The "not registered" line is the actionable
+        # signal — tag-vocab follow-up must be gated.
+        repo_id = quay_install["quay_repo_id"]
+        _write_quay_stub(quay_install["quay_bin"], QUAY_VERSION, [])
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "not registered" in result.stderr
+        assert f"quay repo {repo_id} tag vocab" not in result.stderr

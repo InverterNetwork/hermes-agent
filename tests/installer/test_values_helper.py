@@ -943,3 +943,284 @@ class TestParseTaskListCount:
         assert "expected JSON array" in r.stderr
 
 
+# ---------------------------------------------------------------------------
+# Tag vocab — per-repo `tags:` and deployment `tag_namespaces:` blocks
+# ---------------------------------------------------------------------------
+
+
+def _values_with_repo(tmp_path: Path, body: str) -> Path:
+    """Minimal values.yaml carrying one quay-managed repo plus ``body`` at
+    top level so the new tag-vocab block can be exercised in isolation
+    without dragging in the whole gateway/slack schema."""
+    p = tmp_path / "values.yaml"
+    p.write_text(
+        "repos:\n"
+        "  - id: alpha\n"
+        "    url: https://github.com/example/alpha\n"
+        "    base_branch: main\n"
+        "    quay:\n"
+        "      package_manager: bun\n"
+        "      install_cmd: \"bun install\"\n"
+        + body,
+        encoding="utf-8",
+    )
+    return p
+
+
+class TestGetRepoTags:
+    """`get-repo-tags <repo_id>` — the install-time emitter piped into
+    `quay repo apply-tags --from -`. The JSON shape is the public contract
+    with quay's apply payload: missing/empty `tags:` MUST emit
+    `{"namespaces": {}}` so the strict-reconciliation path actually
+    clears the repo's vocab on removal."""
+
+    def test_bare_list_wrapped_with_required_false(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        area: [vesting, bonding-curve]\n"
+            "        risk: [reentrancy]\n",
+        )
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out == {
+            "namespaces": {
+                "area": {"required": False, "values": ["bonding-curve", "vesting"]},
+                "risk": {"required": False, "values": ["reentrancy"]},
+            }
+        }
+
+    def test_absent_tags_emits_empty_clear_payload(self, tmp_path: Path):
+        # Strict reconciliation: dropping the `tags:` block from values
+        # MUST flow through to "clear the repo's vocab in quay" — that's
+        # the explicit-clear payload upstream's apply-tags accepts.
+        values = _values_with_repo(tmp_path, "")
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"namespaces": {}}
+
+    def test_empty_tags_block_emits_empty_clear_payload(self, tmp_path: Path):
+        values = _values_with_repo(tmp_path, "      tags: {}\n")
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"namespaces": {}}
+
+    def test_unknown_repo_id_exits_1(self, tmp_path: Path):
+        values = _values_with_repo(tmp_path, "")
+        r = _run(values, "get-repo-tags", "no-such-repo")
+        assert r.returncode == 1
+        assert "no-such-repo" in r.stderr
+
+    def test_namespace_with_dash_rejected(self, tmp_path: Path):
+        # Quay's validator splits ticket tags on the first `-`, so a
+        # dashed namespace would be unaddressable. The helper rejects
+        # at validate-time so a typo doesn't reach `apply-tags`.
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        task-type: [bugfix]\n",
+        )
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 1
+        assert "namespace must match" in r.stderr
+
+    def test_value_with_uppercase_rejected(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        area: [Bonding-Curve]\n",
+        )
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 1
+        assert "must match" in r.stderr
+
+    def test_duplicate_value_rejected(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        area: [bonding-curve, bonding-curve]\n",
+        )
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 1
+        assert "duplicate" in r.stderr
+
+    def test_non_list_value_rejected(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        area: not-a-list\n",
+        )
+        r = _run(values, "get-repo-tags", "alpha")
+        assert r.returncode == 1
+        assert "must be a list" in r.stderr
+
+    def test_output_is_deterministic_across_runs(self, tmp_path: Path):
+        # verify-path drift is a string equality check vs `quay repo
+        # get-tags` (which itself sorts). Re-running the helper must
+        # produce byte-identical output, otherwise even a no-op install
+        # would surface as drift.
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        risk: [reentrancy, access-control]\n"
+            "        area: [vesting, bonding-curve]\n",
+        )
+        first = _run(values, "get-repo-tags", "alpha").stdout
+        second = _run(values, "get-repo-tags", "alpha").stdout
+        assert first == second
+        # Sorted form: namespaces alpha-sorted, values within alpha-sorted.
+        assert first.index('"area"') < first.index('"risk"')
+        assert first.index('"access-control"') < first.index('"reentrancy"')
+
+
+class TestGetDeploymentTags:
+    """`get-deployment-tags` — emitter for the deployment-level apply.
+    Same contract as get-repo-tags except it consumes the full envelope
+    (`{required, values}`) so deployment-required namespaces flow
+    through values.yaml into quay."""
+
+    def _values(self, tmp_path: Path, body: str) -> Path:
+        p = tmp_path / "values.yaml"
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def test_envelope_passes_required_through(self, tmp_path: Path):
+        values = self._values(
+            tmp_path,
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    tasktype:\n"
+            "      required: true\n"
+            "      values: [bugfix, refactor]\n"
+            "    risk:\n"
+            "      values: [pii, money-handling]\n",
+        )
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out == {
+            "namespaces": {
+                "risk": {"required": False, "values": ["money-handling", "pii"]},
+                "tasktype": {"required": True, "values": ["bugfix", "refactor"]},
+            }
+        }
+
+    def test_required_omitted_defaults_to_false(self, tmp_path: Path):
+        values = self._values(
+            tmp_path,
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      values: [pii]\n",
+        )
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out["namespaces"]["risk"]["required"] is False
+
+    def test_required_true_with_empty_values_rejected(self, tmp_path: Path):
+        # Mirrors the upstream rule (apply-deployment refuses
+        # `{values: [], required: true}` because every validation would
+        # emit TAG_REQUIRED_MISSING with no satisfying tag possible).
+        # Surfacing this at values-helper time gives a single error line
+        # instead of a partial install.
+        values = self._values(
+            tmp_path,
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      required: true\n"
+            "      values: []\n",
+        )
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 1
+        assert "required=true with no values" in r.stderr
+
+    def test_unknown_key_rejected(self, tmp_path: Path):
+        values = self._values(
+            tmp_path,
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      values: [pii]\n"
+            "      typo_field: true\n",
+        )
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 1
+        assert "unknown key" in r.stderr
+
+    def test_required_non_bool_rejected(self, tmp_path: Path):
+        values = self._values(
+            tmp_path,
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      required: \"yes\"\n"
+            "      values: [pii]\n",
+        )
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 1
+        assert "must be a bool" in r.stderr
+
+    def test_absent_block_emits_empty_clear_payload(self, tmp_path: Path):
+        values = self._values(tmp_path, "quay:\n  version: \"v0.2.0\"\n")
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"namespaces": {}}
+
+    def test_quay_block_absent_is_empty_clear(self, tmp_path: Path):
+        # Pre-quay-enabled forks have no `quay:` block at all; the
+        # helper must still emit the explicit-clear payload so the
+        # installer can pipe it unconditionally without an extra guard.
+        values = self._values(tmp_path, "org:\n  name: T\n")
+        r = _run(values, "get-deployment-tags")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {"namespaces": {}}
+
+
+class TestValidateSchemaTagVocab:
+    """`validate-schema` walks the new tag blocks too — drift in the
+    values file should surface at verify time, not on the next install
+    when half the reconciliation has already run."""
+
+    def test_per_repo_tag_error_surfaces(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        area: [INVALID-CASE]\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "must match" in r.stderr
+
+    def test_deployment_tag_error_surfaces(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      required: true\n"
+            "      values: []\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "required=true" in r.stderr
+
+    def test_clean_tag_blocks_silent(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      tags:\n"
+            "        area: [bonding-curve]\n"
+            "quay:\n"
+            "  tag_namespaces:\n"
+            "    tasktype:\n"
+            "      required: true\n"
+            "      values: [bugfix]\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 0
+        assert r.stderr == ""
+
+

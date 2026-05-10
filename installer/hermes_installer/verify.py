@@ -15,6 +15,7 @@ parity with the bash original — verify never imports the helper in-process.
 from __future__ import annotations
 
 import grp
+import json
 import os
 import pwd
 import re
@@ -665,6 +666,135 @@ def _quay_registered_ids(s: _State) -> tuple[str, bool]:
     return ids.strip(), False
 
 
+def _normalize_namespaces(raw: object) -> dict | None:
+    """Canonical shape for tag-vocab drift compare.
+
+    Accepts the ``namespaces`` field from either ``quay … get-tags`` (live)
+    or ``values_helper.py get-…-tags`` (desired). Returns
+    ``{ns: {"values": sorted([...]), "required": bool}}`` so the two sides
+    string-compare equal even if upstream order or the per-repo
+    bare-list expansion drifts. ``None`` signals an unparseable shape —
+    caller surfaces as a drift line, not a successful "matches".
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, dict] = {}
+    for k, spec in raw.items():
+        if not isinstance(spec, dict):
+            return None
+        values_raw = spec.get("values")
+        if not isinstance(values_raw, list):
+            return None
+        try:
+            values = sorted(str(v) for v in values_raw)
+        except TypeError:
+            return None
+        required = bool(spec.get("required", False))
+        out[str(k)] = {"values": values, "required": required}
+    return dict(sorted(out.items()))
+
+
+def _quay_get_namespaces(s: _State, *args: str) -> dict | None:
+    """Run ``quay …`` and extract a normalised ``namespaces`` dict.
+
+    ``args`` is the verb tail (``"repo", "get-tags", repo_id`` or
+    ``"tags", "get-deployment"``). Returns ``None`` on subprocess failure,
+    JSON parse failure, or unexpected shape — the per-call caller renders
+    that as a drift line.
+    """
+    rc, out, _ = _run([
+        *_sudo_prefix_for(s.agent_owner),
+        "env", f"QUAY_DATA_DIR={s.args.target / 'quay'}",
+        s.quay_bin, *args,
+    ])
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _normalize_namespaces(data.get("namespaces"))
+
+
+def _values_get_namespaces(s: _State, *args: str) -> dict | None:
+    """Run ``values_helper.py …`` and extract a normalised ``namespaces``
+    dict. ``args`` is the subcommand and any positional flags
+    (``"get-repo-tags", repo_id`` / ``"get-deployment-tags"``)."""
+    rc, out, _ = _values_helper_run(
+        s.values_helper, *args, values_file=s.values_file,
+    )
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _normalize_namespaces(data.get("namespaces"))
+
+
+def _check_repo_tag_vocab(s: _State, repo_id: str) -> None:
+    """Drift check for per-repo tag vocab. Compares the live state from
+    ``quay repo get-tags <id>`` against the desired state emitted by
+    ``values_helper get-repo-tags <id>``. Either side unreadable → drift
+    line that names the failing source so the operator knows which
+    surface to look at."""
+    label = f"quay repo {repo_id} tag vocab"
+    live = _quay_get_namespaces(s, "repo", "get-tags", repo_id)
+    desired = _values_get_namespaces(s, "get-repo-tags", repo_id)
+    if live is None:
+        s.v_drift(label, "could not read live state via `quay repo get-tags`")
+        return
+    if desired is None:
+        s.v_drift(
+            label,
+            f"`values_helper.py get-repo-tags {repo_id}` failed "
+            "(re-run for details)",
+        )
+        return
+    if live == desired:
+        s.v_ok(label)
+    else:
+        s.v_drift(
+            label,
+            f"live={json.dumps(live, sort_keys=True)} "
+            f"expected={json.dumps(desired, sort_keys=True)}",
+        )
+
+
+def _check_deployment_tag_vocab(s: _State) -> None:
+    """Drift check for deployment tag vocab. Gated on quay.version being
+    set (matches the existing pattern for quay-side checks). Compares
+    ``quay tags get-deployment`` against
+    ``values_helper get-deployment-tags``."""
+    if not s.quay_version:
+        return
+    label = "quay deployment tag vocab"
+    live = _quay_get_namespaces(s, "tags", "get-deployment")
+    desired = _values_get_namespaces(s, "get-deployment-tags")
+    if live is None:
+        s.v_drift(label, "could not read live state via `quay tags get-deployment`")
+        return
+    if desired is None:
+        s.v_drift(
+            label,
+            "`values_helper.py get-deployment-tags` failed "
+            "(re-run for details)",
+        )
+        return
+    if live == desired:
+        s.v_ok(label)
+    else:
+        s.v_drift(
+            label,
+            f"live={json.dumps(live, sort_keys=True)} "
+            f"expected={json.dumps(desired, sort_keys=True)}",
+        )
+
+
 def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
     """Per-entry code mirror checks + optional bare clone + registration.
 
@@ -725,6 +855,11 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
             if not list_failed:
                 if repo_id in registered_set:
                     s.v_ok(f"quay repo {repo_id} registered")
+                    # Tag-vocab drift only makes sense for an actually-
+                    # registered repo; `quay repo get-tags` on a missing id
+                    # exits with `unknown_repo`, which would surface as a
+                    # spurious "could not read live state" line.
+                    _check_repo_tag_vocab(s, repo_id)
                 else:
                     s.v_drift(f"quay repo {repo_id}", "not registered with quay")
         elif repo_pkg and not s.quay_version:
@@ -954,6 +1089,7 @@ def run(
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
     _check_per_entry_repos(s, repos_tsv)
+    _check_deployment_tag_vocab(s)
     _check_systemd(s)
     if app_auth_expected:
         _check_token_helper(s, repos_tsv)

@@ -1040,9 +1040,36 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
               --package-manager "$repo_pkg" \
               --install-cmd "$repo_install" >/dev/null
         fi
+
+        # Reconcile per-repo tag vocab: pipe the desired state from
+        # deploy.values.yaml to `quay repo apply-tags --from -`. Declarative
+        # replace — values not in the input are removed, so dropping a
+        # namespace from the values file flows through to a removal in
+        # quay (strict reconciliation). Empty / absent `tags:` block emits
+        # `{"namespaces": {}}`, which clears the repo's vocab and reverts
+        # it to the unconfigured (unenforced) state.
+        echo "==> reconciling tag vocab for $repo_id"
+        python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+            get-repo-tags "$repo_id" \
+          | sudo -u "$AGENT_USER" \
+              env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" \
+                repo apply-tags "$repo_id" --from - >/dev/null
       fi
     fi
   done <<<"$ALL_REPOS_TSV"
+fi
+
+# Reconcile deployment-level tag vocab once after the per-repo loop so
+# deployment-required namespaces are in place before any worker (or the
+# inverter-linear skill) calls `quay tags list --repo`. Same strict-
+# reconciliation semantics as the per-repo case: empty input clears,
+# any namespace not in values is removed.
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  echo "==> reconciling deployment tag vocab"
+  python3 "$VALUES_HELPER" --values "$VALUES_FILE" get-deployment-tags \
+    | sudo -u "$AGENT_USER" \
+        env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" \
+          tags apply-deployment --from - >/dev/null
 fi
 
 # Symlinks at render-target root so the agent's existing paths
