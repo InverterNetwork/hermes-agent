@@ -70,6 +70,3 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
-
-# Claude Code harness artifacts (per-checkout state, not repo content)
-.claude/

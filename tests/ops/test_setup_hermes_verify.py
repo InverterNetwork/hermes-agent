@@ -630,6 +630,7 @@ def _write_quay_stub(
     repo_list_override: str | None = None,
     repo_tags: dict[str, dict] | None = None,
     deployment_tags: dict | None = None,
+    tags_supported: bool = True,
 ) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
@@ -662,6 +663,13 @@ def _write_quay_stub(
     # caller didn't explicitly populate. The shape matches what a clean
     # install emits and lets pre-existing tests round-trip without drift
     # on the new tag-vocab checks.
+    #
+    # `tags_supported=False` simulates a pre-tag-vocab binary: the `tags`
+    # noun isn't registered, so `tags --help` exits non-zero and the
+    # capability-gate probe in verify.py / setup-hermes.sh skips the
+    # new reconciliation paths. The repo / deployment tag-vocab branches
+    # below are still emitted so legacy tests that don't probe stay
+    # equivalent in behaviour.
     repo_tags_map = repo_tags or {}
     repo_tags_cases: list[str] = []
     for rid in registered_ids:
@@ -687,10 +695,16 @@ def _write_quay_stub(
         'if [[ "$1" == "tags" && "$2" == "get-deployment" ]]; then '
         f"echo {_json.dumps(_json.dumps(deployment_envelope))}; exit 0; fi\n"
     )
+    tags_help_block = (
+        'if [[ "$1" == "tags" && "$2" == "--help" ]]; then exit 0; fi\n'
+        if tags_supported
+        else 'if [[ "$1" == "tags" && "$2" == "--help" ]]; then echo "unknown_command" >&2; exit 1; fi\n'
+    )
     path.write_text(
         "#!/usr/bin/env bash\n"
         f'if [[ "$1" == "--version" ]]; then echo "{semver}+abc1234"; exit 0; fi\n'
         f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'{repo_list_payload}\'; exit 0; fi\n'
+        + tags_help_block
         + repo_tags_block
         + deployment_block
         + "exit 0\n"
@@ -1092,10 +1106,10 @@ class TestSetupHermesVerifyTagVocab:
         assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
 
     def test_per_repo_drift_remove_from_values_surfaces(self, quay_install):
-        # Inverse: values has no tags, live quay does → drift. This is the
-        # removal path the ticket flagged as load-bearing — strict
-        # reconciliation MUST surface what setup-hermes.sh would clear on
-        # the next install run.
+        # Inverse: values has no tags, live quay does → drift. Strict
+        # reconciliation MUST surface what setup-hermes.sh would clear
+        # on the next install run, otherwise removal silently doesn't
+        # happen and the live vocab keeps growing.
         repo_id = quay_install["quay_repo_id"]
         _write_quay_stub(
             quay_install["quay_bin"],
@@ -1268,3 +1282,120 @@ class TestSetupHermesVerifyTagVocab:
         assert result.returncode == 1
         assert "not registered" in result.stderr
         assert f"quay repo {repo_id} tag vocab" not in result.stderr
+
+    def test_pre_ast87_binary_skips_both_tag_vocab_checks(self, quay_install):
+        # A quay binary without the `tags` noun must skip both
+        # per-repo and deployment tag-vocab drift checks; otherwise a
+        # fork with quay.version still pinned at a pre-tag-vocab
+        # release would surface spurious drift on every verify run.
+        # Even WITH non-empty tag vocab in values, the check must skip
+        # — the install-time path also skips, so checking here would
+        # just amplify the same upgrade-not-yet-taken signal.
+        repo_id = quay_install["quay_repo_id"]
+        self._patch_repo_tags(
+            quay_install,
+            "      tags:\n"
+            "        area: [bonding-curve]\n",
+        )
+        self._patch_deployment_tags(
+            quay_install,
+            "  tag_namespaces:\n"
+            "    risk:\n"
+            "      values: [pii]\n",
+        )
+        _write_quay_stub(
+            quay_install["quay_bin"], QUAY_VERSION, [repo_id],
+            tags_supported=False,
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "tag vocab" not in result.stdout
+        assert "tag vocab" not in result.stderr
+
+    def test_drift_detail_lists_per_namespace_changes(self, quay_install):
+        # The `live={…} expected={…}` JSON-blob form was unreadable
+        # past two namespaces; verify must emit one line per change so
+        # the operator can read the full diff inline. Uses single-word
+        # namespaces (`[a-z0-9]+`, no dashes — the schema validator
+        # would reject dashed namespaces upstream of this drift check).
+        repo_id = quay_install["quay_repo_id"]
+        self._patch_repo_tags(
+            quay_install,
+            "      tags:\n"
+            "        area: [vesting]\n"
+            "        layer: [foo]\n",  # only in values
+        )
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            repo_tags={
+                repo_id: {
+                    "namespaces": {
+                        "area": {"values": ["vesting"], "required": True},  # required-flip
+                        "risk": {"values": ["x"], "required": False},  # only in live
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        # Subject line + per-change extras both visible.
+        assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
+        assert "+ namespace `layer`" in result.stderr
+        assert "- namespace `risk`" in result.stderr
+        assert "area.required" in result.stderr
+
+    def test_malformed_live_required_flag_surfaces(self, quay_install):
+        # `"required": "false"` (string instead of bool) is a real
+        # failure mode if upstream's JSON contract drifts. The verifier
+        # MUST surface it as drift rather than silently coercing
+        # truthy-string to True (and showing [OK]).
+        repo_id = quay_install["quay_repo_id"]
+        _write_quay_stub(
+            quay_install["quay_bin"],
+            QUAY_VERSION,
+            [repo_id],
+            repo_tags={
+                repo_id: {
+                    "namespaces": {
+                        # Type lie: required as string. Helpfully the
+                        # JSON value would normally be true/false; this
+                        # is the regression we're guarding.
+                        "area": {"values": ["bonding-curve"], "required": "false"},
+                    },
+                },
+            },
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
+        assert "required" in result.stderr
+
+    def test_drift_detail_names_failing_source(self, quay_install):
+        # The four failure modes (subprocess error, JSON-decode error,
+        # non-dict top level, namespaces shape) used to collapse into
+        # one "could not read live state" message. The tagged-failure
+        # return path must name the actual source, otherwise an operator
+        # chasing a quay crash and an operator chasing JSON-shape drift
+        # have to start from the same useless string.
+        repo_id = quay_install["quay_repo_id"]
+        # Make `quay repo get-tags <id>` exit non-zero with stderr.
+        quay_stub = quay_install["quay_bin"]
+        quay_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [[ "$1" == "--version" ]]; then echo "{QUAY_VERSION.removeprefix("v")}+abc"; exit 0; fi\n'
+            f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'[{{"repo_id":"{repo_id}"}}]\'; exit 0; fi\n'
+            'if [[ "$1" == "tags" && "$2" == "--help" ]]; then exit 0; fi\n'
+            'if [[ "$1" == "tags" && "$2" == "get-deployment" ]]; then echo \'{"scope":"deployment","namespaces":{}}\'; exit 0; fi\n'
+            'if [[ "$1" == "repo" && "$2" == "get-tags" ]]; then echo "boom: db locked" >&2; exit 7; fi\n'
+            "exit 0\n"
+        )
+        quay_stub.chmod(0o755)
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
+        # The drift line names quay AND the stderr-head: the operator
+        # immediately knows it's a binary failure, not a JSON-shape issue.
+        assert "quay repo get-tags" in result.stderr
+        assert "boom: db locked" in result.stderr

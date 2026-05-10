@@ -925,6 +925,28 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   )"
 fi
 
+# Tag-vocab reconciliation lives behind a capability probe rather than a
+# version compare. The `tags` noun (apply-tags / apply-deployment /
+# get-tags / get-deployment) is recent — older quay binaries don't have
+# it. `quay tags --help` returns 0 only when the noun is registered,
+# so it's a clean dispatch-table probe with no DB side effects (the
+# binary still touches ~/.quay/ via the help path, but
+# reconcile_stale_quay_dir already ran above). This lets a fork bump
+# quay.version on its own cadence: the install just skips the new
+# reconciliation paths until the binary supports them, and a non-empty
+# `tags:` block in values surfaces as drift via verify.py rather than
+# blowing up `set -e` mid-install.
+QUAY_TAGS_SUPPORTED=0
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  if sudo -u "$AGENT_USER" \
+       env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" tags --help \
+       >/dev/null 2>&1; then
+    QUAY_TAGS_SUPPORTED=1
+  else
+    echo "==> quay binary does not support the \`tags\` noun; skipping tag-vocab reconciliation (bump quay.version once a release with the tag-vocab feature ships)"
+  fi
+fi
+
 if [[ -n "$ALL_REPOS_TSV" ]]; then
   AGENT_GITCONFIG="$AGENT_HOME/.gitconfig"
 
@@ -1048,12 +1070,14 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
         # quay (strict reconciliation). Empty / absent `tags:` block emits
         # `{"namespaces": {}}`, which clears the repo's vocab and reverts
         # it to the unconfigured (unenforced) state.
-        echo "==> reconciling tag vocab for $repo_id"
-        python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
-            get-repo-tags "$repo_id" \
-          | sudo -u "$AGENT_USER" \
-              env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" \
-                repo apply-tags "$repo_id" --from - >/dev/null
+        if [[ "$QUAY_TAGS_SUPPORTED" -eq 1 ]]; then
+          echo "==> reconciling tag vocab for $repo_id"
+          python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+              get-repo-tags "$repo_id" \
+            | sudo -u "$AGENT_USER" \
+                env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" \
+                  repo apply-tags "$repo_id" --from - >/dev/null
+        fi
       fi
     fi
   done <<<"$ALL_REPOS_TSV"
@@ -1064,7 +1088,7 @@ fi
 # inverter-linear skill) calls `quay tags list --repo`. Same strict-
 # reconciliation semantics as the per-repo case: empty input clears,
 # any namespace not in values is removed.
-if [[ "$QUAY_ENABLED" -eq 1 ]]; then
+if [[ "$QUAY_TAGS_SUPPORTED" -eq 1 ]]; then
   echo "==> reconciling deployment tag vocab"
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" get-deployment-tags \
     | sudo -u "$AGENT_USER" \
