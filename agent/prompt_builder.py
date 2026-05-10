@@ -1053,6 +1053,30 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+def load_gateway_org_defaults() -> Optional[str]:
+    """Return ``gateway-org-defaults.md`` from HERMES_HOME, or None when absent/empty."""
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug(
+            "Could not ensure HERMES_HOME before loading gateway-org-defaults.md: %s", e,
+        )
+
+    path = get_hermes_home() / "gateway-org-defaults.md"
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.debug("Could not read gateway-org-defaults.md from %s: %s", path, e)
+        return None
+    if not content:
+        return None
+    content = _scan_context_content(content, "gateway-org-defaults.md")
+    return _truncate_content(content, "gateway-org-defaults.md")
+
+
 def _load_hermes_md(cwd_path: Path) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)

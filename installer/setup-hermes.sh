@@ -601,6 +601,15 @@ chown root:"$AGENT_USER" "$GATEWAY_RUNTIME_ENV"
 chmod 0640 "$GATEWAY_RUNTIME_ENV"
 [[ "$runtime_sha_pre" != "$(file_sha "$GATEWAY_RUNTIME_ENV")" ]] && GATEWAY_NEEDS_RESTART=1
 
+# Org-defaults seed for the gateway prompt builder; re-read at session
+# start, so drift here needs no service restart.
+ORG_DEFAULTS_OUT="$TARGET_DIR/gateway-org-defaults.md"
+echo "==> rendering $ORG_DEFAULTS_OUT from $VALUES_FILE"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  render-gateway-org-defaults --out "$ORG_DEFAULTS_OUT"
+chown root:"$AGENT_USER" "$ORG_DEFAULTS_OUT"
+chmod 0640 "$ORG_DEFAULTS_OUT"
+
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
 

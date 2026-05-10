@@ -395,6 +395,19 @@ def _check_config_yaml(s: _State) -> None:
     _check_mode_owner(s, "config.yaml", _stat_info(cfg), "644", s.agent_owner)
 
 
+def _check_gateway_org_defaults(s: _State) -> None:
+    # setup-hermes.sh always renders this (empty file when repos[] is
+    # empty); a missing file means the install step didn't run.
+    path = s.args.target / "gateway-org-defaults.md"
+    if not path.is_file():
+        s.v_drift("gateway-org-defaults.md", f"missing: {path}")
+        return
+    _check_mode_owner(
+        s, "gateway-org-defaults.md", _stat_info(path),
+        "640", s.rails_owner, s.agent_group,
+    )
+
+
 def _check_state_symlinks(s: _State) -> None:
     target = s.args.target
     for d in ("skills", "memories", "cron"):
@@ -1168,6 +1181,7 @@ def run(
     _check_auth(s, app_auth_expected)
     _check_agent_dirs(s)
     _check_config_yaml(s)
+    _check_gateway_org_defaults(s)
     _check_state_symlinks(s)
     _check_state_repo(s, app_auth_expected)
     _check_runtime_version(s)

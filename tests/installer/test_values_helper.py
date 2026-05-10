@@ -846,6 +846,193 @@ class TestValidateSchema:
         assert "base_branch is required" in r.stderr
 
 
+class TestRenderGatewayOrgDefaults:
+    """Direct coverage of `render-gateway-org-defaults`. The seed shape is
+    part of the public contract — the gateway prompt builder loads this
+    file verbatim into the cached system prompt."""
+
+    def test_empty_repos_writes_empty_file(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("org:\n  name: X\n", encoding="utf-8")
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert out.exists()
+        assert out.read_text() == ""
+
+    def test_repos_without_issue_tracker_omit_linear_sentence(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "~/.hermes/code/<repo>/" in text
+        assert "never `git clone`" in text
+        assert "alpha(main)" in text
+        assert "Linear" not in text
+        assert "inverter-linear" not in text
+
+    def test_per_repo_issue_tracker_renders_linear_suffix(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "    aster: 11111111-2222-3333-4444-555555555555\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      linear:\n"
+            "        team: itry\n"
+            "  - id: beta\n"
+            "    url: https://github.com/example/beta\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      linear:\n"
+            "        team: aster\n"
+            "  - id: gamma\n"
+            "    url: https://github.com/example/gamma\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        # Linear sentence present because at least one repo opted in
+        assert "Issue tracking is Linear via the `inverter-linear` skill" in text
+        assert "never `gh issue`" in text
+        # Per-repo Linear suffix only on opted-in entries
+        assert "alpha(main, Linear:itry)" in text
+        assert "beta(main, Linear:aster)" in text
+        assert "gamma(main)" in text  # no suffix when issue_tracker absent
+        # No trailing newline garbage; one paragraph, one trailing \n.
+        assert text.endswith(".\n")
+        assert text.count("\n") == 1
+
+    def test_token_efficient_single_paragraph(self, tmp_path: Path):
+        # Guardrail: the seed must stay one paragraph (no headings, no
+        # bullets, no multi-line structure) — every gateway turn pays this
+        # token cost and the shape is part of the contract.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      linear:\n"
+            "        team: itry\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        # Exactly one trailing newline; no internal line breaks.
+        assert text.count("\n") == 1
+        # No markdown headings or bullets that would inflate the seed.
+        assert not any(line.startswith(("#", "-", "*")) for line in text.splitlines())
+        # Sanity: well under a kilobyte for a one-repo deployment.
+        assert len(text.encode("utf-8")) < 512
+
+    def test_rejects_unknown_team_key(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      linear:\n"
+            "        team: aster\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 1
+        assert "does not match any key in linear.teams" in r.stderr
+
+    def test_rejects_unknown_adapter(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      jira:\n"
+            "        project: ABC\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 1
+        assert "unknown adapter" in r.stderr
+        assert "jira" in r.stderr
+
+    def test_rejects_missing_linear_team(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      linear: {}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 1
+        assert "linear.team is required" in r.stderr
+
+    def test_validate_schema_also_catches_unknown_team(self, tmp_path: Path):
+        # validate-schema is called from `setup-hermes.sh --verify`; the
+        # cross-reference check must live there too, not only in the
+        # render path.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "linear:\n"
+            "  teams:\n"
+            "    itry: 28294e03-c1ce-4c2b-ba24-49e36179a321\n"
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    issue_tracker:\n"
+            "      linear:\n"
+            "        team: aster\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "does not match any key in linear.teams" in r.stderr
+
+
 class TestParseRepoListIds:
     """Direct coverage of `parse-repo-list-ids` — the subcommand both the
     install-time and verify-time paths in setup-hermes.sh pipe `quay repo

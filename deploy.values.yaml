@@ -253,10 +253,18 @@ slack:
 
 # Repos this deployment cares about. Every entry produces a code mirror;
 # entries with a `quay:` block are additionally registered with quay.
+# `issue_tracker:` (optional) wires the gateway's org-defaults prompt seed
+# (rendered by `values_helper.py render-gateway-org-defaults`) so the
+# agent reflexively reaches for Linear instead of `gh issue`. The
+# `team:` value must match a key in `linear.teams` above — typos fail
+# at install-time via `validate-schema`.
 repos:
   - id: test-factory-code
     url: https://github.com/InverterNetwork/test-factory-code
     base_branch: main
+    issue_tracker:
+      linear:
+        team: itry
     quay:
       package_manager: bun
       install_cmd: "bun install"
