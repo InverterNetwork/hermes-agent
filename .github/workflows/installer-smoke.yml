@@ -557,8 +557,8 @@ jobs:
       - name: --verify post-install (catch regressions in verify itself)
         # Running `--verify` against the rendered install catches drift in
         # the verify path before it ships. Without this gate, regressions
-        # like positional parsing of `systemctl show` (PR #46) only surface
-        # on-host, post-merge.
+        # like positional parsing of `systemctl show` only surface on-host,
+        # post-merge.
         #
         # Three drifts are tolerated and asserted-to-exist as the expected
         # CI envelope:
@@ -566,14 +566,14 @@ jobs:
         #     group/world-writable; CI-only fixture artefact.
         #   * state origin — CI fakes the state repo as a filesystem path;
         #     real installs clone github.com.
-        #   * quay binary version — AST-81: quay's binary embeds
-        #     package.json's `0.1.0` instead of the `v0.1.3` git tag pinned
-        #     in deploy.values.yaml. Tolerated until quay bumps package.json.
+        #   * quay binary version — quay's binary embeds package.json's
+        #     `0.1.0` instead of the `v0.1.3` git tag pinned in
+        #     deploy.values.yaml. Tolerated until quay bumps package.json.
         #
         # Anything outside that envelope is a regression and fails the gate.
         # The closing sanity loop also fails if any known label disappears
-        # from output (e.g. AST-81 fixed upstream) so the filter doesn't
-        # rot into a silent pass-through.
+        # from output (e.g. quay's binary self-reports the pinned version)
+        # so the filter doesn't rot into a silent pass-through.
         run: |
           set -euo pipefail
           sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh --verify \
