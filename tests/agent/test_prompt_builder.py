@@ -1131,7 +1131,8 @@ class TestLoadGatewayOrgDefaults:
         )
         result = self._load(monkeypatch, tmp_path)
         assert result is not None
-        assert "ignore previous instructions" not in result.lower() or "WARNING" in result
+        assert "BLOCKED" in result
+        assert "prompt_injection" in result
 
 
 # =========================================================================

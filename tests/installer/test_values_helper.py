@@ -1010,10 +1010,37 @@ class TestRenderGatewayOrgDefaults:
         assert r.returncode == 1
         assert "linear.team is required" in r.stderr
 
+    def test_render_rejects_invalid_repo_id(self, tmp_path: Path):
+        # validate-schema is gated on --verify; the render path must
+        # enforce id/url shape itself so a typo can't reach the seed.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: bad/slash\n"
+            "    url: https://github.com/example/foo\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 1
+        assert "bad/slash" in r.stderr
+
+    def test_render_rejects_invalid_repo_url(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha.git\n"
+            "    base_branch: main\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-org-defaults.md"
+        r = _run(values, "render-gateway-org-defaults", "--out", str(out))
+        assert r.returncode == 1
+        assert ".git" in r.stderr
+
     def test_validate_schema_also_catches_unknown_team(self, tmp_path: Path):
-        # validate-schema is called from `setup-hermes.sh --verify`; the
-        # cross-reference check must live there too, not only in the
-        # render path.
         values = tmp_path / "values.yaml"
         values.write_text(
             "linear:\n"

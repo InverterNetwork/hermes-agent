@@ -1034,14 +1034,25 @@ def cmd_render_gateway_org_defaults(args: argparse.Namespace) -> int:
         if not isinstance(entry, dict):
             sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
             return 1
-        repo_id = entry.get("id")
-        base_branch = entry.get("base_branch")
-        if not repo_id or not base_branch:
-            # cmd_validate_schema is the contract; refuse to emit a partial seed.
+        # Inline schema enforcement: setup-hermes.sh runs validate-schema
+        # only behind --verify, so the render must not assume it.
+        for field in ("id", "url", "base_branch"):
+            if not entry.get(field):
+                sys.stderr.write(
+                    f"values_helper.py: repos[{i}].{field} is required\n"
+                )
+                return 1
+        repo_id = str(entry["id"])
+        base_branch = str(entry["base_branch"])
+        if not _REPO_ID_RE.match(repo_id):
             sys.stderr.write(
-                f"values_helper.py: repos[{i}] missing id/base_branch "
-                f"(run validate-schema for the precise error)\n"
+                f"values_helper.py: repos[{i}].id={repo_id!r} must match "
+                f"{_REPO_ID_RE.pattern}\n"
             )
+            return 1
+        url_err = _validate_repo_url(str(entry["url"]), i)
+        if url_err:
+            sys.stderr.write(f"values_helper.py: {url_err}\n")
             return 1
         tracker, it_err = _validate_repo_issue_tracker_block(
             f"repos[{i}].issue_tracker",
