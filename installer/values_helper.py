@@ -30,6 +30,20 @@ Subcommands:
                                   the provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
+  render-gateway-org-defaults --out <path>
+                                — write a compact org-defaults seed file
+                                  derived from `repos[]` + `linear.teams`.
+                                  Loaded by the gateway agent's prompt
+                                  builder into the cached system prompt
+                                  (one block at session start, prefix-
+                                  cacheable). Tells the agent where the
+                                  code mirrors live and which Linear team
+                                  owns each repo. Always rewritten — the
+                                  file is a reflection of values.yaml.
+                                  Empty `repos[]` writes an empty file
+                                  (prompt-builder treats empty as "no
+                                  seed") so install-time chown/chmod
+                                  doesn't race the helper.
   list-repos                   — emit one TSV line per repos[] entry
                                   (id, url, base_branch, package_manager,
                                   install_cmd) for setup-hermes.sh to iterate.
@@ -764,6 +778,57 @@ def _validate_repo_tags_block(
     return dict(sorted(out.items())), None
 
 
+def _validate_repo_issue_tracker_block(
+    label: str, block: Any, valid_team_keys: set[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate a per-repo ``issue_tracker:`` sub-block.
+
+    Shape today supports one adapter — Linear:
+
+        issue_tracker:
+          linear:
+            team: itry        # must match a key in linear.teams.*
+
+    Returns ``(parsed, None)`` on success, ``(None, error)`` on failure,
+    or ``(None, None)`` when the block is absent. The ``team`` value is
+    cross-checked against ``valid_team_keys`` so a typo fails install-time
+    rather than runtime (when the agent reaches for a missing
+    ``LINEAR_TEAM_<KEY>`` env var).
+    """
+    if block is None:
+        return None, None
+    if not isinstance(block, dict):
+        return None, f"{label} must be a mapping"
+    unknown = set(block.keys()) - {"linear"}
+    if unknown:
+        return None, (
+            f"{label}: unknown adapter(s) {sorted(unknown)!r} "
+            f"(supported: linear)"
+        )
+    linear = block.get("linear")
+    if linear is None:
+        return None, (
+            f"{label}.linear is required when `issue_tracker:` is present"
+        )
+    if not isinstance(linear, dict):
+        return None, f"{label}.linear must be a mapping"
+    unknown = set(linear.keys()) - {"team"}
+    if unknown:
+        return None, (
+            f"{label}.linear: unknown key(s) {sorted(unknown)!r} "
+            f"(supported: team)"
+        )
+    team = linear.get("team")
+    if not isinstance(team, str) or not team:
+        return None, f"{label}.linear.team is required (non-empty string)"
+    if team not in valid_team_keys:
+        return None, (
+            f"{label}.linear.team={team!r} does not match any key in "
+            f"linear.teams (known: {sorted(valid_team_keys)!r})"
+        )
+    return {"linear": {"team": team}}, None
+
+
 def _validate_tag_namespaces_block(
     block: Any,
 ) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
@@ -928,6 +993,99 @@ def cmd_get_deployment_tags(args: argparse.Namespace) -> int:
     return 0
 
 
+def _collect_linear_team_keys(data: dict) -> tuple[set[str] | None, str | None]:
+    """Return ``linear.teams`` keys (empty set if absent), or an error string."""
+    teams = (data.get("linear") or {}).get("teams")
+    if teams is None:
+        return set(), None
+    if not isinstance(teams, dict):
+        return None, "linear.teams must be a mapping"
+    return {str(k) for k in teams.keys()}, None
+
+
+def cmd_render_gateway_org_defaults(args: argparse.Namespace) -> int:
+    """Write the gateway agent's org-defaults seed file from values.yaml.
+
+    Emits one compact paragraph the gateway's prompt builder loads into
+    the cached system prompt: code-mirror location + per-repo Linear
+    team mapping. Always rewritten. Empty ``repos[]`` writes an empty
+    file (prompt-builder treats empty as "no seed") so setup-hermes.sh
+    can chown/chmod the path without racing the helper.
+    """
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+
+    entries = _iter_repos(data)
+    valid_team_keys, team_err = _collect_linear_team_keys(data)
+    if team_err is not None:
+        sys.stderr.write(f"values_helper.py: {team_err}\n")
+        return 1
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not entries:
+        out_path.write_text("", encoding="utf-8")
+        sys.stdout.write(f"wrote: {out_path}\n")
+        return 0
+
+    repo_lines: list[str] = []
+    any_linear = False
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
+            return 1
+        # Inline schema enforcement: setup-hermes.sh runs validate-schema
+        # only behind --verify, so the render must not assume it.
+        for field in ("id", "url", "base_branch"):
+            if not entry.get(field):
+                sys.stderr.write(
+                    f"values_helper.py: repos[{i}].{field} is required\n"
+                )
+                return 1
+        repo_id = str(entry["id"])
+        base_branch = str(entry["base_branch"])
+        if not _REPO_ID_RE.match(repo_id):
+            sys.stderr.write(
+                f"values_helper.py: repos[{i}].id={repo_id!r} must match "
+                f"{_REPO_ID_RE.pattern}\n"
+            )
+            return 1
+        url_err = _validate_repo_url(str(entry["url"]), i)
+        if url_err:
+            sys.stderr.write(f"values_helper.py: {url_err}\n")
+            return 1
+        tracker, it_err = _validate_repo_issue_tracker_block(
+            f"repos[{i}].issue_tracker",
+            entry.get("issue_tracker"),
+            valid_team_keys,
+        )
+        if it_err is not None:
+            sys.stderr.write(f"values_helper.py: {it_err}\n")
+            return 1
+        if tracker is not None:
+            any_linear = True
+            team = tracker["linear"]["team"]
+            repo_lines.append(f"{repo_id}({base_branch}, Linear:{team})")
+        else:
+            repo_lines.append(f"{repo_id}({base_branch})")
+
+    parts: list[str] = [
+        "Org defaults (this deployment): "
+        "code mirrors live at ~/.hermes/code/<repo>/ (~5min refresh) — "
+        "read from those paths, never `git clone` and never `/tmp`.",
+    ]
+    if any_linear:
+        parts.append(
+            "Issue tracking is Linear via the `inverter-linear` skill, "
+            "never `gh issue`."
+        )
+    parts.append("Repos: " + ", ".join(repo_lines) + ".")
+
+    out_path.write_text(" ".join(parts) + "\n", encoding="utf-8")
+    sys.stdout.write(f"wrote: {out_path}\n")
+    return 0
+
+
 def cmd_validate_schema(args: argparse.Namespace) -> int:
     # Single source of truth for the repos[] schema check, called from
     # setup-hermes.sh's verify path so the legacy-key migration message
@@ -935,6 +1093,10 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
     # errors that would otherwise only fire at install time.
     data = _load(Path(args.values))
     entries = _iter_repos(data)
+    valid_team_keys, team_err = _collect_linear_team_keys(data)
+    if team_err is not None:
+        sys.stderr.write(f"values_helper.py: {team_err}\n")
+        return 1
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
             sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
@@ -975,6 +1137,14 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
             if tags_err is not None:
                 sys.stderr.write(f"values_helper.py: {tags_err}\n")
                 return 1
+        _, it_err = _validate_repo_issue_tracker_block(
+            f"repos[{i}].issue_tracker",
+            entry.get("issue_tracker"),
+            valid_team_keys,
+        )
+        if it_err is not None:
+            sys.stderr.write(f"values_helper.py: {it_err}\n")
+            return 1
 
     quay_top = data.get("quay")
     if isinstance(quay_top, dict):
@@ -1084,6 +1254,13 @@ def main(argv: list[str] | None = None) -> int:
     p_quay.add_argument("--force", action="store_true",
                         help="overwrite an existing file")
     p_quay.set_defaults(func=cmd_render_quay_config)
+
+    p_org_defaults = sub.add_parser(
+        "render-gateway-org-defaults",
+        help="write <HERMES_HOME>/gateway-org-defaults.md from repos[] + linear.teams",
+    )
+    p_org_defaults.add_argument("--out", required=True, help="output md path")
+    p_org_defaults.set_defaults(func=cmd_render_gateway_org_defaults)
 
     p_list = sub.add_parser("list-repos",
                             help="emit TSV rows for repos[] entries")
