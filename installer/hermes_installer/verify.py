@@ -947,21 +947,29 @@ def _check_systemd(s: _State) -> None:
         timers.append("quay-tick.timer")
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
-        # the binary returns them newline-separated in request order, so
-        # one subprocess replaces three.
+        # systemctl emits properties in its own (alphabetical) order, not
+        # the `-p` flag order, so we parse `KEY=VALUE` lines and look up
+        # by key rather than relying on positional output. (`--value`
+        # would drop the keys and reintroduce the ordering bug.)
         rc, show_out, _ = _run(
             [
                 "systemctl", "show",
                 "-p", "ActiveState",
                 "-p", "LoadState",
                 "-p", "UnitFileState",
-                "--value", u,
+                u,
             ],
             timeout=10,
         )
-        lines = show_out.splitlines() if rc == 0 else []
-        lines += [""] * (3 - len(lines))
-        active, load, unitfile = lines[0].strip(), lines[1].strip(), lines[2].strip()
+        props: dict[str, str] = {}
+        if rc == 0:
+            for line in show_out.splitlines():
+                key, sep, value = line.partition("=")
+                if sep:
+                    props[key.strip()] = value.strip()
+        active = props.get("ActiveState", "")
+        load = props.get("LoadState", "")
+        unitfile = props.get("UnitFileState", "")
         if active == "active" and load == "loaded" and unitfile == "enabled":
             s.v_ok(f"{u}: active loaded enabled")
         else:
