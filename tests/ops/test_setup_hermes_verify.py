@@ -1,8 +1,12 @@
-"""End-to-end behavior of `setup-hermes.sh --verify` against a tmp install.
+"""Behavior of `hermes_installer.verify` against a tmp install.
 
 The verify path is a read-only health check, so the cheapest meaningful
 coverage is to build a fixture that mirrors a clean install on disk and
 assert each drift case yields a named [DRIFT] subject + non-zero exit.
+
+These tests call ``hermes_installer.verify.run()`` directly. One smoke test
+per class also exercises the ``setup-hermes.sh --verify`` wrapper to prove
+it still forwards correctly.
 
 Production verify expects rails owned by root and state owned by the agent
 user. Tests can't actually chown to root, so the script honors two internal
@@ -15,17 +19,29 @@ from __future__ import annotations
 
 import getpass
 import grp
+import io
 import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "installer" / "setup-hermes.sh"
+INSTALLER_DIR = REPO_ROOT / "installer"
+
+# Make hermes_installer importable for the in-process call path. The bash
+# wrapper sets PYTHONPATH itself; here we mutate sys.path once per session.
+if str(INSTALLER_DIR) not in sys.path:
+    sys.path.insert(0, str(INSTALLER_DIR))
+
+from hermes_installer.verify import VerifyArgs, run as run_verify  # noqa: E402
 
 
 def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -163,20 +179,76 @@ def install(tmp_path: Path) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Helpers: scoped env + direct-call + bash-wrapper invokers
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _scoped_env(updates: dict[str, str]) -> Iterator[None]:
+    """Snapshot/restore os.environ for the duration of a verify run."""
+    saved = os.environ.copy()
+    try:
+        os.environ.update(updates)
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def _base_env(install: dict, env_overrides: dict[str, str] | None = None) -> dict[str, str]:
+    env = {
+        "PATH": f"{install['bin']}{os.pathsep}{os.environ.get('PATH', '')}",
+        "HERMES_VERIFY_EXPECT_RAILS_OWNER": install["user"],
+        "HERMES_VERIFY_EXPECT_AGENT_OWNER": install["user"],
+        "HERMES_VERIFY_EXPECT_AGENT_GROUP": install["group"],
+    }
+    if env_overrides:
+        env.update(env_overrides)
+    return env
+
+
 def _run_verify(
+    install: dict,
+    *,
+    auth_method: str = "none",
+    quiet: bool = False,
+    values: Path | None = None,
+    gh_api_base: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    """Direct call into hermes_installer.verify.run() against the fixture.
+
+    Returns a (returncode, stdout, stderr) bag with the same attribute names
+    as subprocess.CompletedProcess so existing assertions stay readable.
+    """
+    out = io.StringIO()
+    err = io.StringIO()
+    with _scoped_env(_base_env(install, env_overrides)):
+        rc = run_verify(
+            VerifyArgs(
+                fork=install["fork"],
+                target=install["target"],
+                user=install["user"],
+                auth_method=auth_method,
+                quiet=quiet,
+                values=values,
+                gh_api_base=gh_api_base,
+            ),
+            stdout=out, stderr=err,
+        )
+    return SimpleNamespace(returncode=rc, stdout=out.getvalue(), stderr=err.getvalue())
+
+
+def _run_verify_via_wrapper(
     install: dict,
     *extra: str,
     env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
+    """Smoke path — go through bash setup-hermes.sh --verify so we keep
+    coverage of the wrapper's argv forwarding."""
     env = os.environ.copy()
-    env["PATH"] = f"{install['bin']}{os.pathsep}{env['PATH']}"
-    # Test fixture can't chown to root, so tell verify to expect $USER on both
-    # sides. The check logic still runs end-to-end.
-    env["HERMES_VERIFY_EXPECT_RAILS_OWNER"] = install["user"]
-    env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
-    env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
-    if env_overrides:
-        env.update(env_overrides)
+    env.update(_base_env(install, env_overrides))
     return subprocess.run(
         [
             "bash", str(SCRIPT),
@@ -217,8 +289,18 @@ class TestSetupHermesVerify:
         assert "0 drift" in result.stdout
         assert "[DRIFT]" not in result.stderr
 
+    def test_clean_install_passes_via_bash_wrapper(self, install):
+        """End-to-end smoke through setup-hermes.sh --verify so we catch
+        regressions in the bash-side argv forwarding (PYTHONPATH, flag
+        translation, exec)."""
+        result = _run_verify_via_wrapper(install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "==> verify:" in result.stdout
+        assert "0 drift" in result.stdout
+        assert "[DRIFT]" not in result.stderr
+
     def test_quiet_suppresses_ok_lines(self, install):
-        result = _run_verify(install, "--quiet")
+        result = _run_verify(install, quiet=True)
         assert result.returncode == 0, result.stderr
         assert "[OK]" not in result.stdout
         assert "verify:" in result.stdout  # closing summary still prints
@@ -339,7 +421,7 @@ class TestSetupHermesVerify:
         _git(install["state"], "config",
              "credential.https://github.com.helper", helper_cmd)
 
-        result = _run_verify(install, "--auth-method", "app")
+        result = _run_verify(install, auth_method="app")
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "token helper check passes" in result.stdout
         assert "state credential helper configured" in result.stdout
@@ -353,7 +435,7 @@ class TestSetupHermesVerify:
         (auth / "github-app.pem").write_text("-----BEGIN RSA PRIVATE KEY-----\n")
         (auth / "github-app.pem").chmod(0o640)
         # No credential helper configured on the state repo → drift.
-        result = _run_verify(install, "--auth-method", "app")
+        result = _run_verify(install, auth_method="app")
         assert result.returncode == 1
         assert "[DRIFT] state credential helper" in result.stderr
 
@@ -380,7 +462,7 @@ class TestSetupHermesVerify:
         )
         helper.chmod(0o755)
 
-        result = _run_verify(install, "--auth-method", "app")
+        result = _run_verify(install, auth_method="app")
         assert result.returncode == 1
         assert "[DRIFT] token helper check" in result.stderr
 
@@ -394,7 +476,7 @@ class TestSetupHermesVerify:
         present.
         """
         # No auth/ on the fixture, but pass --auth-method app.
-        result = _run_verify(install, "--auth-method", "app")
+        result = _run_verify(install, auth_method="app")
         assert result.returncode == 1
         # Auth dir, both required files, and credential helper each fire
         # their own [DRIFT] line. The token helper smoke runs against the
@@ -426,7 +508,7 @@ class TestSetupHermesVerify:
         _git(install["state"], "config",
              "credential.https://github.com.helper", helper_cmd)
 
-        result = _run_verify(install, "--auth-method", "app")
+        result = _run_verify(install, auth_method="app")
         assert result.returncode == 1
         assert "[DRIFT] auth file github-app.pem" in result.stderr
 
@@ -437,7 +519,7 @@ class TestSetupHermesVerify:
         # Replace the systemctl stub with one that reports the timer
         # inactive but still loaded+enabled. Substring matching used to let
         # this state through ("inactive" contains "active") — exact-equality
-        # parsing in the script now catches it.
+        # parsing now catches it.
         systemctl = install["bin"] / "systemctl"
         systemctl.write_text(
             "#!/usr/bin/env bash\n"
@@ -698,17 +780,26 @@ def quay_install(install: dict) -> dict:
     return install
 
 
-def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
+def _quay_env(install: dict) -> dict[str, str]:
+    return {
+        "HERMES_VERIFY_QUAY_BIN": str(install["quay_bin"]),
+        "HERMES_VERIFY_QUAY_WRAPPER": str(install["quay_wrapper"]),
+        "HERMES_VERIFY_QUAY_RUNNER": str(install["quay_runner"]),
+        "HERMES_VERIFY_QUAY_PROFILE": str(install["quay_profile"]),
+        "HERMES_VERIFY_RUNTIME_DIR": str(install["bin"]),
+    }
+
+
+def _run_verify_quay(install: dict, *, env_overrides: dict[str, str] | None = None) -> SimpleNamespace:
+    overrides = _quay_env(install)
+    if env_overrides:
+        overrides.update(env_overrides)
+    return _run_verify(install, values=install["values_file"], env_overrides=overrides)
+
+
+def _run_verify_quay_via_wrapper(install: dict) -> subprocess.CompletedProcess:
     env = os.environ.copy()
-    env["PATH"] = f"{install['bin']}{os.pathsep}{env['PATH']}"
-    env["HERMES_VERIFY_EXPECT_RAILS_OWNER"] = install["user"]
-    env["HERMES_VERIFY_EXPECT_AGENT_OWNER"] = install["user"]
-    env["HERMES_VERIFY_EXPECT_AGENT_GROUP"] = install["group"]
-    env["HERMES_VERIFY_QUAY_BIN"] = str(install["quay_bin"])
-    env["HERMES_VERIFY_QUAY_WRAPPER"] = str(install["quay_wrapper"])
-    env["HERMES_VERIFY_QUAY_RUNNER"] = str(install["quay_runner"])
-    env["HERMES_VERIFY_QUAY_PROFILE"] = str(install["quay_profile"])
-    env["HERMES_VERIFY_RUNTIME_DIR"] = str(install["bin"])
+    env.update(_base_env(install, _quay_env(install)))
     return subprocess.run(
         [
             "bash", str(SCRIPT),
@@ -717,7 +808,6 @@ def _run_verify_quay(install: dict, *extra: str) -> subprocess.CompletedProcess:
             "--fork", str(install["fork"]),
             "--user", install["user"],
             "--values", str(install["values_file"]),
-            *extra,
         ],
         env=env, check=False, capture_output=True, text=True,
     )
@@ -736,6 +826,14 @@ class TestSetupHermesVerifyQuay:
         assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
         assert "[OK] quay-as-hermes wrapper:" in result.stdout
         assert "[OK] quay profile.d drop-in:" in result.stdout
+
+    def test_clean_quay_install_passes_via_bash_wrapper(self, quay_install):
+        """Smoke through bash setup-hermes.sh --verify with the values flag
+        wired through, so wrapper-side argv forwarding stays covered for the
+        quay codepath too."""
+        result = _run_verify_quay_via_wrapper(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] quay binary:" in result.stdout
 
     def test_missing_quay_wrapper_is_drift(self, quay_install):
         quay_install["quay_wrapper"].unlink()
