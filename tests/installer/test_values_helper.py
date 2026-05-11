@@ -537,6 +537,19 @@ class TestRenderQuayConfig:
         assert "# stale" not in text
         assert "agent_invocation" in text
 
+    def test_header_advertises_every_run_reconciliation(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        # The header is the only operator-visible cue that this file is
+        # configs-as-code. Pin it so a future edit that softens the wording
+        # (e.g., back to "preserve this file") trips the test.
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "on every run" in text
+        assert "reconciled away" in text
+
     def test_quote_in_agent_invocation_is_escaped(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(

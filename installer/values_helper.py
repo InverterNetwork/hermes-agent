@@ -475,13 +475,13 @@ def _toml_basic_string(s: str) -> str:
 
 
 def cmd_render_quay_config(args: argparse.Namespace) -> int:
-    """Seed <target>/quay/config.toml from the quay.* block.
+    """Render <target>/quay/config.toml from the quay.* block.
 
-    Idempotent: refuses to overwrite an existing file unless --force is passed,
-    so operator hand-edits to the live config survive subsequent installer
-    runs (matches render-runtime-config). Always creates a file when the
-    inputs validate, so setup-hermes.sh can chown/chmod the path without
-    racing the helper.
+    Refuses to overwrite an existing file unless --force is passed. The
+    installer always passes --force so deploy.values.yaml stays the source of
+    truth — every key written here is configs-as-code, with no operator-edit
+    domain in the file. Always creates a file when inputs validate, so
+    setup-hermes.sh can chown/chmod the path without racing the helper.
 
     Deliberately omitted from the rendered TOML:
       * data_dir   — set via QUAY_DATA_DIR in the systemd unit env, so the
@@ -516,11 +516,11 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         return 1
 
     lines = [
-        "# Seeded by setup-hermes.sh from deploy.values.yaml on first install.",
-        "# Subsequent installer runs preserve this file — edit freely.",
+        "# Rendered by setup-hermes.sh from deploy.values.yaml on every run.",
+        "# Edit deploy.values.yaml — local edits here are reconciled away.",
         "#",
         "# data_dir comes from QUAY_DATA_DIR set in the systemd unit; repos_root",
-        "# defaults to ${data_dir}/repos. Set them here only to override.",
+        "# defaults to ${data_dir}/repos.",
         "",
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
     ]
