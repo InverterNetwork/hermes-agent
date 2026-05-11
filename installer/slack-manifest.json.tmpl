@@ -9,20 +9,7 @@
             "display_name": "${slack.app.display_name}",
             "always_online": false
         },
-        "slash_commands": [
-            {
-                "command": "/${slack.app.slash_command_name}",
-                "description": "${slack.app.slash_command_description}",
-                "usage_hint": "[questions]",
-                "should_escape": false
-            },
-            {
-                "command": "/take",
-                "description": "Have the bot pick up a Linear ticket and enqueue autonomous work",
-                "usage_hint": "<BRIX-XXXX>",
-                "should_escape": false
-            }
-        ]
+        "slash_commands": []
     },
     "oauth_config": {
         "scopes": {

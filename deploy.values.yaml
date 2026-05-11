@@ -274,8 +274,6 @@ slack:
     display_name: BabyDidier(dev)
     description: 'Clack clack, I''m cooking ("je cuisine")'
     background_color: "#1b1b8c"
-    slash_command_name: lmdtfy
-    slash_command_description: Let Me Didier That For You
   runtime:
     # Slack member IDs (U…) authorized to talk to the bot. Comma-joined into
     # SLACK_ALLOWED_USERS on every install via auth/gateway-runtime.env, so
