@@ -36,11 +36,22 @@
 # preamble. Permissive on helper failure: missing PEM or transient mint
 # error → exec without $GH_TOKEN and let quay's auth-error surface.
 #
+# Two invocation paths share this preamble:
+#   1. operator path — root or fabian-on-host → drop to __AGENT_USER__ via sudo
+#   2. agent path    — already __AGENT_USER__ (hermes-gateway shelling out
+#                      from agent context) → skip sudo; the agent user is
+#                      intentionally not in sudoers, so `sudo -u self` would
+#                      reject and break agent-driven quay invocations.
+# The cd /, quay.env load, and $GH_TOKEN mint apply identically in both,
+# so the body is held in AGENT_BODY and re-entered via
+# `sh -c "$AGENT_BODY" -- "$@"` either directly or under sudo. AGENT_BODY
+# is single-quoted, so its "$@" stays literal until sh expands it against
+# the script's forwarded argv.
+#
 # __AGENT_USER__ and __TARGET_DIR__ are substituted by setup-hermes.sh
 # at install time, matching the quay-tick.service template pattern.
-exec sudo -u __AGENT_USER__ \
-     env QUAY_DATA_DIR=__TARGET_DIR__/quay HERMES_HOME=__TARGET_DIR__ \
-     sh -c '
+
+AGENT_BODY='
 cd /
 ENV_FILE=__TARGET_DIR__/auth/quay.env
 if [ -r "$ENV_FILE" ]; then
@@ -66,4 +77,14 @@ if [ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
   fi
 fi
 exec /usr/local/bin/quay "$@"
-' -- "$@"
+'
+
+if [ "$(id -un)" = "__AGENT_USER__" ]; then
+  export QUAY_DATA_DIR=__TARGET_DIR__/quay
+  export HERMES_HOME=__TARGET_DIR__
+  exec sh -c "$AGENT_BODY" -- "$@"
+else
+  exec sudo -u __AGENT_USER__ \
+       env QUAY_DATA_DIR=__TARGET_DIR__/quay HERMES_HOME=__TARGET_DIR__ \
+       sh -c "$AGENT_BODY" -- "$@"
+fi
