@@ -182,6 +182,45 @@
 #                                 SLACK_TOKEN is staged by stage-secrets.sh
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
+#
+#   slack_triggers             — list of (channel, entry-skill) bindings that
+#                                 turn top-level Slack messages in a channel
+#                                 into autonomous skill invocations. Schema-
+#                                 validated at install time. Threaded replies
+#                                 never re-trigger (the entry skill MUST post
+#                                 replies threaded on the source message —
+#                                 thread_ts is set → top-level filter rejects).
+#                                 Rendered into config.yaml as slack.triggers,
+#                                 bridged to the Slack adapter's extra.triggers
+#                                 at gateway boot.
+#                                 Each entry:
+#                                   channel_id      Slack channel id (C…/G…)
+#                                   channel_name    optional, comment-only
+#                                   skill           bound entry skill (must
+#                                                   resolve under HERMES_SKILLS_ROOT
+#                                                   at validate time when set)
+#                                   require_top_level
+#                                                   default true; reject
+#                                                   thread replies
+#                                   accept_from_bots
+#                                                   default false; flip true
+#                                                   for webhook bots like
+#                                                   New Relic
+#                                   synthetic_author{name,slack_id}
+#                                                   required iff accept_from_bots
+#                                                   true (quay validate-ticket
+#                                                   needs a non-empty authors[]
+#                                                   for bot-triggered tickets)
+#                                   rate_limit{max_per_hour,on_overflow}
+#                                                   per-channel sliding window;
+#                                                   defaults 30/hr, skip on
+#                                                   overflow; alt: error.
+#                                                   Slack re-delivers anyway;
+#                                                   never queue.
+#                                   default_repo    fallback when the entry
+#                                                   skill can't infer a repo;
+#                                                   the skill's inferred repo
+#                                                   takes precedence.
 
 org:
   name: Inverter
@@ -361,3 +400,21 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
+
+# Channel-trigger router. Each entry binds a Slack channel to an entry
+# skill — top-level messages in that channel autonomously invoke the
+# skill. Threaded replies never re-trigger (require_top_level: true).
+# Populate `channel_id` from the actual Slack channel id (visible in
+# the URL: https://app.slack.com/client/<team>/<channel_id>); the
+# `feedback-intake` skill is shipped in hermes-state.
+slack_triggers: []
+  # Example (uncomment and fill in once the feedback channel id is known):
+  # - channel_id: C0XXXXXXXXX
+  #   channel_name: feedback              # comment-only, for readability
+  #   skill: feedback-intake
+  #   require_top_level: true
+  #   accept_from_bots: false
+  #   rate_limit:
+  #     max_per_hour: 30
+  #     on_overflow: skip
+  #   default_repo: iTRY-monorepo

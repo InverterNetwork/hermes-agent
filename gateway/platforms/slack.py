@@ -36,6 +36,16 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.slack_triggers import (
+    SlackTriggerConfigError,
+    SlackTriggerRouter,
+    STATUS_FAILED,
+    STATUS_FINISHED,
+    STATUS_STARTED,
+    build_envelope,
+    is_bot_message,
+    parse_triggers,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -328,6 +338,28 @@ class SlackAdapter(BasePlatformAdapter):
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+        # Channel-trigger router: top-level messages in pre-bound channels
+        # autonomously invoke a bound entry skill. Built lazily from
+        # config.extra["triggers"] — a malformed block becomes a logged
+        # warning and an empty router (the rest of the platform keeps
+        # working). Bot user id flows in once Slack auth completes.
+        self._trigger_router: Optional[SlackTriggerRouter] = None
+        raw_triggers = self.config.extra.get("triggers") or []
+        if raw_triggers:
+            try:
+                parsed_triggers = parse_triggers(raw_triggers)
+            except SlackTriggerConfigError as exc:
+                logger.error(
+                    "[Slack] slack_triggers config rejected: %s", exc,
+                )
+                parsed_triggers = []
+            if parsed_triggers:
+                self._trigger_router = SlackTriggerRouter(parsed_triggers)
+                logger.info(
+                    "[Slack] slack_triggers active: %s",
+                    ", ".join(t.channel_id for t in parsed_triggers),
+                )
+
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
         if response is None or not hasattr(response, "get"):
@@ -564,6 +596,12 @@ class SlackAdapter(BasePlatformAdapter):
                 # First token sets the primary bot_user_id (backward compat)
                 if self._bot_user_id is None:
                     self._bot_user_id = bot_user_id
+
+                # Trigger router needs the bot user id to short-circuit
+                # any message the gateway itself posted (defense-in-depth
+                # against accept_from_bots: true misconfig).
+                if self._trigger_router is not None:
+                    self._trigger_router.set_bot_user_id(self._bot_user_id)
 
                 logger.info(
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",
@@ -1708,12 +1746,184 @@ class SlackAdapter(BasePlatformAdapter):
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
 
+    async def _resolve_slack_permalink(
+        self, channel_id: str, message_ts: str,
+    ) -> str:
+        """Fetch chat.getPermalink, or return a deterministic fallback URL.
+
+        The fallback (``slack://<channel>/<ts>``) is never user-facing — it
+        only gets stamped into the trigger envelope and surfaces in the
+        Linear ticket if the API call fails. Failing soft keeps the trigger
+        flow live even when the Slack token can't reach Web API briefly.
+        """
+        try:
+            client = self._get_client(channel_id)
+            resp = await client.chat_getPermalink(
+                channel=channel_id, message_ts=message_ts,
+            )
+            if resp and resp.get("ok") and resp.get("permalink"):
+                return str(resp["permalink"])
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Slack] chat.getPermalink failed for %s/%s: %s",
+                channel_id, message_ts, exc,
+            )
+        return f"slack://{channel_id}/{message_ts}"
+
+    async def _maybe_dispatch_slack_trigger(self, event: dict) -> bool:
+        """Route a Slack message through the channel-trigger router.
+
+        Returns ``True`` when the event was consumed (the trigger fired,
+        or was deliberately skipped for trigger-specific reasons like
+        rate-limit, dedup, or bot-gate). Returns ``False`` when the
+        channel isn't trigger-bound — the caller falls through to the
+        normal Slack message path.
+        """
+        router = self._trigger_router
+        if router is None:
+            return False
+        channel_id = event.get("channel") or ""
+        if not channel_id:
+            return False
+        message_ts = event.get("ts") or ""
+        thread_ts = event.get("thread_ts") or None
+        bot_id = event.get("bot_id") or None
+        user_id = event.get("user") or None
+        subtype = event.get("subtype") or None
+
+        trigger, status = router.evaluate(
+            channel_id=channel_id,
+            message_ts=message_ts,
+            thread_ts=thread_ts,
+            bot_id=bot_id,
+            user_id=user_id,
+            subtype=subtype,
+        )
+        if trigger is None and not status:
+            # Channel isn't trigger-bound — fall through to normal flow.
+            return False
+        if trigger is None:
+            # Channel IS trigger-bound but this event is skipped (top-level
+            # filter, bot gate, dedup, rate-limit). Consume so it doesn't
+            # re-enter the normal flow.
+            bound = router.get(channel_id)
+            logger.info(
+                "[Slack][trigger] channel=%s skill=%s ts=%s status=%s",
+                channel_id,
+                bound.skill if bound else "?",
+                message_ts,
+                status,
+            )
+            return True
+
+        # Trigger matched — build envelope and dispatch.
+        message_text = event.get("text") or ""
+        is_bot = is_bot_message(bot_id=bot_id, subtype=subtype)
+
+        if is_bot and trigger.synthetic_author is not None:
+            author_name = trigger.synthetic_author.name
+            author_slack_id = trigger.synthetic_author.slack_id
+            permalink = await self._resolve_slack_permalink(channel_id, message_ts)
+        else:
+            author_slack_id = user_id or ""
+            # User resolution + permalink fetch both hit the Slack Web API
+            # and are independent; run them concurrently to shave the
+            # round-trip latency off every trigger.
+            name_result, permalink = await asyncio.gather(
+                self._resolve_user_name(user_id or "", chat_id=channel_id),
+                self._resolve_slack_permalink(channel_id, message_ts),
+                return_exceptions=True,
+            )
+            if isinstance(name_result, Exception):
+                logger.debug(
+                    "[Slack][trigger] user-name resolution failed: %r", name_result,
+                )
+                author_name = ""
+            else:
+                author_name = name_result or ""
+            if isinstance(permalink, Exception):
+                logger.warning(
+                    "[Slack][trigger] permalink resolution raised: %r", permalink,
+                )
+                permalink = f"slack://{channel_id}/{message_ts}"
+        envelope = build_envelope(
+            trigger=trigger,
+            permalink=permalink,
+            message_ts=message_ts,
+            author_name=author_name or "(unknown)",
+            author_slack_id=author_slack_id or "(unknown)",
+            message_text=message_text,
+        )
+
+        team_id = event.get("team") or event.get("team_id") or ""
+        if team_id and channel_id:
+            self._channel_team[channel_id] = team_id
+
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=trigger.channel_name or channel_id,
+            chat_type="group",
+            user_id=author_slack_id,
+            user_name=author_name or "(unknown)",
+            thread_id=message_ts,  # entry-skill reply threads off the source ts
+        )
+
+        msg_event = MessageEvent(
+            text=envelope,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=event,
+            message_id=message_ts,
+            reply_to_message_id=None,
+            auto_skill=trigger.skill,
+            # Bot-sourced triggers (accept_from_bots: true) bypass the
+            # gateway's per-user authz: the trigger config IS the
+            # authorization for those events. User-sourced triggers still
+            # respect SLACK_ALLOWED_USERS so a leaky public channel can't
+            # auto-file tickets from outside the org.
+            internal=is_bot,
+        )
+
+        t0 = time.monotonic()
+        logger.info(
+            "[Slack][trigger] channel=%s skill=%s ts=%s status=%s",
+            channel_id, trigger.skill, message_ts, STATUS_STARTED,
+        )
+        try:
+            await self.handle_message(msg_event)
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            logger.error(
+                "[Slack][trigger] channel=%s skill=%s ts=%s status=%s "
+                "duration_ms=%d error=%r",
+                channel_id, trigger.skill, message_ts, STATUS_FAILED,
+                duration_ms, exc,
+            )
+            raise
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "[Slack][trigger] channel=%s skill=%s ts=%s status=%s duration_ms=%d",
+            channel_id, trigger.skill, message_ts, STATUS_FINISHED, duration_ms,
+        )
+        return True
+
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
             return
+
+        # Channel-trigger router runs BEFORE the global bot/mention/allowlist
+        # gates: a trigger may opt into bot messages on its own terms, fires
+        # without an @mention, and is the authorization for skill invocation
+        # in the bound channel. When the router takes the event, the
+        # existing flow is short-circuited. When it skips (or the channel
+        # isn't trigger-bound), the existing flow runs unchanged.
+        if self._trigger_router is not None and event.get("channel"):
+            handled = await self._maybe_dispatch_slack_trigger(event)
+            if handled:
+                return
 
         # Bot message filtering (SLACK_ALLOW_BOTS / config allow_bots):
         #   "none"     — ignore all bot messages (default, backward-compatible)

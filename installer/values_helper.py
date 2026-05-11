@@ -283,6 +283,20 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     if isinstance(cp, dict) and cp:
         slack_block["channel_prompts"] = {str(k): str(v) for k, v in cp.items()}
 
+    # slack_triggers is a top-level block in values.yaml (the spec models
+    # it as gateway behavior, not slack.runtime config). The rendered
+    # config.yaml flattens it under slack.triggers so the platform
+    # bridge in gateway/config.py finds it next to the rest of the
+    # slack.* keys.
+    triggers_parsed, st_err = _validate_slack_triggers_block(
+        data.get("slack_triggers"),
+    )
+    if st_err is not None:
+        sys.stderr.write(f"values_helper.py: {st_err}\n")
+        return 1
+    if triggers_parsed:
+        slack_block["triggers"] = triggers_parsed
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Always write a file (even with an empty body) so setup-hermes.sh can
     # rely on the path existing for chown/chmod.
@@ -829,6 +843,163 @@ def _validate_repo_issue_tracker_block(
     return {"linear": {"team": team}}, None
 
 
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{6,}$")
+_SLACK_USER_ID_RE = re.compile(r"^[UBW][A-Z0-9]{6,}$")
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_VALID_ON_OVERFLOW = ("skip", "error")
+
+
+def _validate_slack_triggers_block(
+    block: Any,
+    *,
+    known_skills: set[str] | None = None,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Validate the top-level ``slack_triggers:`` block.
+
+    Shape::
+
+        slack_triggers:
+          - channel_id: C0XXXXXXXXX
+            channel_name: feedback         # optional, comment-only
+            skill: feedback-intake
+            require_top_level: true        # optional, default true
+            accept_from_bots: false        # optional, default false
+            synthetic_author:              # required iff accept_from_bots: true
+              name: New Relic
+              slack_id: BNEWRELIC
+            rate_limit:                    # optional; defaults: 30/hr, skip
+              max_per_hour: 30
+              on_overflow: skip            # skip | error
+            default_repo: iTRY-monorepo    # optional
+
+    Returns ``(parsed, None)`` on success or ``(None, error)`` on failure.
+    A ``None`` / absent block returns ``([], None)``.
+
+    ``known_skills`` is the set of skill names present in the deploy's
+    skills root (see ``_collect_known_skills``). When supplied, an unknown
+    ``skill`` is a hard fail — the install-time guard the spec asks for.
+    When omitted (skills root not available yet), the skill-existence
+    check is skipped with shape-validation only.
+    """
+    label = "slack_triggers"
+    if block is None:
+        return [], None
+    if not isinstance(block, list):
+        return None, f"{label} must be a list"
+    seen_channels: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for i, entry in enumerate(block):
+        item_label = f"{label}[{i}]"
+        if not isinstance(entry, dict):
+            return None, f"{item_label} must be a mapping"
+
+        channel_id = entry.get("channel_id")
+        if not isinstance(channel_id, str) or not _SLACK_CHANNEL_ID_RE.match(channel_id):
+            return None, (
+                f"{item_label}.channel_id must match {_SLACK_CHANNEL_ID_RE.pattern} "
+                f"(uppercase Slack channel id like C0123ABCDEF)"
+            )
+        if channel_id in seen_channels:
+            return None, (
+                f"{item_label}.channel_id={channel_id!r}: already bound by an "
+                f"earlier entry — one entry per channel"
+            )
+        seen_channels.add(channel_id)
+
+        skill = entry.get("skill")
+        if not isinstance(skill, str) or not _SKILL_NAME_RE.match(skill):
+            return None, (
+                f"{item_label}.skill must be a non-empty skill name matching "
+                f"{_SKILL_NAME_RE.pattern}"
+            )
+        if known_skills is not None and skill not in known_skills:
+            return None, (
+                f"{item_label}.skill={skill!r} is not present in the skills "
+                f"directory — typo or skill not yet synced"
+            )
+
+        for bool_field in ("require_top_level", "accept_from_bots"):
+            v = entry.get(bool_field, None)
+            if v is not None and not isinstance(v, bool):
+                return None, f"{item_label}.{bool_field} must be a bool"
+
+        accept_from_bots = bool(entry.get("accept_from_bots", False))
+        synthetic = entry.get("synthetic_author")
+        if accept_from_bots and synthetic is None:
+            return None, (
+                f"{item_label}.synthetic_author is required when "
+                f"accept_from_bots is true (quay validate-ticket needs a "
+                f"non-empty authors[] for bot-triggered tickets)"
+            )
+        if synthetic is not None:
+            if not isinstance(synthetic, dict):
+                return None, f"{item_label}.synthetic_author must be a mapping"
+            sa_name = synthetic.get("name")
+            sa_id = synthetic.get("slack_id")
+            if not isinstance(sa_name, str) or not sa_name.strip():
+                return None, (
+                    f"{item_label}.synthetic_author.name must be a non-empty string"
+                )
+            if not isinstance(sa_id, str) or not _SLACK_USER_ID_RE.match(sa_id):
+                return None, (
+                    f"{item_label}.synthetic_author.slack_id must match "
+                    f"{_SLACK_USER_ID_RE.pattern}"
+                )
+
+        rl_block = entry.get("rate_limit")
+        if rl_block is not None:
+            if not isinstance(rl_block, dict):
+                return None, f"{item_label}.rate_limit must be a mapping when set"
+            mph = rl_block.get("max_per_hour", 30)
+            if not isinstance(mph, int) or isinstance(mph, bool) or mph <= 0:
+                return None, (
+                    f"{item_label}.rate_limit.max_per_hour must be a positive int"
+                )
+            on_overflow = rl_block.get("on_overflow", "skip")
+            if on_overflow not in _VALID_ON_OVERFLOW:
+                return None, (
+                    f"{item_label}.rate_limit.on_overflow must be one of "
+                    f"{list(_VALID_ON_OVERFLOW)!r} (got {on_overflow!r})"
+                )
+
+        default_repo = entry.get("default_repo")
+        if default_repo is not None and (
+            not isinstance(default_repo, str) or not default_repo.strip()
+        ):
+            return None, (
+                f"{item_label}.default_repo must be a non-empty string when set"
+            )
+
+        channel_name = entry.get("channel_name")
+        if channel_name is not None and not isinstance(channel_name, str):
+            return None, f"{item_label}.channel_name must be a string when set"
+
+        out.append(dict(entry))
+    return out, None
+
+
+def _collect_known_skills(skills_root: Path) -> set[str] | None:
+    """Return the set of skill directory names under ``skills_root``.
+
+    A skill is a top-level directory containing ``SKILL.md``. Sub-category
+    layouts (``skills/<category>/<name>/SKILL.md``) are walked, and the
+    skill name is the immediate parent of ``SKILL.md`` — matching the
+    convention used by the gateway's skill loader.
+
+    Returns ``None`` if the root doesn't exist; the caller treats that
+    as "no skill-existence enforcement available" and shape-validates only.
+    """
+    if not skills_root.is_dir():
+        return None
+    names: set[str] = set()
+    for skill_md in skills_root.rglob("SKILL.md"):
+        try:
+            names.add(skill_md.parent.name)
+        except Exception:
+            continue
+    return names
+
+
 def _validate_tag_namespaces_block(
     block: Any,
 ) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
@@ -1152,6 +1323,22 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
         if ns_err is not None:
             sys.stderr.write(f"values_helper.py: {ns_err}\n")
             return 1
+
+    # slack_triggers[] — top-level. `--skills-root` is optional: when set
+    # and the directory exists, an unknown skill is a hard fail (the
+    # install-time guard the spec asks for). When unset or the directory
+    # doesn't exist yet (e.g. first install before skill sync), we
+    # shape-validate only and let the gateway warn on missing skills at
+    # boot.
+    known_skills = None
+    if getattr(args, "skills_root", None):
+        known_skills = _collect_known_skills(Path(args.skills_root))
+    _, st_err = _validate_slack_triggers_block(
+        data.get("slack_triggers"), known_skills=known_skills,
+    )
+    if st_err is not None:
+        sys.stderr.write(f"values_helper.py: {st_err}\n")
+        return 1
     return 0
 
 
@@ -1283,6 +1470,16 @@ def main(argv: list[str] | None = None) -> int:
     p_validate = sub.add_parser(
         "validate-schema",
         help="validate repos[] schema (rejects legacy quay.repos[]); silent on success",
+    )
+    p_validate.add_argument(
+        "--skills-root",
+        default=os.environ.get("HERMES_SKILLS_ROOT"),
+        help=(
+            "directory holding skill subdirs (each with SKILL.md). When set "
+            "and present, slack_triggers[].skill must reference an existing "
+            "skill — unknown skill names fail loud at validate time. Default: "
+            "$HERMES_SKILLS_ROOT or unset (shape-validate only)."
+        ),
     )
     p_validate.set_defaults(func=cmd_validate_schema)
 
