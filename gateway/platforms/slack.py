@@ -342,6 +342,15 @@ class SlackAdapter(BasePlatformAdapter):
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+        # Operator-configured top-level catch-all slash, e.g. `lmdtfy`. Sourced
+        # from SLACK_SLASH_COMMAND_NAME (set by the installer from
+        # slack.app.slash_command_name in deploy.values.yaml). Treated like
+        # `/hermes` in `_handle_slash_command` so the operator's chosen name
+        # routes through the same subcommand-map + free-form question path.
+        # Resolved in connect() (env load happens after process start), but
+        # initialized here so the attribute is always present.
+        self._configured_top_slash: str = ""
+
         # Channel-trigger router: top-level messages in pre-bound channels
         # autonomously invoke a bound entry skill. Built lazily from
         # config.extra["triggers"] — a malformed block becomes a logged
@@ -659,15 +668,16 @@ class SlackAdapter(BasePlatformAdapter):
             #
             # Every gateway command from COMMAND_REGISTRY is a native Slack
             # slash, matching Discord and Telegram's model (e.g. /btw, /stop,
-            # /model work directly without /hermes prefix). Skill-registered
-            # slash commands (discovered from SKILL.md frontmatter) are also
-            # included so e.g. `/take` dispatches to the take skill the same
-            # way `/btw` dispatches to the btw command. A single regex matcher
-            # dispatches all of them to one handler so we don't need N
-            # identical @app.command() decorators — slack_bolt would
-            # otherwise treat unmatched slashes as "Unhandled request" and
-            # never ack, breaching the 3-second Slack deadline and surfacing
-            # "did not respond" to the user.
+            # /model work directly without /hermes prefix). The operator's
+            # configured top-level catch-all slash (slack.app.slash_command_name
+            # in deploy.values.yaml, exposed at runtime via
+            # SLACK_SLASH_COMMAND_NAME — e.g. /lmdtfy) and skill-registered
+            # slash triggers (from SKILL.md frontmatter, e.g. /take) are also
+            # included. A single regex matcher dispatches all of them to one
+            # handler so we don't need N identical @app.command() decorators
+            # — slack_bolt would otherwise treat unmatched slashes as
+            # "Unhandled request" and never ack, breaching the 3-second
+            # Slack deadline and surfacing "did not respond" to the user.
             #
             # The slash commands must ALSO be declared in the Slack app
             # manifest (see `hermes slack manifest`). In Socket Mode, Slack
@@ -684,12 +694,20 @@ class SlackAdapter(BasePlatformAdapter):
             import re as _re
 
             _native_names = [name for name, _d, _h in slack_native_slashes()]
+            self._configured_top_slash = (
+                os.environ.get("SLACK_SLASH_COMMAND_NAME") or ""
+            ).strip().lstrip("/")
+            _configured_top = (
+                [self._configured_top_slash] if self._configured_top_slash else []
+            )
             # Skill-command keys are stored as "/slug"; strip the leading
             # slash so we can build a single "^/(a|b|c)$" pattern.
             _skill_names = sorted(
                 key.lstrip("/") for key in get_skill_commands().keys()
             )
-            _all_names = list(dict.fromkeys(_native_names + _skill_names))
+            _all_names = list(dict.fromkeys(
+                _native_names + _configured_top + _skill_names
+            ))
             if _all_names:
                 _slash_pattern = _re.compile(
                     r"^/(?:" + "|".join(_re.escape(n) for n in _all_names) + r")$"
@@ -2978,10 +2996,17 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
-        if slash_name in ("hermes", ""):
+        configured_top = (self._configured_top_slash or "").lower()
+        if slash_name in ("hermes", "") or (
+            configured_top and slash_name == configured_top
+        ):
             # Legacy /hermes <subcommand> [args] routing + free-form questions.
             # Empty slash_name falls into this branch for backward compat
             # with any caller that didn't populate command["command"].
+            # The operator-configured top-level slash (e.g. /lmdtfy) is an
+            # alias for /hermes — same subcommand-map + free-form semantics
+            # under whatever brand name the operator picked in
+            # deploy.values.yaml.
             from hermes_cli.commands import slack_subcommand_map
             subcommand_map = slack_subcommand_map()
             subcommand_map["compact"] = "/compress"

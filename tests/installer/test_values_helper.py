@@ -303,6 +303,29 @@ class TestRenderGatewayRuntimeEnv:
         assert r.returncode == 1
         assert "linear.teams must be a mapping" in r.stderr
 
+    def test_writes_slack_slash_command_name(self, tmp_path: Path):
+        # slack.app.slash_command_name must be plumbed to the runtime so the
+        # gateway's slash-listener regex recognizes the operator-configured
+        # top-level slash (otherwise slack_bolt drops it as "Unhandled
+        # request" and Slack surfaces "did not respond" to the user).
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  app:\n    slash_command_name: lmdtfy\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "SLACK_SLASH_COMMAND_NAME=lmdtfy" in out.read_text()
+
+    def test_slash_command_name_absent_omits_line(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("slack:\n  app:\n    display_name: Bot\n", encoding="utf-8")
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "SLACK_SLASH_COMMAND_NAME" not in out.read_text()
+
     def test_always_rewrites_existing_file(self, tmp_path: Path):
         # Unlike render-runtime-config, this output is a reflection of
         # values.yaml; operator hand-edits don't survive.

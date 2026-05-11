@@ -115,6 +115,33 @@ class TestSlashCommandSessionIsolation:
         assert event.source.user_id == "U123"
 
     @pytest.mark.asyncio
+    async def test_configured_top_slash_routes_through_hermes_semantics(self, adapter):
+        # The operator's configured top-level catch-all (e.g. /lmdtfy) is an
+        # alias for /hermes — subcommand routing + free-form questions must
+        # behave the same way regardless of the brand name picked in
+        # deploy.values.yaml.
+        adapter._configured_top_slash = "lmdtfy"
+
+        command = {
+            "command": "/lmdtfy",
+            "text": "stop",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        # `/lmdtfy stop` must resolve to /stop (subcommand-map dispatch),
+        # not to a literal `/lmdtfy stop` text — the latter would hit
+        # gateway-run.py's "Unknown command `/lmdtfy`" branch.
+        assert event.text == "/stop", (
+            f"expected /lmdtfy to route through /hermes semantics; got {event.text!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_dm_slash_command_keeps_dm_session_semantics(self, adapter):
         command = {
             "text": "hello",
@@ -254,7 +281,10 @@ class TestAppMentionHandler:
              patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
              patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
              patch("agent.skill_commands.get_skill_commands", return_value=fake_skill_commands), \
-             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch.dict(os.environ, {
+                 "SLACK_APP_TOKEN": "xapp-fake",
+                 "SLACK_SLASH_COMMAND_NAME": "lmdtfy",
+             }), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("asyncio.create_task"):
             asyncio.run(adapter.connect())
@@ -275,6 +305,17 @@ class TestAppMentionHandler:
         assert slash_matcher.match("/multi-word-skill"), (
             "skill slash /multi-word-skill must match the listener regex"
         )
+
+        # Operator-configured top-level slash (SLACK_SLASH_COMMAND_NAME from
+        # deploy.values.yaml) must match too — without this the manifest
+        # registers /lmdtfy but slack_bolt never acks it.
+        assert slash_matcher.match("/lmdtfy"), (
+            "configured top-level slash /lmdtfy must match the listener regex"
+        )
+
+        # Adapter exposes the configured top so _handle_slash_command can
+        # route it through /hermes semantics.
+        assert adapter._configured_top_slash == "lmdtfy"
 
         # Genuinely unknown slashes still don't match.
         assert not slash_matcher.match("/definitely-not-a-skill-or-command")
