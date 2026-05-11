@@ -448,6 +448,125 @@ Generate some audio.
         assert msg is not None
         assert 'file_path="<path>"' in msg
 
+    def test_sender_context_line_emitted_when_both_fields_set(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                "do stuff",
+                sender_name="Fabian Scherer",
+                sender_slack_id="U123ABC",
+                sender_platform="slack",
+            )
+
+        assert msg is not None
+        assert (
+            "[Skill invocation context: triggered by Fabian Scherer "
+            "(slack_id U123ABC) on slack]"
+        ) in msg
+
+    def test_sender_context_line_appears_before_skill_content(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill", body="Body marker line.")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                sender_name="Fabian Scherer",
+                sender_slack_id="U123ABC",
+                sender_platform="slack",
+            )
+
+        assert msg is not None
+        ctx_idx = msg.index("Skill invocation context")
+        body_idx = msg.index("Body marker line.")
+        assert ctx_idx < body_idx
+
+    def test_sender_context_line_omitted_when_both_fields_none(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/test-skill", "do stuff")
+
+        assert msg is not None
+        assert "Skill invocation context" not in msg
+        assert "triggered by None" not in msg
+
+    def test_sender_context_line_with_only_name(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                sender_name="Fabian Scherer",
+                sender_platform="slack",
+            )
+
+        assert msg is not None
+        assert (
+            "[Skill invocation context: triggered by Fabian Scherer on slack]"
+        ) in msg
+        assert "slack_id" not in msg
+
+    def test_sender_context_line_without_platform_falls_back_to_user_id(self, tmp_path):
+        # Without a platform string the id label cannot be specialized,
+        # so the line falls back to the generic `user_id` label rather
+        # than the Slack-specific `slack_id`.
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                sender_name="Fabian Scherer",
+                sender_slack_id="U123ABC",
+            )
+
+        assert msg is not None
+        assert (
+            "[Skill invocation context: triggered by Fabian Scherer (user_id U123ABC)]"
+        ) in msg
+        assert "slack_id" not in msg
+
+    def test_sender_context_line_id_label_tracks_platform(self, tmp_path):
+        # Non-Slack platforms must emit a non-Slack id label so a consumer
+        # cannot silently parse a Discord/Telegram id out of a `slack_id`
+        # token (forward-looking guard for future platform consumers).
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                sender_name="Alice",
+                sender_slack_id="1234567890",
+                sender_platform="discord",
+            )
+
+        assert msg is not None
+        assert (
+            "[Skill invocation context: triggered by Alice "
+            "(discord_id 1234567890) on discord]"
+        ) in msg
+        assert "slack_id" not in msg
+
+    def test_sender_context_line_id_only_pins_shape(self, tmp_path):
+        # source.user_name is Optional[str]; if a Slack invocation arrives
+        # with only a user id (e.g. an app/bot without a display name),
+        # the rendered line still parses cleanly. Pin the shape so the
+        # contract for downstream skills is explicit.
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "test-skill")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(
+                "/test-skill",
+                sender_slack_id="U123ABC",
+                sender_platform="slack",
+            )
+
+        assert msg is not None
+        assert (
+            "[Skill invocation context: triggered by (slack_id U123ABC) on slack]"
+        ) in msg
+
 
 class TestSkillDirectoryHeader:
     """The activation message must expose the absolute skill directory and
