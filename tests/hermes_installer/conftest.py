@@ -1,8 +1,12 @@
 """Shared fixtures for hermes_installer tests.
 
-A "fake bun" is the only runtime we have a recipe for today, so the helpers
-build a zip whose member layout (``bun-linux-x64/bun``) matches the recipe
-in ``installer/hermes_installer/runtimes.py:_RECIPES['bun']``.
+A "fake bun" exercises the zip-archive recipe path; a "fake binary"
+exercises the plain-binary recipe path. The zip's member layout
+(``bun-linux-x64/bun``) matches the recipe in
+``installer/hermes_installer/runtimes.py:_RECIPES['bun']``; the
+plain-binary helper builds a single executable file with no archive
+wrapper — the same shape that a pnpm-style ``pnpm-linux-x64`` release
+asset has.
 """
 
 from __future__ import annotations
@@ -35,6 +39,18 @@ def build_bun_zip(out_dir: Path, version: str) -> tuple[Path, str]:
         zf.writestr(info, body)
     sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
     return zip_path, sha
+
+
+def build_fake_binary(out_dir: Path, name: str, version: str) -> tuple[Path, str]:
+    """Create a fake plain-binary asset (bash script reporting ``--version``)
+    in ``out_dir``. Returns (binary_path, sha256). Mirrors the upstream
+    pnpm-linux-x64 distribution shape: a single executable file, no archive.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = out_dir / name
+    bin_path.write_bytes(fake_bun_script(version).encode())
+    sha = hashlib.sha256(bin_path.read_bytes()).hexdigest()
+    return bin_path, sha
 
 
 @pytest.fixture(autouse=True)

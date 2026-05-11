@@ -5,6 +5,7 @@ Covers:
 * Idempotent re-install — binary at pinned version is a no-op (no fetch).
 * Wrong-version replacement — pinned version mismatch triggers replace.
 * Missing archive member — extracted zip without the recipe member fails loud.
+* Plain-binary recipe — downloads, SHA-verifies, installs without extracting.
 * Atomic install — half-installed binaries don't survive failed extracts.
 * Permission/root failure — require_root() exits when euid != 0.
 """
@@ -24,7 +25,7 @@ from installer.hermes_installer import runtimes
 from installer.hermes_installer.runtimes import ensure_runtime, ensure_runtimes
 from installer.hermes_installer.util import require_root
 
-from tests.hermes_installer.conftest import fake_bun_script
+from tests.hermes_installer.conftest import build_fake_binary, fake_bun_script
 
 
 class TestEnsureRuntime:
@@ -230,6 +231,136 @@ class TestEnsureRuntime:
         monkeypatch.setattr(runtimes.urllib.request, "urlretrieve", _track)
         ensure_runtime(pin, install_path)
         assert called["urlretrieve"], "wrong-mode binary should trigger re-install"
+
+
+class TestBinaryRecipe:
+    """Plain-binary recipes (e.g. pnpm) ship the executable directly — no
+    zip wrapper. The installer must skip the extract step and install the
+    downloaded file as-is, while still SHA-verifying it against the pin."""
+
+    @staticmethod
+    def _register_fake(monkeypatch, name: str, url_template: str) -> None:
+        recipes = dict(runtimes._RECIPES)
+        recipes[name] = runtimes._Recipe(
+            url_template=url_template, archive_kind="binary",
+        )
+        monkeypatch.setattr(runtimes, "_RECIPES", recipes)
+
+    def test_happy_path_installs_executable(
+        self, tmp_path: Path, monkeypatch
+    ):
+        self._register_fake(monkeypatch, "fakepm", "https://example/{version}")
+        src_bin, sha = build_fake_binary(tmp_path / "src", "fakepm", "10.0.0")
+        src_bytes = src_bin.read_bytes()
+
+        def _fake(url, dst):  # noqa: ARG001
+            Path(dst).write_bytes(src_bytes)
+
+        monkeypatch.setattr(runtimes.urllib.request, "urlretrieve", _fake)
+
+        pin = RuntimeManagerPin(
+            name="fakepm", version="10.0.0", linux_x64_sha256=sha
+        )
+        install_path = tmp_path / "bin" / "fakepm"
+        install_path.parent.mkdir()
+        ensure_runtime(pin, install_path)
+
+        assert install_path.is_file()
+        assert install_path.stat().st_mode & stat.S_IXUSR
+        assert (install_path.stat().st_mode & 0o777) == 0o755
+        assert install_path.read_bytes() == src_bytes
+
+    def test_no_extract_step_for_binary(
+        self, tmp_path: Path, monkeypatch
+    ):
+        # An invalid zip would crash the zip-path extractor; binary recipes
+        # must never reach that code, so a non-zip payload installs cleanly.
+        self._register_fake(monkeypatch, "fakepm", "https://example/{version}")
+        src_bin, sha = build_fake_binary(tmp_path / "src", "fakepm", "10.0.0")
+        src_bytes = src_bin.read_bytes()
+        assert not src_bytes.startswith(b"PK"), "test asset must not be a zip"
+
+        def _fake(url, dst):  # noqa: ARG001
+            Path(dst).write_bytes(src_bytes)
+
+        monkeypatch.setattr(runtimes.urllib.request, "urlretrieve", _fake)
+
+        # Sentinel: if anyone reintroduces an unconditional extract, this fires.
+        def _explode(*args, **kwargs):
+            raise AssertionError("zip extract reached on binary recipe")
+
+        monkeypatch.setattr(runtimes.zipfile, "ZipFile", _explode)
+
+        pin = RuntimeManagerPin(
+            name="fakepm", version="10.0.0", linux_x64_sha256=sha
+        )
+        install_path = tmp_path / "bin" / "fakepm"
+        install_path.parent.mkdir()
+        ensure_runtime(pin, install_path)
+        assert install_path.is_file()
+
+    def test_sha_mismatch_refuses(
+        self, tmp_path: Path, monkeypatch, capsys
+    ):
+        self._register_fake(monkeypatch, "fakepm", "https://example/{version}")
+        src_bin, _real_sha = build_fake_binary(
+            tmp_path / "src", "fakepm", "10.0.0"
+        )
+        src_bytes = src_bin.read_bytes()
+
+        def _fake(url, dst):  # noqa: ARG001
+            Path(dst).write_bytes(src_bytes)
+
+        monkeypatch.setattr(runtimes.urllib.request, "urlretrieve", _fake)
+
+        bad_pin = RuntimeManagerPin(
+            name="fakepm", version="10.0.0", linux_x64_sha256="0" * 64
+        )
+        install_path = tmp_path / "bin" / "fakepm"
+        install_path.parent.mkdir()
+        with pytest.raises(SystemExit) as excinfo:
+            ensure_runtime(bad_pin, install_path)
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "SHA256 mismatch" in err
+        assert "expected:" in err and "actual:" in err and "url:" in err
+        assert not install_path.exists(), "no half-install on SHA refusal"
+
+
+class TestRecipeShape:
+    """The recipe data model enforces archive_kind/archive_member coherence
+    at construction time, so a mistyped _RECIPES entry fails loud at import."""
+
+    def test_zip_recipe_requires_archive_member(self):
+        with pytest.raises(ValueError, match="archive_member"):
+            runtimes._Recipe(url_template="https://x/{version}", archive_kind="zip")
+
+    def test_binary_recipe_rejects_archive_member(self):
+        with pytest.raises(ValueError, match="archive_member"):
+            runtimes._Recipe(
+                url_template="https://x/{version}",
+                archive_kind="binary",
+                archive_member="something/else",
+            )
+
+    def test_unknown_archive_kind_rejected_at_construction(self):
+        # A typo like "bniary" must fail at import rather than silently
+        # falling through to a non-zip install path.
+        with pytest.raises(ValueError, match="archive_kind"):
+            runtimes._Recipe(
+                url_template="https://x/{version}",
+                archive_kind="bniary",  # type: ignore[arg-type]
+            )
+
+    def test_unknown_archive_kind_rejected_with_archive_member(self):
+        # Same guard, even when archive_member is set — kind check runs
+        # first so the operator's actionable error is the unknown kind.
+        with pytest.raises(ValueError, match="archive_kind"):
+            runtimes._Recipe(
+                url_template="https://x/{version}",
+                archive_kind="tar",  # type: ignore[arg-type]
+                archive_member="some/path",
+            )
 
 
 class TestEnsureRuntimes:
