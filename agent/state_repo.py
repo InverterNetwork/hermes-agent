@@ -115,47 +115,44 @@ def _format_skill_message(action: str, name: str, session_id: Optional[str],
     return f"skill: {action} {name} (session {sid})"
 
 
-def _validate_skill_rel(rel: str) -> None:
-    """Reject pathspecs that escape skills/ or contain traversal components."""
-    p = Path(rel)
-    if p.is_absolute() or ".." in p.parts:
-        raise StateRepoError(f"invalid skill rel_path: {rel!r}")
-    parts = p.parts
-    if not parts or parts[0] != "skills" or len(parts) < 2:
-        raise StateRepoError(f"invalid skill rel_path: {rel!r}")
+def _validated_skill_pathspec(skill_rel: str) -> str:
+    """Build the state-repo pathspec from a SKILLS_DIR-relative subpath.
+
+    Rejects absolute paths and any traversal components so a misconfigured
+    caller can't ask the helper to stage outside ``skills/``.
+    """
+    p = Path(skill_rel)
+    if not skill_rel or p.is_absolute() or ".." in p.parts:
+        raise StateRepoError(f"invalid skill rel_path: {skill_rel!r}")
+    return f"skills/{p.as_posix()}"
 
 
 def _discover_skill_rel(state: Path, name: str) -> str:
-    """Locate the on-disk (or HEAD-tracked) rel path for a skill.
+    """Find the SKILLS_DIR-relative subpath for a skill, post-delete included.
 
-    Handles both uncategorized (``skills/<name>``) and categorized
-    (``skills/<category>/<name>``) layouts. Prefers the location that
-    exists on disk; falls back to scanning the index so the helper still
-    works after ``_delete_skill`` has removed the directory but before the
-    deletion has been committed. When nothing matches, returns the
-    uncategorized default — matches the pre-existing behaviour for
-    callers that haven't created the skill yet.
+    Falls back to scanning the index so the helper still works after
+    ``_delete_skill`` has removed the directory but before the deletion has
+    been committed.
     """
     skills = state / "skills"
-    direct = skills / name
-    if direct.is_dir():
-        return f"skills/{name}"
+    if (skills / name).is_dir():
+        return name
     if skills.is_dir():
         for child in skills.iterdir():
             if not child.is_dir() or child.name.startswith("."):
                 continue
             if (child / name).is_dir():
-                return f"skills/{child.name}/{name}"
+                return f"{child.name}/{name}"
 
     ls = _git(state, "ls-files", "--", "skills/", check=False)
     for line in (ls.stdout or "").splitlines():
         parts = line.split("/")
         if len(parts) >= 3 and parts[0] == "skills":
             if parts[1] == name:
-                return f"skills/{name}"
+                return name
             if len(parts) >= 4 and parts[2] == name:
-                return f"skills/{parts[1]}/{name}"
-    return f"skills/{name}"
+                return f"{parts[1]}/{name}"
+    return name
 
 
 def _rollback_skill_subtree(state: Path, rel: str) -> None:
@@ -189,11 +186,11 @@ def commit_skill_change(action: str, name: str, *,
                         rel_path: Optional[str] = None) -> Optional[str]:
     """Stage the skill's subtree and commit a skill_manage write.
 
-    ``rel_path`` is the skill directory relative to the state repo root
-    (e.g. ``skills/quay/quay-run`` for a categorized skill,
-    ``skills/foo`` for an uncategorized one). When omitted, the helper
-    locates the directory on disk (or in the index for an already-deleted
-    skill) so older callers and tests that only know ``name`` keep working.
+    ``rel_path`` is the skill directory **relative to ``skills/``** — e.g.
+    ``quay/quay-run`` for a categorized skill, ``foo`` for an uncategorized
+    one. When omitted, the helper locates the directory on disk (or in the
+    index for an already-deleted skill) so older callers and tests that
+    only know ``name`` keep working.
 
     Returns the resulting commit SHA, or ``None`` when there's nothing staged
     (idempotent re-write) or when the install has no state repo. Raises
@@ -210,11 +207,8 @@ def commit_skill_change(action: str, name: str, *,
     msg = _format_skill_message(action, name, sid, inv)
 
     with _GIT_LOCK:
-        if rel_path is None:
-            rel = _discover_skill_rel(state, name)
-        else:
-            rel = rel_path
-        _validate_skill_rel(rel)
+        skill_rel = rel_path if rel_path is not None else _discover_skill_rel(state, name)
+        rel = _validated_skill_pathspec(skill_rel)
 
         try:
             # Stage only this skill's subtree (covers new files, modifications,

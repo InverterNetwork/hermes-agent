@@ -225,7 +225,7 @@ class TestCommitSkillChange:
         (skill_dir / "SKILL.md").write_text("---\nname: quay-run\n---\nbody\n")
 
         sha = state_repo.commit_skill_change(
-            "create", "quay-run", rel_path="skills/quay/quay-run",
+            "create", "quay-run", rel_path="quay/quay-run",
         )
 
         assert sha is not None
@@ -253,12 +253,14 @@ class TestCommitSkillChange:
         message."""
         with pytest.raises(state_repo.StateRepoError, match="invalid skill rel_path"):
             state_repo.commit_skill_change(
-                "patch", "evil", rel_path="memories/some-skill",
+                "patch", "evil", rel_path="../memories/some-skill",
             )
         with pytest.raises(state_repo.StateRepoError, match="invalid skill rel_path"):
             state_repo.commit_skill_change(
-                "patch", "evil", rel_path="skills/../etc",
+                "patch", "evil", rel_path="/absolute/path",
             )
+        with pytest.raises(state_repo.StateRepoError, match="invalid skill rel_path"):
+            state_repo.commit_skill_change("patch", "evil", rel_path="")
 
     def test_rollback_removes_categorized_skill_on_commit_failure(
         self, state_repo_dir, monkeypatch,
@@ -285,7 +287,7 @@ class TestCommitSkillChange:
         monkeypatch.setattr(state_repo, "_git", _commit_fails)
         with pytest.raises(state_repo.StateRepoError):
             state_repo.commit_skill_change(
-                "create", "rb-cat", rel_path="skills/quay/rb-cat",
+                "create", "rb-cat", rel_path="quay/rb-cat",
             )
         assert not skill_dir.exists(), "rollback should have removed the new categorized skill"
 
