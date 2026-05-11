@@ -206,6 +206,79 @@ class TestAppMentionHandler:
                 f"Slack slash regex does not match {expected}"
             )
 
+    def test_slash_regex_matches_skill_triggers(self):
+        """Skill-registered slash commands must match the listener regex.
+
+        Before the fix the pattern was built only from
+        ``slack_native_slashes()`` (COMMAND_REGISTRY), so a SKILL.md named
+        ``take`` produced ``/take`` slashes that slack_bolt treated as
+        "Unhandled request" — no ack, 3-second deadline expired, users
+        saw "did not respond."
+        """
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        registered_commands = []
+
+        mock_app = MagicMock()
+
+        def mock_event(_event_type):
+            def decorator(fn): return fn
+            return decorator
+
+        def mock_command(cmd):
+            def decorator(fn):
+                registered_commands.append(cmd)
+                return fn
+            return decorator
+
+        mock_app.event = mock_event
+        mock_app.command = mock_command
+        mock_app.action = lambda *_a, **_k: (lambda fn: fn)
+        mock_app.client = AsyncMock()
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
+        fake_skill_commands = {
+            "/take": {"name": "take", "description": "d"},
+            "/multi-word-skill": {"name": "multi-word-skill", "description": "d"},
+        }
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch("agent.skill_commands.get_skill_commands", return_value=fake_skill_commands), \
+             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("asyncio.create_task"):
+            asyncio.run(adapter.connect())
+
+        assert len(registered_commands) == 1
+        slash_matcher = registered_commands[0]
+        import re as _re
+        assert isinstance(slash_matcher, _re.Pattern)
+
+        # Native slashes still match.
+        assert slash_matcher.match("/hermes")
+        assert slash_matcher.match("/btw")
+
+        # Skill slashes now match too.
+        assert slash_matcher.match("/take"), (
+            "skill slash /take must match the listener regex"
+        )
+        assert slash_matcher.match("/multi-word-skill"), (
+            "skill slash /multi-word-skill must match the listener regex"
+        )
+
+        # Genuinely unknown slashes still don't match.
+        assert not slash_matcher.match("/definitely-not-a-skill-or-command")
+
 
 class TestSlackConnectCleanup:
     """Regression coverage for failed connect() cleanup."""

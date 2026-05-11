@@ -659,22 +659,40 @@ class SlackAdapter(BasePlatformAdapter):
             #
             # Every gateway command from COMMAND_REGISTRY is a native Slack
             # slash, matching Discord and Telegram's model (e.g. /btw, /stop,
-            # /model work directly without /hermes prefix). A single regex
-            # matcher dispatches all of them to one handler so we don't need
-            # N identical @app.command() decorators.
+            # /model work directly without /hermes prefix). Skill-registered
+            # slash commands (discovered from SKILL.md frontmatter) are also
+            # included so e.g. `/take` dispatches to the take skill the same
+            # way `/btw` dispatches to the btw command. A single regex matcher
+            # dispatches all of them to one handler so we don't need N
+            # identical @app.command() decorators — slack_bolt would
+            # otherwise treat unmatched slashes as "Unhandled request" and
+            # never ack, breaching the 3-second Slack deadline and surfacing
+            # "did not respond" to the user.
             #
             # The slash commands must ALSO be declared in the Slack app
             # manifest (see `hermes slack manifest`). In Socket Mode, Slack
             # routes the command event through the socket regardless of the
             # manifest's request URL, but it will not deliver an event for
             # a slash command the manifest doesn't declare.
+            #
+            # The pattern is compiled once at startup; a skill installed via
+            # hermes-sync after the gateway is running won't match until the
+            # next restart. Same staleness as the rest of the skill-command
+            # cache today.
             from hermes_cli.commands import slack_native_slashes
+            from agent.skill_commands import get_skill_commands
             import re as _re
 
-            _slash_names = [name for name, _d, _h in slack_native_slashes()]
-            if _slash_names:
+            _native_names = [name for name, _d, _h in slack_native_slashes()]
+            # Skill-command keys are stored as "/slug"; strip the leading
+            # slash so we can build a single "^/(a|b|c)$" pattern.
+            _skill_names = sorted(
+                key.lstrip("/") for key in get_skill_commands().keys()
+            )
+            _all_names = list(dict.fromkeys(_native_names + _skill_names))
+            if _all_names:
                 _slash_pattern = _re.compile(
-                    r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
+                    r"^/(?:" + "|".join(_re.escape(n) for n in _all_names) + r")$"
                 )
             else:  # pragma: no cover - registry always non-empty
                 _slash_pattern = _re.compile(r"^/hermes$")
