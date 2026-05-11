@@ -1106,6 +1106,59 @@ class TestStateRepoCommitPropagation:
         assert result["success"] is True
         assert "state_commit_sha" not in result
 
+    def test_categorized_skill_commit_lands_proper_sha(self, tmp_path, monkeypatch):
+        """BRIX-1370 regression: creating a skill under a category must
+        produce a proper ``skill: create`` commit instead of failing with a
+        ``pathspec did not match`` error and silently leaving the on-disk
+        write to be mopped up by ``hermes-sync``."""
+        import subprocess as _sp
+        state = tmp_path / "state"
+        state.mkdir()
+        _sp.run(["git", "init", "--quiet", "-b", "main", str(state)], check=True)
+        for k, v in (("user.email", "t@h.l"), ("user.name", "t")):
+            _sp.run(["git", "-C", str(state), "config", k, v], check=True)
+        skills_root = state / "skills"
+        skills_root.mkdir()
+        (state / "README.md").write_text("seed\n")
+        _sp.run(["git", "-C", str(state), "add", "-A"], check=True)
+        _sp.run(["git", "-C", str(state), "commit", "-m", "seed", "--quiet"], check=True)
+        monkeypatch.setenv("HERMES_STATE_DIR", str(state))
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]):
+            raw = skill_manage(
+                action="create", name="quay-run", category="quay",
+                content=VALID_SKILL_CONTENT,
+            )
+            result = json.loads(raw)
+            assert result["success"] is True, result
+            assert "state_commit_sha" in result
+
+            # Now patch the categorized skill — this is the exact path that
+            # used to fail. The write must commit, not roll back.
+            raw_patch = skill_manage(
+                action="patch", name="quay-run",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the updated thing.",
+            )
+            patch_result = json.loads(raw_patch)
+        assert patch_result["success"] is True, patch_result
+        assert "state_commit_sha" in patch_result
+
+        # The patch commit must land under skills/quay/quay-run, and the
+        # commit message must be a real skill commit (not an auto: state
+        # mop-up).
+        files = _sp.run(
+            ["git", "-C", str(state), "show", "--name-only", "--pretty=", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert "skills/quay/quay-run/SKILL.md" in files.splitlines()
+        msg = _sp.run(
+            ["git", "-C", str(state), "log", "-1", "--pretty=%B"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        assert msg.startswith("skill: patch quay-run (session ")
+
     def test_successful_commit_attaches_sha(self, tmp_path, monkeypatch):
         """When the state repo is configured and the commit lands, the SHA is
         attached to the tool result so downstream consumers (snapshot/replay)

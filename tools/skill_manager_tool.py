@@ -319,6 +319,21 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return SKILLS_DIR / name
 
 
+def _rel_to_skills_dir(skill_dir: Path) -> Optional[str]:
+    """Return ``skill_dir`` as a POSIX path relative to ``SKILLS_DIR``.
+
+    Used to plumb the real on-disk layout (categorized vs flat) into the
+    state-repo commit so the pathspec targets the right subtree. Returns
+    ``None`` when the skill lives outside ``SKILLS_DIR`` (external skill
+    dirs configured via ``skills.external_dirs``) — the state repo only
+    versions the local skills tree, so commits aren't applicable there.
+    """
+    try:
+        return Path(skill_dir).resolve().relative_to(SKILLS_DIR.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
@@ -454,11 +469,13 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    rel_to_skills = str(skill_dir.relative_to(SKILLS_DIR))
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(SKILLS_DIR)),
+        "path": rel_to_skills,
         "skill_md": str(skill_md),
+        "skill_rel_path": rel_to_skills,
     }
     if category:
         result["category"] = category
@@ -507,6 +524,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
         "success": True,
         "message": f"Skill '{name}' updated.",
         "path": str(existing["path"]),
+        "skill_rel_path": _rel_to_skills_dir(existing["path"]),
     }
 
 
@@ -609,6 +627,7 @@ def _patch_skill(
     return {
         "success": True,
         "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
+        "skill_rel_path": _rel_to_skills_dir(skill_dir),
     }
 
 
@@ -656,6 +675,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
 
     skill_dir = existing["path"]
     skills_root = _containing_skills_root(skill_dir)
+    # Capture the rel path before rmtree so the state-repo commit can target
+    # the right subtree even when the skill lived under a category.
+    rel_to_skills = _rel_to_skills_dir(skill_dir)
     shutil.rmtree(skill_dir)
 
     # Clean up empty category directories (don't remove the skills root itself)
@@ -670,6 +692,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     return {
         "success": True,
         "message": message,
+        "skill_rel_path": rel_to_skills,
     }
 
 
@@ -730,6 +753,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
         "success": True,
         "message": f"File '{file_path}' written to skill '{name}'.",
         "path": str(target),
+        "skill_rel_path": _rel_to_skills_dir(existing["path"]),
     }
 
 
@@ -781,6 +805,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     return {
         "success": True,
         "message": f"File '{file_path}' removed from skill '{name}'.",
+        "skill_rel_path": _rel_to_skills_dir(skill_dir),
     }
 
 
@@ -846,9 +871,16 @@ def skill_manage(
         # write didn't record a recoverable state — the helper rolls the
         # disk mutation back to HEAD so a retry sees pre-write state. No-op
         # when the install has no state repo (dev workstations).
+        #
+        # ``skill_rel_path`` is an internal hand-off from the handler to the
+        # state-repo helper (carries the real on-disk layout, including
+        # categorized ``<category>/<name>``). Pop it before the result is
+        # serialized so the LLM-visible JSON stays unchanged.
+        skill_rel = result.pop("skill_rel_path", None)
         try:
             from agent.state_repo import commit_skill_change, StateRepoError
-            sha = commit_skill_change(action, name)
+            commit_rel_path = f"skills/{skill_rel}" if skill_rel else None
+            sha = commit_skill_change(action, name, rel_path=commit_rel_path)
             if sha:
                 result["state_commit_sha"] = sha
         except StateRepoError as state_err:

@@ -213,6 +213,82 @@ class TestCommitSkillChange:
         # The brand-new skill (never in HEAD) must be gone after rollback.
         assert not skill.exists(), "rollback should have removed the new skill"
 
+    def test_commits_categorized_skill_via_rel_path(self, state_repo_dir):
+        """Categorized layout (skills/<category>/<name>) is the failure mode
+        from BRIX-1370: hardcoding ``skills/<name>`` produces a pathspec
+        error and a silent rollback miss. Passing the real rel path through
+        must stage and commit the categorized subtree just like the flat
+        case."""
+        state_repo.set_session_context("sess-cat", 9)
+        skill_dir = state_repo_dir / "skills" / "quay" / "quay-run"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: quay-run\n---\nbody\n")
+
+        sha = state_repo.commit_skill_change(
+            "create", "quay-run", rel_path="skills/quay/quay-run",
+        )
+
+        assert sha is not None
+        msg = _git(state_repo_dir, "log", "-1", "--pretty=%B")
+        assert msg.startswith("skill: create quay-run (session sess-cat, invocation 9)")
+        ls = _git(state_repo_dir, "ls-tree", "-r", "HEAD", "--name-only")
+        assert "skills/quay/quay-run/SKILL.md" in ls.splitlines()
+
+    def test_discovers_categorized_skill_without_rel_path(self, state_repo_dir):
+        """When rel_path is omitted, the helper must locate the categorized
+        directory on disk rather than falling back to ``skills/<name>``."""
+        state_repo.set_session_context("sess-disc", 2)
+        skill_dir = state_repo_dir / "skills" / "quay" / "quay-disc"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: quay-disc\n---\nbody\n")
+
+        sha = state_repo.commit_skill_change("create", "quay-disc")
+        assert sha is not None
+        ls = _git(state_repo_dir, "ls-tree", "-r", "HEAD", "--name-only")
+        assert "skills/quay/quay-disc/SKILL.md" in ls.splitlines()
+
+    def test_rejects_rel_path_outside_skills(self, state_repo_dir):
+        """Pathspec must stay inside skills/ — anything else would let a
+        misconfigured caller commit cron/ or memories/ under a skill
+        message."""
+        with pytest.raises(state_repo.StateRepoError, match="invalid skill rel_path"):
+            state_repo.commit_skill_change(
+                "patch", "evil", rel_path="memories/some-skill",
+            )
+        with pytest.raises(state_repo.StateRepoError, match="invalid skill rel_path"):
+            state_repo.commit_skill_change(
+                "patch", "evil", rel_path="skills/../etc",
+            )
+
+    def test_rollback_removes_categorized_skill_on_commit_failure(
+        self, state_repo_dir, monkeypatch,
+    ):
+        """The pre-fix rollback dialed ``skills/<name>`` and silently
+        missed the real path under a category. With the rel-path plumbing,
+        a failed create under ``skills/<cat>/<name>`` must leave the disk
+        clean."""
+        state_repo.set_session_context("sess-rb-cat", 1)
+        skill_dir = state_repo_dir / "skills" / "quay" / "rb-cat"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: rb-cat\n---\n")
+        assert skill_dir.exists()
+
+        real_git = state_repo._git
+
+        def _commit_fails(state_path, *args, **kwargs):
+            if args and args[0] == "commit":
+                raise subprocess.CalledProcessError(
+                    1, ("git", "commit"), stderr="bad commit",
+                )
+            return real_git(state_path, *args, **kwargs)
+
+        monkeypatch.setattr(state_repo, "_git", _commit_fails)
+        with pytest.raises(state_repo.StateRepoError):
+            state_repo.commit_skill_change(
+                "create", "rb-cat", rel_path="skills/quay/rb-cat",
+            )
+        assert not skill_dir.exists(), "rollback should have removed the new categorized skill"
+
     def test_rollback_restores_modified_skill_on_commit_failure(
         self, state_repo_dir, monkeypatch,
     ):
