@@ -486,8 +486,15 @@ def _check_runtime_version(s: _State) -> None:
 def _check_repos_schema(s: _State) -> None:
     if not (s.values_file.is_file() and s.values_helper.is_file()):
         return
+    # Pass the synced skills tree so `slack_triggers[].skill` is checked
+    # against installed skills, not just shape. Missing directory →
+    # validate-schema shape-validates only (first install before sync).
+    helper_args: list[str] = ["validate-schema"]
+    skills_root = s.args.target / "skills"
+    if skills_root.is_dir():
+        helper_args += ["--skills-root", str(skills_root)]
     rc, out, errout = _values_helper_run(
-        s.values_helper, "validate-schema", values_file=s.values_file,
+        s.values_helper, *helper_args, values_file=s.values_file,
     )
     if rc != 0:
         # Capture both streams so the drift detail names the actual problem.
