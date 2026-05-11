@@ -1,9 +1,17 @@
-"""Pinned-binary install machinery for runtime managers (bun, ...).
+"""Pinned-binary install machinery for runtime managers (bun, pnpm, ...).
 
 Each entry in ``_RECIPES`` knows how to turn a version pin into a download
-URL and where in the extracted archive its executable lives.
-``ensure_runtime`` fetches the upstream zip, verifies the SHA256 against
-the values-file pin, extracts the binary, and atomically installs it
+URL and how to extract the executable from the downloaded asset. Two
+archive kinds are supported:
+
+* ``"zip"`` — upstream ships a zip (bun); ``archive_member`` is the path
+  inside the zip to the executable to install.
+* ``"binary"`` — upstream ships the executable directly (pnpm); the
+  downloaded file IS the install target.
+
+``ensure_runtime`` fetches the upstream asset, verifies the SHA256
+against the values-file pin, extracts the binary (zip path) or uses the
+downloaded file as-is (binary path), and atomically installs it
 root:root 0755 at the target path. Idempotent — a binary already at the
 pinned version is a no-op.
 """
@@ -21,15 +29,34 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .config import RuntimeManagerPin
 from .util import fail, info
 
 
+ArchiveKind = Literal["zip", "binary"]
+
+
 @dataclass(frozen=True)
 class _Recipe:
     url_template: str  # uses {version}; pinned to the linux x86_64 asset
-    archive_member: str  # path inside the zip to the executable to install
+    archive_kind: ArchiveKind = "zip"
+    # Path inside the zip to the executable; required for ``archive_kind="zip"``
+    # and must be ``None`` for ``archive_kind="binary"`` (the downloaded file
+    # IS the install target).
+    archive_member: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.archive_kind == "zip" and not self.archive_member:
+            raise ValueError(
+                "zip recipe requires `archive_member` (path inside the zip)"
+            )
+        if self.archive_kind == "binary" and self.archive_member is not None:
+            raise ValueError(
+                "binary recipe must not set `archive_member` "
+                "(the downloaded file is the install target)"
+            )
 
 
 _RECIPES: dict[str, _Recipe] = {
@@ -80,13 +107,14 @@ def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
 
     with tempfile.TemporaryDirectory(prefix=f"hermes-{pin.name}-") as tmp_str:
         tmp = Path(tmp_str)
-        zip_path = tmp / f"{pin.name}.zip"
+        suffix = ".zip" if recipe.archive_kind == "zip" else ""
+        download_path = tmp / f"{pin.name}{suffix}"
         try:
-            urllib.request.urlretrieve(url, zip_path)
+            urllib.request.urlretrieve(url, download_path)
         except (OSError, urllib.error.URLError) as exc:
             fail(f"download failed for {pin.name} {pin.version} ({url}): {exc}")
 
-        actual_sha = _sha256(zip_path)
+        actual_sha = _sha256(download_path)
         if actual_sha != pin.linux_x64_sha256:
             fail(
                 f"SHA256 mismatch for {pin.name} {pin.version}\n"
@@ -95,24 +123,41 @@ def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
                 f"       url:      {url}"
             )
 
-        extract_dir = tmp / "extract"
-        extract_dir.mkdir()
-        try:
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(extract_dir)
-        except zipfile.BadZipFile as exc:
-            fail(f"{pin.name} {pin.version}: not a valid zip ({exc})")
-
-        member_path = extract_dir / recipe.archive_member
-        if not member_path.is_file():
-            fail(
-                f"{pin.name} {pin.version}: archive member "
-                f"{recipe.archive_member!r} missing after extract"
+        if recipe.archive_kind == "zip":
+            source_path = _extract_zip_member(
+                pin=pin, recipe=recipe, zip_path=download_path, tmp=tmp,
             )
+        else:
+            source_path = download_path
 
-        _atomic_install(member_path, install_path)
+        _atomic_install(source_path, install_path)
 
     info(f"{pin.name} {pin.version} installed at {install_path}")
+
+
+def _extract_zip_member(
+    *,
+    pin: RuntimeManagerPin,
+    recipe: _Recipe,
+    zip_path: Path,
+    tmp: Path,
+) -> Path:
+    extract_dir = tmp / "extract"
+    extract_dir.mkdir()
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile as exc:
+        fail(f"{pin.name} {pin.version}: not a valid zip ({exc})")
+
+    assert recipe.archive_member is not None  # validated in _Recipe.__post_init__
+    member_path = extract_dir / recipe.archive_member
+    if not member_path.is_file():
+        fail(
+            f"{pin.name} {pin.version}: archive member "
+            f"{recipe.archive_member!r} missing after extract"
+        )
+    return member_path
 
 
 def _atomic_install(src: Path, dst: Path) -> None:
