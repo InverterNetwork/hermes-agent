@@ -115,6 +115,26 @@ class TestSlashCommandSessionIsolation:
         assert event.source.user_id == "U123"
 
     @pytest.mark.asyncio
+    async def test_configured_top_slash_routes_through_hermes_semantics(self, adapter):
+        adapter._configured_top_slash = "lmdtfy"
+
+        command = {
+            "command": "/lmdtfy",
+            "text": "stop",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/stop", (
+            f"expected /lmdtfy to route through /hermes semantics; got {event.text!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_dm_slash_command_keeps_dm_session_semantics(self, adapter):
         command = {
             "text": "hello",
@@ -205,6 +225,69 @@ class TestAppMentionHandler:
             assert slash_matcher.match(expected), (
                 f"Slack slash regex does not match {expected}"
             )
+
+    def test_slash_regex_matches_skill_triggers(self):
+        """Skill triggers and the operator-configured top-level must match
+        the slash-listener regex; unknown slashes must not."""
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+
+        registered_commands = []
+
+        mock_app = MagicMock()
+
+        def mock_event(_event_type):
+            def decorator(fn): return fn
+            return decorator
+
+        def mock_command(cmd):
+            def decorator(fn):
+                registered_commands.append(cmd)
+                return fn
+            return decorator
+
+        mock_app.event = mock_event
+        mock_app.command = mock_command
+        mock_app.action = lambda *_a, **_k: (lambda fn: fn)
+        mock_app.client = AsyncMock()
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(return_value={
+            "user_id": "U_BOT",
+            "user": "testbot",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        })
+
+        fake_skill_commands = {
+            "/take": {"name": "take", "description": "d"},
+            "/multi-word-skill": {"name": "multi-word-skill", "description": "d"},
+        }
+
+        with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
+             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch("agent.skill_commands.get_skill_commands", return_value=fake_skill_commands), \
+             patch.dict(os.environ, {
+                 "SLACK_APP_TOKEN": "xapp-fake",
+                 "SLACK_SLASH_COMMAND_NAME": "lmdtfy",
+             }), \
+             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
+             patch("asyncio.create_task"):
+            asyncio.run(adapter.connect())
+
+        assert len(registered_commands) == 1
+        slash_matcher = registered_commands[0]
+        import re as _re
+        assert isinstance(slash_matcher, _re.Pattern)
+
+        assert slash_matcher.match("/hermes")
+        assert slash_matcher.match("/btw")
+        assert slash_matcher.match("/take")
+        assert slash_matcher.match("/multi-word-skill")
+        assert slash_matcher.match("/lmdtfy")
+        assert adapter._configured_top_slash == "lmdtfy"
+        assert not slash_matcher.match("/definitely-not-a-skill-or-command")
 
 
 class TestSlackConnectCleanup:
