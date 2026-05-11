@@ -73,8 +73,13 @@ jobs:
 
       - name: stage fixture repos + patch values for repos[]
         # Real deploys point repos[].url at private GitHub repos. CI has
-        # no credentials for those, so fabricate three local non-bare repos:
+        # no credentials for those, so fabricate four local non-bare repos:
         #   * test-factory-code   — quay-managed (entry has a `quay:` block).
+        #   * brix-indexer        — quay-managed, base_branch: dev (private
+        #                           pnpm-based repo in the real fork; here a
+        #                           local fixture init'd on `dev` directly to
+        #                           exercise the second quay-managed entry +
+        #                           the pnpm plain-binary runtime-manager path).
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
         #                           repos[] loop.
@@ -90,6 +95,7 @@ jobs:
         # only) and clone directly.
         run: |
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
+          BRIX_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-indexer
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
           git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
@@ -101,6 +107,9 @@ jobs:
             git_in "$1" commit -q -m "$2"
           }
           init_fixture "$QUAY_FIXTURE" "init fixture"
+          # brix-indexer real repo lives on `dev`; init the fixture there
+          # directly so the values entry's base_branch=dev resolves cleanly.
+          init_fixture "$BRIX_FIXTURE" "init fixture" dev
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -113,23 +122,27 @@ jobs:
           git_in "$DEV_FIXTURE" add -A
           git_in "$DEV_FIXTURE" commit -q -m "develop commit"
           git_in "$DEV_FIXTURE" checkout -q main
-          # Repoint the existing quay-managed entry's URL at the local
-          # fixture and append the two new code-only entries to repos[].
-          # Use python to round-trip through PyYAML so the structure stays
-          # valid no matter where `quay:` lives relative to `repos:`.
+          # Repoint both quay-managed entries' URLs at their local fixtures
+          # and append the two code-only entries to repos[]. Use python to
+          # round-trip through PyYAML so the structure stays valid no matter
+          # where `quay:` lives relative to `repos:`.
           # The heredoc body is indented to keep the YAML `run: |` block
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$BRIX_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
-          quay_fixture, code_fixture, dev_fixture = sys.argv[1:4]
+          quay_fixture, brix_fixture, code_fixture, dev_fixture = sys.argv[1:5]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
+          rewrite = {
+              "test-factory-code": quay_fixture,
+              "brix-indexer": brix_fixture,
+          }
           for entry in data.get("repos", []):
-              if entry.get("id") == "test-factory-code":
-                  entry["url"] = f"file://{quay_fixture}"
+              if entry.get("id") in rewrite:
+                  entry["url"] = f"file://{rewrite[entry['id']]}"
           data["repos"].append({
               "id": "code-only-fixture",
               "url": f"file://{code_fixture}",
@@ -297,33 +310,45 @@ jobs:
             echo "state preservation: OK"
           '
 
-      - name: runtime manager probes (bun pinned + on PATH for /bin/sh)
-        # repos[].quay.package_manager: bun → installer must drop bun at
-        # /usr/local/bin/bun root:root 0755 with the pinned version, so
-        # quay's `/bin/sh -c install_cmd` (minimal PATH) finds it. The
-        # SHA pin in deploy.values.yaml is the security boundary; this
-        # probe asserts the install-time fetch + verify + extract worked.
+      - name: runtime manager probes (bun + pnpm pinned + on PATH for /bin/sh)
+        # repos[].quay.package_manager → installer must drop each pinned
+        # manager at /usr/local/bin/<name> root:root 0755 so quay's
+        # `/bin/sh -c install_cmd` (minimal PATH) finds it. The SHA pin
+        # in deploy.values.yaml is the security boundary; these probes
+        # assert the install-time fetch + verify + install worked for
+        # both archive kinds (bun: zip recipe; pnpm: plain-binary recipe).
         run: |
           set -euo pipefail
-          [[ -x /usr/local/bin/bun ]] || { echo "FAIL: bun binary missing at /usr/local/bin/bun"; exit 1; }
-          mode=$(stat -c "%a" /usr/local/bin/bun)
-          owner=$(stat -c "%U:%G" /usr/local/bin/bun)
-          [[ "$mode" == "755" ]]          || { echo "FAIL: bun mode=$mode (expected 755)"; exit 1; }
-          [[ "$owner" == "root:root" ]]   || { echo "FAIL: bun owner=$owner (expected root:root)"; exit 1; }
-          # Substring match — same shape as the quay binary version probe;
-          # bun's --version output is just the semver string today, but
-          # absorbing future build suffixes is cheap.
-          pin=$(python3 /srv/hermes/repos/hermes-agent/installer/values_helper.py \
-            --values /srv/hermes/repos/hermes-agent/deploy.values.yaml \
-            get quay.runtime_managers.bun.version)
-          actual=$(/usr/local/bin/bun --version 2>&1 | head -n1)
-          [[ "$actual" == *"$pin"* ]] \
-            || { echo "FAIL: bun --version='$actual' does not contain pin '$pin'"; exit 1; }
-          # /bin/sh -c is what quay's bootstrap uses; assert bun is reachable
-          # there (PATH must contain /usr/local/bin without sourcing a profile).
-          /bin/sh -c 'command -v bun >/dev/null' \
-            || { echo "FAIL: bun not on PATH for /bin/sh -c (quay bootstrap will fail)"; exit 1; }
-          echo "runtime manager probes: OK (bun ${actual})"
+          probe_manager() {  # $1=name
+            local name="$1"
+            [[ -x "/usr/local/bin/$name" ]] \
+              || { echo "FAIL: $name binary missing at /usr/local/bin/$name"; exit 1; }
+            local mode owner pin actual
+            mode=$(stat -c "%a" "/usr/local/bin/$name")
+            owner=$(stat -c "%U:%G" "/usr/local/bin/$name")
+            [[ "$mode" == "755" ]]        || { echo "FAIL: $name mode=$mode (expected 755)"; exit 1; }
+            [[ "$owner" == "root:root" ]] || { echo "FAIL: $name owner=$owner (expected root:root)"; exit 1; }
+            pin=$(python3 /srv/hermes/repos/hermes-agent/installer/values_helper.py \
+              --values /srv/hermes/repos/hermes-agent/deploy.values.yaml \
+              get "quay.runtime_managers.${name}.version")
+            actual=$(/usr/local/bin/"$name" --version 2>&1 | head -n1)
+            # Substring match — absorbs build suffixes the upstream binary
+            # may emit (e.g. `+commit-sha`) without flaking the probe.
+            [[ "$actual" == *"$pin"* ]] \
+              || { echo "FAIL: $name --version='$actual' does not contain pin '$pin'"; exit 1; }
+            # /bin/sh -c is what quay's bootstrap uses; assert the binary
+            # is reachable there (PATH must contain /usr/local/bin without
+            # sourcing a profile).
+            /bin/sh -c "command -v $name >/dev/null" \
+              || { echo "FAIL: $name not on PATH for /bin/sh -c (quay bootstrap will fail)"; exit 1; }
+            echo "runtime manager probe: OK ($name ${actual})"
+          }
+          # bun goes through the zip recipe; pnpm goes through the plain-
+          # binary recipe (pnpm-linux-x64 is a single ELF, not a zip, so
+          # it installs directly without an extract step). Both must land
+          # cleanly here for any quay-managed entry to bootstrap.
+          probe_manager bun
+          probe_manager pnpm
 
       - name: quay artefact probes (binary + bare clone + registration)
         run: |
@@ -333,14 +358,23 @@ jobs:
             T=/home/hermes/.hermes
             [[ -d "$T/quay" ]]                              || { echo "FAIL: quay data dir missing"; exit 1; }
             [[ -f "$T/quay/config.toml" ]]                  || { echo "FAIL: quay config.toml missing"; exit 1; }
-            [[ -d "$T/quay/repos/test-factory-code.git" ]]  || { echo "FAIL: bare clone missing"; exit 1; }
-            origin=$(git -C "$T/quay/repos/test-factory-code.git" remote get-url origin)
-            [[ "$origin" == "file:///srv/hermes/repos/quay-fixtures/test-factory-code" ]] \
-              || { echo "FAIL: bare clone origin=$origin"; exit 1; }
+            for spec in \
+              test-factory-code:/srv/hermes/repos/quay-fixtures/test-factory-code \
+              brix-indexer:/srv/hermes/repos/quay-fixtures/brix-indexer; do
+              id="${spec%%:*}"
+              fixture="${spec#*:}"
+              [[ -d "$T/quay/repos/$id.git" ]] \
+                || { echo "FAIL: bare clone missing for $id"; exit 1; }
+              origin=$(git -C "$T/quay/repos/$id.git" remote get-url origin)
+              [[ "$origin" == "file://$fixture" ]] \
+                || { echo "FAIL: $id bare clone origin=$origin (expected file://$fixture)"; exit 1; }
+            done
             registered=$(env QUAY_DATA_DIR="$T/quay" /usr/local/bin/quay repo list \
               | python3 -c "import json,sys;print(\"\\n\".join(r[\"repo_id\"] for r in json.load(sys.stdin)))")
-            grep -Fxq "test-factory-code" <<< "$registered" \
-              || { echo "FAIL: test-factory-code not registered (got: $registered)"; exit 1; }
+            for id in test-factory-code brix-indexer; do
+              grep -Fxq "$id" <<< "$registered" \
+                || { echo "FAIL: $id not registered (got: $registered)"; exit 1; }
+            done
             grep -Fxq "code-only-fixture" <<< "$registered" \
               && { echo "FAIL: code-only entry leaked into quay registrations"; exit 1; }
             [[ -d "$T/quay/repos/code-only-fixture.git" ]] \
@@ -349,11 +383,11 @@ jobs:
           '
 
       - name: code mirror probes (every repos[] entry has one)
-        # All three repos[] entries (quay-managed test-factory-code,
-        # code-only-fixture on main, non-default-branch-fixture on
-        # develop) must produce a working-tree clone at $T/code/<id>/,
-        # agent-owned, on origin/<base_branch>. The mirror is what
-        # hermes-code-sync refreshes on its 5-min timer.
+        # All four repos[] entries (quay-managed test-factory-code on main
+        # and brix-indexer on dev, code-only-fixture on main,
+        # non-default-branch-fixture on develop) must produce a working-
+        # tree clone at $T/code/<id>/, agent-owned, on origin/<base_branch>.
+        # The mirror is what hermes-code-sync refreshes on its 5-min timer.
         run: |
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes
@@ -361,6 +395,7 @@ jobs:
             # Format: id:expected_base
             for spec in \
               test-factory-code:main \
+              brix-indexer:dev \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"
@@ -405,6 +440,7 @@ jobs:
             T=/home/hermes/.hermes
             for spec in \
               test-factory-code:main \
+              brix-indexer:dev \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"

@@ -76,6 +76,13 @@ _RECIPES: dict[str, _Recipe] = {
         ),
         archive_member="bun-linux-x64/bun",
     ),
+    "pnpm": _Recipe(
+        url_template=(
+            "https://github.com/pnpm/pnpm/releases/download/"
+            "v{version}/pnpm-linux-x64"
+        ),
+        archive_kind="binary",
+    ),
 }
 
 

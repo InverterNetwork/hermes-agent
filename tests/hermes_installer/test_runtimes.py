@@ -116,10 +116,11 @@ class TestEnsureRuntime:
         assert "archive member" in capsys.readouterr().err
 
     def test_unknown_recipe_fails_loud(self, tmp_path: Path, capsys):
+        # Use a synthetic name not in _RECIPES — bun and pnpm are both wired.
         pin = RuntimeManagerPin(
-            name="pnpm", version="9.0.0", linux_x64_sha256="0" * 64
+            name="never-shipped", version="9.0.0", linux_x64_sha256="0" * 64
         )
-        install_path = tmp_path / "bin" / "pnpm"
+        install_path = tmp_path / "bin" / "never-shipped"
         install_path.parent.mkdir()
         with pytest.raises(SystemExit):
             ensure_runtime(pin, install_path)
@@ -361,6 +362,21 @@ class TestRecipeShape:
                 archive_kind="tar",  # type: ignore[arg-type]
                 archive_member="some/path",
             )
+
+    def test_pnpm_wired_as_binary_recipe(self):
+        # pnpm-linux-x64 ships as a single executable, not a zip — the
+        # recipe must take the plain-binary path so the install matches
+        # upstream's distribution shape.
+        recipe = runtimes._RECIPES["pnpm"]
+        assert recipe.archive_kind == "binary"
+        assert recipe.archive_member is None
+        assert "pnpm-linux-x64" in recipe.url_template
+        assert "{version}" in recipe.url_template
+
+    def test_bun_wired_as_zip_recipe(self):
+        recipe = runtimes._RECIPES["bun"]
+        assert recipe.archive_kind == "zip"
+        assert recipe.archive_member == "bun-linux-x64/bun"
 
 
 class TestEnsureRuntimes:
