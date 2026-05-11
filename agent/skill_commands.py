@@ -142,6 +142,9 @@ def _build_skill_message(
     user_instruction: str = "",
     runtime_note: str = "",
     session_id: str | None = None,
+    sender_name: str | None = None,
+    sender_slack_id: str | None = None,
+    sender_platform: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
     from tools.skills_tool import SKILLS_DIR
@@ -158,7 +161,26 @@ def _build_skill_message(
         timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
         content = _expand_inline_shell(content, skill_dir, timeout)
 
-    parts = [activation_note, "", content.strip()]
+    parts = [activation_note]
+
+    # Sender-attribution context line: surfaces the operator who invoked
+    # the slash command so the skill can attribute work (e.g. building
+    # an `authors:` list, routing alerts back to the source user).
+    # Emitted near the top so it isn't buried beneath the SKILL.md body.
+    if sender_name or sender_slack_id:
+        bits: list[str] = []
+        if sender_name:
+            bits.append(str(sender_name))
+        if sender_slack_id:
+            bits.append(f"(slack_id {sender_slack_id})")
+        context_line = f"[Skill invocation context: triggered by {' '.join(bits)}"
+        if sender_platform:
+            context_line += f" on {sender_platform}"
+        context_line += "]"
+        parts.append("")
+        parts.append(context_line)
+
+    parts.extend(["", content.strip()])
 
     # ── Inject the absolute skill directory so the agent can reference
     #    bundled scripts without an extra skill_view() round-trip. ──
@@ -408,12 +430,19 @@ def build_skill_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     runtime_note: str = "",
+    sender_name: str | None = None,
+    sender_slack_id: str | None = None,
+    sender_platform: str | None = None,
 ) -> Optional[str]:
     """Build the user message content for a skill slash command invocation.
 
     Args:
         cmd_key: The command key including leading slash (e.g., "/gif-search").
         user_instruction: Optional text the user typed after the command.
+        sender_name: Display name of the operator who issued the slash command.
+        sender_slack_id: Platform user id (Slack ``U…``, Discord snowflake, …).
+            Naming reflects the dominant consumer; the value is platform-agnostic.
+        sender_platform: Source platform string (e.g. ``"slack"``).
 
     Returns:
         The formatted message string, or None if the skill wasn't found.
@@ -447,6 +476,9 @@ def build_skill_invocation_message(
         user_instruction=user_instruction,
         runtime_note=runtime_note,
         session_id=task_id,
+        sender_name=sender_name,
+        sender_slack_id=sender_slack_id,
+        sender_platform=sender_platform,
     )
 
 
