@@ -22,7 +22,6 @@ from __future__ import annotations
 import getpass
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -144,8 +143,7 @@ class TestQuayAsHermesWrapper:
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
 
         assert not wrapper_env["sudo_log"].exists(), (
-            "wrapper invoked sudo despite caller already being the agent user; "
-            "this is the regression BRIX-1368 fixed:\n"
+            "wrapper invoked sudo despite caller already being the agent user:\n"
             + wrapper_env["sudo_log"].read_text()
         )
         log = _parse_quay_log(wrapper_env["quay_log"])
