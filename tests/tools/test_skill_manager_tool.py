@@ -1106,11 +1106,60 @@ class TestStateRepoCommitPropagation:
         assert result["success"] is True
         assert "state_commit_sha" not in result
 
+    def test_external_skill_dir_skips_state_commit(self, tmp_path, monkeypatch):
+        """Skills resolved from ``skills.external_dirs`` live outside
+        SKILLS_DIR. The state repo only versions the local tree, so writes
+        to external skills must succeed without attempting a commit (no
+        bogus ``pathspec did not match`` rollback)."""
+        import subprocess as _sp
+        state = tmp_path / "state"
+        state.mkdir()
+        _sp.run(["git", "init", "--quiet", "-b", "main", str(state)], check=True)
+        for k, v in (("user.email", "t@h.l"), ("user.name", "t")):
+            _sp.run(["git", "-C", str(state), "config", k, v], check=True)
+        (state / "skills").mkdir()
+        (state / "README.md").write_text("seed\n")
+        _sp.run(["git", "-C", str(state), "add", "-A"], check=True)
+        _sp.run(["git", "-C", str(state), "commit", "-m", "seed", "--quiet"], check=True)
+        monkeypatch.setenv("HERMES_STATE_DIR", str(state))
+
+        # SKILLS_DIR is the local tree; the external dir lives elsewhere
+        # and is discoverable via get_all_skills_dirs but not via SKILLS_DIR.
+        local_skills = tmp_path / "local-skills"
+        local_skills.mkdir()
+        external_skills = tmp_path / "external-skills"
+        external_skills.mkdir()
+        # _find_skill matches by directory name, so the skill dir must be
+        # named after the skill, not after VALID_SKILL_CONTENT's frontmatter.
+        ext_skill = external_skills / "test-skill"
+        ext_skill.mkdir()
+        (ext_skill / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", local_skills), \
+             patch(
+                 "agent.skill_utils.get_all_skills_dirs",
+                 return_value=[local_skills, external_skills],
+             ):
+            raw = skill_manage(
+                action="patch", name="test-skill",
+                old_string="Step 1: Do the thing.",
+                new_string="Step 1: Do the updated thing.",
+            )
+        result = json.loads(raw)
+        assert result["success"] is True, result
+        assert "state_commit_sha" not in result
+        # No new commit landed against the state repo.
+        log = _sp.run(
+            ["git", "-C", str(state), "log", "--oneline"],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        assert len(log) == 1, f"expected only the seed commit, got: {log}"
+
     def test_categorized_skill_commit_lands_proper_sha(self, tmp_path, monkeypatch):
-        """BRIX-1370 regression: creating a skill under a category must
-        produce a proper ``skill: create`` commit instead of failing with a
-        ``pathspec did not match`` error and silently leaving the on-disk
-        write to be mopped up by ``hermes-sync``."""
+        """Creating a skill under a category must produce a proper
+        ``skill: create`` commit instead of failing with a ``pathspec did
+        not match`` error and silently leaving the on-disk write to be
+        mopped up by ``hermes-sync``."""
         import subprocess as _sp
         state = tmp_path / "state"
         state.mkdir()

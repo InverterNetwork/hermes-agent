@@ -144,14 +144,18 @@ def _discover_skill_rel(state: Path, name: str) -> str:
             if (child / name).is_dir():
                 return f"{child.name}/{name}"
 
+    # Anchor on tracked SKILL.md files so a subdirectory that happens to
+    # share a name with another skill (e.g. references/) can't be mistaken
+    # for the skill dir itself.
     ls = _git(state, "ls-files", "--", "skills/", check=False)
     for line in (ls.stdout or "").splitlines():
         parts = line.split("/")
-        if len(parts) >= 3 and parts[0] == "skills":
-            if parts[1] == name:
-                return name
-            if len(parts) >= 4 and parts[2] == name:
-                return f"{parts[1]}/{name}"
+        if not parts or parts[-1] != "SKILL.md":
+            continue
+        if len(parts) == 3 and parts[1] == name:
+            return name
+        if len(parts) == 4 and parts[2] == name:
+            return f"{parts[1]}/{name}"
     return name
 
 

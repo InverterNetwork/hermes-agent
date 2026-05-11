@@ -872,20 +872,25 @@ def skill_manage(
         #
         # ``skill_rel_path`` is an internal handler→helper hand-off carrying
         # the real on-disk layout (categorized vs flat). Popped so it stays
-        # out of the LLM-visible JSON.
-        skill_rel = result.pop("skill_rel_path", None)
-        try:
-            from agent.state_repo import commit_skill_change, StateRepoError
-            sha = commit_skill_change(action, name, rel_path=skill_rel)
-            if sha:
-                result["state_commit_sha"] = sha
-        except StateRepoError as state_err:
-            return tool_error(
-                f"Skill write rolled back: state-repo commit failed and the "
-                f"on-disk change has been reverted to HEAD. Retry once the "
-                f"state repo is healthy. Detail: {state_err}",
-                success=False,
-            )
+        # out of the LLM-visible JSON. A handler-supplied ``None`` means the
+        # skill lives outside SKILLS_DIR (external skill dir) — the state
+        # repo only versions the local tree, so skip the commit entirely.
+        _MISSING = object()
+        skill_rel = result.pop("skill_rel_path", _MISSING)
+        if skill_rel is not None:
+            try:
+                from agent.state_repo import commit_skill_change, StateRepoError
+                kwargs = {} if skill_rel is _MISSING else {"rel_path": skill_rel}
+                sha = commit_skill_change(action, name, **kwargs)
+                if sha:
+                    result["state_commit_sha"] = sha
+            except StateRepoError as state_err:
+                return tool_error(
+                    f"Skill write rolled back: state-repo commit failed and the "
+                    f"on-disk change has been reverted to HEAD. Retry once the "
+                    f"state repo is healthy. Detail: {state_err}",
+                    success=False,
+                )
 
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache

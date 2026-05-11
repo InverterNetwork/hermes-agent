@@ -214,11 +214,10 @@ class TestCommitSkillChange:
         assert not skill.exists(), "rollback should have removed the new skill"
 
     def test_commits_categorized_skill_via_rel_path(self, state_repo_dir):
-        """Categorized layout (skills/<category>/<name>) is the failure mode
-        from BRIX-1370: hardcoding ``skills/<name>`` produces a pathspec
-        error and a silent rollback miss. Passing the real rel path through
-        must stage and commit the categorized subtree just like the flat
-        case."""
+        """Categorized layout (skills/<category>/<name>) must stage and
+        commit the categorized subtree just like the flat case. Hardcoding
+        ``skills/<name>`` produces a pathspec error and a silent rollback
+        miss; the real rel path threaded through avoids that."""
         state_repo.set_session_context("sess-cat", 9)
         skill_dir = state_repo_dir / "skills" / "quay" / "quay-run"
         skill_dir.mkdir(parents=True)
