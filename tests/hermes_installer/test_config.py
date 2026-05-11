@@ -27,6 +27,11 @@ VALID_BUN_PIN = {
     "linux_x64_sha256": "4680e80e44e32aa718560ceae85d22ecfbf2efb8f3641782e35e4b7efd65a1aa",
 }
 
+VALID_PNPM_PIN = {
+    "version": "10.33.4",
+    "linux_x64_sha256": "ff1795595535a10d0dfe327303f3dd02377be141190b1f5756de68edde2cf813",
+}
+
 
 class TestRequiredRuntimeManagers:
     def test_no_package_managers_declared(self):
@@ -100,6 +105,29 @@ class TestRequiredRuntimeManagers:
         with pytest.raises(SystemExit):
             required_runtime_managers(values)
         assert "version" in capsys.readouterr().err
+
+    def test_bun_and_pnpm_pins_returned_together(self):
+        # When repos[] declares both bun- and pnpm-managed entries,
+        # ensure_runtimes must see both pins so neither manager goes
+        # unpinned at install time.
+        values = _values(
+            repos=[
+                {
+                    "id": "test-factory-code",
+                    "quay": {"package_manager": "bun"},
+                },
+                {
+                    "id": "brix-indexer",
+                    "quay": {"package_manager": "pnpm"},
+                },
+            ],
+            runtime_managers={"bun": VALID_BUN_PIN, "pnpm": VALID_PNPM_PIN},
+        )
+        pins = required_runtime_managers(values)
+        assert set(pins) == {"bun", "pnpm"}
+        assert pins["bun"].version == "1.3.9"
+        assert pins["pnpm"].version == "10.33.4"
+        assert pins["pnpm"].linux_x64_sha256 == VALID_PNPM_PIN["linux_x64_sha256"]
 
     def test_repos_without_quay_block_ignored(self):
         values = _values(
