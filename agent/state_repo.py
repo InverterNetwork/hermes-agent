@@ -115,8 +115,52 @@ def _format_skill_message(action: str, name: str, session_id: Optional[str],
     return f"skill: {action} {name} (session {sid})"
 
 
-def _rollback_skill_subtree(state: Path, name: str) -> None:
-    """Restore ``skills/<name>/`` to HEAD after a failed commit.
+def _validated_skill_pathspec(skill_rel: str) -> str:
+    """Build the state-repo pathspec from a SKILLS_DIR-relative subpath.
+
+    Rejects absolute paths and any traversal components so a misconfigured
+    caller can't ask the helper to stage outside ``skills/``.
+    """
+    p = Path(skill_rel)
+    if not skill_rel or p.is_absolute() or ".." in p.parts:
+        raise StateRepoError(f"invalid skill rel_path: {skill_rel!r}")
+    return f"skills/{p.as_posix()}"
+
+
+def _discover_skill_rel(state: Path, name: str) -> str:
+    """Find the SKILLS_DIR-relative subpath for a skill, post-delete included.
+
+    Falls back to scanning the index so the helper still works after
+    ``_delete_skill`` has removed the directory but before the deletion has
+    been committed.
+    """
+    skills = state / "skills"
+    if (skills / name).is_dir():
+        return name
+    if skills.is_dir():
+        for child in skills.iterdir():
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if (child / name).is_dir():
+                return f"{child.name}/{name}"
+
+    # Anchor on tracked SKILL.md files so a subdirectory that happens to
+    # share a name with another skill (e.g. references/) can't be mistaken
+    # for the skill dir itself.
+    ls = _git(state, "ls-files", "--", "skills/", check=False)
+    for line in (ls.stdout or "").splitlines():
+        parts = line.split("/")
+        if not parts or parts[-1] != "SKILL.md":
+            continue
+        if len(parts) == 3 and parts[1] == name:
+            return name
+        if len(parts) == 4 and parts[2] == name:
+            return f"{parts[1]}/{name}"
+    return name
+
+
+def _rollback_skill_subtree(state: Path, rel: str) -> None:
+    """Restore ``<rel>/`` to HEAD after a failed commit.
 
     Without this, a partial write (file on disk but not committed) would
     trip the LLM's retry: ``create`` would hit the existing-skill collision,
@@ -124,16 +168,15 @@ def _rollback_skill_subtree(state: Path, name: str) -> None:
     mutation in three steps so both new-create and modify-existing cases
     are covered:
 
-    1. ``git reset HEAD -- skills/<name>`` — unstage anything we just added.
-    2. ``git checkout HEAD -- skills/<name>`` — restore tracked content
+    1. ``git reset HEAD -- <rel>`` — unstage anything we just added.
+    2. ``git checkout HEAD -- <rel>`` — restore tracked content
        (no-op when the path has no HEAD entry, e.g. brand-new create).
-    3. ``git clean -fd skills/<name>`` — remove now-untracked leftovers
+    3. ``git clean -fd <rel>`` — remove now-untracked leftovers
        (the new files from a failed create).
 
     Best-effort — rollback failures are logged but never re-raised, because
     the original commit-failure error is what the caller needs to see.
     """
-    rel = f"skills/{name}"
     try:
         _git(state, "reset", "-q", "HEAD", "--", rel, check=False)
         _git(state, "checkout", "HEAD", "--", rel, check=False)
@@ -143,8 +186,15 @@ def _rollback_skill_subtree(state: Path, name: str) -> None:
 
 
 def commit_skill_change(action: str, name: str, *,
-                        state_root: Optional[Path] = None) -> Optional[str]:
-    """Stage ``skills/<name>/`` and commit a skill_manage write.
+                        state_root: Optional[Path] = None,
+                        rel_path: Optional[str] = None) -> Optional[str]:
+    """Stage the skill's subtree and commit a skill_manage write.
+
+    ``rel_path`` is the skill directory **relative to ``skills/``** — e.g.
+    ``quay/quay-run`` for a categorized skill, ``foo`` for an uncategorized
+    one. When omitted, the helper locates the directory on disk (or in the
+    index for an already-deleted skill) so older callers and tests that
+    only know ``name`` keep working.
 
     Returns the resulting commit SHA, or ``None`` when there's nothing staged
     (idempotent re-write) or when the install has no state repo. Raises
@@ -159,12 +209,14 @@ def commit_skill_change(action: str, name: str, *,
 
     sid, inv = get_session_context()
     msg = _format_skill_message(action, name, sid, inv)
-    rel = f"skills/{name}"
 
     with _GIT_LOCK:
+        skill_rel = rel_path if rel_path is not None else _discover_skill_rel(state, name)
+        rel = _validated_skill_pathspec(skill_rel)
+
         try:
             # Stage only this skill's subtree (covers new files, modifications,
-            # deletes inside skills/<name>/). Path-isolated so a pre-staged
+            # deletes inside <rel>/). Path-isolated so a pre-staged
             # cron/ or memories/ change can't leak into the commit.
             _git(state, "add", "-A", "--", rel)
             diff = _git(state, "diff", "--cached", "--quiet", "--", rel, check=False)
@@ -178,7 +230,7 @@ def commit_skill_change(action: str, name: str, *,
             return _git(state, "rev-parse", "HEAD").stdout.strip()
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip()
-            _rollback_skill_subtree(state, name)
+            _rollback_skill_subtree(state, rel)
             raise StateRepoError(
                 f"state-repo commit failed for skill_manage({action} {name}): {stderr}"
             ) from exc
