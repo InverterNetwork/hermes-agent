@@ -131,6 +131,26 @@ def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
     ).returncode == 1
 
 
+def test_installer_renders_quay_config_with_force_on_every_run():
+    """Configs-as-code guard: setup-hermes.sh must call render-quay-config
+    with --force (no first-install gate) so quay.agent_invocation and the
+    rest of the quay.* block stay in sync with deploy.values.yaml on every
+    install. The earlier gate let updated invocations silently drift on
+    re-runs — workers kept running the seeded-on-first-install command.
+    """
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    # Allow any whitespace/line-continuations between the subcommand and the
+    # --force flag, but require they appear in the same invocation block.
+    pattern = r'render-quay-config[^\n]*--out[^\n]*"[^\n]*"\s*(?:\\\s*\n\s*)?--force'
+    assert re.search(pattern, content), (
+        "installer must invoke `render-quay-config --out … --force` so the "
+        "quay config reconciles from deploy.values.yaml on every install"
+    )
+    # Belt-and-suspenders: the old preserve branch printed this exact phrase.
+    # Its presence would mean the gate snuck back in.
+    assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
+
+
 def test_installer_unset_loop_iterates_both_suffixes():
     """Static guard: the installer's quay-managed unset branch must
     iterate over both the empty suffix and `.git`. Without this loop a

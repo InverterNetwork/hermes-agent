@@ -778,20 +778,18 @@ done
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/quay"
 
-  # quay/config.toml — same first-install-seed pattern as config.yaml above.
-  # The bash gate scopes chown/chmod to first install (the helper itself
-  # also preserves the file body, but the gate avoids re-flipping perms on
-  # every re-run, which would clobber any operator chmod).
+  # quay/config.toml is rendered from deploy.values.yaml on every run so
+  # changes to quay.agent_invocation (and other quay.* fields) reconcile
+  # without manual host edits. Every key the helper writes is sourced from
+  # deploy.values.yaml — there is no operator-edit domain to preserve.
+  # Operator-overridable runtime knobs live in the systemd unit env
+  # (QUAY_DATA_DIR, EnvironmentFile=/etc/default/quay-tick), not here.
   QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
-  if [[ -f "$QUAY_CONFIG_OUT" ]]; then
-    echo "==> $QUAY_CONFIG_OUT already present (preserving)"
-  else
-    echo "==> seeding $QUAY_CONFIG_OUT from $VALUES_FILE"
-    python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
-      render-quay-config --out "$QUAY_CONFIG_OUT"
-    chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
-    chmod 0644 "$QUAY_CONFIG_OUT"
-  fi
+  echo "==> rendering $QUAY_CONFIG_OUT from $VALUES_FILE"
+  python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+    render-quay-config --out "$QUAY_CONFIG_OUT" --force
+  chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
+  chmod 0644 "$QUAY_CONFIG_OUT"
 
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/quay/repos"
 fi
