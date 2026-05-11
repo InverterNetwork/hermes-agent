@@ -36,6 +36,7 @@ from .util import fail, info
 
 
 ArchiveKind = Literal["zip", "binary"]
+_ARCHIVE_KINDS: frozenset[str] = frozenset({"zip", "binary"})
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,14 @@ class _Recipe:
     archive_member: str | None = None
 
     def __post_init__(self) -> None:
+        # Validate ``archive_kind`` against the known set first — a typo
+        # (e.g. "bniary") must fail loud at import, not silently fall
+        # through to the binary install path with the wrong asset.
+        if self.archive_kind not in _ARCHIVE_KINDS:
+            raise ValueError(
+                f"archive_kind={self.archive_kind!r} is not one of "
+                f"{sorted(_ARCHIVE_KINDS)}"
+            )
         if self.archive_kind == "zip" and not self.archive_member:
             raise ValueError(
                 "zip recipe requires `archive_member` (path inside the zip)"
@@ -127,8 +136,19 @@ def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
             source_path = _extract_zip_member(
                 pin=pin, recipe=recipe, zip_path=download_path, tmp=tmp,
             )
-        else:
+        elif recipe.archive_kind == "binary":
             source_path = download_path
+        else:
+            # Unreachable: _Recipe.__post_init__ validates archive_kind
+            # against _ARCHIVE_KINDS. Kept as a defensive guard so a future
+            # discriminator (e.g. "tar") added to the type alias without
+            # wiring up an install branch here fails loud instead of
+            # silently installing the raw download.
+            fail(
+                f"{pin.name} {pin.version}: unhandled archive_kind="
+                f"{recipe.archive_kind!r}; wire up an install branch in "
+                "ensure_runtime() before adding the kind to ArchiveKind."
+            )
 
         _atomic_install(source_path, install_path)
 

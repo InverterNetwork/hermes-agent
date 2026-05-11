@@ -343,6 +343,25 @@ class TestRecipeShape:
                 archive_member="something/else",
             )
 
+    def test_unknown_archive_kind_rejected_at_construction(self):
+        # A typo like "bniary" must fail at import rather than silently
+        # falling through to a non-zip install path.
+        with pytest.raises(ValueError, match="archive_kind"):
+            runtimes._Recipe(
+                url_template="https://x/{version}",
+                archive_kind="bniary",  # type: ignore[arg-type]
+            )
+
+    def test_unknown_archive_kind_rejected_with_archive_member(self):
+        # Same guard, even when archive_member is set — kind check runs
+        # first so the operator's actionable error is the unknown kind.
+        with pytest.raises(ValueError, match="archive_kind"):
+            runtimes._Recipe(
+                url_template="https://x/{version}",
+                archive_kind="tar",  # type: ignore[arg-type]
+                archive_member="some/path",
+            )
+
 
 class TestEnsureRuntimes:
     def test_empty_pins_is_noop(self, tmp_path: Path):
