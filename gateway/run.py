@@ -5491,7 +5491,12 @@ class GatewayRunner:
                             )
                     user_instruction = event.get_command_args().strip()
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key,
+                        user_instruction,
+                        task_id=_quick_key,
+                        sender_name=source.user_name,
+                        sender_slack_id=source.user_id,
+                        sender_platform=source.platform.value if source.platform else None,
                     )
                     if msg:
                         event.text = msg

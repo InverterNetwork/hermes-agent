@@ -525,6 +525,15 @@ config_sha_pre="$(file_sha "$CONFIG_YAML_OUT")"
 echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   merge-config-model --out "$CONFIG_YAML_OUT"
+
+# `slack.triggers` is values-driven and must reconcile on every run so an
+# operator can wire a new channel-trigger binding without manually
+# editing config.yaml. Declarative: an absent / empty `slack_triggers:`
+# in values.yaml clears the rendered `slack.triggers:` key.
+echo "==> merging slack.triggers into $CONFIG_YAML_OUT from $VALUES_FILE"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  merge-slack-triggers --out "$CONFIG_YAML_OUT"
+
 # config.yaml must be agent-writable: `hermes auth add` rewrites
 # model.provider after the OAuth flow, and `hermes model` does the same on
 # the interactive picker. Root-owned silently no-ops those writes.
