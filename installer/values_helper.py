@@ -15,9 +15,10 @@ Subcommands:
                                 — write <auth>/gateway-runtime.env from
                                   values.yaml. Holds non-secret env vars
                                   derived from the values file
-                                  (SLACK_ALLOWED_USERS today). Always
-                                  rewrites — the file is a reflection of
-                                  values.yaml, not operator input.
+                                  (SLACK_ALLOWED_USERS,
+                                  SLACK_SLASH_COMMAND_NAME, LINEAR_TEAM_*).
+                                  Always rewrites — the file is a reflection
+                                  of values.yaml, not operator input.
   merge-config-model <out>     — set <out>'s ``model.provider`` and
                                   ``model.base_url`` from
                                   ``gateway.model_provider`` /
@@ -480,9 +481,14 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     """Write ``<auth>/gateway-runtime.env`` from non-secret values.yaml fields.
 
     Holds env vars the gateway needs at runtime that are non-secret, values-
-    derived config. Today: ``SLACK_ALLOWED_USERS`` from
-    ``slack.runtime.allowed_users``. Future migrations land more keys here
-    (``LINEAR_TEAM_ITRY`` etc.).
+    derived config:
+
+    * ``SLACK_ALLOWED_USERS`` from ``slack.runtime.allowed_users``.
+    * ``SLACK_SLASH_COMMAND_NAME`` from ``slack.app.slash_command_name`` —
+      the operator's configured top-level slash, recognized by the gateway's
+      slash listener so manifest-registered slashes ack within Slack's
+      3-second deadline.
+    * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
     Always rewritten — values.yaml is the source of truth and the file is a
     reflection. Operator hand-edits live in ``/etc/default/hermes-gateway``
@@ -510,6 +516,25 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
                 return 1
             joined = ",".join(_env_safe("slack.runtime.allowed_users[]", str(v)) for v in au)
             lines.append(f"SLACK_ALLOWED_USERS={joined}")
+
+    # The operator-configured top-level slash (slack.app.slash_command_name)
+    # is templated into the rendered Slack manifest at install time. Without
+    # the matching env var, the gateway's slash-listener regex has no idea
+    # that the manifest-registered slash exists — slack_bolt drops it as
+    # "Unhandled request", the 3-second Slack ack deadline expires, and the
+    # user sees "did not respond". Plumb the same value through to the
+    # runtime so the regex and `_handle_slash_command` recognize it.
+    app = (data.get("slack") or {}).get("app") or {}
+    if isinstance(app, dict):
+        slash_name = app.get("slash_command_name")
+        if slash_name:
+            if not isinstance(slash_name, str):
+                sys.stderr.write(
+                    "values_helper.py: slack.app.slash_command_name must be a string\n"
+                )
+                return 1
+            sanitized = _env_safe("slack.app.slash_command_name", slash_name)
+            lines.append(f"SLACK_SLASH_COMMAND_NAME={sanitized}")
 
     # linear.teams.<key>: <uuid>  →  LINEAR_TEAM_<KEY>=<uuid>
     # Lets skills (e.g. inverter-linear) reference team UUIDs by env var
