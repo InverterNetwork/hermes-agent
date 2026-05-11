@@ -298,6 +298,10 @@ class SlackAdapter(BasePlatformAdapter):
         self._app: Optional[Any] = None
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
+        # auth.test returns both `user_id` (U…) and `bot_id` (B…); some
+        # bot_message subtypes carry only the latter, so the router needs
+        # both to reliably short-circuit on the gateway's own posts.
+        self._bot_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
@@ -589,19 +593,23 @@ class SlackAdapter(BasePlatformAdapter):
                 bot_user_id = auth_response.get("user_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
+                bot_id_raw = auth_response.get("bot_id") or ""
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
 
-                # First token sets the primary bot_user_id (backward compat)
+                # First token sets the primary bot identifiers (backward compat).
                 if self._bot_user_id is None:
                     self._bot_user_id = bot_user_id
+                if not self._bot_id and bot_id_raw:
+                    self._bot_id = bot_id_raw
 
-                # Trigger router needs the bot user id to short-circuit
+                # Trigger router needs the bot identifiers to short-circuit
                 # any message the gateway itself posted (defense-in-depth
                 # against accept_from_bots: true misconfig).
                 if self._trigger_router is not None:
                     self._trigger_router.set_bot_user_id(self._bot_user_id)
+                    self._trigger_router.set_bot_id(self._bot_id)
 
                 logger.info(
                     "[Slack] Authenticated as @%s in workspace %s (team: %s)",
@@ -1746,6 +1754,234 @@ class SlackAdapter(BasePlatformAdapter):
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
 
+    def _extract_slack_text_payload(self, event: dict) -> str:
+        """Merge ``event["text"]`` with rich-text quotes, blocks, and link unfurls.
+
+        Slack's modern composer embeds forwarded/quoted content in ``blocks``
+        (``rich_text_quote`` etc.) and link previews in ``attachments`` —
+        neither is reflected in the plain ``text`` field. Both the normal
+        message path and the trigger-router path need the merged result so
+        a forwarded report or unfurled link reaches the agent intact.
+        """
+        text = event.get("text", "") or ""
+
+        blocks = event.get("blocks")
+        if blocks:
+            blocks_text = _extract_text_from_slack_blocks(blocks)
+            if blocks_text:
+                stripped_blocks = blocks_text.strip()
+                if stripped_blocks and stripped_blocks not in text.strip():
+                    logger.debug(
+                        "Slack: extracted additional text from blocks "
+                        "(likely quoted/forwarded content): %s",
+                        stripped_blocks[:300],
+                    )
+                    text = (text.strip() + "\n" + stripped_blocks).strip()
+
+            blocks_payload = _serialize_slack_blocks_for_agent(blocks)
+            if blocks_payload:
+                text = (text.strip() + "\n\n" + blocks_payload).strip()
+
+        slack_attachments = event.get("attachments") or []
+        if slack_attachments:
+            att_parts: list[str] = []
+            for att in slack_attachments:
+                if att.get("is_msg_unfurl"):
+                    continue
+                att_title = att.get("title", "")
+                att_url = att.get("title_link", "") or att.get("from_url", "")
+                att_text = att.get("text", "")
+                att_footer = att.get("footer", "")
+                att_fallback = att.get("fallback", "")
+
+                if att_title and att_url:
+                    header = f"📎 [{att_title}]({att_url})"
+                elif att_title:
+                    header = f"📎 {att_title}"
+                elif att_url:
+                    header = f"📎 {att_url}"
+                else:
+                    header = None
+
+                body = att_text or att_fallback or ""
+                if body:
+                    body = body.strip()
+                    if len(body) > 500:
+                        body = body[:497] + "..."
+
+                if header and body:
+                    section = f"{header}\n   {body}"
+                elif header:
+                    section = header
+                elif body:
+                    section = f"📎 {body}"
+                else:
+                    continue
+
+                if section in text:
+                    continue
+                if att_footer:
+                    section = f"{section}\n   _{att_footer}_"
+                att_parts.append(section)
+
+            if att_parts:
+                text = (text.strip() + "\n\n" + "\n\n".join(att_parts)).strip()
+                logger.debug(
+                    "Slack: appended %d link unfurl(s) to message text",
+                    len(att_parts),
+                )
+        return text
+
+    async def _extract_slack_media(
+        self, event: dict, *, channel_id: str, team_id: str,
+    ) -> tuple[list[str], list[str], list[str], str]:
+        """Download attached files into the local media cache.
+
+        Returns ``(media_urls, media_types, attachment_notices, inline_text)``
+        where ``inline_text`` is the body of any small text-ish documents
+        injected directly into the prompt (matches the normal flow's
+        ``[Content of …]`` prefix). Failures are captured as user-facing
+        notices, not raised — the trigger path must always reach
+        ``handle_message``.
+        """
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        attachment_notices: list[str] = []
+        inline_chunks: list[str] = []
+        files = event.get("files") or []
+        for f in files:
+            if f.get("file_access") == "check_file_info":
+                file_id = f.get("id")
+                if not file_id:
+                    continue
+                try:
+                    info_resp = await self._get_client(channel_id).files_info(file=file_id)
+                    if info_resp.get("ok"):
+                        f = info_resp["file"]
+                    else:
+                        detail = self._describe_slack_api_error(info_resp, file_obj=f)
+                        if detail:
+                            attachment_notices.append(detail)
+                            logger.warning("[Slack] %s", detail)
+                        else:
+                            logger.warning(
+                                "[Slack] files.info failed for %s: %s",
+                                file_id, info_resp.get("error"),
+                            )
+                        continue
+                except Exception as e:
+                    response = getattr(e, "response", None)
+                    detail = self._describe_slack_api_error(response, file_obj=f)
+                    if detail:
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
+                    else:
+                        logger.warning(
+                            "[Slack] files.info error for %s: %s",
+                            file_id, e, exc_info=True,
+                        )
+                    continue
+
+            mimetype = f.get("mimetype", "unknown")
+            url = f.get("url_private_download") or f.get("url_private", "")
+            if mimetype.startswith("image/") and url:
+                try:
+                    ext = "." + mimetype.split("/")[-1].split(";")[0]
+                    if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                        ext = ".jpg"
+                    cached = await self._download_slack_file(url, ext, team_id=team_id)
+                    media_urls.append(cached)
+                    media_types.append(mimetype)
+                except Exception as e:  # pragma: no cover - defensive logging
+                    detail = self._describe_slack_download_failure(e, file_obj=f)
+                    if detail:
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
+                    else:
+                        logger.warning(
+                            "[Slack] Failed to cache image from %s: %s",
+                            url, e, exc_info=True,
+                        )
+            elif mimetype.startswith("audio/") and url:
+                try:
+                    ext = "." + mimetype.split("/")[-1].split(";")[0]
+                    if ext not in (".ogg", ".mp3", ".wav", ".webm", ".m4a"):
+                        ext = ".ogg"
+                    cached = await self._download_slack_file(
+                        url, ext, audio=True, team_id=team_id,
+                    )
+                    media_urls.append(cached)
+                    media_types.append(mimetype)
+                except Exception as e:  # pragma: no cover - defensive logging
+                    detail = self._describe_slack_download_failure(e, file_obj=f)
+                    if detail:
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
+                    else:
+                        logger.warning(
+                            "[Slack] Failed to cache audio from %s: %s",
+                            url, e, exc_info=True,
+                        )
+            elif url:
+                try:
+                    original_filename = f.get("name", "")
+                    ext = ""
+                    if original_filename:
+                        _, ext = os.path.splitext(original_filename)
+                        ext = ext.lower()
+                    if not ext and mimetype:
+                        mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+                        ext = mime_to_ext.get(mimetype, "")
+                    if ext not in SUPPORTED_DOCUMENT_TYPES:
+                        continue
+
+                    file_size = f.get("size", 0)
+                    MAX_DOC_BYTES = 20 * 1024 * 1024
+                    if not file_size or file_size > MAX_DOC_BYTES:
+                        logger.warning(
+                            "[Slack] Document too large or unknown size: %s",
+                            file_size,
+                        )
+                        continue
+
+                    raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
+                    cached_path = cache_document_from_bytes(
+                        raw_bytes, original_filename or f"document{ext}"
+                    )
+                    doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+                    media_urls.append(cached_path)
+                    media_types.append(doc_mime)
+                    logger.debug("[Slack] Cached user document: %s", cached_path)
+
+                    MAX_TEXT_INJECT_BYTES = 100 * 1024
+                    TEXT_INJECT_EXTENSIONS = {
+                        ".md", ".txt", ".csv", ".log", ".json", ".xml",
+                        ".yaml", ".yml", ".toml", ".ini", ".cfg",
+                    }
+                    if ext in TEXT_INJECT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        try:
+                            text_content = raw_bytes.decode("utf-8")
+                            display_name = original_filename or f"document{ext}"
+                            display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                            inline_chunks.append(
+                                f"[Content of {display_name}]:\n{text_content}"
+                            )
+                        except UnicodeDecodeError:
+                            pass
+                except Exception as e:  # pragma: no cover - defensive logging
+                    detail = self._describe_slack_download_failure(e, file_obj=f)
+                    if detail:
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
+                    else:
+                        logger.warning(
+                            "[Slack] Failed to cache document from %s: %s",
+                            url, e, exc_info=True,
+                        )
+
+        inline_text = "\n\n".join(inline_chunks)
+        return media_urls, media_types, attachment_notices, inline_text
+
     async def _resolve_slack_permalink(
         self, channel_id: str, message_ts: str,
     ) -> str:
@@ -1817,47 +2053,72 @@ class SlackAdapter(BasePlatformAdapter):
             return True
 
         # Trigger matched — build envelope and dispatch.
-        message_text = event.get("text") or ""
         is_bot = is_bot_message(bot_id=bot_id, subtype=subtype)
+        team_id = event.get("team") or event.get("team_id") or ""
+        if team_id and channel_id:
+            self._channel_team[channel_id] = team_id
+
+        # Reuse the same text/media extraction the normal flow uses so a
+        # forwarded report, link unfurl, screenshot, or document attached
+        # to a top-level message reaches the entry skill the same way it
+        # would reach a regular @mention.
+        merged_text = self._extract_slack_text_payload(event)
 
         if is_bot and trigger.synthetic_author is not None:
             author_name = trigger.synthetic_author.name
             author_slack_id = trigger.synthetic_author.slack_id
+            media_urls, media_types, attachment_notices, inline_text = (
+                await self._extract_slack_media(
+                    event, channel_id=channel_id, team_id=team_id,
+                )
+            )
             permalink = await self._resolve_slack_permalink(channel_id, message_ts)
         else:
             author_slack_id = user_id or ""
-            # User resolution + permalink fetch both hit the Slack Web API
-            # and are independent; run them concurrently to shave the
-            # round-trip latency off every trigger.
-            name_result, permalink = await asyncio.gather(
+            (
+                author_name,
+                permalink,
+                (media_urls, media_types, attachment_notices, inline_text),
+            ) = await asyncio.gather(
                 self._resolve_user_name(user_id or "", chat_id=channel_id),
                 self._resolve_slack_permalink(channel_id, message_ts),
-                return_exceptions=True,
+                self._extract_slack_media(
+                    event, channel_id=channel_id, team_id=team_id,
+                ),
             )
-            if isinstance(name_result, Exception):
-                logger.debug(
-                    "[Slack][trigger] user-name resolution failed: %r", name_result,
-                )
-                author_name = ""
-            else:
-                author_name = name_result or ""
-            if isinstance(permalink, Exception):
-                logger.warning(
-                    "[Slack][trigger] permalink resolution raised: %r", permalink,
-                )
-                permalink = f"slack://{channel_id}/{message_ts}"
+            author_name = author_name or ""
+
+        if inline_text:
+            merged_text = (
+                f"{inline_text}\n\n{merged_text}".strip()
+                if merged_text else inline_text
+            )
+        if attachment_notices:
+            notice_block = "[Slack attachment notice]\n" + "\n".join(
+                f"- {n}" for n in attachment_notices
+            )
+            merged_text = (
+                f"{notice_block}\n\n{merged_text}".strip()
+                if merged_text else notice_block
+            )
+
         envelope = build_envelope(
             trigger=trigger,
             permalink=permalink,
             message_ts=message_ts,
             author_name=author_name or "(unknown)",
             author_slack_id=author_slack_id or "(unknown)",
-            message_text=message_text,
+            message_text=merged_text,
         )
 
-        team_id = event.get("team") or event.get("team_id") or ""
-        if team_id and channel_id:
-            self._channel_team[channel_id] = team_id
+        if media_urls and any(m.startswith("image/") for m in media_types):
+            msg_type = MessageType.PHOTO
+        elif media_urls and any(m.startswith("audio/") for m in media_types):
+            msg_type = MessageType.VOICE
+        elif media_urls:
+            msg_type = MessageType.DOCUMENT
+        else:
+            msg_type = MessageType.TEXT
 
         source = self.build_source(
             chat_id=channel_id,
@@ -1870,10 +2131,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         msg_event = MessageEvent(
             text=envelope,
-            message_type=MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             raw_message=event,
             message_id=message_ts,
+            media_urls=media_urls,
+            media_types=media_types,
             reply_to_message_id=None,
             auto_skill=trigger.skill,
             # Bot-sourced triggers (accept_from_bots: true) bypass the
@@ -1952,96 +2215,7 @@ class SlackAdapter(BasePlatformAdapter):
             return
 
         original_text = event.get("text", "")
-        text = original_text
-
-        # Extract quoted/forwarded content from Slack blocks.
-        # Slack's modern composer embeds forwarded messages in the ``blocks``
-        # array as ``rich_text_quote`` elements, which are NOT reflected in
-        # the plain ``text`` field.  Merge block text so the agent sees the
-        # full message content.
-        blocks = event.get("blocks")
-        if blocks:
-            blocks_text = _extract_text_from_slack_blocks(blocks)
-            if blocks_text:
-                # Only append if the blocks contain text not already present
-                # in the plain text field (avoids duplication).
-                stripped_blocks = blocks_text.strip()
-                if stripped_blocks and stripped_blocks not in text.strip():
-                    logger.debug(
-                        "Slack: extracted additional text from blocks "
-                        "(likely quoted/forwarded content): %s",
-                        stripped_blocks[:300],
-                    )
-                    text = (text.strip() + "\n" + stripped_blocks).strip()
-
-            blocks_payload = _serialize_slack_blocks_for_agent(blocks)
-            if blocks_payload:
-                text = (text.strip() + "\n\n" + blocks_payload).strip()
-
-        # Extract link unfurls / rich attachments (e.g. Notion previews).
-        # Slack places unfurled link previews in the ``attachments`` array with
-        # fields like title, title_link/from_url, text, footer, and fallback.
-        # Without reading these, the agent never sees shared link previews.
-        slack_attachments = event.get("attachments") or []
-        if slack_attachments:
-            att_parts: list[str] = []
-            for att in slack_attachments:
-                att_title = att.get("title", "")
-                att_url = att.get("title_link", "") or att.get("from_url", "")
-                att_text = att.get("text", "")
-                att_footer = att.get("footer", "")
-                att_fallback = att.get("fallback", "")
-
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
-                if att.get("is_msg_unfurl"):
-                    continue
-
-                # Build a readable representation.
-                if att_title and att_url:
-                    header = f"📎 [{att_title}]({att_url})"
-                elif att_title:
-                    header = f"📎 {att_title}"
-                elif att_url:
-                    header = f"📎 {att_url}"
-                else:
-                    header = None
-
-                # Prefer preview text, fall back to fallback description.
-                body = att_text or att_fallback or ""
-                if body:
-                    body = body.strip()
-                    if len(body) > 500:
-                        body = body[:497] + "..."
-
-                if header and body:
-                    section = f"{header}\n   {body}"
-                elif header:
-                    section = header
-                elif body:
-                    section = f"📎 {body}"
-                else:
-                    continue
-
-                # Deduplicate only when the fully rendered section is already
-                # present. The shared URL often already appears in the user's
-                # message text, and skipping on URL/title alone would hide the
-                # preview body we actually want the agent to see.
-                if section in text:
-                    continue
-
-                if att_footer:
-                    section = f"{section}\n   _{att_footer}_"
-
-                att_parts.append(section)
-
-            if att_parts:
-                attachment_text = "\n\n".join(att_parts)
-                text = (text.strip() + "\n\n" + attachment_text).strip()
-                logger.debug(
-                    "Slack: appended %d link unfurl(s) to message text",
-                    len(att_parts),
-                )
+        text = self._extract_slack_text_payload(event)
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
@@ -2162,142 +2336,18 @@ class SlackAdapter(BasePlatformAdapter):
             msg_type = MessageType.COMMAND
 
         # Handle file attachments
-        media_urls = []
-        media_types = []
-        attachment_notices: List[str] = []
-        files = event.get("files", [])
-        for f in files:
-            # Slack Connect channels return stub file objects with
-            # file_access="check_file_info" and no URL fields. We must
-            # call files.info to retrieve the full object (including url_private_download)
-            # before we can download it.
-            # https://docs.slack.dev/reference/objects/file-object/#slack_connect_files
-            if f.get("file_access") == "check_file_info":
-                file_id = f.get("id")
-                if not file_id:
-                    continue
-                try:
-                    info_resp = await self._get_client(channel_id).files_info(file=file_id)
-                    if info_resp.get("ok"):
-                        f = info_resp["file"]
-                    else:
-                        detail = self._describe_slack_api_error(info_resp, file_obj=f)
-                        if detail:
-                            attachment_notices.append(detail)
-                            logger.warning("[Slack] %s", detail)
-                        else:
-                            logger.warning(
-                                "[Slack] files.info failed for %s: %s",
-                                file_id, info_resp.get("error"),
-                            )
-                        continue
-                except Exception as e:
-                    response = getattr(e, "response", None)
-                    detail = self._describe_slack_api_error(response, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning("[Slack] files.info error for %s: %s", file_id, e, exc_info=True)
-                    continue
-
-            mimetype = f.get("mimetype", "unknown")
-            url = f.get("url_private_download") or f.get("url_private", "")
-            if mimetype.startswith("image/") and url:
-                try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
-                        ext = ".jpg"
-                    # Slack private URLs require the bot token as auth header
-                    cached = await self._download_slack_file(url, ext, team_id=team_id)
-                    media_urls.append(cached)
-                    media_types.append(mimetype)
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning("[Slack] Failed to cache image from %s: %s", url, e, exc_info=True)
-            elif mimetype.startswith("audio/") and url:
-                try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in (".ogg", ".mp3", ".wav", ".webm", ".m4a"):
-                        ext = ".ogg"
-                    cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id)
-                    media_urls.append(cached)
-                    media_types.append(mimetype)
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning("[Slack] Failed to cache audio from %s: %s", url, e, exc_info=True)
-            elif url:
-                # Try to handle as a document attachment
-                try:
-                    original_filename = f.get("name", "")
-                    ext = ""
-                    if original_filename:
-                        _, ext = os.path.splitext(original_filename)
-                        ext = ext.lower()
-
-                    # Fallback: reverse-lookup from MIME type
-                    if not ext and mimetype:
-                        mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
-                        ext = mime_to_ext.get(mimetype, "")
-
-                    if ext not in SUPPORTED_DOCUMENT_TYPES:
-                        continue  # Skip unsupported file types silently
-
-                    # Check file size (Slack limit: 20 MB for bots)
-                    file_size = f.get("size", 0)
-                    MAX_DOC_BYTES = 20 * 1024 * 1024
-                    if not file_size or file_size > MAX_DOC_BYTES:
-                        logger.warning("[Slack] Document too large or unknown size: %s", file_size)
-                        continue
-
-                    # Download and cache
-                    raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
-                    cached_path = cache_document_from_bytes(
-                        raw_bytes, original_filename or f"document{ext}"
-                    )
-                    doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
-                    media_urls.append(cached_path)
-                    media_types.append(doc_mime)
-                    logger.debug("[Slack] Cached user document: %s", cached_path)
-
-                    # Inject small text-ish files directly into the prompt so
-                    # snippets like JSON/YAML/configs are actually visible to the agent.
-                    MAX_TEXT_INJECT_BYTES = 100 * 1024
-                    TEXT_INJECT_EXTENSIONS = {
-                        ".md", ".txt", ".csv", ".log", ".json", ".xml",
-                        ".yaml", ".yml", ".toml", ".ini", ".cfg",
-                    }
-                    if ext in TEXT_INJECT_EXTENSIONS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
-                        try:
-                            text_content = raw_bytes.decode("utf-8")
-                            display_name = original_filename or f"document{ext}"
-                            display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                            injection = f"[Content of {display_name}]:\n{text_content}"
-                            if text:
-                                text = f"{injection}\n\n{text}"
-                            else:
-                                text = injection
-                        except UnicodeDecodeError:
-                            pass  # Binary content, skip injection
-
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning("[Slack] Failed to cache document from %s: %s", url, e, exc_info=True)
+        media_urls, media_types, attachment_notices, inline_text = (
+            await self._extract_slack_media(
+                event, channel_id=channel_id, team_id=team_id,
+            )
+        )
+        if inline_text:
+            text = f"{inline_text}\n\n{text}".strip() if text else inline_text
 
         if attachment_notices:
-            notice_block = "[Slack attachment notice]\n" + "\n".join(f"- {n}" for n in attachment_notices)
+            notice_block = "[Slack attachment notice]\n" + "\n".join(
+                f"- {n}" for n in attachment_notices
+            )
             text = f"{notice_block}\n\n{text}" if text else notice_block
 
         if msg_type != MessageType.COMMAND and media_types:

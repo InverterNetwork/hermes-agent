@@ -214,9 +214,10 @@
 #                                   rate_limit{max_per_hour,on_overflow}
 #                                                   per-channel sliding window;
 #                                                   defaults 30/hr, skip on
-#                                                   overflow; alt: error.
-#                                                   Slack re-delivers anyway;
-#                                                   never queue.
+#                                                   overflow. Slack re-delivers
+#                                                   anyway; never queue.
+#                                                   `skip` is the only
+#                                                   currently-accepted policy.
 #                                   default_repo    fallback when the entry
 #                                                   skill can't infer a repo;
 #                                                   the skill's inferred repo

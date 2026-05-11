@@ -208,3 +208,76 @@ class TestTriggerDispatch:
         # flow handles the message (and likely drops it on mention/allow
         # gating). Just confirm we don't blow up.
         await adapter_no_triggers._handle_slack_message(event)
+
+    @pytest.mark.asyncio
+    async def test_rich_text_unfurl_flows_through_trigger_path(
+        self, adapter_with_trigger,
+    ):
+        """The trigger path must reuse the same text-normalization the
+        normal flow uses — otherwise a feedback report consisting only
+        of a link unfurl or a forwarded quote would reach the entry
+        skill empty. PR #62 review [2]."""
+        event = {
+            "channel": CHAN,
+            "ts": "1700000000.000600",
+            "user": "U_ALICE",
+            "text": "see the linked doc",
+            "team": "T1",
+            "attachments": [
+                {
+                    "title": "Crash report",
+                    "title_link": "https://example.com/crash",
+                    "text": "users see a 500 on /login",
+                }
+            ],
+        }
+
+        await adapter_with_trigger._handle_slack_message(event)
+
+        adapter_with_trigger.handle_message.assert_awaited_once()
+        msg_event = adapter_with_trigger.handle_message.call_args.args[0]
+        # Body sentinel encloses the merged text, and the unfurl reached
+        # the entry skill.
+        assert "<<<SLACK_MESSAGE_BODY" in msg_event.text
+        assert "Crash report" in msg_event.text
+        assert "users see a 500 on /login" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_screenshot_only_message_flows_media_through_trigger(
+        self, adapter_with_trigger, tmp_path, monkeypatch,
+    ):
+        """A screenshot-only feedback post must reach the entry skill
+        with the cached image path attached, not as an `(empty)` body
+        with no media. PR #62 review [2]."""
+        cached = tmp_path / "img.png"
+        cached.write_bytes(b"PNGDATA")
+        # Stub the Slack-API-backed download to return our temp file.
+        async def _fake_download(url, ext, audio=False, team_id=""):
+            return str(cached)
+        monkeypatch.setattr(
+            adapter_with_trigger, "_download_slack_file", _fake_download,
+        )
+
+        event = {
+            "channel": CHAN,
+            "ts": "1700000000.000700",
+            "user": "U_ALICE",
+            "text": "",
+            "team": "T1",
+            "files": [
+                {
+                    "mimetype": "image/png",
+                    "url_private_download": "https://files.slack.com/private/x.png",
+                }
+            ],
+        }
+
+        await adapter_with_trigger._handle_slack_message(event)
+
+        adapter_with_trigger.handle_message.assert_awaited_once()
+        msg_event = adapter_with_trigger.handle_message.call_args.args[0]
+        assert msg_event.media_urls == [str(cached)]
+        assert msg_event.media_types == ["image/png"]
+        # message_type promotes when an image attaches.
+        from gateway.platforms.base import MessageType
+        assert msg_event.message_type == MessageType.PHOTO

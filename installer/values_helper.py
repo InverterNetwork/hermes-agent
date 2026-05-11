@@ -283,11 +283,11 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     if isinstance(cp, dict) and cp:
         slack_block["channel_prompts"] = {str(k): str(v) for k, v in cp.items()}
 
-    # slack_triggers is a top-level block in values.yaml (the spec models
-    # it as gateway behavior, not slack.runtime config). The rendered
-    # config.yaml flattens it under slack.triggers so the platform
-    # bridge in gateway/config.py finds it next to the rest of the
-    # slack.* keys.
+    # `slack_triggers:` is a top-level block in values.yaml — flatten it
+    # into the rendered `slack.triggers:` so gateway/config.py finds it
+    # alongside the other slack.* keys. NB: this seed runs once on first
+    # install; subsequent re-reconciliation is done by
+    # cmd_merge_slack_triggers on every run.
     triggers_parsed, st_err = _validate_slack_triggers_block(
         data.get("slack_triggers"),
     )
@@ -388,6 +388,70 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
         encoding="utf-8",
     )
     sys.stdout.write(f"merged: {out_path} model.provider={provider}\n")
+    return 0
+
+
+def cmd_merge_slack_triggers(args: argparse.Namespace) -> int:
+    """Reconcile ``slack.triggers`` in config.yaml from top-level ``slack_triggers``.
+
+    render-runtime-config seeds the block only on first install (it
+    preserves an existing config.yaml so operator hand-edits survive).
+    Without an always-reconciled merge, adding a new trigger to
+    deploy.values.yaml and re-running the installer would never reach
+    the gateway. This command runs on every install and updates only the
+    ``slack.triggers:`` scalar, preserving every other top-level key.
+
+    Empty / absent ``slack_triggers:`` deletes ``slack.triggers:`` from
+    config.yaml — declarative reconciliation, matching the rest of the
+    values-driven runtime surface.
+    """
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+
+    triggers_parsed, err = _validate_slack_triggers_block(
+        data.get("slack_triggers"),
+    )
+    if err is not None:
+        sys.stderr.write(f"values_helper.py: {err}\n")
+        return 1
+
+    if not out_path.exists():
+        sys.stderr.write(
+            f"values_helper.py: {out_path} does not exist; "
+            "render-runtime-config must seed it before merge-slack-triggers\n"
+        )
+        return 1
+    try:
+        existing = yaml.safe_load(out_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        sys.stderr.write(f"values_helper.py: {out_path} is not valid YAML: {exc}\n")
+        return 1
+    if not isinstance(existing, dict):
+        sys.stderr.write(
+            f"values_helper.py: {out_path} top level must be a mapping\n"
+        )
+        return 1
+
+    slack_block = existing.get("slack")
+    if not isinstance(slack_block, dict):
+        slack_block = {}
+    if triggers_parsed:
+        slack_block["triggers"] = triggers_parsed
+    else:
+        slack_block.pop("triggers", None)
+    if slack_block:
+        existing["slack"] = slack_block
+    elif "slack" in existing:
+        existing["slack"] = {}
+
+    out_path.write_text(
+        _CONFIG_YAML_HEADER
+        + yaml.safe_dump(existing, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+    sys.stdout.write(
+        f"merged: {out_path} slack.triggers={len(triggers_parsed or [])}\n"
+    )
     return 0
 
 
@@ -877,9 +941,9 @@ def _validate_slack_triggers_block(
 
     ``known_skills`` is the set of skill names present in the deploy's
     skills root (see ``_collect_known_skills``). When supplied, an unknown
-    ``skill`` is a hard fail — the install-time guard the spec asks for.
-    When omitted (skills root not available yet), the skill-existence
-    check is skipped with shape-validation only.
+    ``skill`` is a hard fail at install time. When omitted (skills root
+    not available yet), the skill-existence check is skipped with
+    shape-validation only.
     """
     label = "slack_triggers"
     if block is None:
@@ -1325,11 +1389,10 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
             return 1
 
     # slack_triggers[] — top-level. `--skills-root` is optional: when set
-    # and the directory exists, an unknown skill is a hard fail (the
-    # install-time guard the spec asks for). When unset or the directory
-    # doesn't exist yet (e.g. first install before skill sync), we
-    # shape-validate only and let the gateway warn on missing skills at
-    # boot.
+    # and the directory exists, an unknown skill is a hard fail. When
+    # unset or the directory doesn't exist yet (e.g. first install before
+    # skill sync), we shape-validate only and let the gateway warn on
+    # missing skills at boot.
     known_skills = None
     if getattr(args, "skills_root", None):
         known_skills = _collect_known_skills(Path(args.skills_root))
@@ -1434,6 +1497,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_merge_model.add_argument("--out", required=True, help="path to config.yaml to update")
     p_merge_model.set_defaults(func=cmd_merge_config_model)
+
+    p_merge_triggers = sub.add_parser(
+        "merge-slack-triggers",
+        help=(
+            "reconcile slack.triggers in config.yaml from top-level "
+            "slack_triggers (declarative; absent block clears triggers)"
+        ),
+    )
+    p_merge_triggers.add_argument("--out", required=True, help="path to config.yaml to update")
+    p_merge_triggers.set_defaults(func=cmd_merge_slack_triggers)
 
     p_quay = sub.add_parser("render-quay-config",
                             help="seed <target>/quay/config.toml from quay.*")

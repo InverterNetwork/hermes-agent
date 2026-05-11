@@ -24,7 +24,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Mapping, Optional
+from typing import Any, Iterable, Literal, Optional
 
 from gateway.platforms.helpers import MessageDeduplicator
 
@@ -53,8 +53,12 @@ _SLACK_USER_ID_RE = re.compile(r"^[UBW][A-Z0-9]{6,}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 _DEFAULT_MAX_PER_HOUR = 30
-_DEFAULT_ON_OVERFLOW: Literal["skip", "error"] = "skip"
-_VALID_ON_OVERFLOW = frozenset({"skip", "error"})
+# Only "skip" is implemented today: over-cap events get logged and dropped.
+# Slack re-delivers anyway, and a queued backlog after a burst is rarely
+# what we want. Extend the literal here when a real use case for "error"
+# (or any other policy) lands.
+_DEFAULT_ON_OVERFLOW: Literal["skip"] = "skip"
+_VALID_ON_OVERFLOW = frozenset({"skip"})
 
 
 class SlackTriggerConfigError(ValueError):
@@ -70,7 +74,7 @@ class SyntheticAuthor:
 @dataclass(frozen=True)
 class RateLimit:
     max_per_hour: int = _DEFAULT_MAX_PER_HOUR
-    on_overflow: Literal["skip", "error"] = _DEFAULT_ON_OVERFLOW
+    on_overflow: Literal["skip"] = _DEFAULT_ON_OVERFLOW
 
 
 @dataclass(frozen=True)
@@ -87,14 +91,6 @@ class SlackTriggerConfig:
     # Free-text comment in deploy.values.yaml — channel_id is the canonical
     # key (rename-stable). Surfaced in the envelope for human readability.
     channel_name: Optional[str] = None
-
-
-@dataclass(frozen=True)
-class SlackTriggerMatch:
-    trigger: SlackTriggerConfig
-    envelope_text: str
-    author_name: str
-    author_slack_id: str
 
 
 def parse_triggers(raw: Any, *, known_skills: Optional[Iterable[str]] = None) -> list[SlackTriggerConfig]:
@@ -261,9 +257,14 @@ def build_envelope(
     lines.append(f"author.slack_id: {author_slack_id}")
     if trigger.default_repo:
         lines.append(f"default_repo: {trigger.default_repo}")
+    # Fence the verbatim user body so a hostile payload (pasted
+    # `default_repo:` lines, "ignore the above" instructions, etc.) can't
+    # be mistaken for a continuation of the structured envelope above.
+    # Entry skills MUST read the body only between these sentinels.
     lines.append("")
-    lines.append("Message:")
-    lines.append(message_text or "(empty)")
+    lines.append("<<<SLACK_MESSAGE_BODY")
+    lines.append(message_text if message_text else "(empty)")
+    lines.append("SLACK_MESSAGE_BODY>>>")
     return "\n".join(lines)
 
 
@@ -283,12 +284,18 @@ class SlackTriggerRouter:
         triggers: Iterable[SlackTriggerConfig],
         *,
         bot_user_id: Optional[str] = None,
+        bot_id: Optional[str] = None,
         time_source: Optional[Any] = None,
     ) -> None:
         self._by_channel: dict[str, SlackTriggerConfig] = {
             t.channel_id: t for t in triggers
         }
+        # Slack identifies the gateway's own posts via two independent ids:
+        # `user_id` (U…, the bot's user) and `bot_id` (B…, the integration).
+        # Some bot_message subtypes / edits drop `user` while keeping
+        # `bot_id`, so we match on whichever the event carries.
         self._bot_user_id: Optional[str] = bot_user_id
+        self._bot_id: Optional[str] = bot_id
         self._now = time_source or time.monotonic
         # Defense-in-depth: the Slack adapter already dedups on ``ts`` via
         # its own MessageDeduplicator before the router sees the event, but
@@ -307,6 +314,9 @@ class SlackTriggerRouter:
 
     def set_bot_user_id(self, bot_user_id: Optional[str]) -> None:
         self._bot_user_id = bot_user_id
+
+    def set_bot_id(self, bot_id: Optional[str]) -> None:
+        self._bot_id = bot_id
 
     def evaluate(
         self,
@@ -335,8 +345,13 @@ class SlackTriggerRouter:
 
         if is_bot_message(bot_id=bot_id, subtype=subtype):
             # Defense-in-depth: never re-trigger on our own posts even if
-            # an operator misconfigures accept_from_bots: true.
-            if user_id and self._bot_user_id and user_id == self._bot_user_id:
+            # an operator misconfigures accept_from_bots: true. Match on
+            # whichever id Slack populated (some bot_message subtypes
+            # carry bot_id without user).
+            if (
+                (user_id and self._bot_user_id and user_id == self._bot_user_id)
+                or (bot_id and self._bot_id and bot_id == self._bot_id)
+            ):
                 return None, STATUS_SKIPPED_SELF
             if not trigger.accept_from_bots:
                 return None, STATUS_SKIPPED_BOT

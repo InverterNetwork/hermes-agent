@@ -189,6 +189,96 @@ class TestValidateSchema:
         assert r.returncode == 0, r.stderr
 
 
+class TestMergeSlackTriggers:
+    """Every-run reconciliation of slack.triggers — the blocking issue from
+    PR #62 review. render-runtime-config seeds on first install only, so
+    without this command, adding a new trigger to deploy.values.yaml and
+    re-running the installer would never reach the gateway."""
+
+    def _seed_config(self, tmp_path: Path, body: str = "") -> Path:
+        out = tmp_path / "config.yaml"
+        out.write_text(body or "slack:\n  allowed_channels:\n    - C_TEST\n",
+                       encoding="utf-8")
+        return out
+
+    def test_adds_triggers_on_first_merge(
+        self, tmp_path: Path, base_values_body: str,
+    ):
+        triggers = textwrap.dedent(
+            """
+            slack_triggers:
+              - channel_id: C0FEEDBACK
+                skill: feedback-intake
+                default_repo: iTRY-monorepo
+            """
+        )
+        values = _write_values(tmp_path, base_values_body, triggers)
+        out = self._seed_config(tmp_path)
+        r = _run(values, "merge-slack-triggers", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        rendered = yaml.safe_load(out.read_text(encoding="utf-8"))
+        assert rendered["slack"]["triggers"][0]["channel_id"] == "C0FEEDBACK"
+        # Pre-existing operator-edited keys survive the merge.
+        assert rendered["slack"]["allowed_channels"] == ["C_TEST"]
+
+    def test_overwrites_existing_triggers(
+        self, tmp_path: Path, base_values_body: str,
+    ):
+        """Declarative reconciliation: a values.yaml edit replaces the
+        live triggers list verbatim. Stale entries that the operator
+        removed from values.yaml must disappear from config.yaml."""
+        triggers = textwrap.dedent(
+            """
+            slack_triggers:
+              - channel_id: C0NEW01
+                skill: feedback-intake
+            """
+        )
+        values = _write_values(tmp_path, base_values_body, triggers)
+        out = self._seed_config(
+            tmp_path,
+            body=(
+                "slack:\n"
+                "  allowed_channels:\n    - C_TEST\n"
+                "  triggers:\n"
+                "    - channel_id: C0STALE01\n"
+                "      skill: feedback-intake\n"
+            ),
+        )
+        r = _run(values, "merge-slack-triggers", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        rendered = yaml.safe_load(out.read_text(encoding="utf-8"))
+        channel_ids = [t["channel_id"] for t in rendered["slack"]["triggers"]]
+        assert channel_ids == ["C0NEW01"]
+
+    def test_empty_block_clears_triggers(
+        self, tmp_path: Path, base_values_body: str,
+    ):
+        values = _write_values(tmp_path, base_values_body, "slack_triggers: []\n")
+        out = self._seed_config(
+            tmp_path,
+            body=(
+                "slack:\n"
+                "  triggers:\n"
+                "    - channel_id: C0STALE01\n"
+                "      skill: feedback-intake\n"
+            ),
+        )
+        r = _run(values, "merge-slack-triggers", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        rendered = yaml.safe_load(out.read_text(encoding="utf-8"))
+        assert "triggers" not in (rendered.get("slack") or {})
+
+    def test_missing_config_is_an_error(
+        self, tmp_path: Path, base_values_body: str,
+    ):
+        values = _write_values(tmp_path, base_values_body, "slack_triggers: []\n")
+        out = tmp_path / "nonexistent.yaml"
+        r = _run(values, "merge-slack-triggers", "--out", str(out))
+        assert r.returncode == 1
+        assert "render-runtime-config must seed" in r.stderr
+
+
 class TestRenderRuntimeConfigEmitsTriggers:
     def test_top_level_block_becomes_slack_triggers(
         self, tmp_path: Path, base_values_body: str,
