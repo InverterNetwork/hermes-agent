@@ -25,7 +25,7 @@ class _FakeState:
     """Minimal stand-in for `_State`. Captures v_ok / v_drift calls."""
 
     rails_owner = "root"
-    quay_version = "v0.1.3"
+    quay_version = "v0.1.4"
 
     def __init__(self):
         self.ok: list[str] = []
