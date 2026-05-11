@@ -167,12 +167,17 @@ def _build_skill_message(
     # the slash command so the skill can attribute work (e.g. building
     # an `authors:` list, routing alerts back to the source user).
     # Emitted near the top so it isn't buried beneath the SKILL.md body.
+    # The id label encodes the source platform ("slack_id", "discord_id",
+    # …) so a non-Slack consumer that mirrors the Slack-targeted
+    # /quay-run contract can't silently write the wrong id type into a
+    # YAML field literally named `slack_id`.
     if sender_name or sender_slack_id:
         bits: list[str] = []
         if sender_name:
             bits.append(str(sender_name))
         if sender_slack_id:
-            bits.append(f"(slack_id {sender_slack_id})")
+            id_label = f"{sender_platform}_id" if sender_platform else "user_id"
+            bits.append(f"({id_label} {sender_slack_id})")
         context_line = f"[Skill invocation context: triggered by {' '.join(bits)}"
         if sender_platform:
             context_line += f" on {sender_platform}"
