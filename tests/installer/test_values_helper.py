@@ -304,10 +304,6 @@ class TestRenderGatewayRuntimeEnv:
         assert "linear.teams must be a mapping" in r.stderr
 
     def test_writes_slack_slash_command_name(self, tmp_path: Path):
-        # slack.app.slash_command_name must be plumbed to the runtime so the
-        # gateway's slash-listener regex recognizes the operator-configured
-        # top-level slash (otherwise slack_bolt drops it as "Unhandled
-        # request" and Slack surfaces "did not respond" to the user).
         values = tmp_path / "values.yaml"
         values.write_text(
             "slack:\n  app:\n    slash_command_name: lmdtfy\n",
