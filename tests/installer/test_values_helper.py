@@ -746,7 +746,7 @@ class TestRenderQuayConfig:
 
 
 class TestRenderQuayConfigAgents:
-    """`quay.agents` block (AST-107): emits `[agents]` plus a
+    """`quay.agents` block: emits `[agents]` plus a
     `[agents.invocations.<id>]` table per agent id. Legacy
     `quay.agent_invocation` always renders — quay's back-compat path treats
     it as the worker default when the new block is absent.
@@ -801,9 +801,9 @@ class TestRenderQuayConfigAgents:
         self, tmp_path: Path
     ):
         # Strict back-compat: removing the legacy line is a separate
-        # deprecation step that lands once AST-107's quay-side treats the
-        # new block as the sole source. Until then the renderer must keep
-        # emitting it so existing quay deployments boot unchanged.
+        # deprecation step that lands once quay treats the new block as the
+        # sole source. Until then the renderer must keep emitting it so
+        # existing quay deployments boot unchanged.
         values = tmp_path / "values.yaml"
         values.write_text(
             "quay:\n"
@@ -929,6 +929,28 @@ class TestRenderQuayConfigAgents:
         r = _run(values, "render-quay-config", "--out", str(out))
         assert r.returncode == 1
         assert "must define at least one" in r.stderr
+
+    def test_dotted_agent_id_rejected(self, tmp_path: Path):
+        # A dotted id (e.g. `gpt.5`) would render as
+        # `[agents.invocations.gpt.5]`, which TOML parses as nested keys
+        # rather than a single agent entry. Reject at validate time so the
+        # renderer can keep emitting a bare header without quoting.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    invocations:\n"
+            "      gpt.5:\n"
+            '        worker: "gpt < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "gpt.5" in r.stderr
+        assert "must match" in r.stderr
+        assert not out.exists()
 
     def test_command_quotes_escaped(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
@@ -1833,65 +1855,10 @@ class TestValidateSchemaTagVocab:
 
 
 class TestValidateSchemaAgents:
-    """`validate-schema` walks the `quay.agents` block and per-repo
-    `repos[].quay.agent_{worker,reviewer}` overrides so typos fail at
-    verify time, not when quay rejects a malformed config.toml mid-install.
+    """`validate-schema` walks the top-level `quay.agents` block so typos
+    surface at verify time, not when quay rejects a malformed config.toml
+    mid-install.
     """
-
-    def test_per_repo_overrides_accepted(self, tmp_path: Path):
-        values = _values_with_repo(
-            tmp_path,
-            "      agent_worker: codex\n"
-            "      agent_reviewer: claude\n"
-            "quay:\n"
-            "  agents:\n"
-            "    invocations:\n"
-            "      claude:\n"
-            "        worker: \"claude < {prompt_file}\"\n"
-            "        reviewer: \"claude < {prompt_file}\"\n"
-            "      codex:\n"
-            "        worker: \"codex < {prompt_file}\"\n",
-        )
-        r = _run(values, "validate-schema")
-        assert r.returncode == 0, r.stderr
-        assert r.stderr == ""
-
-    def test_per_repo_override_must_be_string(self, tmp_path: Path):
-        values = _values_with_repo(
-            tmp_path,
-            "      agent_worker: 42\n",
-        )
-        r = _run(values, "validate-schema")
-        assert r.returncode == 1
-        assert "agent_worker must be a non-empty string" in r.stderr
-
-    def test_per_repo_override_bad_charset_rejected(self, tmp_path: Path):
-        values = _values_with_repo(
-            tmp_path,
-            "      agent_worker: \"has space\"\n",
-        )
-        r = _run(values, "validate-schema")
-        assert r.returncode == 1
-        assert "must match" in r.stderr
-
-    def test_per_repo_override_pointing_at_unknown_invocation_rejected(
-        self, tmp_path: Path
-    ):
-        # Cross-check: the override names an agent the global invocations
-        # table doesn't define for that role. Catch here instead of letting
-        # the install land a broken `quay repo apply-agent`.
-        values = _values_with_repo(
-            tmp_path,
-            "      agent_worker: gpt\n"
-            "quay:\n"
-            "  agents:\n"
-            "    invocations:\n"
-            "      claude:\n"
-            "        worker: \"claude < {prompt_file}\"\n",
-        )
-        r = _run(values, "validate-schema")
-        assert r.returncode == 1
-        assert "agent_worker='gpt'" in r.stderr
 
     def test_global_agents_typo_rejected_via_validate(self, tmp_path: Path):
         values = _values_with_repo(
@@ -1905,8 +1872,6 @@ class TestValidateSchemaAgents:
         assert "unknown key" in r.stderr
 
     def test_no_agents_block_still_validates(self, tmp_path: Path):
-        # Pre-AST-107 deployments don't carry `quay.agents` at all; the
-        # validator must stay quiet on the legacy shape.
         values = _values_with_repo(tmp_path, "")
         r = _run(values, "validate-schema")
         assert r.returncode == 0, r.stderr

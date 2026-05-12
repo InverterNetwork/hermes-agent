@@ -541,10 +541,17 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
 
 
 # Per-agent invocation tables carry exactly these role keys today; reviewer
-# spawn and worker spawn are the only consumers in AST-107's design. Any
-# other key is almost certainly a typo (e.g. `workers`) and should fail loud
-# at validate time rather than silently drop on the floor.
+# and worker spawn are the only consumers. Any other key is almost certainly
+# a typo (e.g. `workers`) and should fail loud at validate time rather than
+# silently drop on the floor.
 _AGENT_ROLE_KEYS = ("worker", "reviewer")
+
+# Stricter than `_REPO_ID_RE`: agent ids are interpolated bare into TOML
+# table headers (`[agents.invocations.<id>]`), and a dotted id like `gpt.5`
+# would parse as nested keys (`agents.invocations.gpt.5`) rather than as a
+# single agent entry. Reject dots here so the renderer can keep emitting a
+# bare header without quoting.
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 
 
 def _validate_quay_agents_block(
@@ -555,7 +562,7 @@ def _validate_quay_agents_block(
 ]:
     """Validate ``quay.agents`` and return a normalised view (or error string).
 
-    Schema (placeholder until AST-107 freezes — keys here match its design):
+    Schema::
 
         agents:
           worker: <agent_id>       # optional default for worker spawns
@@ -589,10 +596,10 @@ def _validate_quay_agents_block(
                     f"quay.agents.{role} must be a non-empty string "
                     f"(got {type(v).__name__}: {v!r})"
                 )
-            if not _REPO_ID_RE.match(v):
+            if not _AGENT_ID_RE.match(v):
                 return None, (
                     f"quay.agents.{role}={v!r} must match "
-                    f"{_REPO_ID_RE.pattern}"
+                    f"{_AGENT_ID_RE.pattern}"
                 )
             out[role] = v
 
@@ -604,10 +611,10 @@ def _validate_quay_agents_block(
 
     parsed_inv: dict[str, dict[str, str]] = {}
     for agent_id, roles in invocations.items():
-        if not isinstance(agent_id, str) or not _REPO_ID_RE.match(agent_id):
+        if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
             return None, (
                 f"quay.agents.invocations.{agent_id!r}: agent id must match "
-                f"{_REPO_ID_RE.pattern}"
+                f"{_AGENT_ID_RE.pattern}"
             )
         if not isinstance(roles, dict):
             return None, (
@@ -728,9 +735,9 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
     ]
 
-    # AST-107: legacy `agent_invocation` above continues to render unchanged —
-    # quay's back-compat path treats it as the worker default when no
-    # `[agents]` block is present.
+    # Legacy `agent_invocation` above continues to render unchanged — quay's
+    # back-compat path treats it as the worker default when no `[agents]`
+    # block is present.
     if agents_block is not None:
         lines.append("")
         lines.append("[agents]")
@@ -1514,24 +1521,12 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
         return 1
 
     quay_top = data.get("quay") if isinstance(data.get("quay"), dict) else None
-    agents_parsed, ag_err = _validate_quay_agents_block(
+    _, ag_err = _validate_quay_agents_block(
         quay_top.get("agents") if quay_top else None
     )
     if ag_err is not None:
         sys.stderr.write(f"values_helper.py: {ag_err}\n")
         return 1
-    # Derive override-target sets once so the per-repo loop can cross-check
-    # `agent_worker` / `agent_reviewer` against the global invocations table
-    # without re-walking it. `None` means the agents block is absent, so
-    # overrides only need shape validation, not cross-checking.
-    if agents_parsed is not None:
-        inv = agents_parsed["invocations"]
-        known_role_targets: dict[str, set[str]] | None = {
-            "worker": {aid for aid, r in inv.items() if "worker" in r},
-            "reviewer": {aid for aid, r in inv.items() if "reviewer" in r},
-        }
-    else:
-        known_role_targets = None
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -1573,38 +1568,6 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
             if tags_err is not None:
                 sys.stderr.write(f"values_helper.py: {tags_err}\n")
                 return 1
-            # Per-repo agent overrides (AST-107) — schema-validated so typos
-            # fail at install time, plus a cross-check that the named agent
-            # actually has a matching role entry in quay.agents.invocations.
-            for field, role in (
-                ("agent_worker", "worker"),
-                ("agent_reviewer", "reviewer"),
-            ):
-                if field not in quay_block:
-                    continue
-                v = quay_block[field]
-                if not isinstance(v, str) or not v:
-                    sys.stderr.write(
-                        f"values_helper.py: repos[{i}].quay.{field} must be a "
-                        f"non-empty string (got {type(v).__name__}: {v!r})\n"
-                    )
-                    return 1
-                if not _REPO_ID_RE.match(v):
-                    sys.stderr.write(
-                        f"values_helper.py: repos[{i}].quay.{field}={v!r} "
-                        f"must match {_REPO_ID_RE.pattern}\n"
-                    )
-                    return 1
-                if (
-                    known_role_targets is not None
-                    and v not in known_role_targets[role]
-                ):
-                    sys.stderr.write(
-                        f"values_helper.py: repos[{i}].quay.{field}={v!r} "
-                        f"but quay.agents.invocations.{v}.{role} is not "
-                        f"defined\n"
-                    )
-                    return 1
         _, it_err = _validate_repo_issue_tracker_block(
             f"repos[{i}].issue_tracker",
             entry.get("issue_tracker"),

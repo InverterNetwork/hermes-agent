@@ -159,22 +159,19 @@
 #                                 supervisor invokes for each task.
 #                                 {prompt_file} is the only placeholder;
 #                                 substituted with the path to the synthesized
-#                                 brief inside the worktree. AST-107 keeps
-#                                 this as the back-compat alias — treated as
+#                                 brief inside the worktree. Treated as the
+#                                 back-compat alias for
 #                                 `[agents.invocations.claude].worker` when
-#                                 the newer `quay.agents` block is absent.
-#                                 Always rendered so existing quay deploys
+#                                 the newer `quay.agents` block is absent;
+#                                 always rendered so existing quay deploys
 #                                 boot unchanged.
-#   quay.agents                — OPTIONAL multi-agent block (AST-107). Picks
-#                                 a default agent id per role and registers
-#                                 each agent's invocation template:
+#   quay.agents                — OPTIONAL multi-agent block. Picks a default
+#                                 agent id per role and registers each
+#                                 agent's invocation template:
 #                                   worker:   <agent_id>   global default
 #                                   reviewer: <agent_id>   global default
 #                                   invocations.<id>.{worker,reviewer}
 #                                                          per-agent cmd
-#                                 Per-repo overrides under
-#                                 `repos[].quay.{agent_worker,agent_reviewer}`
-#                                 point at the same `invocations.<id>` table.
 #                                 Codex runs under ChatGPT-subscription auth,
 #                                 NOT an OPENAI_API_KEY — don't stage an
 #                                 API-key env file for codex invocations.
@@ -405,18 +402,17 @@ quay:
   # `tool_trace` artifact (AST-97). This is the highest-signal data for
   # prompt iteration and would have made AST-100 triage nearly free.
   agent_invocation: "claude --permission-mode bypassPermissions --output-format json --debug --debug-file .quay-tool-trace.log < {prompt_file} > .quay-usage.json"
-  # AST-107 multi-agent registry. The defaults below match the legacy
-  # `agent_invocation` above; once AST-107's quay-side merge lands, the
+  # Multi-agent registry. The defaults below match the legacy
+  # `agent_invocation` above; once quay's back-compat path is retired the
   # legacy line becomes redundant. Reviewer invocation drops the
   # `--debug --debug-file` pair: reviewer attempts don't need a tool trace
   # (no patch is produced) and the file would shadow worker traces in the
   # same worktree.
   #
-  # To switch a repo to codex: (1) install codex CLI on krustentier under
-  # the agent user with ChatGPT-subscription auth; (2) uncomment the
-  # `codex:` invocation block below with concrete flags; (3) flip
-  # `worker:` / `reviewer:` here or set `repos[].quay.agent_worker` /
-  # `agent_reviewer` on the affected repo.
+  # To switch to codex: (1) install codex CLI on krustentier under the agent
+  # user with ChatGPT-subscription auth; (2) uncomment the `codex:`
+  # invocation block below with concrete flags; (3) flip `worker:` /
+  # `reviewer:` here.
   agents:
     worker: claude
     reviewer: claude
