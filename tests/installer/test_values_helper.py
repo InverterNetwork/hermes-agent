@@ -35,8 +35,6 @@ def values_file(tmp_path: Path) -> Path:
         "    display_name: TestBot\n"
         "    description: testing\n"
         "    background_color: \"#000000\"\n"
-        "    slash_command_name: testcmd\n"
-        "    slash_command_description: Test description\n"
         "  runtime:\n"
         "    allowed_channels:\n"
         "      - C_TEST\n"
@@ -81,13 +79,14 @@ class TestRenderManifest:
         tmpl = self._tmpl(
             tmp_path,
             '{"name": "${slack.app.display_name}", '
-            '"cmd": "/${slack.app.slash_command_name}"}',
+            '"desc": "${slack.app.description}"}',
         )
         out = tmp_path / "manifest.json"
         r = _run(values_file, "render-manifest", "--in", str(tmpl), "--out", str(out))
         assert r.returncode == 0, r.stderr
         rendered = json.loads(out.read_text())
-        assert rendered == {"name": "TestBot", "cmd": "/testcmd"}
+        assert rendered["name"] == "TestBot"
+        assert rendered["desc"] == "testing"
 
     def test_unresolved_placeholder_exits_nonzero(
         self, values_file: Path, tmp_path: Path
@@ -121,7 +120,8 @@ class TestRenderManifest:
         r = _run(values, "render-manifest", "--in", str(tmpl), "--out", str(out))
         assert r.returncode == 0, r.stderr
         # If quotes weren't escaped, json.loads would fail.
-        assert json.loads(out.read_text()) == {"d": 'I said "hi"'}
+        rendered = json.loads(out.read_text())
+        assert rendered["d"] == 'I said "hi"'
 
 
 class TestRenderRuntimeConfig:
@@ -302,25 +302,6 @@ class TestRenderGatewayRuntimeEnv:
         r = _run(values, "render-gateway-runtime-env", "--out", str(out))
         assert r.returncode == 1
         assert "linear.teams must be a mapping" in r.stderr
-
-    def test_writes_slack_slash_command_name(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "slack:\n  app:\n    slash_command_name: lmdtfy\n",
-            encoding="utf-8",
-        )
-        out = tmp_path / "gateway-runtime.env"
-        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
-        assert r.returncode == 0, r.stderr
-        assert "SLACK_SLASH_COMMAND_NAME=lmdtfy" in out.read_text()
-
-    def test_slash_command_name_absent_omits_line(self, tmp_path: Path):
-        values = tmp_path / "values.yaml"
-        values.write_text("slack:\n  app:\n    display_name: Bot\n", encoding="utf-8")
-        out = tmp_path / "gateway-runtime.env"
-        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
-        assert r.returncode == 0, r.stderr
-        assert "SLACK_SLASH_COMMAND_NAME" not in out.read_text()
 
     def test_always_rewrites_existing_file(self, tmp_path: Path):
         # Unlike render-runtime-config, this output is a reflection of

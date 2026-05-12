@@ -48,8 +48,6 @@ def base_values_body() -> str:
             display_name: TestBot
             description: testing
             background_color: "#000000"
-            slash_command_name: testcmd
-            slash_command_description: Test
           runtime:
             allowed_users: []
             allowed_channels: []
