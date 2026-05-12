@@ -94,6 +94,71 @@ The symlink makes `claude` available system-wide so root-owned scripts can
 invoke it. The login caches credentials under `~<agent>/.claude/` and is
 read by the worker process which runs as the agent user.
 
+## Pre-install: codex CLI (quay workers)
+
+Alternative to claude for quay's worker invocation. Configure by pointing
+`quay.agent_invocation` in `deploy.values.yaml` at `codex` (e.g.
+`codex exec --json -- … < {prompt_file} > .quay-usage.json`) — the
+installer fails loud if the invocation references `codex` and the binary
+is absent on the agent user's `PATH`.
+
+Subscription model: **ChatGPT subscription via `codex login`**, *not* an
+`OPENAI_API_KEY`. This is the same subscription class as the gateway's
+`openai-codex` auth but a distinct credential store (`~<agent>/.codex/`
+vs. `~<agent>/.hermes/auth.json`) — the codex CLI manages its own session.
+
+Install (operator's choice — codex ships several distribution paths, and
+the installer doesn't provision the binary itself; the rails-class
+SHA-pinned install pattern used for the `quay` binary may be adopted in a
+follow-up once codex publishes stable static-binary releases). Two paths
+currently work:
+
+```sh
+# Path A — npm (canonical upstream distribution today). Requires node+npm.
+sudo -u <agent> -H npm install -g @openai/codex
+
+# Path B — static binary from openai/codex GitHub releases.
+# Substitute the release tag and platform asset name as appropriate.
+sudo -u <agent> -H bash -c 'curl -fsSL <release-url> | tar xz -C ~/.local/bin/'
+```
+
+Symlink to a system path so root-owned scripts and `command -v codex`
+probes find it (parallel to claude):
+
+```sh
+sudo ln -sf $(sudo -u <agent> -H bash -c 'command -v codex') /usr/local/bin/codex
+```
+
+Log in (interactive — opens a browser flow on the local machine; complete
+before running the installer):
+
+```sh
+sudo -u <agent> -H codex login
+```
+
+On a headless host (no display), `codex login` can fall back to a paste-
+code-from-browser device flow on recent versions. If that path is
+unavailable on the version pinned for the deployment, `codex login` on a
+laptop and copy the resulting session over:
+
+```sh
+scp -r ~/.codex/ root@<host>:/home/<agent>/.codex/
+sudo chown -R <agent>:<agent> /home/<agent>/.codex
+sudo chmod 700 /home/<agent>/.codex
+```
+
+`verify.py` flags `~<agent>/.codex/` as DRIFT if it's missing, empty,
+world-readable, or owned by the wrong user.
+
+### Refresh / re-auth
+
+Token expiry on ChatGPT subscription auth is silent until the next
+worker spawn — failed attempts surface as auth errors in the worktree-
+local `.quay-tool-trace.log`. To refresh, re-run `sudo -u <agent> -H
+codex login` (or re-`scp` the laptop session). No daemon restart is
+needed: `quay-tick` spawns a fresh `codex` subprocess for each task and
+picks up the new tokens at the next tick.
+
 ## Pre-install: Codex auth (gateway runtime)
 
 `hermes-gateway` needs an LLM credential to interpret Slack messages and call
@@ -122,10 +187,11 @@ set `model.provider=openai-codex`.
 
 Subscription scope at a glance:
 
-| Surface         | Auth                              | Stored at                          |
-| --------------- | --------------------------------- | ---------------------------------- |
-| quay workers    | `claude login` (Anthropic sub)    | `~<agent>/.claude/`                |
-| `hermes-gateway`| `hermes auth add openai-codex`    | `~<agent>/.hermes/auth.json`       |
+| Surface                   | Auth                              | Stored at                          |
+| ------------------------- | --------------------------------- | ---------------------------------- |
+| quay workers (claude)     | `claude login` (Anthropic sub)    | `~<agent>/.claude/`                |
+| quay workers (codex)      | `codex login` (ChatGPT sub)       | `~<agent>/.codex/`                 |
+| `hermes-gateway`          | `hermes auth add openai-codex`    | `~<agent>/.hermes/auth.json`       |
 
 Token refresh is automatic — `hermes` mints a fresh access token from its
 refresh token on demand. If the refresh token is invalidated (e.g. the

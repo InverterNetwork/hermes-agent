@@ -408,9 +408,11 @@ fi
 PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
   ensure-runtimes --values "$VALUES_FILE"
 
-# ---------- claude CLI prerequisite check ----------
+# ---------- agent CLI prerequisite checks ----------
 # Fail loud here (before any user-side provisioning) rather than letting
 # the agent invoke fail with a cryptic "command not found" hours later.
+# Each agent the deployment may invoke (claude, codex) gets its own gate,
+# triggered by a substring match against quay.agent_invocation.
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   agent_invocation="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.agent_invocation)"
   if [[ "$agent_invocation" == *claude* ]]; then
@@ -421,6 +423,16 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
       echo "        sudo ln -sf ~$AGENT_USER/.local/bin/claude /usr/local/bin/claude" >&2
       echo "        sudo -u $AGENT_USER -H claude login" >&2
       echo "      See ops/README.md → 'Pre-install: claude CLI' for details." >&2
+      exit 1
+    fi
+  fi
+  if [[ "$agent_invocation" == *codex* ]]; then
+    if ! sudo -u "$AGENT_USER" -H bash -c 'command -v codex' >/dev/null 2>&1; then
+      echo "FAIL: quay.agent_invocation references 'codex' but the codex binary is not on PATH for $AGENT_USER" >&2
+      echo "      Install + log in as $AGENT_USER (ChatGPT subscription auth, not OPENAI_API_KEY)" >&2
+      echo "      before re-running setup-hermes.sh." >&2
+      echo "      See ops/README.md → 'Pre-install: codex CLI' for the supported install paths" >&2
+      echo "      and the 'codex login' bootstrap." >&2
       exit 1
     fi
   fi
