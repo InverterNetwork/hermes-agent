@@ -660,6 +660,14 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
                 f"(got {type(reviewer[key]).__name__}: {reviewer[key]!r})\n"
             )
             return 1
+    if "login" in reviewer:
+        login_val = reviewer["login"]
+        if not isinstance(login_val, str) or not login_val:
+            sys.stderr.write(
+                "values_helper.py: quay.reviewer.login must be a non-empty "
+                f"string (got {type(login_val).__name__}: {login_val!r})\n"
+            )
+            return 1
     if reviewer.get("enabled") is True:
         lines.append("")
         lines.append("[reviewer]")
