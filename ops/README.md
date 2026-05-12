@@ -484,8 +484,14 @@ of the registered repos live at `<HERMES_HOME>/quay/repos/<id>.git`.
 
 ## Worker auth
 
-The worker (`agent_invocation` in `quay/config.toml`) needs an Anthropic
-credential to call the Claude API. Two modes:
+The worker (`agent_invocation` in `quay/config.toml`) needs an LLM
+credential, which depends on whether the invocation calls `claude` or
+`codex`. See the pre-install sections above for the install + login
+bootstrap; this section just covers the runtime credential model.
+
+### Claude worker (`agent_invocation` calls `claude`)
+
+Anthropic credential. Two modes:
 
 * **Subscription auth** — run `sudo -u <agent_user> -H claude login` once;
   the CLI caches the credential at `~<agent_user>/.claude/`. Leave
@@ -499,6 +505,15 @@ credential to call the Claude API. Two modes:
 and `claude login` was also done), the env var silently overrides the login.
 Operators expect "blank = use subscription" — rotate or clear a stale key
 before relying on subscription auth.
+
+### Codex worker (`agent_invocation` calls `codex`)
+
+ChatGPT subscription auth via `codex login` — see
+"Pre-install: codex CLI (quay workers)" above. The CLI caches OAuth
+tokens at `~<agent_user>/.codex/auth.json`. No `OPENAI_API_KEY` env var
+is set in `quay.env`; the codex CLI reads its own session file directly.
+The token refresh / re-auth playbook lives in the same pre-install
+section.
 
 ## GitHub auth
 

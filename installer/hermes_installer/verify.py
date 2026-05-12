@@ -708,17 +708,42 @@ def _check_codex_prereqs(s: _State) -> None:
     else:
         s.v_ok(f"codex auth dir: mode={mode} owner={owner}")
 
-    try:
-        populated = any(codex_dir.iterdir())
-    except OSError:
-        populated = False
-    if not populated:
+    # auth.json schema: {"tokens": {"access_token": "...", "refresh_token":
+    # "...", ...}}. Both tokens must be present and non-empty — that's what
+    # hermes_cli/auth.py:_import_codex_cli_tokens reads on every Codex API
+    # call. A dir holding only config.toml / stale files would otherwise
+    # pass verify while workers fail at runtime.
+    auth_path = codex_dir / "auth.json"
+    if not auth_path.is_file():
         s.v_drift(
             "codex auth",
-            f"{codex_dir} is empty — run `sudo -u {s.agent_owner} -H codex login`",
+            f"missing {auth_path} — run `sudo -u {s.agent_owner} -H codex login`",
         )
-    else:
-        s.v_ok(f"codex auth: {codex_dir} populated")
+        return
+    try:
+        payload = json.loads(auth_path.read_text())
+    except PermissionError:
+        s.v_drift(
+            "codex auth",
+            f"{auth_path}: permission denied (run verify as root or {s.agent_owner})",
+        )
+        return
+    except (OSError, ValueError) as exc:
+        s.v_drift("codex auth", f"{auth_path}: unreadable or malformed ({exc})")
+        return
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if not isinstance(tokens, dict):
+        s.v_drift("codex auth", f"{auth_path}: missing `tokens` object")
+        return
+    access = tokens.get("access_token")
+    refresh = tokens.get("refresh_token")
+    if not isinstance(access, str) or not access:
+        s.v_drift("codex auth", f"{auth_path}: tokens.access_token empty/missing")
+        return
+    if not isinstance(refresh, str) or not refresh:
+        s.v_drift("codex auth", f"{auth_path}: tokens.refresh_token empty/missing")
+        return
+    s.v_ok(f"codex auth: {auth_path} carries access+refresh tokens")
 
 
 def _quay_registered_ids(s: _State) -> tuple[str, bool]:
