@@ -50,6 +50,14 @@
 # are still honored as per-run overrides for staging. Subsequent runs reuse
 # the PEM persisted under $TARGET/auth/. --auth-method none (the default)
 # skips auth wiring and is what CI uses with the local fixture.
+#
+# Reviewer App: pass --reviewer-app-key-path on first install to register a
+# *second* GitHub App identity used by quay's reviewer worker. IDs default
+# to deploy.values.yaml's auth.github_app_reviewer.{id, installation_id};
+# the key is persisted at /etc/hermes/reviewer.pem and a systemd timer
+# (hermes-reviewer-token.timer) keeps /run/hermes/reviewer-gh-token fresh
+# for the reviewer to consume per AST-109. Reviewer wiring is gated on
+# --auth-method=app and skipped when no key has ever been staged.
 
 set -euo pipefail
 
@@ -79,6 +87,17 @@ APP_KEY_PATH=""
 SKIP_AUTH_CHECK=0
 # API base override — only set in CI where we point at a localhost mock.
 GH_API_BASE=""
+# Reviewer App — a *second* GitHub App identity (different from the worker
+# App above) so the reviewer worker can post APPROVE reviews on PRs
+# opened by the worker without GitHub blocking the self-review. Bootstrap
+# via --reviewer-app-key-path on first install; subsequent re-runs reuse
+# the PEM persisted at /etc/hermes/reviewer.pem and the IDs from
+# auth.github_app_reviewer.{id,installation_id} in deploy.values.yaml.
+# Reviewer wiring is skipped entirely when no key has ever been staged.
+# See BRIX-1390 / AST-109 for the cross-component design.
+REVIEWER_APP_ID=""
+REVIEWER_APP_INSTALLATION_ID=""
+REVIEWER_APP_KEY_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,6 +115,9 @@ while [[ $# -gt 0 ]]; do
     --app-id)                APP_ID="$2";               shift 2 ;;
     --app-installation-id)   APP_INSTALLATION_ID="$2";  shift 2 ;;
     --app-key-path)          APP_KEY_PATH="$2";         shift 2 ;;
+    --reviewer-app-id)              REVIEWER_APP_ID="$2";              shift 2 ;;
+    --reviewer-app-installation-id) REVIEWER_APP_INSTALLATION_ID="$2"; shift 2 ;;
+    --reviewer-app-key-path)        REVIEWER_APP_KEY_PATH="$2";        shift 2 ;;
     --skip-auth-check)       SKIP_AUTH_CHECK=1;         shift   ;;
     --gh-api-base)           GH_API_BASE="$2";          shift 2 ;;
     --verify)                VERIFY=1;                  shift   ;;
@@ -684,6 +706,74 @@ EOF
     || { echo "FAIL: token helper missing at $TOKEN_HELPER_PY" >&2; exit 1; }
   [[ -x "$VENV_PY" ]] \
     || { echo "FAIL: venv python missing at $VENV_PY" >&2; exit 1; }
+fi
+
+# ---------- reviewer App auth (separate identity from worker) ----------
+# Reviewer wiring is gated on --auth-method=app (it shares the token-helper
+# machinery). Activated when the operator passes --reviewer-app-key-path
+# OR /etc/hermes/reviewer.pem already exists (idempotent re-run). Same
+# resolution order as worker auth: CLI flag > deploy.values.yaml >
+# existing env file. See BRIX-1390 / AST-109.
+REVIEWER_ETC_DIR="/etc/hermes"
+REVIEWER_KEY_DST="$REVIEWER_ETC_DIR/reviewer.pem"
+REVIEWER_ENV="$REVIEWER_ETC_DIR/reviewer.env"
+REVIEWER_ENABLED=0
+if [[ -n "$REVIEWER_APP_KEY_PATH" || -f "$REVIEWER_KEY_DST" ]]; then
+  REVIEWER_ENABLED=1
+fi
+
+if [[ "$REVIEWER_ENABLED" -eq 1 ]]; then
+  [[ "$AUTH_METHOD" == "app" ]] \
+    || { echo "FAIL: reviewer App wiring requires --auth-method=app (got: $AUTH_METHOD)" >&2; exit 1; }
+
+  echo "==> wiring reviewer GitHub App auth at $REVIEWER_ETC_DIR"
+  install -d -o root -g "$AGENT_USER" -m 0750 "$REVIEWER_ETC_DIR"
+
+  if [[ -n "$REVIEWER_APP_KEY_PATH" ]]; then
+    [[ -f "$REVIEWER_APP_KEY_PATH" ]] \
+      || { echo "FAIL: --reviewer-app-key-path file not found: $REVIEWER_APP_KEY_PATH" >&2; exit 1; }
+    # Same tight regex as the worker key — PyJWT can't read passphrase-
+    # protected PEMs, so reject ENCRYPTED upfront.
+    head -1 "$REVIEWER_APP_KEY_PATH" | grep -Eq '^-----BEGIN (RSA |EC )?PRIVATE KEY-----$' \
+      || { echo "FAIL: $REVIEWER_APP_KEY_PATH does not look like an unencrypted PEM private key" >&2; exit 1; }
+    if grep -q 'ENCRYPTED' "$REVIEWER_APP_KEY_PATH"; then
+      echo "FAIL: $REVIEWER_APP_KEY_PATH is passphrase-protected; PyJWT requires an unencrypted key" >&2
+      exit 1
+    fi
+    install -o root -g "$AGENT_USER" -m 0640 "$REVIEWER_APP_KEY_PATH" "$REVIEWER_KEY_DST"
+  fi
+
+  # Re-assert perms every run (idempotent; corrects drift).
+  chown root:"$AGENT_USER" "$REVIEWER_KEY_DST"
+  chmod 0640 "$REVIEWER_KEY_DST"
+
+  # IDs: CLI flag > deploy.values.yaml.auth.github_app_reviewer > existing env file.
+  REVIEWER_APP_ID="${REVIEWER_APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.id 2>/dev/null || true)}"
+  REVIEWER_APP_INSTALLATION_ID="${REVIEWER_APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.installation_id 2>/dev/null || true)}"
+  REVIEWER_GH_API_BASE="${GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.api_base 2>/dev/null || true)}"
+  if [[ -f "$REVIEWER_ENV" ]]; then
+    REVIEWER_APP_ID="${REVIEWER_APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$REVIEWER_ENV")}"
+    REVIEWER_APP_INSTALLATION_ID="${REVIEWER_APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$REVIEWER_ENV")}"
+    REVIEWER_GH_API_BASE="${REVIEWER_GH_API_BASE:-$(awk -F= '$1=="HERMES_GH_API"{print $2; exit}' "$REVIEWER_ENV")}"
+  fi
+  [[ "$REVIEWER_APP_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --reviewer-app-id must be a positive integer (got: '$REVIEWER_APP_ID')" >&2; exit 1; }
+  [[ "$REVIEWER_APP_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --reviewer-app-installation-id must be a positive integer (got: '$REVIEWER_APP_INSTALLATION_ID')" >&2; exit 1; }
+
+  # Cache lives in /run/hermes/ so reboot wipes it alongside the token —
+  # the helper's TTL/refresh-margin logic still applies between mints.
+  umask 0027
+  cat > "$REVIEWER_ENV" <<EOF
+HERMES_GH_APP_ID=$REVIEWER_APP_ID
+HERMES_GH_INSTALLATION_ID=$REVIEWER_APP_INSTALLATION_ID
+HERMES_GH_APP_KEY=$REVIEWER_KEY_DST
+HERMES_GH_TOKEN_CACHE=/run/hermes/reviewer-token-cache.json
+${REVIEWER_GH_API_BASE:+HERMES_GH_API=$REVIEWER_GH_API_BASE}
+EOF
+  umask 0022
+  chown root:"$AGENT_USER" "$REVIEWER_ENV"
+  chmod 0640 "$REVIEWER_ENV"
 fi
 
 # ---------- state (agent-owned, writable) ----------
@@ -1378,6 +1468,43 @@ elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
     || echo "==> WARNING: $QUAY_TICK_SRC missing; skipping quay-tick install" >&2
   [[ -f "$QUAY_TICK_RUNNER_SRC" ]] \
     || echo "==> WARNING: $QUAY_TICK_RUNNER_SRC missing; skipping quay-tick install" >&2
+fi
+
+# ---------- hermes-reviewer-token ----------
+# Periodic refresh of /run/hermes/reviewer-gh-token from the reviewer
+# GitHub App (separate identity from the worker App). Gated on the
+# reviewer auth block above having staged a key — no key, no timer.
+# Same install model as quay-tick: sed-templated User=/__TARGET_DIR__
+# substitutions, no /etc/default/ override (config lives in the
+# install-time-written /etc/hermes/reviewer.env).
+
+REVIEWER_TOKEN_SRC="$OPS_DIR/hermes-reviewer-token.service"
+REVIEWER_TOKEN_TIMER_SRC="$OPS_DIR/hermes-reviewer-token.timer"
+
+if [[ "$REVIEWER_ENABLED" -eq 1 && -f "$REVIEWER_TOKEN_SRC" && -f "$REVIEWER_TOKEN_TIMER_SRC" ]]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd timer for hermes-reviewer-token (user=$AGENT_USER)"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        "$REVIEWER_TOKEN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin \
+          /etc/systemd/system/hermes-reviewer-token.service
+    install -o root -g root -m 0644 \
+      "$REVIEWER_TOKEN_TIMER_SRC" \
+      /etc/systemd/system/hermes-reviewer-token.timer
+    systemctl daemon-reload
+    # `enable --now` also fires the service immediately (oneshot), so the
+    # token file lands before the next quay-tick attempts to read it.
+    systemctl enable --now hermes-reviewer-token.timer
+    systemctl start hermes-reviewer-token.service
+  else
+    echo "==> systemctl not present; skipping hermes-reviewer-token timer (units installed)" >&2
+  fi
+elif [[ "$REVIEWER_ENABLED" -eq 1 ]]; then
+  [[ -f "$REVIEWER_TOKEN_SRC" ]] \
+    || echo "==> WARNING: $REVIEWER_TOKEN_SRC missing; skipping hermes-reviewer-token install" >&2
+  [[ -f "$REVIEWER_TOKEN_TIMER_SRC" ]] \
+    || echo "==> WARNING: $REVIEWER_TOKEN_TIMER_SRC missing; skipping hermes-reviewer-token install" >&2
 fi
 
 # ---------- hermes-gateway ----------

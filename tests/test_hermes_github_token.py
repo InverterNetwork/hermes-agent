@@ -158,6 +158,22 @@ def test_credential_protocol_get(hermes_home, monkeypatch):
     assert "password=ghs_z" in out
 
 
+def test_write_token_to_file_atomic_and_mode_0600(hermes_home, tmp_path, monkeypatch):
+    # write-token is what hermes-reviewer-token.service runs each tick. The
+    # output file must end up with mode 0600 and no trailing newline — the
+    # consumer (`gh auth login --with-token` / quay's `gh_token_file`)
+    # reads the whole file as the token.
+    monkeypatch.setenv("HERMES_GH_TOKEN_OVERRIDE", "ghs_reviewer_xyz")
+    out_path = tmp_path / "run-hermes" / "reviewer-gh-token"
+    hgt.write_token_to_file(out_path)
+
+    assert out_path.read_text() == "ghs_reviewer_xyz"
+    mode = os.stat(out_path).st_mode & 0o777
+    assert mode == 0o600, f"token file mode {oct(mode)} (expected 0600)"
+    # The temp file must be gone (rename is atomic on POSIX).
+    assert not out_path.with_suffix(out_path.suffix + ".tmp").exists()
+
+
 def test_credential_protocol_no_op(hermes_home):
     assert hgt.credential_protocol("store", "") == ""
     assert hgt.credential_protocol("erase", "") == ""

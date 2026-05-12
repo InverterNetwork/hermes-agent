@@ -6,6 +6,10 @@
 #   hermes_github_token.py mint              # print a token to stdout
 #   hermes_github_token.py check             # exit 0 iff a token can be obtained, no stdout
 #   hermes_github_token.py credential get    # git credential helper protocol
+#   hermes_github_token.py write-token --out PATH
+#                                            # atomically write the token to PATH (mode 0600)
+#                                            # — used by hermes-reviewer-token.service to
+#                                            # produce /run/hermes/reviewer-gh-token
 #
 # Configuration is read from $HERMES_GH_CONFIG (default: ~/.hermes/auth/github-app.env),
 # with each line in the form KEY=VALUE. Recognized keys:
@@ -237,6 +241,32 @@ def credential_protocol(action: str, stdin: str = "") -> str:
     return f"username=x-access-token\npassword={token}\n"
 
 
+def write_token_to_file(out_path: Path) -> None:
+    """Mint a token and atomically persist it to ``out_path`` at mode 0600.
+
+    Used by hermes-reviewer-token.service to refresh /run/hermes/reviewer-gh-token.
+    No trailing newline — consumers (`quay`'s upcoming `gh_token_file` per
+    AST-109; `gh auth login --with-token`) read the whole file as the token.
+    """
+    token = get_token()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    # Open with the target mode upfront — same posture as _write_cache(): the
+    # token never lives in a world-readable file even momentarily.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(tmp, 0o600)
+    tmp.replace(out_path)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -253,6 +283,14 @@ def main(argv: list[str]) -> int:
     if cmd == "credential":
         action = argv[2] if len(argv) > 2 else "get"
         sys.stdout.write(credential_protocol(action, sys.stdin.read()))
+        return 0
+    if cmd == "write-token":
+        # Tiny argparse to keep the surface explicit; the only operator-facing
+        # contract is `--out <path>`.
+        if len(argv) < 4 or argv[2] != "--out":
+            print("usage: hermes_github_token.py write-token --out PATH", file=sys.stderr)
+            return 2
+        write_token_to_file(Path(argv[3]))
         return 0
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 2
