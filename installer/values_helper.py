@@ -644,13 +644,28 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         lines.append("enabled = true")
         lines.append(f"bot_token_env = {_toml_basic_string(str(bot_token_env))}")
 
-    reviewer = quay.get("reviewer") or {}
-    if isinstance(reviewer, dict) and reviewer.get("enabled"):
+    reviewer = quay.get("reviewer")
+    if reviewer is None:
+        reviewer = {}
+    if not isinstance(reviewer, dict):
+        sys.stderr.write("values_helper.py: quay.reviewer must be a mapping\n")
+        return 1
+    # Strict bool — Python's truthiness coerces "false"/"0" to True, which
+    # would silently flip the quay-owned done → pr-review gate the operator
+    # was trying to disable.
+    for key in ("enabled", "gate_quay_owned_done"):
+        if key in reviewer and not isinstance(reviewer[key], bool):
+            sys.stderr.write(
+                f"values_helper.py: quay.reviewer.{key} must be a bool "
+                f"(got {type(reviewer[key]).__name__}: {reviewer[key]!r})\n"
+            )
+            return 1
+    if reviewer.get("enabled") is True:
         lines.append("")
         lines.append("[reviewer]")
         lines.append("enabled = true")
         if "gate_quay_owned_done" in reviewer:
-            gate = bool(reviewer["gate_quay_owned_done"])
+            gate = reviewer["gate_quay_owned_done"]
             lines.append(f"gate_quay_owned_done = {'true' if gate else 'false'}")
         login = reviewer.get("login")
         if isinstance(login, str) and login:

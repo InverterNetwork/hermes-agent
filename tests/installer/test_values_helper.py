@@ -678,6 +678,65 @@ class TestRenderQuayConfig:
         assert r.returncode == 0, r.stderr
         assert 'login = "hermes-reviewer"' in out.read_text()
 
+    @pytest.mark.parametrize(
+        "yaml_value",
+        ['"false"', '"true"', "1", "0", "null"],
+    )
+    def test_reviewer_enabled_must_be_strict_bool(
+        self, tmp_path: Path, yaml_value: str
+    ):
+        # Python truthiness would coerce the string "false" → True and emit
+        # enabled = true. Reject anything that isn't a real YAML bool.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            f"    enabled: {yaml_value}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer.enabled must be a bool" in r.stderr
+        assert not out.exists()
+
+    @pytest.mark.parametrize(
+        "yaml_value",
+        ['"false"', '"true"', "1", "0"],
+    )
+    def test_reviewer_gate_must_be_strict_bool(
+        self, tmp_path: Path, yaml_value: str
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n"
+            f"    gate_quay_owned_done: {yaml_value}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer.gate_quay_owned_done must be a bool" in r.stderr
+        assert not out.exists()
+
+    def test_reviewer_must_be_mapping(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            '  reviewer: "yes please"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer must be a mapping" in r.stderr
+        assert not out.exists()
+
 
 class TestListRepos:
     @pytest.fixture
