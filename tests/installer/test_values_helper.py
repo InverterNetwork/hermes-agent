@@ -745,6 +745,208 @@ class TestRenderQuayConfig:
         assert not out.exists()
 
 
+class TestRenderQuayConfigAgents:
+    """`quay.agents` block (AST-107): emits `[agents]` plus a
+    `[agents.invocations.<id>]` table per agent id. Legacy
+    `quay.agent_invocation` always renders — quay's back-compat path treats
+    it as the worker default when the new block is absent.
+    """
+
+    def test_legacy_only_omits_agents_block(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[agents]" not in text
+        assert "[agents.invocations" not in text
+
+    def test_new_agents_block_renders_defaults_and_invocations(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    worker: claude\n"
+            "    reviewer: claude\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude --foo < {prompt_file}"\n'
+            '        reviewer: "claude --bar < {prompt_file}"\n'
+            "      codex:\n"
+            '        worker: "codex --baz < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[agents]" in text
+        assert 'worker = "claude"' in text
+        assert 'reviewer = "claude"' in text
+        assert "[agents.invocations.claude]" in text
+        assert 'worker = "claude --foo < {prompt_file}"' in text
+        assert 'reviewer = "claude --bar < {prompt_file}"' in text
+        assert "[agents.invocations.codex]" in text
+        assert 'worker = "codex --baz < {prompt_file}"' in text
+
+    def test_legacy_agent_invocation_still_required_with_new_block(
+        self, tmp_path: Path
+    ):
+        # Strict back-compat: removing the legacy line is a separate
+        # deprecation step that lands once AST-107's quay-side treats the
+        # new block as the sole source. Until then the renderer must keep
+        # emitting it so existing quay deployments boot unchanged.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  agents:\n"
+            "    worker: claude\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "agent_invocation is required" in r.stderr
+
+    def test_invocations_emitted_in_sorted_order(self, tmp_path: Path):
+        # Deterministic output: re-rendering the same values.yaml MUST
+        # produce byte-identical TOML so hermes-sync's drift detector
+        # doesn't flip on every install.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    invocations:\n"
+            "      zeta:\n"
+            '        worker: "z < {prompt_file}"\n'
+            "      alpha:\n"
+            '        worker: "a < {prompt_file}"\n'
+            "      mu:\n"
+            '        worker: "m < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        pos_alpha = text.index("[agents.invocations.alpha]")
+        pos_mu = text.index("[agents.invocations.mu]")
+        pos_zeta = text.index("[agents.invocations.zeta]")
+        assert pos_alpha < pos_mu < pos_zeta
+
+    def test_agents_must_be_mapping(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            '  agents: "yes"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.agents must be a mapping" in r.stderr
+        assert not out.exists()
+
+    def test_typo_top_level_key_rejected(self, tmp_path: Path):
+        # `workers` (plural) is a plausible typo — fail loud rather than
+        # silently dropping the default.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    workers: claude\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "unknown key" in r.stderr
+        assert "workers" in r.stderr
+
+    def test_typo_invocation_role_rejected(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        reviewers: "claude --bar"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "reviewers" in r.stderr
+
+    def test_default_pointing_at_undefined_invocation_rejected(
+        self, tmp_path: Path
+    ):
+        # Misalignment between `worker:` default and `invocations.<id>`
+        # would render a config.toml quay refuses to parse — catch it at
+        # validate time instead.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    worker: gpt\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "no quay.agents.invocations.gpt" in r.stderr
+
+    def test_invocation_with_no_roles_rejected(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    invocations:\n"
+            "      claude: {}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "must define at least one" in r.stderr
+
+    def test_command_quotes_escaped(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  agents:\n"
+            "    invocations:\n"
+            "      claude:\n"
+            "        worker: 'claude --sys \"be terse\" < {prompt_file}'\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert r'\"be terse\"' in out.read_text()
+
+
 class TestListRepos:
     @pytest.fixture
     def repos_values(self, tmp_path: Path) -> Path:
@@ -1627,6 +1829,87 @@ class TestValidateSchemaTagVocab:
         )
         r = _run(values, "validate-schema")
         assert r.returncode == 0
+        assert r.stderr == ""
+
+
+class TestValidateSchemaAgents:
+    """`validate-schema` walks the `quay.agents` block and per-repo
+    `repos[].quay.agent_{worker,reviewer}` overrides so typos fail at
+    verify time, not when quay rejects a malformed config.toml mid-install.
+    """
+
+    def test_per_repo_overrides_accepted(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      agent_worker: codex\n"
+            "      agent_reviewer: claude\n"
+            "quay:\n"
+            "  agents:\n"
+            "    invocations:\n"
+            "      claude:\n"
+            "        worker: \"claude < {prompt_file}\"\n"
+            "        reviewer: \"claude < {prompt_file}\"\n"
+            "      codex:\n"
+            "        worker: \"codex < {prompt_file}\"\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 0, r.stderr
+        assert r.stderr == ""
+
+    def test_per_repo_override_must_be_string(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      agent_worker: 42\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "agent_worker must be a non-empty string" in r.stderr
+
+    def test_per_repo_override_bad_charset_rejected(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "      agent_worker: \"has space\"\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "must match" in r.stderr
+
+    def test_per_repo_override_pointing_at_unknown_invocation_rejected(
+        self, tmp_path: Path
+    ):
+        # Cross-check: the override names an agent the global invocations
+        # table doesn't define for that role. Catch here instead of letting
+        # the install land a broken `quay repo apply-agent`.
+        values = _values_with_repo(
+            tmp_path,
+            "      agent_worker: gpt\n"
+            "quay:\n"
+            "  agents:\n"
+            "    invocations:\n"
+            "      claude:\n"
+            "        worker: \"claude < {prompt_file}\"\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "agent_worker='gpt'" in r.stderr
+
+    def test_global_agents_typo_rejected_via_validate(self, tmp_path: Path):
+        values = _values_with_repo(
+            tmp_path,
+            "quay:\n"
+            "  agents:\n"
+            "    workers: claude\n",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "unknown key" in r.stderr
+
+    def test_no_agents_block_still_validates(self, tmp_path: Path):
+        # Pre-AST-107 deployments don't carry `quay.agents` at all; the
+        # validator must stay quiet on the legacy shape.
+        values = _values_with_repo(tmp_path, "")
+        r = _run(values, "validate-schema")
+        assert r.returncode == 0, r.stderr
         assert r.stderr == ""
 
 
