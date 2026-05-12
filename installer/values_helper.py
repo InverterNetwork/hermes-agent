@@ -644,6 +644,18 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         lines.append("enabled = true")
         lines.append(f"bot_token_env = {_toml_basic_string(str(bot_token_env))}")
 
+    reviewer = quay.get("reviewer") or {}
+    if isinstance(reviewer, dict) and reviewer.get("enabled"):
+        lines.append("")
+        lines.append("[reviewer]")
+        lines.append("enabled = true")
+        if "gate_quay_owned_done" in reviewer:
+            gate = bool(reviewer["gate_quay_owned_done"])
+            lines.append(f"gate_quay_owned_done = {'true' if gate else 'false'}")
+        login = reviewer.get("login")
+        if isinstance(login, str) and login:
+            lines.append(f"login = {_toml_basic_string(login)}")
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     sys.stdout.write(f"wrote: {out_path}\n")

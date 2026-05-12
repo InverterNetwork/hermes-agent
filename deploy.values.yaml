@@ -413,6 +413,17 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
+  # Quay v0.2.0 pr-review subsystem. `enabled: true` alone only activates
+  # ad-hoc /review on human-owned PRs; `gate_quay_owned_done: true` is what
+  # opens the `pr-open → done → pr-review` path for quay-spawned tasks
+  # (src/core/tick.ts: enter-review fires only when both are true, and
+  # src/core/pr_review.ts skips with `quay_owned_gate_disabled` otherwise).
+  # `login` left unset — single hermes user on krustentier, tick + worker
+  # share gh auth. `max_concurrent_reviewers` left at the binary default
+  # of 2.
+  reviewer:
+    enabled: true
+    gate_quay_owned_done: true
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the
