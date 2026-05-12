@@ -253,6 +253,21 @@ auth:
     # Empty = production github.com. Set only for GitHub Enterprise or
     # a CI mock endpoint.
     api_base: ""
+  # Second GitHub App used by quay's reviewer worker — must be a distinct
+  # identity from `github_app` above. GitHub refuses to let an App approve
+  # PRs opened by the same App, so the worker and reviewer have to be two
+  # separate identities (the operational pairing on krustentier is
+  # didier-worker + didier-reviewer). First-install requires
+  # --reviewer-app-key-path on the installer; the PEM persists at
+  # /etc/hermes/reviewer.pem and a systemd timer refreshes
+  # /run/hermes/reviewer-gh-token, which the quay reviewer worker reads
+  # per AST-109. Leave id/installation_id empty to skip reviewer wiring
+  # entirely (the install still runs; reviewer worker just won't get a
+  # distinct token).
+  github_app_reviewer:
+    id: ""
+    installation_id: ""
+    api_base: ""
 
 linear:
   # Linear team UUIDs exposed to the gateway as LINEAR_TEAM_<KEY> env vars
@@ -424,6 +439,14 @@ quay:
   # spawn under the same App; once a separate reviewer App is provisioned
   # this changes to its slug. `max_concurrent_reviewers` left at the binary
   # default of 2.
+  #
+  # AST-109 follow-up: once quay's `[reviewer]` config accepts a token-
+  # file knob, add `gh_token_file: /run/hermes/reviewer-gh-token` here so
+  # the reviewer worker authenticates as the distinct reviewer App
+  # (provisioned by `auth.github_app_reviewer` + the installer's
+  # hermes-reviewer-token timer). Until that schema lands, both worker
+  # and reviewer share the worker App's $GH_TOKEN and GitHub blocks the
+  # self-review — same failure mode as BRIX-1389.
   reviewer:
     enabled: true
     gate_quay_owned_done: true

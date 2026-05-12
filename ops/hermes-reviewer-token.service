@@ -1,0 +1,35 @@
+[Unit]
+Description=Hermes reviewer GitHub App token refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User/Group and the target-dir-derived paths below are substituted by
+# setup-hermes.sh at install time (same pattern as quay-tick.service).
+User=__AGENT_USER__
+Group=__AGENT_USER__
+# RuntimeDirectory= creates /run/hermes owned by hermes:hermes (mode
+# 0750) before ExecStart, and systemd wipes it on reboot — exactly the
+# lifetime an installation token should have. Set Preserve=yes so a
+# concurrent unit owning a sibling file in /run/hermes/ doesn't see
+# its dir vanish between our ticks.
+RuntimeDirectory=hermes
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+# Reviewer config: a separate App identity from the worker. The env file
+# points HERMES_GH_{APP_ID,INSTALLATION_ID,APP_KEY} at the reviewer App's
+# credentials, and HERMES_GH_TOKEN_CACHE at /run/hermes/reviewer-token-
+# cache.json so the cache is wiped on reboot alongside the token file.
+Environment=HERMES_GH_CONFIG=/etc/hermes/reviewer.env
+# Mint via the shared helper. `write-token` atomically renames into
+# /run/hermes/reviewer-gh-token at mode 0600 so quay's reviewer worker
+# (per AST-109's `gh_token_file` schema) can read it as $GH_TOKEN.
+ExecStart=__TARGET_DIR__/hermes-agent/venv/bin/python __TARGET_DIR__/hermes-agent/installer/hermes_github_token.py write-token --out /run/hermes/reviewer-gh-token
+# A transient mint failure shouldn't park the timer; let the next tick
+# retry. Restart=no keeps systemd's failed-unit signal honest.
+Restart=no
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

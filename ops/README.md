@@ -29,6 +29,16 @@ Five units live here:
   `/usr/local/bin/quay tick`. `QUAY_DATA_DIR` points at
   `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
   carrying a `quay:` block.
+* **`hermes-reviewer-token`** — 30-min oneshot that refreshes
+  `/run/hermes/reviewer-gh-token` from a *second* GitHub App (the
+  reviewer identity), so quay's reviewer worker can post APPROVE reviews
+  on PRs opened by the worker App without GitHub blocking the
+  self-review. Installed only when the operator passes
+  `--reviewer-app-key-path` on first install (the PEM persists at
+  `/etc/hermes/reviewer.pem`); IDs come from
+  `auth.github_app_reviewer.{id,installation_id}` in
+  `deploy.values.yaml`. See BRIX-1390 + AST-109 for the cross-component
+  design.
 
 ## Files
 
@@ -49,6 +59,8 @@ Five units live here:
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
+| `ops/hermes-reviewer-token.service`        | systemd service unit (oneshot). Mints the reviewer App's installation token via `installer/hermes_github_token.py write-token` and writes it to `/run/hermes/reviewer-gh-token`. `User=__AGENT_USER__` and `__TARGET_DIR__` templated by `setup-hermes.sh`. |
+| `ops/hermes-reviewer-token.timer`          | systemd timer unit. `OnBootSec=30s` + 30-min steady cadence. |
 | `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 

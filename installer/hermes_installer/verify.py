@@ -1050,6 +1050,11 @@ def _check_systemd(s: _State) -> None:
     ]
     if s.quay_version:
         timers.append("quay-tick.timer")
+    # Reviewer timer is install-gated by the reviewer auth block having
+    # staged /etc/hermes/reviewer.env; presence of that file is the
+    # ground truth (same probe we use for _check_reviewer_token).
+    if Path("/etc/hermes/reviewer.env").is_file():
+        timers.append("hermes-reviewer-token.timer")
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
         # systemctl emits properties in its own (alphabetical) order, not
@@ -1100,6 +1105,27 @@ def _check_systemd(s: _State) -> None:
                     )
 
 
+def _gh_api_http_code(token: str, url: str) -> str:
+    """GET ``url`` with ``Authorization: Bearer <token>``; return the HTTP
+    status code as a string (``"000"`` on local failure).
+
+    Token flows via ``--config -`` on stdin so it never lands in argv,
+    where ``/proc/<pid>/cmdline`` (any user) would surface it.
+    """
+    _rc, code_out, _ = _run(
+        [
+            "curl", "-sS", "-o", "/dev/null",
+            "-w", "%{http_code}",
+            "--config", "-",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "X-GitHub-Api-Version: 2022-11-28",
+            url,
+        ],
+        input=f'header = "Authorization: Bearer {token}"\n',
+    )
+    return code_out.strip() or "000"
+
+
 def _check_token_helper(s: _State, repos_tsv: str) -> None:
     """Under --auth-method=app, the helper must be runnable end-to-end.
     Names missing-helper vs missing-venv-python separately so the drift line
@@ -1128,8 +1154,6 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
     else:
         s.v_drift("token helper check", "mint failed")
 
-    # App scope: curl with --config - fed via stdin so the token never lands
-    # in any argv visible through /proc/<pid>/cmdline.
     if app_token and repos_tsv.strip():
         gh_api_base = s.args.gh_api_base or "https://api.github.com"
         for scope_id, scope_url, _scope_base, scope_pkg, _scope_install in _parse_repos_tsv(
@@ -1141,18 +1165,7 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
             if not m:
                 continue
             api_url = f"{gh_api_base}/repos/{m.group(1)}/{m.group(2)}"
-            _rc, code_out, _ = _run(
-                [
-                    "curl", "-sS", "-o", "/dev/null",
-                    "-w", "%{http_code}",
-                    "--config", "-",
-                    "-H", "Accept: application/vnd.github+json",
-                    "-H", "X-GitHub-Api-Version: 2022-11-28",
-                    api_url,
-                ],
-                input=f'header = "Authorization: Bearer {app_token}"\n',
-            )
-            http_code = code_out.strip() or "000"
+            http_code = _gh_api_http_code(app_token, api_url)
             if http_code == "200":
                 s.v_ok(f"App scope {scope_id}: HTTP 200")
             else:
@@ -1160,6 +1173,63 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
                     f"App scope {scope_id}",
                     f"{api_url} returned HTTP {http_code}",
                 )
+
+
+def _check_reviewer_token(s: _State) -> None:
+    """Reviewer App auth: /etc/hermes/reviewer.{pem,env} on-disk perms,
+    /run/hermes/reviewer-gh-token freshness, and an App-installation API
+    probe with the minted token (the BRIX-1390 acceptance criterion).
+
+    Gated on presence of /etc/hermes/reviewer.env — that's what
+    setup-hermes.sh writes when the reviewer auth block runs. Hosts that
+    never staged a reviewer key skip every check here silently."""
+    etc_dir = Path("/etc/hermes")
+    env_file = etc_dir / "reviewer.env"
+    if not env_file.is_file():
+        return
+
+    key_file = etc_dir / "reviewer.pem"
+    _check_mode_owner(
+        s, "reviewer.pem", _stat_info(key_file), "640", s.rails_owner, s.agent_group,
+    )
+    _check_mode_owner(
+        s, "reviewer.env", _stat_info(env_file), "640", s.rails_owner, s.agent_group,
+    )
+
+    token_file = Path("/run/hermes/reviewer-gh-token")
+    info = _stat_info(token_file)
+    if info is None:
+        s.v_drift("reviewer-gh-token", f"missing: {token_file}")
+        return
+    _check_mode_owner(
+        s, "reviewer-gh-token", info, "600", s.agent_owner, s.agent_group,
+    )
+    try:
+        token = token_file.read_text().strip()
+    except OSError as exc:
+        s.v_drift("reviewer-gh-token", f"unreadable: {exc}")
+        return
+    if not token:
+        s.v_drift("reviewer-gh-token", "empty")
+        return
+    s.v_ok("reviewer-gh-token: non-empty")
+
+    # Per BRIX-1390 acceptance: token must answer `gh api /installation/
+    # repositories` — proves the App identity is recognized for *some*
+    # installation, without coupling to the specific repos[] entries
+    # (which the reviewer App's scope may be a strict subset of, e.g.
+    # didier-reviewer installed only on test-factory-code +
+    # brix-indexer + hermes-agent per the ticket).
+    gh_api_base = s.args.gh_api_base or "https://api.github.com"
+    api_url = f"{gh_api_base}/installation/repositories"
+    http_code = _gh_api_http_code(token, api_url)
+    if http_code == "200":
+        s.v_ok("reviewer App installation scope: HTTP 200")
+    else:
+        s.v_drift(
+            "reviewer App installation scope",
+            f"{api_url} returned HTTP {http_code}",
+        )
 
 
 def _check_upstream_workspace(s: _State) -> None:
@@ -1300,6 +1370,9 @@ def run(
     _check_systemd(s)
     if app_auth_expected:
         _check_token_helper(s, repos_tsv)
+    # Reviewer auth is gated by /etc/hermes/reviewer.env presence inside
+    # the check itself; safe to invoke unconditionally.
+    _check_reviewer_token(s)
     _check_upstream_workspace(s)
 
     print(
