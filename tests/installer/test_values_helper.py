@@ -584,6 +584,159 @@ class TestRenderQuayConfig:
         text = out.read_text()
         assert r'\"be terse\"' in text
 
+    def test_reviewer_absent_omits_section(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "[reviewer]" not in out.read_text()
+
+    def test_reviewer_disabled_omits_section(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: false\n"
+            "    gate_quay_owned_done: true\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[reviewer]" not in text
+        assert "gate_quay_owned_done" not in text
+
+    def test_reviewer_enabled_only_emits_enabled_line(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[reviewer]" in text
+        assert "enabled = true" in text
+        assert "gate_quay_owned_done" not in text
+        assert "login" not in text
+
+    def test_reviewer_enabled_with_gate_emits_both_keys(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n"
+            "    gate_quay_owned_done: true\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[reviewer]" in text
+        assert "enabled = true" in text
+        # TOML booleans are lowercase — repr(True) would emit "True" and quay
+        # would refuse to parse the file.
+        assert "gate_quay_owned_done = true" in text
+
+    def test_reviewer_gate_false_emits_lowercase_false(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n"
+            "    gate_quay_owned_done: false\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "gate_quay_owned_done = false" in text
+
+    def test_reviewer_login_quoted_as_basic_string(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n"
+            '    login: "hermes-reviewer"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert 'login = "hermes-reviewer"' in out.read_text()
+
+    @pytest.mark.parametrize(
+        "yaml_value",
+        ['"false"', '"true"', "1", "0", "null"],
+    )
+    def test_reviewer_enabled_must_be_strict_bool(
+        self, tmp_path: Path, yaml_value: str
+    ):
+        # Python truthiness would coerce the string "false" → True and emit
+        # enabled = true. Reject anything that isn't a real YAML bool.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            f"    enabled: {yaml_value}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer.enabled must be a bool" in r.stderr
+        assert not out.exists()
+
+    @pytest.mark.parametrize(
+        "yaml_value",
+        ['"false"', '"true"', "1", "0"],
+    )
+    def test_reviewer_gate_must_be_strict_bool(
+        self, tmp_path: Path, yaml_value: str
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n"
+            f"    gate_quay_owned_done: {yaml_value}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer.gate_quay_owned_done must be a bool" in r.stderr
+        assert not out.exists()
+
+    def test_reviewer_must_be_mapping(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            '  reviewer: "yes please"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer must be a mapping" in r.stderr
+        assert not out.exists()
+
 
 class TestListRepos:
     @pytest.fixture
