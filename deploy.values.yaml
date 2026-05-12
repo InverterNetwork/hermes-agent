@@ -418,12 +418,18 @@ quay:
   # opens the `pr-open → done → pr-review` path for quay-spawned tasks
   # (src/core/tick.ts: enter-review fires only when both are true, and
   # src/core/pr_review.ts skips with `quay_owned_gate_disabled` otherwise).
-  # `login` left unset — single hermes user on krustentier, tick + worker
-  # share gh auth. `max_concurrent_reviewers` left at the binary default
-  # of 2.
+  # `login` must be set explicitly under GitHub App auth — quay's fallback
+  # `gh api user --jq .login` returns HTTP 403 for App tokens, which locks
+  # the reviewer tick in an error loop. The string is matched literally
+  # against `gh pr view --json reviews .reviews[].author.login`, which for
+  # GitHub App authors returns `app/<slug>`. Today both worker and reviewer
+  # spawn under the same App; once a separate reviewer App is provisioned
+  # this changes to its slug. `max_concurrent_reviewers` left at the binary
+  # default of 2.
   reviewer:
     enabled: true
     gate_quay_owned_done: true
+    login: "app/didier-worker"
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the

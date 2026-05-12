@@ -737,6 +737,32 @@ class TestRenderQuayConfig:
         assert "quay.reviewer must be a mapping" in r.stderr
         assert not out.exists()
 
+    @pytest.mark.parametrize(
+        "yaml_value",
+        ["42", "true", '""', "null", "[a, b]"],
+    )
+    def test_reviewer_login_must_be_nonempty_string(
+        self, tmp_path: Path, yaml_value: str
+    ):
+        # Silent-drop guard. Previous code accepted only `isinstance(str)` at
+        # the emission site, so an int/bool/empty-string login was dropped
+        # without warning — leaving quay to fall back to `gh api user`, which
+        # 403s under App auth and locks the tick in an error loop.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  reviewer:\n"
+            "    enabled: true\n"
+            f"    login: {yaml_value}\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.reviewer.login must be a non-empty string" in r.stderr
+        assert not out.exists()
+
 
 class TestListRepos:
     @pytest.fixture
