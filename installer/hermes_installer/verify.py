@@ -1020,6 +1020,27 @@ def _check_systemd(s: _State) -> None:
                     )
 
 
+def _gh_api_http_code(token: str, url: str) -> str:
+    """GET ``url`` with ``Authorization: Bearer <token>``; return the HTTP
+    status code as a string (``"000"`` on local failure).
+
+    Token flows via ``--config -`` on stdin so it never lands in argv,
+    where ``/proc/<pid>/cmdline`` (any user) would surface it.
+    """
+    _rc, code_out, _ = _run(
+        [
+            "curl", "-sS", "-o", "/dev/null",
+            "-w", "%{http_code}",
+            "--config", "-",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "X-GitHub-Api-Version: 2022-11-28",
+            url,
+        ],
+        input=f'header = "Authorization: Bearer {token}"\n',
+    )
+    return code_out.strip() or "000"
+
+
 def _check_token_helper(s: _State, repos_tsv: str) -> None:
     """Under --auth-method=app, the helper must be runnable end-to-end.
     Names missing-helper vs missing-venv-python separately so the drift line
@@ -1048,8 +1069,6 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
     else:
         s.v_drift("token helper check", "mint failed")
 
-    # App scope: curl with --config - fed via stdin so the token never lands
-    # in any argv visible through /proc/<pid>/cmdline.
     if app_token and repos_tsv.strip():
         gh_api_base = s.args.gh_api_base or "https://api.github.com"
         for scope_id, scope_url, _scope_base, scope_pkg, _scope_install in _parse_repos_tsv(
@@ -1061,18 +1080,7 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
             if not m:
                 continue
             api_url = f"{gh_api_base}/repos/{m.group(1)}/{m.group(2)}"
-            _rc, code_out, _ = _run(
-                [
-                    "curl", "-sS", "-o", "/dev/null",
-                    "-w", "%{http_code}",
-                    "--config", "-",
-                    "-H", "Accept: application/vnd.github+json",
-                    "-H", "X-GitHub-Api-Version: 2022-11-28",
-                    api_url,
-                ],
-                input=f'header = "Authorization: Bearer {app_token}"\n',
-            )
-            http_code = code_out.strip() or "000"
+            http_code = _gh_api_http_code(app_token, api_url)
             if http_code == "200":
                 s.v_ok(f"App scope {scope_id}: HTTP 200")
             else:
@@ -1129,18 +1137,7 @@ def _check_reviewer_token(s: _State) -> None:
     # brix-indexer + hermes-agent per the ticket).
     gh_api_base = s.args.gh_api_base or "https://api.github.com"
     api_url = f"{gh_api_base}/installation/repositories"
-    _rc, code_out, _ = _run(
-        [
-            "curl", "-sS", "-o", "/dev/null",
-            "-w", "%{http_code}",
-            "--config", "-",
-            "-H", "Accept: application/vnd.github+json",
-            "-H", "X-GitHub-Api-Version: 2022-11-28",
-            api_url,
-        ],
-        input=f'header = "Authorization: Bearer {token}"\n',
-    )
-    http_code = code_out.strip() or "000"
+    http_code = _gh_api_http_code(token, api_url)
     if http_code == "200":
         s.v_ok("reviewer App installation scope: HTTP 200")
     else:

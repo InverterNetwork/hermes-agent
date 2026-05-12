@@ -644,6 +644,13 @@ chown root:"$AGENT_USER" "$ORG_DEFAULTS_OUT"
 chmod 0640 "$ORG_DEFAULTS_OUT"
 [[ "$org_defaults_sha_pre" != "$(file_sha "$ORG_DEFAULTS_OUT")" ]] && GATEWAY_NEEDS_RESTART=1
 
+# Snapshot the CLI value before the worker auth block mutates $GH_API_BASE
+# from values. The reviewer auth block reads CLI_GH_API_BASE so the CLI
+# flag still applies to both Apps (CI mock), while the per-App values
+# entries (auth.github_app.api_base vs auth.github_app_reviewer.api_base)
+# stay independent.
+CLI_GH_API_BASE="$GH_API_BASE"
+
 if [[ "$AUTH_METHOD" == "app" ]]; then
   echo "==> wiring GitHub App auth at $AUTH_DIR"
 
@@ -748,9 +755,15 @@ if [[ "$REVIEWER_ENABLED" -eq 1 ]]; then
   chmod 0640 "$REVIEWER_KEY_DST"
 
   # IDs: CLI flag > deploy.values.yaml.auth.github_app_reviewer > existing env file.
+  # Note: $GH_API_BASE has already been mutated by the worker auth block above
+  # (to carry auth.github_app.api_base when no CLI flag was passed), so falling
+  # back to $GH_API_BASE here would silently inherit the worker's endpoint.
+  # Use $CLI_GH_API_BASE (captured before the worker block ran) instead, so
+  # the CLI flag's "applies to both" semantics survive while the per-App
+  # values entries remain independent.
   REVIEWER_APP_ID="${REVIEWER_APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.id 2>/dev/null || true)}"
   REVIEWER_APP_INSTALLATION_ID="${REVIEWER_APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.installation_id 2>/dev/null || true)}"
-  REVIEWER_GH_API_BASE="${GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.api_base 2>/dev/null || true)}"
+  REVIEWER_GH_API_BASE="${CLI_GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get auth.github_app_reviewer.api_base 2>/dev/null || true)}"
   if [[ -f "$REVIEWER_ENV" ]]; then
     REVIEWER_APP_ID="${REVIEWER_APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$REVIEWER_ENV")}"
     REVIEWER_APP_INSTALLATION_ID="${REVIEWER_APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$REVIEWER_ENV")}"

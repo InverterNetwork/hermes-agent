@@ -161,26 +161,32 @@ def _read_cache(cache_path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _write_cache(cache_path: Path, payload: dict[str, Any]) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    # Open with the target mode upfront so the file is never world-readable —
-    # write_text() + chmod() leaves a window where a co-located low-priv user
-    # could read the token. The umask on the syscall caps the effective mode.
+def _atomic_write_0600(path: Path, content: str) -> None:
+    """Atomically write ``content`` to ``path`` at mode 0600.
+
+    Opens the temp file with the target mode upfront so the token never
+    lives in a world-readable file even momentarily; re-asserts 0600 before
+    the rename in case the tmp pre-existed with looser perms (O_TRUNC
+    reuses the inode without re-applying the open() mode).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(payload))
+            f.write(content)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
-    # If the file pre-existed with looser perms, the open() above won't have
-    # changed them — assert tight perms before the rename completes the swap.
     os.chmod(tmp, 0o600)
-    tmp.replace(cache_path)
+    tmp.replace(path)
+
+
+def _write_cache(cache_path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_0600(cache_path, json.dumps(payload))
 
 
 def get_token(cfg: dict[str, str] | None = None, *, now: int | None = None) -> str:
@@ -248,23 +254,7 @@ def write_token_to_file(out_path: Path) -> None:
     No trailing newline — consumers (`quay`'s upcoming `gh_token_file` per
     AST-109; `gh auth login --with-token`) read the whole file as the token.
     """
-    token = get_token()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    # Open with the target mode upfront — same posture as _write_cache(): the
-    # token never lives in a world-readable file even momentarily.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(token)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    os.chmod(tmp, 0o600)
-    tmp.replace(out_path)
+    _atomic_write_0600(out_path, get_token())
 
 
 def main(argv: list[str]) -> int:
@@ -285,8 +275,6 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(credential_protocol(action, sys.stdin.read()))
         return 0
     if cmd == "write-token":
-        # Tiny argparse to keep the surface explicit; the only operator-facing
-        # contract is `--out <path>`.
         if len(argv) < 4 or argv[2] != "--out":
             print("usage: hermes_github_token.py write-token --out PATH", file=sys.stderr)
             return 2
