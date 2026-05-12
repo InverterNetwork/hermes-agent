@@ -73,13 +73,19 @@ jobs:
 
       - name: stage fixture repos + patch values for repos[]
         # Real deploys point repos[].url at private GitHub repos. CI has
-        # no credentials for those, so fabricate four local non-bare repos:
+        # no credentials for those, so fabricate five local non-bare repos:
         #   * test-factory-code   — quay-managed (entry has a `quay:` block).
         #   * brix-indexer        — quay-managed, base_branch: dev (private
         #                           pnpm-based repo in the real fork; here a
         #                           local fixture init'd on `dev` directly to
         #                           exercise the second quay-managed entry +
         #                           the pnpm plain-binary runtime-manager path).
+        #   * hermes-agent        — quay-managed self-host entry; the fork
+        #                           lists itself in repos[] so quay can take
+        #                           tickets that touch the installer. Stub
+        #                           with a local fixture so the auth-method
+        #                           precondition (github.com + quay → App
+        #                           creds) doesn't trip on CI.
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
         #                           repos[] loop.
@@ -96,6 +102,7 @@ jobs:
         run: |
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
           BRIX_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-indexer
+          HERMES_FIXTURE=/srv/hermes/repos/quay-fixtures/hermes-agent
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
           git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
@@ -110,6 +117,7 @@ jobs:
           # brix-indexer real repo lives on `dev`; init the fixture there
           # directly so the values entry's base_branch=dev resolves cleanly.
           init_fixture "$BRIX_FIXTURE" "init fixture" dev
+          init_fixture "$HERMES_FIXTURE" "init fixture"
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -130,15 +138,16 @@ jobs:
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$BRIX_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$BRIX_FIXTURE" "$HERMES_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
-          quay_fixture, brix_fixture, code_fixture, dev_fixture = sys.argv[1:5]
+          quay_fixture, brix_fixture, hermes_fixture, code_fixture, dev_fixture = sys.argv[1:6]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
           rewrite = {
               "test-factory-code": quay_fixture,
               "brix-indexer": brix_fixture,
+              "hermes-agent": hermes_fixture,
           }
           for entry in data.get("repos", []):
               if entry.get("id") in rewrite:
