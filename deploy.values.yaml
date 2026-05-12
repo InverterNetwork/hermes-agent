@@ -344,6 +344,18 @@ repos:
       # `task:` namespace from quay.tag_namespaces below still applies.
       # Add per-repo vocab here once real ticket flow informs the
       # namespace shape; absence is the explicit "no vocab yet" signal.
+  - id: hermes-agent
+    url: https://github.com/InverterNetwork/hermes-agent
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
+      # No per-repo tag vocab yet — deployment-wide `task:` namespace from
+      # quay.tag_namespaces still applies. Add vocab here once ticket flow
+      # against the installer/agent settles into a shape worth enforcing.
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
