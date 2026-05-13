@@ -795,6 +795,15 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
                 f"string (got {type(login_val).__name__}: {login_val!r})\n"
             )
             return 1
+    if "gh_token_file" in reviewer:
+        gh_token_file_val = reviewer["gh_token_file"]
+        if not isinstance(gh_token_file_val, str) or not gh_token_file_val:
+            sys.stderr.write(
+                "values_helper.py: quay.reviewer.gh_token_file must be a "
+                "non-empty string (got "
+                f"{type(gh_token_file_val).__name__}: {gh_token_file_val!r})\n"
+            )
+            return 1
     if reviewer.get("enabled") is True:
         lines.append("")
         lines.append("[reviewer]")
@@ -805,6 +814,9 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         login = reviewer.get("login")
         if isinstance(login, str) and login:
             lines.append(f"login = {_toml_basic_string(login)}")
+        gh_token_file = reviewer.get("gh_token_file")
+        if isinstance(gh_token_file, str) and gh_token_file:
+            lines.append(f"gh_token_file = {_toml_basic_string(gh_token_file)}")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

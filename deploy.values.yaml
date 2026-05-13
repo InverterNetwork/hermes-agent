@@ -280,8 +280,8 @@ auth:
   # entirely (the install still runs; reviewer worker just won't get a
   # distinct token).
   github_app_reviewer:
-    id: ""
-    installation_id: ""
+    id: "3693088"
+    installation_id: "131824317"
     api_base: ""
 
 linear:
@@ -479,17 +479,19 @@ quay:
   # this changes to its slug. `max_concurrent_reviewers` left at the binary
   # default of 2.
   #
-  # AST-109 follow-up: once quay's `[reviewer]` config accepts a token-
-  # file knob, add `gh_token_file: /run/hermes/reviewer-gh-token` here so
-  # the reviewer worker authenticates as the distinct reviewer App
-  # (provisioned by `auth.github_app_reviewer` + the installer's
-  # hermes-reviewer-token timer). Until that schema lands, both worker
-  # and reviewer share the worker App's $GH_TOKEN and GitHub blocks the
-  # self-review — same failure mode as BRIX-1389.
+  # `gh_token_file` points at the file the installer's
+  # hermes-reviewer-token timer keeps fresh (the timer mints a new
+  # installation token from `auth.github_app_reviewer` every ~50 min).
+  # Quay's tick exports the file's contents as $GH_TOKEN inside the
+  # reviewer tmux pane only, per AST-109, so the reviewer authenticates
+  # as `app/didier-reviewer` — distinct from the worker's
+  # `app/didier-worker` — which unblocks self-review (GitHub forbids
+  # an App approving PRs it authored).
   reviewer:
     enabled: true
     gate_quay_owned_done: true
-    login: "app/didier-worker"
+    login: "app/didier-reviewer"
+    gh_token_file: "/run/hermes/reviewer-gh-token"
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the
