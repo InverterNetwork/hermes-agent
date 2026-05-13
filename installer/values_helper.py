@@ -22,12 +22,14 @@ Subcommands:
                                   ``model.base_url`` from
                                   ``gateway.model_provider`` /
                                   ``gateway.model_base_url`` in
-                                  values.yaml. Preserves every other top-
-                                  level key. Run on every install so
-                                  ``hermes auth add`` config-update
-                                  failures (it can fail silently when
-                                  config.yaml is root-owned) can't leave
-                                  the provider pin drifted.
+                                  values.yaml, and optionally set
+                                  ``approvals.mode`` from
+                                  ``gateway.approvals_mode``. Preserves
+                                  every other top-level key. Run on every
+                                  install so ``hermes auth add`` config-
+                                  update failures (it can fail silently
+                                  when config.yaml is root-owned) can't
+                                  leave the provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
   render-gateway-org-defaults --out <path>
@@ -236,19 +238,45 @@ def cmd_render_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
-# Header re-emitted on every config.yaml write (seeder *and* model merge) so
-# the file's contract matches reality. Operator-added top-level keys
-# survive across re-installs, but YAML comments (including this header)
+# Header re-emitted on every config.yaml write (seeder *and* gateway config
+# merge) so the file's contract matches reality. Operator-added top-level
+# keys survive across re-installs, but YAML comments (including this header)
 # don't — merge-config-model round-trips through PyYAML on every install,
 # which strips comments.
 _CONFIG_YAML_HEADER = (
     "# Seeded by setup-hermes.sh from deploy.values.yaml.\n"
     "# Operator-added top-level keys are preserved across re-installs,\n"
-    "# but YAML comments are not — model.* is rewritten on every run\n"
+    "# but YAML comments are not — model.* is rewritten on every run,\n"
+    "# and approvals.mode is rewritten when gateway.approvals_mode is set\n"
     "# (round-trips the file). Prefer deploy.values.yaml for non-secret\n"
     "# config knobs; edit known keys here only when they aren't yet\n"
     "# values-driven.\n"
 )
+
+_GATEWAY_APPROVALS_MODES = ("manual", "smart", "off")
+
+
+def _validate_gateway_approvals_mode(gateway: Any) -> tuple[str | None, str | None]:
+    raw = gateway.get("approvals_mode", _MISSING)
+    if raw is _MISSING or raw is None or raw == "":
+        return None, None
+    # PyYAML follows YAML 1.1 here: bare `off` parses as False. The deploy
+    # values contract documents `approvals_mode: off`, so normalize that
+    # common shape instead of forcing operators to quote it.
+    if raw is False:
+        return "off", None
+    if not isinstance(raw, str):
+        return None, (
+            "gateway.approvals_mode, if set, must be one of "
+            f"{list(_GATEWAY_APPROVALS_MODES)!r}"
+        )
+    mode = raw.strip().lower()
+    if mode not in _GATEWAY_APPROVALS_MODES:
+        return None, (
+            "gateway.approvals_mode must be one of "
+            f"{list(_GATEWAY_APPROVALS_MODES)!r}"
+        )
+    return mode, None
 
 
 def cmd_render_runtime_config(args: argparse.Namespace) -> int:
@@ -310,14 +338,17 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
 
 
 def cmd_merge_config_model(args: argparse.Namespace) -> int:
-    """Set ``model.provider`` / ``model.base_url`` in ``<out>`` from values.yaml.
+    """Set gateway-managed config in ``<out>`` from values.yaml.
 
     Idempotent: read the existing config.yaml, overwrite the two keys (creating
-    the ``model:`` block if missing), preserve every other top-level key.
+    the ``model:`` block if missing), optionally overwrite ``approvals.mode``
+    from ``gateway.approvals_mode``, and preserve every other top-level key.
     Run on every install so the gateway's provider pin matches what
     ``deploy.values.yaml`` declares — independent of whether
     ``hermes auth add`` ran successfully (it can fail silently when the
-    seeded config.yaml is root-owned).
+    seeded config.yaml is root-owned). ``approvals.mode: off`` disables
+    interactive command approval prompts, but the hardline blocklist remains
+    enforced.
 
     Roundtrips through PyYAML, so YAML-level comments inside config.yaml
     are not preserved (matching ``hermes_cli.config.save_config``'s existing
@@ -342,6 +373,10 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
         sys.stderr.write(
             "values_helper.py: gateway.model_base_url, if set, must be a string\n"
         )
+        return 1
+    approvals_mode, approvals_err = _validate_gateway_approvals_mode(gateway)
+    if approvals_err is not None:
+        sys.stderr.write(f"values_helper.py: {approvals_err}\n")
         return 1
 
     # Load existing config.yaml. Missing-file is an error — render-runtime-config
@@ -376,6 +411,13 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
         # actually takes effect.
         model_block.pop("base_url", None)
     existing["model"] = model_block
+
+    if approvals_mode is not None:
+        approvals_block = existing.get("approvals")
+        if not isinstance(approvals_block, dict):
+            approvals_block = {}
+        approvals_block["mode"] = approvals_mode
+        existing["approvals"] = approvals_block
 
     # Re-emit the standard header so the file's intro text doesn't quietly
     # vanish after the first merge (the round-trip strips any prior
@@ -1532,6 +1574,16 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
         sys.stderr.write(f"values_helper.py: {team_err}\n")
         return 1
 
+    gateway = data.get("gateway")
+    if gateway is not None:
+        if not isinstance(gateway, dict):
+            sys.stderr.write("values_helper.py: gateway must be a mapping\n")
+            return 1
+        _, approvals_err = _validate_gateway_approvals_mode(gateway)
+        if approvals_err is not None:
+            sys.stderr.write(f"values_helper.py: {approvals_err}\n")
+            return 1
+
     quay_top = data.get("quay") if isinstance(data.get("quay"), dict) else None
     _, ag_err = _validate_quay_agents_block(
         quay_top.get("agents") if quay_top else None
@@ -1700,7 +1752,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_merge_model = sub.add_parser(
         "merge-config-model",
-        help="set config.yaml's model.provider/base_url from values.yaml gateway.*",
+        help=(
+            "set gateway-managed config.yaml keys from values.yaml gateway.* "
+            "(model.*, optional approvals.mode)"
+        ),
     )
     p_merge_model.add_argument("--out", required=True, help="path to config.yaml to update")
     p_merge_model.set_defaults(func=cmd_merge_config_model)

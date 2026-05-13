@@ -40,6 +40,12 @@
 #                                 base URL. Leave empty to use the provider
 #                                 default; set only for self-hosted endpoints
 #                                 or routing through a gateway.
+#   gateway.approvals_mode     — optional values-driven command approval mode
+#                                 merged into <target>/config.yaml as
+#                                 approvals.mode on every install. Valid:
+#                                 manual, smart, off. Use off only for trusted
+#                                 internal Slack deployments; hardline-blocked
+#                                 commands remain blocked.
 #
 #   auth.github_app.id         — numeric GitHub App ID. Identifier (not a
 #                                 secret); committing here means re-installs
@@ -253,6 +259,11 @@ gateway:
   # Empty = use the provider's default endpoint. Set only for routing
   # through a self-hosted gateway or an org-internal proxy.
   model_base_url: ""
+  # Optional: merge into <target>/config.yaml as approvals.mode on every
+  # install. Set to "off" to bypass dangerous-command approval prompts for
+  # trusted internal Slack deployments. The hardline blocklist still applies
+  # even with approvals disabled.
+  # approvals_mode: manual
 
 auth:
   # GitHub App used for the agent's git push back to hermes-state. IDs are

@@ -548,6 +548,7 @@ fi
 # First-install seed only; preserved on re-runs so operator hand-edits
 # survive. Delete the file to force a refresh from values.yaml.
 CONFIG_YAML_OUT="$TARGET_DIR/config.yaml"
+GATEWAY_NEEDS_RESTART=0
 if [[ -f "$CONFIG_YAML_OUT" ]]; then
   echo "==> $CONFIG_YAML_OUT already present (preserving)"
 else
@@ -556,11 +557,11 @@ else
     render-runtime-config --out "$CONFIG_YAML_OUT"
 fi
 
-# model.* is rewritten on every run, even when the file above was preserved
-# — the helper docstring covers the rationale (silent `hermes auth add`
-# failures leaving the pin drifted).
+# Gateway-managed config keys are rewritten on every run, even when the file
+# above was preserved — the helper docstring covers the rationale (silent
+# `hermes auth add` failures leaving the model pin drifted).
 config_sha_pre="$(file_sha "$CONFIG_YAML_OUT")"
-echo "==> merging gateway.model_* into $CONFIG_YAML_OUT from $VALUES_FILE"
+echo "==> merging gateway config into $CONFIG_YAML_OUT from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   merge-config-model --out "$CONFIG_YAML_OUT"
 
@@ -634,12 +635,11 @@ chmod g-s "$AUTH_DIR"
 # source of truth; the file is a reflection. Operator hand-edits belong in
 # /etc/default/hermes-gateway, not here.
 #
-# GATEWAY_NEEDS_RESTART accumulates content drift across this and the two
-# other env-affecting writes below (config.yaml model merge, runtime-env
-# drop-in). systemd doesn't re-read EnvironmentFile= for a running process
-# on `daemon-reload`, so we have to restart explicitly when content
-# actually changed.
-GATEWAY_NEEDS_RESTART=0
+# GATEWAY_NEEDS_RESTART accumulates content drift across config.yaml and the
+# env-affecting writes below (gateway-runtime.env, runtime-env drop-in).
+# systemd doesn't re-read EnvironmentFile= for a running process on
+# `daemon-reload`, so we have to restart explicitly when content actually
+# changed.
 runtime_sha_pre="$(file_sha "$GATEWAY_RUNTIME_ENV")"
 echo "==> rendering $GATEWAY_RUNTIME_ENV from $VALUES_FILE"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
