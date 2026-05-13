@@ -15,6 +15,7 @@ parity with the bash original — verify never imports the helper in-process.
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import pwd
@@ -179,6 +180,25 @@ def _first_stdout_line(cmd: list[str], timeout: float = 10) -> str:
     substring compare."""
     _rc, out, _ = _run(cmd, timeout=timeout)
     return (out.splitlines() or [""])[0]
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _read_expected_sha256(path: Path) -> str:
+    try:
+        first = (path.read_text(encoding="utf-8").split() or [""])[0].lower()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return first if re.fullmatch(r"[0-9a-f]{64}", first) else ""
 
 
 def _git_config_get(repo: Path, *args: str) -> str:
@@ -564,14 +584,50 @@ def _executable_info(path: Path) -> tuple[str, str, str] | None:
 def _check_version_pin(
     s: _State, label: str, bin_path: Path, pin: str,
 ) -> None:
-    """Substring-match ``<bin> --version`` against ``pin``. Used by the quay
-    binary and runtime-manager checks; both binaries may emit build-suffixed
-    versions like ``0.1.0+abc1234`` or ``1.3.9+commit``."""
+    """Substring-match ``<bin> --version`` against ``pin``. Used by
+    runtime-manager checks; binaries may emit build-suffixed versions like
+    ``1.3.9+commit``."""
     actual = _first_stdout_line([str(bin_path), "--version"])
     if actual and pin in actual:
         s.v_ok(f"{label}: {actual}")
     else:
         s.v_drift(label, f"got '{actual or '?'}' (expected to contain '{pin}')")
+
+
+def _check_quay_binary_sha256(s: _State, quay_bin: Path, expected_file: Path) -> None:
+    if not expected_file.is_file():
+        s.v_drift("quay binary SHA256", f"missing expected hash: {expected_file}")
+        return
+
+    _check_mode_owner(
+        s, "quay SHA256SUM.expected", _stat_info(expected_file), "644", s.rails_owner,
+    )
+    expected = _read_expected_sha256(expected_file)
+    if not expected:
+        s.v_drift("quay binary SHA256", f"invalid expected hash in {expected_file}")
+        return
+
+    actual = _sha256(quay_bin)
+    if not actual:
+        s.v_drift("quay binary SHA256", f"could not read {quay_bin}")
+    elif actual == expected:
+        s.v_ok(f"quay binary SHA256: {actual}")
+    else:
+        s.v_drift(
+            "quay binary SHA256",
+            f"got {actual} (expected {expected})",
+        )
+
+
+def _quay_expected_sha_file(target: Path) -> Path:
+    return (
+        target
+        / "hermes-agent"
+        / "installer"
+        / ".state"
+        / "quay"
+        / "SHA256SUM.expected"
+    )
 
 
 def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
@@ -586,13 +642,7 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
         s.v_drift("quay binary", f"missing or non-executable: {quay_bin}")
     else:
         _check_mode_owner(s, "quay binary", quay_bin_info, "755", s.rails_owner)
-        # quay.version is a git tag (`v0.1.0`); the binary embeds
-        # `${pkg.version}+${shortSHA}` (`0.1.0+abc1234`) — no `v` prefix.
-        # Strip the leading `v` from the pin for the substring compare so a
-        # clean release-built binary doesn't fire false drift.
-        _check_version_pin(
-            s, "quay binary version", quay_bin, s.quay_version.removeprefix("v"),
-        )
+        _check_quay_binary_sha256(s, quay_bin, _quay_expected_sha_file(target))
 
     if not quay_dir.is_dir():
         s.v_drift("quay data dir", f"missing: {quay_dir}")
