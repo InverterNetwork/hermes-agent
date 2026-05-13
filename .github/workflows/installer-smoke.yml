@@ -605,20 +605,16 @@ jobs:
         # like positional parsing of `systemctl show` only surface on-host,
         # post-merge.
         #
-        # Three drifts are tolerated and asserted-to-exist as the expected
+        # Two drifts are tolerated and asserted-to-exist as the expected
         # CI envelope:
         #   * rails perms — `pip install -e .` leaves egg-info entries
         #     group/world-writable; CI-only fixture artefact.
         #   * state origin — CI fakes the state repo as a filesystem path;
         #     real installs clone github.com.
-        #   * quay binary version — quay's binary embeds package.json's
-        #     `0.1.0` instead of the `v0.1.4` git tag pinned in
-        #     deploy.values.yaml. Tolerated until quay bumps package.json.
         #
         # Anything outside that envelope is a regression and fails the gate.
         # The closing sanity loop also fails if any known label disappears
-        # from output (e.g. quay's binary self-reports the pinned version)
-        # so the filter doesn't rot into a silent pass-through.
+        # from output so the filter doesn't rot into a silent pass-through.
         run: |
           set -euo pipefail
           sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh --verify \
@@ -631,14 +627,14 @@ jobs:
           echo "=== verify stderr (DRIFT lines) ==="
           cat verify.err
           unexpected=$(grep '^\[DRIFT\]' verify.err \
-            | grep -Ev '^\[DRIFT\] (rails perms|state origin|quay binary version):' \
+            | grep -Ev '^\[DRIFT\] (rails perms|state origin):' \
             || true)
           if [[ -n "$unexpected" ]]; then
             echo "FAIL: --verify reported drift outside the known CI envelope:"
             echo "$unexpected"
             exit 1
           fi
-          for label in 'rails perms' 'state origin' 'quay binary version'; do
+          for label in 'rails perms' 'state origin'; do
             grep -q "^\[DRIFT\] ${label}:" verify.err \
               || { echo "FAIL: expected known drift '${label}' missing from --verify output (filter likely stale; remove it from the grep -Ev list)"; exit 1; }
           done
