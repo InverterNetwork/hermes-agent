@@ -2854,7 +2854,7 @@ class SlackAdapter(BasePlatformAdapter):
         # is not also in allowed_channels.
         bypass_allowlist = (
             self._trigger_router is not None
-            and channel_id in self._trigger_router.channel_ids()
+            and channel_id in self._trigger_router.channel_ids
         )
 
         # Reuse the slash-command dispatch path — the skill sees the same
