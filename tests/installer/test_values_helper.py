@@ -387,6 +387,60 @@ class TestMergeConfigModel:
         assert loaded["model"]["provider"] == "openai"
         assert "base_url" not in loaded["model"]
 
+    def test_sets_gateway_approvals_mode_when_declared(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai\n"
+            "  approvals_mode: off\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "approvals:\n"
+            "  timeout: 30\n"
+            "model:\n"
+            "  default: claude-sonnet-4-5\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["approvals"]["mode"] == "off"
+        assert loaded["approvals"]["timeout"] == 30
+
+    def test_preserves_approvals_mode_when_values_key_absent(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "approvals:\n"
+            "  mode: smart\n"
+            "model:\n"
+            "  provider: stale\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["approvals"]["mode"] == "smart"
+
+    def test_rejects_invalid_gateway_approvals_mode(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai\n"
+            "  approvals_mode: auto\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.approvals_mode must be one of" in r.stderr
+
     def test_requires_gateway_model_provider(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text("gateway:\n  model_provider: \"\"\n", encoding="utf-8")
@@ -1324,6 +1378,16 @@ class TestValidateSchema:
         assert r.returncode == 1
         assert "base_branch is required" in r.stderr
 
+    def test_rejects_invalid_gateway_approvals_mode(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  approvals_mode: allow\n",
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "gateway.approvals_mode must be one of" in r.stderr
+
 
 class TestRenderGatewayOrgDefaults:
     """Direct coverage of `render-gateway-org-defaults`. The seed shape is
@@ -1939,5 +2003,3 @@ class TestValidateSchemaAgents:
         r = _run(values, "validate-schema")
         assert r.returncode == 0, r.stderr
         assert r.stderr == ""
-
-
