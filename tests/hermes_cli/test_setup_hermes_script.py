@@ -151,6 +151,18 @@ def test_installer_renders_quay_config_with_force_on_every_run():
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
 
 
+def test_installer_persists_quay_expected_sha_for_verify():
+    """The installer must leave verify a SHA source of truth for the quay
+    binary instead of forcing verify to trust `quay --version` output."""
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    assert "QUAY_EXPECTED_SHA" in content
+    assert "SHA256SUM.expected" in content
+    assert re.search(
+        r"install\s+-o\s+root\s+-g\s+root\s+-m\s+0644\s+/dev/stdin\s+\"\$TARGET_DIR/quay/SHA256SUM\.expected\"",
+        content,
+    )
+
+
 def test_installer_unset_loop_iterates_both_suffixes():
     """Static guard: the installer's quay-managed unset branch must
     iterate over both the empty suffix and `.git`. Without this loop a

@@ -346,8 +346,8 @@ echo "    auth:    $AUTH_METHOD${APP_ID:+ (app=$APP_ID, install=$APP_INSTALLATIO
 echo
 
 # ---------- quay binary (rails-class, /usr/local/bin/quay) ----------
-# The version pin is the security boundary: no override flag, SHA256
-# verified against the matching GitHub Release on every install run.
+# The release SHA is the security boundary: no override flag, SHA256
+# verified against the pinned GitHub Release on every install run.
 # Empty `quay.version` is treated as "quay not enabled for this fork yet"
 # — staging the fork (or running CI) before a quay release is cut skips
 # every quay-related step below. Once a v* tag is pinned, all quay
@@ -356,6 +356,7 @@ echo
 QUAY_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.version)"
 QUAY_BIN_DST="/usr/local/bin/quay"
 QUAY_ENABLED=0
+QUAY_EXPECTED_SHA=""
 
 if [[ -z "$QUAY_VERSION" ]]; then
   echo "==> quay.version unset in $VALUES_FILE; skipping quay provisioning"
@@ -386,6 +387,7 @@ else
     "$QUAY_TMP/SHA256SUMS")"
   [[ -n "$QUAY_EXPECTED_LINE" ]] \
     || { echo "FAIL: $QUAY_ASSET not listed in SHA256SUMS for ${QUAY_VERSION}" >&2; exit 1; }
+  read -r QUAY_EXPECTED_SHA _ <<<"$QUAY_EXPECTED_LINE"
   ( cd "$QUAY_TMP" && echo "$QUAY_EXPECTED_LINE" | sha256sum -c --strict --status ) \
     || { echo "FAIL: SHA256 mismatch for $QUAY_ASSET (release ${QUAY_VERSION})" >&2; exit 1; }
 
@@ -901,6 +903,11 @@ done
 # branch when both QUAY_ENABLED and the entry's `quay:` block are present.
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/quay"
+
+  # Persist the exact release SHA used to install /usr/local/bin/quay so
+  # read-only verify can check binary drift without trusting `quay --version`.
+  printf '%s  %s\n' "$QUAY_EXPECTED_SHA" "$QUAY_BIN_DST" \
+    | install -o root -g root -m 0644 /dev/stdin "$TARGET_DIR/quay/SHA256SUM.expected"
 
   # quay/config.toml is rendered from deploy.values.yaml on every run so
   # changes to quay.agent_invocation (and other quay.* fields) reconcile
