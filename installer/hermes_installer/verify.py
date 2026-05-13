@@ -1340,9 +1340,15 @@ def run(
     if values_file.is_file() and values_helper.is_file():
         quay_version = _values_get(values_file, values_helper, "quay.version")
         if quay_version:
-            agent_invocation = _values_get(
-                values_file, values_helper, "quay.agent_invocation",
+            rc, active_out, _ = _values_helper_run(
+                values_helper, "active-agent-invocations", values_file=values_file,
             )
+            if rc == 0:
+                agent_invocation = active_out
+            else:
+                agent_invocation = _values_get(
+                    values_file, values_helper, "quay.agent_invocation",
+                )
 
     quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
 

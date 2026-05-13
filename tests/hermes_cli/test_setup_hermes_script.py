@@ -151,6 +151,19 @@ def test_installer_renders_quay_config_with_force_on_every_run():
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
 
 
+def test_installer_provisions_claude_cli_from_active_invocations():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    assert "active-agent-invocations" in content
+    assert 'if [[ "$agent_invocations" == *claude* ]]; then' in content
+    assert (
+        "sudo -u \"$AGENT_USER\" -H bash -c "
+        "'curl -fsSL https://claude.ai/install.sh | bash'"
+    ) in content
+    assert 'CLAUDE_AGENT_BIN="$AGENT_HOME/.local/bin/claude"' in content
+    assert 'ln -sf "$CLAUDE_AGENT_BIN" /usr/local/bin/claude' in content
+    assert "quay.agent_invocation references 'claude'" not in content
+
+
 def test_installer_persists_quay_expected_sha_for_verify():
     """The installer must leave verify a SHA source of truth for the quay
     binary instead of forcing verify to trust `quay --version` output."""
