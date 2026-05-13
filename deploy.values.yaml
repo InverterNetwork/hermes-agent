@@ -263,7 +263,7 @@ gateway:
   # install. Set to "off" to bypass dangerous-command approval prompts for
   # trusted internal Slack deployments. The hardline blocklist still applies
   # even with approvals disabled.
-  # approvals_mode: manual
+  approvals_mode: off
 
 auth:
   # GitHub App used for the agent's git push back to hermes-state. IDs are
