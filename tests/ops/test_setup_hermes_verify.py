@@ -722,6 +722,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _write_expected_quay_sha(expected_file: Path, quay_bin: Path) -> None:
+    expected_file.parent.mkdir(parents=True, exist_ok=True)
     expected_file.write_text(f"{_sha256_file(quay_bin)}  /usr/local/bin/quay\n")
     expected_file.chmod(0o644)
 
@@ -729,6 +730,17 @@ def _write_expected_quay_sha(expected_file: Path, quay_bin: Path) -> None:
 def _write_live_quay_stub(install: dict, version: str, registered_ids: list[str], **kwargs) -> None:
     _write_quay_stub(install["quay_bin"], version, registered_ids, **kwargs)
     _write_expected_quay_sha(install["quay_expected_sha"], install["quay_bin"])
+
+
+def _quay_expected_sha_path(target: Path) -> Path:
+    return (
+        target
+        / "hermes-agent"
+        / "installer"
+        / ".state"
+        / "quay"
+        / "SHA256SUM.expected"
+    )
 
 
 @pytest.fixture
@@ -824,7 +836,7 @@ def quay_install(install: dict) -> dict:
     # HERMES_VERIFY_QUAY_BIN to redirect away from /usr/local/bin/quay.
     quay_stub = bin_dir / "quay"
     _write_quay_stub(quay_stub, QUAY_VERSION, [repo_id])
-    quay_expected_sha = quay_dir / "SHA256SUM.expected"
+    quay_expected_sha = _quay_expected_sha_path(target)
     _write_expected_quay_sha(quay_expected_sha, quay_stub)
 
     # values_helper.py imports pyyaml. The system `python3` on dev macOS

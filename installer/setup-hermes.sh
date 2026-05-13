@@ -355,6 +355,8 @@ echo
 
 QUAY_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.version)"
 QUAY_BIN_DST="/usr/local/bin/quay"
+QUAY_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/quay"
+QUAY_EXPECTED_SHA_DST="$QUAY_EXPECTED_SHA_DIR/SHA256SUM.expected"
 QUAY_ENABLED=0
 QUAY_EXPECTED_SHA=""
 
@@ -906,8 +908,10 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
 
   # Persist the exact release SHA used to install /usr/local/bin/quay so
   # read-only verify can check binary drift without trusting `quay --version`.
+  # Keep it under the root-owned rails tree, not the agent-writable quay data dir.
+  install -d -o root -g root -m 0755 "$QUAY_EXPECTED_SHA_DIR"
   printf '%s  %s\n' "$QUAY_EXPECTED_SHA" "$QUAY_BIN_DST" \
-    | install -o root -g root -m 0644 /dev/stdin "$TARGET_DIR/quay/SHA256SUM.expected"
+    | install -o root -g root -m 0644 /dev/stdin "$QUAY_EXPECTED_SHA_DST"
 
   # quay/config.toml is rendered from deploy.values.yaml on every run so
   # changes to quay.agent_invocation (and other quay.* fields) reconcile

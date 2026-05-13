@@ -619,6 +619,17 @@ def _check_quay_binary_sha256(s: _State, quay_bin: Path, expected_file: Path) ->
         )
 
 
+def _quay_expected_sha_file(target: Path) -> Path:
+    return (
+        target
+        / "hermes-agent"
+        / "installer"
+        / ".state"
+        / "quay"
+        / "SHA256SUM.expected"
+    )
+
+
 def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
     """All quay-binary, data-dir, operator-glue, and runtime-manager checks
     that gate on quay.version being non-empty."""
@@ -631,7 +642,7 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
         s.v_drift("quay binary", f"missing or non-executable: {quay_bin}")
     else:
         _check_mode_owner(s, "quay binary", quay_bin_info, "755", s.rails_owner)
-        _check_quay_binary_sha256(s, quay_bin, quay_dir / "SHA256SUM.expected")
+        _check_quay_binary_sha256(s, quay_bin, _quay_expected_sha_file(target))
 
     if not quay_dir.is_dir():
         s.v_drift("quay data dir", f"missing: {quay_dir}")

@@ -157,10 +157,14 @@ def test_installer_persists_quay_expected_sha_for_verify():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
     assert "QUAY_EXPECTED_SHA" in content
     assert "SHA256SUM.expected" in content
+    assert 'QUAY_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/quay"' in content
+    assert 'QUAY_EXPECTED_SHA_DST="$QUAY_EXPECTED_SHA_DIR/SHA256SUM.expected"' in content
+    assert 'install -d -o root -g root -m 0755 "$QUAY_EXPECTED_SHA_DIR"' in content
     assert re.search(
-        r"install\s+-o\s+root\s+-g\s+root\s+-m\s+0644\s+/dev/stdin\s+\"\$TARGET_DIR/quay/SHA256SUM\.expected\"",
+        r"install\s+-o\s+root\s+-g\s+root\s+-m\s+0644\s+/dev/stdin\s+\"\$QUAY_EXPECTED_SHA_DST\"",
         content,
     )
+    assert '"$TARGET_DIR/quay/SHA256SUM.expected"' not in content
 
 
 def test_installer_unset_loop_iterates_both_suffixes():
