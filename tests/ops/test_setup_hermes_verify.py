@@ -745,8 +745,6 @@ def quay_install(install: dict) -> dict:
         "    display_name: t\n"
         "    description: t\n"
         "    background_color: \"#000\"\n"
-        "    slash_command_name: t\n"
-        "    slash_command_description: t\n"
         "  runtime:\n"
         "    allowed_channels: []\n"
         "    home_channel: \"\"\n"

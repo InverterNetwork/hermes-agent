@@ -60,6 +60,7 @@ class _State:
     values_file: Path
     values_helper: Path
     quay_version: str
+    agent_invocation: str
     quay_tags_supported: bool = False
     total: int = 0
     drift: int = 0
@@ -661,6 +662,90 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
         _check_version_pin(s, f"{label} version", rt_path, rt_pin)
 
 
+def _check_codex_prereqs(s: _State) -> None:
+    """Codex CLI host-prep checks — fire only when quay.agent_invocation
+    references `codex`. Codex is operator-installed under the agent user
+    (mirrors the claude precedent, not rails-class), so verify confirms
+    the operator completed install + `codex login` rather than provisioning
+    the binary itself. ChatGPT subscription auth — never OPENAI_API_KEY."""
+    rc, out, _ = _run([
+        *_sudo_prefix_for(s.agent_owner), "bash", "-c", "codex --version",
+    ])
+    if rc != 0:
+        s.v_drift(
+            "codex binary",
+            f"`codex --version` failed for {s.agent_owner}; "
+            "install per ops/README.md → 'Pre-install: codex CLI'",
+        )
+        return
+    s.v_ok(f"codex binary: {(out.splitlines() or [''])[0] or '?'}")
+
+    try:
+        agent_home = Path(pwd.getpwnam(s.agent_owner).pw_dir)
+    except KeyError:
+        s.v_drift("codex auth dir", f"agent user not found: {s.agent_owner}")
+        return
+    codex_dir = agent_home / ".codex"
+    info = _stat_info(codex_dir)
+    if info is None:
+        s.v_drift(
+            "codex auth",
+            f"missing {codex_dir} — run `sudo -u {s.agent_owner} -H codex login`",
+        )
+        return
+    mode, owner, _grp = info
+    if owner != s.agent_owner:
+        s.v_drift(
+            "codex auth dir ownership",
+            f"{codex_dir}: owner={owner} (expected {s.agent_owner})",
+        )
+    elif mode not in ("700", "750"):
+        # Holds OAuth tokens; world-readable would leak the ChatGPT session.
+        s.v_drift(
+            "codex auth dir perms",
+            f"{codex_dir}: mode={mode} (expected 700)",
+        )
+    else:
+        s.v_ok(f"codex auth dir: mode={mode} owner={owner}")
+
+    # auth.json schema: {"tokens": {"access_token": "...", "refresh_token":
+    # "...", ...}}. Both tokens must be present and non-empty — that's what
+    # hermes_cli/auth.py:_import_codex_cli_tokens reads on every Codex API
+    # call. A dir holding only config.toml / stale files would otherwise
+    # pass verify while workers fail at runtime.
+    auth_path = codex_dir / "auth.json"
+    if not auth_path.is_file():
+        s.v_drift(
+            "codex auth",
+            f"missing {auth_path} — run `sudo -u {s.agent_owner} -H codex login`",
+        )
+        return
+    try:
+        payload = json.loads(auth_path.read_text())
+    except PermissionError:
+        s.v_drift(
+            "codex auth",
+            f"{auth_path}: permission denied (run verify as root or {s.agent_owner})",
+        )
+        return
+    except (OSError, ValueError) as exc:
+        s.v_drift("codex auth", f"{auth_path}: unreadable or malformed ({exc})")
+        return
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if not isinstance(tokens, dict):
+        s.v_drift("codex auth", f"{auth_path}: missing `tokens` object")
+        return
+    access = tokens.get("access_token")
+    refresh = tokens.get("refresh_token")
+    if not isinstance(access, str) or not access:
+        s.v_drift("codex auth", f"{auth_path}: tokens.access_token empty/missing")
+        return
+    if not isinstance(refresh, str) or not refresh:
+        s.v_drift("codex auth", f"{auth_path}: tokens.refresh_token empty/missing")
+        return
+    s.v_ok(f"codex auth: {auth_path} carries access+refresh tokens")
+
+
 def _quay_registered_ids(s: _State) -> tuple[str, bool]:
     """Returns (newline-joined ids, list_failed). Empty + False means quay not
     enabled / not present, no list attempted."""
@@ -965,6 +1050,11 @@ def _check_systemd(s: _State) -> None:
     ]
     if s.quay_version:
         timers.append("quay-tick.timer")
+    # Reviewer timer is install-gated by the reviewer auth block having
+    # staged /etc/hermes/reviewer.env; presence of that file is the
+    # ground truth (same probe we use for _check_reviewer_token).
+    if Path("/etc/hermes/reviewer.env").is_file():
+        timers.append("hermes-reviewer-token.timer")
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
         # systemctl emits properties in its own (alphabetical) order, not
@@ -1015,6 +1105,27 @@ def _check_systemd(s: _State) -> None:
                     )
 
 
+def _gh_api_http_code(token: str, url: str) -> str:
+    """GET ``url`` with ``Authorization: Bearer <token>``; return the HTTP
+    status code as a string (``"000"`` on local failure).
+
+    Token flows via ``--config -`` on stdin so it never lands in argv,
+    where ``/proc/<pid>/cmdline`` (any user) would surface it.
+    """
+    _rc, code_out, _ = _run(
+        [
+            "curl", "-sS", "-o", "/dev/null",
+            "-w", "%{http_code}",
+            "--config", "-",
+            "-H", "Accept: application/vnd.github+json",
+            "-H", "X-GitHub-Api-Version: 2022-11-28",
+            url,
+        ],
+        input=f'header = "Authorization: Bearer {token}"\n',
+    )
+    return code_out.strip() or "000"
+
+
 def _check_token_helper(s: _State, repos_tsv: str) -> None:
     """Under --auth-method=app, the helper must be runnable end-to-end.
     Names missing-helper vs missing-venv-python separately so the drift line
@@ -1043,8 +1154,6 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
     else:
         s.v_drift("token helper check", "mint failed")
 
-    # App scope: curl with --config - fed via stdin so the token never lands
-    # in any argv visible through /proc/<pid>/cmdline.
     if app_token and repos_tsv.strip():
         gh_api_base = s.args.gh_api_base or "https://api.github.com"
         for scope_id, scope_url, _scope_base, scope_pkg, _scope_install in _parse_repos_tsv(
@@ -1056,18 +1165,7 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
             if not m:
                 continue
             api_url = f"{gh_api_base}/repos/{m.group(1)}/{m.group(2)}"
-            _rc, code_out, _ = _run(
-                [
-                    "curl", "-sS", "-o", "/dev/null",
-                    "-w", "%{http_code}",
-                    "--config", "-",
-                    "-H", "Accept: application/vnd.github+json",
-                    "-H", "X-GitHub-Api-Version: 2022-11-28",
-                    api_url,
-                ],
-                input=f'header = "Authorization: Bearer {app_token}"\n',
-            )
-            http_code = code_out.strip() or "000"
+            http_code = _gh_api_http_code(app_token, api_url)
             if http_code == "200":
                 s.v_ok(f"App scope {scope_id}: HTTP 200")
             else:
@@ -1075,6 +1173,63 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
                     f"App scope {scope_id}",
                     f"{api_url} returned HTTP {http_code}",
                 )
+
+
+def _check_reviewer_token(s: _State) -> None:
+    """Reviewer App auth: /etc/hermes/reviewer.{pem,env} on-disk perms,
+    /run/hermes/reviewer-gh-token freshness, and an App-installation API
+    probe with the minted token (the BRIX-1390 acceptance criterion).
+
+    Gated on presence of /etc/hermes/reviewer.env — that's what
+    setup-hermes.sh writes when the reviewer auth block runs. Hosts that
+    never staged a reviewer key skip every check here silently."""
+    etc_dir = Path("/etc/hermes")
+    env_file = etc_dir / "reviewer.env"
+    if not env_file.is_file():
+        return
+
+    key_file = etc_dir / "reviewer.pem"
+    _check_mode_owner(
+        s, "reviewer.pem", _stat_info(key_file), "640", s.rails_owner, s.agent_group,
+    )
+    _check_mode_owner(
+        s, "reviewer.env", _stat_info(env_file), "640", s.rails_owner, s.agent_group,
+    )
+
+    token_file = Path("/run/hermes/reviewer-gh-token")
+    info = _stat_info(token_file)
+    if info is None:
+        s.v_drift("reviewer-gh-token", f"missing: {token_file}")
+        return
+    _check_mode_owner(
+        s, "reviewer-gh-token", info, "600", s.agent_owner, s.agent_group,
+    )
+    try:
+        token = token_file.read_text().strip()
+    except OSError as exc:
+        s.v_drift("reviewer-gh-token", f"unreadable: {exc}")
+        return
+    if not token:
+        s.v_drift("reviewer-gh-token", "empty")
+        return
+    s.v_ok("reviewer-gh-token: non-empty")
+
+    # Per BRIX-1390 acceptance: token must answer `gh api /installation/
+    # repositories` — proves the App identity is recognized for *some*
+    # installation, without coupling to the specific repos[] entries
+    # (which the reviewer App's scope may be a strict subset of, e.g.
+    # didier-reviewer installed only on test-factory-code +
+    # brix-indexer + hermes-agent per the ticket).
+    gh_api_base = s.args.gh_api_base or "https://api.github.com"
+    api_url = f"{gh_api_base}/installation/repositories"
+    http_code = _gh_api_http_code(token, api_url)
+    if http_code == "200":
+        s.v_ok("reviewer App installation scope: HTTP 200")
+    else:
+        s.v_drift(
+            "reviewer App installation scope",
+            f"{api_url} returned HTTP {http_code}",
+        )
 
 
 def _check_upstream_workspace(s: _State) -> None:
@@ -1131,8 +1286,13 @@ def run(
         os.environ.get("VALUES_HELPER") or (args.fork / "installer" / "values_helper.py")
     )
     quay_version = ""
+    agent_invocation = ""
     if values_file.is_file() and values_helper.is_file():
         quay_version = _values_get(values_file, values_helper, "quay.version")
+        if quay_version:
+            agent_invocation = _values_get(
+                values_file, values_helper, "quay.agent_invocation",
+            )
 
     quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
 
@@ -1167,6 +1327,7 @@ def run(
         values_file=values_file,
         values_helper=values_helper,
         quay_version=quay_version,
+        agent_invocation=agent_invocation,
         quay_tags_supported=quay_tags_supported,
     )
 
@@ -1202,11 +1363,16 @@ def run(
         )
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
+    if "codex" in s.agent_invocation:
+        _check_codex_prereqs(s)
     _check_per_entry_repos(s, repos_tsv)
     _check_deployment_tag_vocab(s)
     _check_systemd(s)
     if app_auth_expected:
         _check_token_helper(s, repos_tsv)
+    # Reviewer auth is gated by /etc/hermes/reviewer.env presence inside
+    # the check itself; safe to invoke unconditionally.
+    _check_reviewer_token(s)
     _check_upstream_workspace(s)
 
     print(

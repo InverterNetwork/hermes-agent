@@ -15,8 +15,7 @@ Subcommands:
                                 — write <auth>/gateway-runtime.env from
                                   values.yaml. Holds non-secret env vars
                                   derived from the values file
-                                  (SLACK_ALLOWED_USERS,
-                                  SLACK_SLASH_COMMAND_NAME, LINEAR_TEAM_*).
+                                  (SLACK_ALLOWED_USERS, LINEAR_TEAM_*).
                                   Always rewrites — the file is a reflection
                                   of values.yaml, not operator input.
   merge-config-model <out>     — set <out>'s ``model.provider`` and
@@ -484,10 +483,6 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     derived config:
 
     * ``SLACK_ALLOWED_USERS`` from ``slack.runtime.allowed_users``.
-    * ``SLACK_SLASH_COMMAND_NAME`` from ``slack.app.slash_command_name`` —
-      the operator's configured top-level slash, recognized by the gateway's
-      slash listener so manifest-registered slashes ack within Slack's
-      3-second deadline.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
     Always rewritten — values.yaml is the source of truth and the file is a
@@ -517,25 +512,6 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
             joined = ",".join(_env_safe("slack.runtime.allowed_users[]", str(v)) for v in au)
             lines.append(f"SLACK_ALLOWED_USERS={joined}")
 
-    # The operator-configured top-level slash (slack.app.slash_command_name)
-    # is templated into the rendered Slack manifest at install time. Without
-    # the matching env var, the gateway's slash-listener regex has no idea
-    # that the manifest-registered slash exists — slack_bolt drops it as
-    # "Unhandled request", the 3-second Slack ack deadline expires, and the
-    # user sees "did not respond". Plumb the same value through to the
-    # runtime so the regex and `_handle_slash_command` recognize it.
-    app = (data.get("slack") or {}).get("app") or {}
-    if isinstance(app, dict):
-        slash_name = app.get("slash_command_name")
-        if slash_name:
-            if not isinstance(slash_name, str):
-                sys.stderr.write(
-                    "values_helper.py: slack.app.slash_command_name must be a string\n"
-                )
-                return 1
-            sanitized = _env_safe("slack.app.slash_command_name", slash_name)
-            lines.append(f"SLACK_SLASH_COMMAND_NAME={sanitized}")
-
     # linear.teams.<key>: <uuid>  →  LINEAR_TEAM_<KEY>=<uuid>
     # Lets skills (e.g. inverter-linear) reference team UUIDs by env var
     # instead of hardcoding them. Adding a new team to values.yaml is enough
@@ -562,6 +538,132 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     sys.stdout.write(f"wrote: {out_path}\n")
     return 0
+
+
+# Per-agent invocation tables carry exactly these role keys today; reviewer
+# and worker spawn are the only consumers. Any other key is almost certainly
+# a typo (e.g. `workers`) and should fail loud at validate time rather than
+# silently drop on the floor.
+_AGENT_ROLE_KEYS = ("worker", "reviewer")
+
+# Stricter than `_REPO_ID_RE`: agent ids are interpolated bare into TOML
+# table headers (`[agents.invocations.<id>]`), and a dotted id like `gpt.5`
+# would parse as nested keys (`agents.invocations.gpt.5`) rather than as a
+# single agent entry. Reject dots here so the renderer can keep emitting a
+# bare header without quoting.
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+
+
+def _validate_quay_agents_block(
+    block: Any,
+) -> tuple[
+    dict[str, Any] | None,
+    str | None,
+]:
+    """Validate ``quay.agents`` and return a normalised view (or error string).
+
+    Schema::
+
+        agents:
+          worker: <agent_id>       # optional default for worker spawns
+          reviewer: <agent_id>     # optional default for reviewer spawns
+          invocations:             # required when worker/reviewer reference an id
+            <agent_id>:
+              worker: "<cmd>"      # both roles optional individually; at
+              reviewer: "<cmd>"    # least one must be present per agent
+
+    Absent block → ``(None, None)`` (legacy ``agent_invocation`` path).
+    """
+    if block is None:
+        return None, None
+    if not isinstance(block, dict):
+        return None, "quay.agents must be a mapping when present"
+
+    allowed_top = {*_AGENT_ROLE_KEYS, "invocations"}
+    unknown = sorted(set(block.keys()) - allowed_top)
+    if unknown:
+        return None, (
+            f"quay.agents has unknown key(s): {unknown!r} "
+            f"(allowed: {sorted(allowed_top)!r})"
+        )
+
+    out: dict[str, Any] = {}
+    for role in _AGENT_ROLE_KEYS:
+        if role in block:
+            v = block[role]
+            if not isinstance(v, str) or not v:
+                return None, (
+                    f"quay.agents.{role} must be a non-empty string "
+                    f"(got {type(v).__name__}: {v!r})"
+                )
+            if not _AGENT_ID_RE.match(v):
+                return None, (
+                    f"quay.agents.{role}={v!r} must match "
+                    f"{_AGENT_ID_RE.pattern}"
+                )
+            out[role] = v
+
+    invocations = block.get("invocations")
+    if invocations is None:
+        invocations = {}
+    if not isinstance(invocations, dict):
+        return None, "quay.agents.invocations must be a mapping"
+
+    parsed_inv: dict[str, dict[str, str]] = {}
+    for agent_id, roles in invocations.items():
+        if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+            return None, (
+                f"quay.agents.invocations.{agent_id!r}: agent id must match "
+                f"{_AGENT_ID_RE.pattern}"
+            )
+        if not isinstance(roles, dict):
+            return None, (
+                f"quay.agents.invocations.{agent_id} must be a mapping "
+                f"(got {type(roles).__name__})"
+            )
+        bad_role = sorted(set(roles.keys()) - set(_AGENT_ROLE_KEYS))
+        if bad_role:
+            return None, (
+                f"quay.agents.invocations.{agent_id} has unknown key(s): "
+                f"{bad_role!r} (allowed: {list(_AGENT_ROLE_KEYS)!r})"
+            )
+        roles_out: dict[str, str] = {}
+        for role in _AGENT_ROLE_KEYS:
+            if role in roles:
+                v = roles[role]
+                if not isinstance(v, str) or not v:
+                    return None, (
+                        f"quay.agents.invocations.{agent_id}.{role} must be a "
+                        f"non-empty string (got {type(v).__name__}: {v!r})"
+                    )
+                roles_out[role] = v
+        if not roles_out:
+            return None, (
+                f"quay.agents.invocations.{agent_id} must define at least one "
+                f"of {list(_AGENT_ROLE_KEYS)!r}"
+            )
+        parsed_inv[agent_id] = roles_out
+
+    # Cross-check: if `worker`/`reviewer` defaults name an agent id, that id
+    # must have a matching role entry in `invocations`. Otherwise the rendered
+    # config.toml would point at an agent quay can't resolve.
+    for role in _AGENT_ROLE_KEYS:
+        ref = out.get(role)
+        if ref is None:
+            continue
+        if ref not in parsed_inv:
+            return None, (
+                f"quay.agents.{role}={ref!r} but no quay.agents.invocations."
+                f"{ref} entry is defined"
+            )
+        if role not in parsed_inv[ref]:
+            return None, (
+                f"quay.agents.{role}={ref!r} but quay.agents.invocations."
+                f"{ref}.{role} is not set"
+            )
+
+    out["invocations"] = parsed_inv
+    return out, None
 
 
 def _toml_basic_string(s: str) -> str:
@@ -613,6 +715,11 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         )
         return 1
 
+    agents_block, agents_err = _validate_quay_agents_block(quay.get("agents"))
+    if agents_err is not None:
+        sys.stderr.write(f"values_helper.py: {agents_err}\n")
+        return 1
+
     adapters = quay.get("adapters") or {}
     if not isinstance(adapters, dict):
         sys.stderr.write("values_helper.py: quay.adapters must be a mapping\n")
@@ -627,6 +734,26 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         "",
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
     ]
+
+    # Legacy `agent_invocation` above continues to render unchanged — quay's
+    # back-compat path treats it as the worker default when no `[agents]`
+    # block is present.
+    if agents_block is not None:
+        lines.append("")
+        lines.append("[agents]")
+        for role in _AGENT_ROLE_KEYS:
+            v = agents_block.get(role)
+            if isinstance(v, str):
+                lines.append(f"{role} = {_toml_basic_string(v)}")
+        # Sort invocation keys so re-rendering the same values.yaml produces
+        # byte-identical TOML — hermes-sync's drift detector relies on it.
+        for agent_id in sorted(agents_block["invocations"]):
+            roles = agents_block["invocations"][agent_id]
+            lines.append("")
+            lines.append(f"[agents.invocations.{agent_id}]")
+            for role in _AGENT_ROLE_KEYS:
+                if role in roles:
+                    lines.append(f"{role} = {_toml_basic_string(roles[role])}")
 
     linear = adapters.get("linear") or {}
     if isinstance(linear, dict) and linear.get("enabled"):
@@ -658,6 +785,14 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"values_helper.py: quay.reviewer.{key} must be a bool "
                 f"(got {type(reviewer[key]).__name__}: {reviewer[key]!r})\n"
+            )
+            return 1
+    if "login" in reviewer:
+        login_val = reviewer["login"]
+        if not isinstance(login_val, str) or not login_val:
+            sys.stderr.write(
+                "values_helper.py: quay.reviewer.login must be a non-empty "
+                f"string (got {type(login_val).__name__}: {login_val!r})\n"
             )
             return 1
     if reviewer.get("enabled") is True:
@@ -1384,6 +1519,15 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
     if team_err is not None:
         sys.stderr.write(f"values_helper.py: {team_err}\n")
         return 1
+
+    quay_top = data.get("quay") if isinstance(data.get("quay"), dict) else None
+    _, ag_err = _validate_quay_agents_block(
+        quay_top.get("agents") if quay_top else None
+    )
+    if ag_err is not None:
+        sys.stderr.write(f"values_helper.py: {ag_err}\n")
+        return 1
+
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
             sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
@@ -1433,8 +1577,7 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
             sys.stderr.write(f"values_helper.py: {it_err}\n")
             return 1
 
-    quay_top = data.get("quay")
-    if isinstance(quay_top, dict):
+    if quay_top is not None:
         _, ns_err = _validate_tag_namespaces_block(quay_top.get("tag_namespaces"))
         if ns_err is not None:
             sys.stderr.write(f"values_helper.py: {ns_err}\n")

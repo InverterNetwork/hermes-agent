@@ -29,6 +29,16 @@ Five units live here:
   `/usr/local/bin/quay tick`. `QUAY_DATA_DIR` points at
   `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
   carrying a `quay:` block.
+* **`hermes-reviewer-token`** — 30-min oneshot that refreshes
+  `/run/hermes/reviewer-gh-token` from a *second* GitHub App (the
+  reviewer identity), so quay's reviewer worker can post APPROVE reviews
+  on PRs opened by the worker App without GitHub blocking the
+  self-review. Installed only when the operator passes
+  `--reviewer-app-key-path` on first install (the PEM persists at
+  `/etc/hermes/reviewer.pem`); IDs come from
+  `auth.github_app_reviewer.{id,installation_id}` in
+  `deploy.values.yaml`. See BRIX-1390 + AST-109 for the cross-component
+  design.
 
 ## Files
 
@@ -49,6 +59,8 @@ Five units live here:
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
+| `ops/hermes-reviewer-token.service`        | systemd service unit (oneshot). Mints the reviewer App's installation token via `installer/hermes_github_token.py write-token` and writes it to `/run/hermes/reviewer-gh-token`. `User=__AGENT_USER__` and `__TARGET_DIR__` templated by `setup-hermes.sh`. |
+| `ops/hermes-reviewer-token.timer`          | systemd timer unit. `OnBootSec=30s` + 30-min steady cadence. |
 | `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
@@ -94,6 +106,71 @@ The symlink makes `claude` available system-wide so root-owned scripts can
 invoke it. The login caches credentials under `~<agent>/.claude/` and is
 read by the worker process which runs as the agent user.
 
+## Pre-install: codex CLI (quay workers)
+
+Alternative to claude for quay's worker invocation. Configure by pointing
+`quay.agent_invocation` in `deploy.values.yaml` at `codex` (e.g.
+`codex exec --json -- … < {prompt_file} > .quay-usage.json`) — the
+installer fails loud if the invocation references `codex` and the binary
+is absent on the agent user's `PATH`.
+
+Subscription model: **ChatGPT subscription via `codex login`**, *not* an
+`OPENAI_API_KEY`. This is the same subscription class as the gateway's
+`openai-codex` auth but a distinct credential store (`~<agent>/.codex/`
+vs. `~<agent>/.hermes/auth.json`) — the codex CLI manages its own session.
+
+Install (operator's choice — codex ships several distribution paths, and
+the installer doesn't provision the binary itself; the rails-class
+SHA-pinned install pattern used for the `quay` binary may be adopted in a
+follow-up once codex publishes stable static-binary releases). Two paths
+currently work:
+
+```sh
+# Path A — npm (canonical upstream distribution today). Requires node+npm.
+sudo -u <agent> -H npm install -g @openai/codex
+
+# Path B — static binary from openai/codex GitHub releases.
+# Substitute the release tag and platform asset name as appropriate.
+sudo -u <agent> -H bash -c 'curl -fsSL <release-url> | tar xz -C ~/.local/bin/'
+```
+
+Symlink to a system path so root-owned scripts and `command -v codex`
+probes find it (parallel to claude):
+
+```sh
+sudo ln -sf $(sudo -u <agent> -H bash -c 'command -v codex') /usr/local/bin/codex
+```
+
+Log in (interactive — opens a browser flow on the local machine; complete
+before running the installer):
+
+```sh
+sudo -u <agent> -H codex login
+```
+
+On a headless host (no display), `codex login` can fall back to a paste-
+code-from-browser device flow on recent versions. If that path is
+unavailable on the version pinned for the deployment, `codex login` on a
+laptop and copy the resulting session over:
+
+```sh
+scp -r ~/.codex/ root@<host>:/home/<agent>/.codex/
+sudo chown -R <agent>:<agent> /home/<agent>/.codex
+sudo chmod 700 /home/<agent>/.codex
+```
+
+`verify.py` flags `~<agent>/.codex/` as DRIFT if it's missing, empty,
+world-readable, or owned by the wrong user.
+
+### Refresh / re-auth
+
+Token expiry on ChatGPT subscription auth is silent until the next
+worker spawn — failed attempts surface as auth errors in the worktree-
+local `.quay-tool-trace.log`. To refresh, re-run `sudo -u <agent> -H
+codex login` (or re-`scp` the laptop session). No daemon restart is
+needed: `quay-tick` spawns a fresh `codex` subprocess for each task and
+picks up the new tokens at the next tick.
+
 ## Pre-install: Codex auth (gateway runtime)
 
 `hermes-gateway` needs an LLM credential to interpret Slack messages and call
@@ -122,10 +199,11 @@ set `model.provider=openai-codex`.
 
 Subscription scope at a glance:
 
-| Surface         | Auth                              | Stored at                          |
-| --------------- | --------------------------------- | ---------------------------------- |
-| quay workers    | `claude login` (Anthropic sub)    | `~<agent>/.claude/`                |
-| `hermes-gateway`| `hermes auth add openai-codex`    | `~<agent>/.hermes/auth.json`       |
+| Surface                   | Auth                              | Stored at                          |
+| ------------------------- | --------------------------------- | ---------------------------------- |
+| quay workers (claude)     | `claude login` (Anthropic sub)    | `~<agent>/.claude/`                |
+| quay workers (codex)      | `codex login` (ChatGPT sub)       | `~<agent>/.codex/`                 |
+| `hermes-gateway`          | `hermes auth add openai-codex`    | `~<agent>/.hermes/auth.json`       |
 
 Token refresh is automatic — `hermes` mints a fresh access token from its
 refresh token on demand. If the refresh token is invalidated (e.g. the
@@ -418,8 +496,14 @@ of the registered repos live at `<HERMES_HOME>/quay/repos/<id>.git`.
 
 ## Worker auth
 
-The worker (`agent_invocation` in `quay/config.toml`) needs an Anthropic
-credential to call the Claude API. Two modes:
+The worker (`agent_invocation` in `quay/config.toml`) needs an LLM
+credential, which depends on whether the invocation calls `claude` or
+`codex`. See the pre-install sections above for the install + login
+bootstrap; this section just covers the runtime credential model.
+
+### Claude worker (`agent_invocation` calls `claude`)
+
+Anthropic credential. Two modes:
 
 * **Subscription auth** — run `sudo -u <agent_user> -H claude login` once;
   the CLI caches the credential at `~<agent_user>/.claude/`. Leave
@@ -433,6 +517,15 @@ credential to call the Claude API. Two modes:
 and `claude login` was also done), the env var silently overrides the login.
 Operators expect "blank = use subscription" — rotate or clear a stale key
 before relying on subscription auth.
+
+### Codex worker (`agent_invocation` calls `codex`)
+
+ChatGPT subscription auth via `codex login` — see
+"Pre-install: codex CLI (quay workers)" above. The CLI caches OAuth
+tokens at `~<agent_user>/.codex/auth.json`. No `OPENAI_API_KEY` env var
+is set in `quay.env`; the codex CLI reads its own session file directly.
+The token refresh / re-auth playbook lives in the same pre-install
+section.
 
 ## GitHub auth
 
