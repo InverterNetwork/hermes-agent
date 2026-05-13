@@ -465,28 +465,30 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # Quay v0.2.0 pr-review subsystem. `enabled: true` alone only activates
+  # Quay pr-review subsystem. `enabled: true` alone only activates
   # ad-hoc /review on human-owned PRs; `gate_quay_owned_done: true` is what
   # opens the `pr-open → done → pr-review` path for quay-spawned tasks
   # (src/core/tick.ts: enter-review fires only when both are true, and
   # src/core/pr_review.ts skips with `quay_owned_gate_disabled` otherwise).
+  #
   # `login` must be set explicitly under GitHub App auth — quay's fallback
   # `gh api user --jq .login` returns HTTP 403 for App tokens, which locks
   # the reviewer tick in an error loop. The string is matched literally
   # against `gh pr view --json reviews .reviews[].author.login`, which for
-  # GitHub App authors returns `app/<slug>`. Today both worker and reviewer
-  # spawn under the same App; once a separate reviewer App is provisioned
-  # this changes to its slug. `max_concurrent_reviewers` left at the binary
-  # default of 2.
+  # GitHub App authors returns `app/<slug>`. Worker and reviewer run under
+  # distinct App identities (`app/didier-worker` opens PRs;
+  # `app/didier-reviewer` approves them) — GitHub forbids an App from
+  # approving PRs it authored, so a separate reviewer identity is the
+  # only way to unblock self-review.
   #
   # `gh_token_file` points at the file the installer's
   # hermes-reviewer-token timer keeps fresh (the timer mints a new
   # installation token from `auth.github_app_reviewer` every ~50 min).
   # Quay's tick exports the file's contents as $GH_TOKEN inside the
-  # reviewer tmux pane only, per AST-109, so the reviewer authenticates
-  # as `app/didier-reviewer` — distinct from the worker's
-  # `app/didier-worker` — which unblocks self-review (GitHub forbids
-  # an App approving PRs it authored).
+  # reviewer tmux pane only (per AST-109), which is how the reviewer
+  # authenticates as a different App from the worker.
+  #
+  # `max_concurrent_reviewers` left at the binary default of 2.
   reviewer:
     enabled: true
     gate_quay_owned_done: true
