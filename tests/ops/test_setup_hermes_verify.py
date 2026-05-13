@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import getpass
 import grp
+import hashlib
 import io
 import os
 import re
@@ -135,9 +136,8 @@ def install(tmp_path: Path) -> dict:
     (target / "gateway-org-defaults.md").chmod(0o640)
 
     # Stub systemctl in PATH bin so verify thinks the timers are loaded.
-    # Verify batches `systemctl show -p A -p B -p C --value <unit>` and
-    # expects newline-separated values in the requested order — same wire
-    # format as real systemctl.
+    # Verify batches `systemctl show -p A -p B -p C <unit>` and parses
+    # KEY=VALUE lines — same wire format as real systemctl without --value.
     systemctl_log = tmp_path / "systemctl.log"
     systemctl = bin_dir / "systemctl"
     systemctl.write_text(
@@ -155,9 +155,9 @@ def install(tmp_path: Path) -> dict:
         "  done\n"
         "  for prop in \"${props[@]}\"; do\n"
         "    case \"$prop\" in\n"
-        "      ActiveState)   echo active ;;\n"
-        "      LoadState)     echo loaded ;;\n"
-        "      UnitFileState) echo enabled ;;\n"
+        "      ActiveState)   echo ActiveState=active ;;\n"
+        "      LoadState)     echo LoadState=loaded ;;\n"
+        "      UnitFileState) echo UnitFileState=enabled ;;\n"
         "    esac\n"
         "  done\n"
         "  exit 0\n"
@@ -557,9 +557,9 @@ class TestSetupHermesVerify:
             "  done\n"
             "  for prop in \"${props[@]}\"; do\n"
             "    case \"$prop\" in\n"
-            "      ActiveState)   echo inactive ;;\n"
-            "      LoadState)     echo loaded ;;\n"
-            "      UnitFileState) echo enabled ;;\n"
+            "      ActiveState)   echo ActiveState=inactive ;;\n"
+            "      LoadState)     echo LoadState=loaded ;;\n"
+            "      UnitFileState) echo UnitFileState=enabled ;;\n"
             "    esac\n"
             "  done\n"
             "  exit 0\n"
@@ -638,11 +638,10 @@ def _write_quay_stub(
 ) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
-    `version` is the tag-shaped pin (`v0.1.0`); the stub strips the leading
-    `v` and appends a fake build SHA to mirror what the real binary emits
+    `version` is tag-shaped (`v0.1.0`); the stub strips the leading `v` and
+    appends a fake build SHA to mirror what older real binaries emitted
     (`${pkg.version}+${shortSHA}`, see scripts/embed.ts in lafawnduh1966/quay).
-    The verify path strips the `v` from the pin before comparing, so the
-    test exercises that real format end-to-end.
+    Verify ignores this output for binary drift and compares SHA256 instead.
 
     `repo_list_override` lets a caller substitute the `repo list` payload
     directly — useful for testing parse-failure paths with non-JSON output.
@@ -714,6 +713,34 @@ def _write_quay_stub(
         + "exit 0\n"
     )
     path.chmod(0o755)
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def _write_expected_quay_sha(expected_file: Path, quay_bin: Path) -> None:
+    expected_file.parent.mkdir(parents=True, exist_ok=True)
+    expected_file.write_text(f"{_sha256_file(quay_bin)}  /usr/local/bin/quay\n")
+    expected_file.chmod(0o644)
+
+
+def _write_live_quay_stub(install: dict, version: str, registered_ids: list[str], **kwargs) -> None:
+    _write_quay_stub(install["quay_bin"], version, registered_ids, **kwargs)
+    _write_expected_quay_sha(install["quay_expected_sha"], install["quay_bin"])
+
+
+def _quay_expected_sha_path(target: Path) -> Path:
+    return (
+        target
+        / "hermes-agent"
+        / "installer"
+        / ".state"
+        / "quay"
+        / "SHA256SUM.expected"
+    )
 
 
 @pytest.fixture
@@ -809,6 +836,8 @@ def quay_install(install: dict) -> dict:
     # HERMES_VERIFY_QUAY_BIN to redirect away from /usr/local/bin/quay.
     quay_stub = bin_dir / "quay"
     _write_quay_stub(quay_stub, QUAY_VERSION, [repo_id])
+    quay_expected_sha = _quay_expected_sha_path(target)
+    _write_expected_quay_sha(quay_expected_sha, quay_stub)
 
     # values_helper.py imports pyyaml. The system `python3` on dev macOS
     # often lacks it, so shadow `python3` in PATH with a shim that
@@ -848,6 +877,7 @@ def quay_install(install: dict) -> dict:
     install["values_file"] = fork / "deploy.values.yaml"
     install["quay_dir"] = quay_dir
     install["quay_bin"] = quay_stub
+    install["quay_expected_sha"] = quay_expected_sha
     install["quay_repo_id"] = repo_id
     install["quay_repo_url"] = repo_url
     install["quay_bare"] = bare
@@ -896,7 +926,9 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "[OK] quay binary:" in result.stdout
-        assert "[OK] quay binary version:" in result.stdout
+        assert "[OK] quay SHA256SUM.expected:" in result.stdout
+        assert "[OK] quay binary SHA256:" in result.stdout
+        assert "quay binary version" not in result.stdout
         assert "[OK] quay data dir ownership:" in result.stdout
         assert "[OK] quay config.toml:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} ownership:" in result.stdout
@@ -940,14 +972,31 @@ class TestSetupHermesVerifyQuay:
         assert result.returncode == 1
         assert "[DRIFT] quay binary" in result.stderr
 
-    def test_quay_version_mismatch_is_drift(self, quay_install):
-        # Stub now reports a different tag than the values file claims —
-        # the binary on disk is lying about its tag, which is exactly the
-        # drift this check exists to catch.
+    def test_quay_sha_mismatch_is_drift(self, quay_install):
+        # Stub now has different bytes than the release SHA recorded at
+        # install time, which is the post-install drift signal.
         _write_quay_stub(quay_install["quay_bin"], "v9.9.9", [quay_install["quay_repo_id"]])
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
-        assert "[DRIFT] quay binary version" in result.stderr
+        assert "[DRIFT] quay binary SHA256" in result.stderr
+
+    def test_quay_version_string_mismatch_is_not_drift_when_sha_matches(self, quay_install):
+        # quay --version can lie independently of the release artifact. If
+        # the installed bytes match the recorded SHA, verify must pass.
+        _write_live_quay_stub(
+            quay_install, "v9.9.9", [quay_install["quay_repo_id"]],
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] quay binary SHA256:" in result.stdout
+        assert "quay binary version" not in result.stdout + result.stderr
+
+    def test_missing_quay_expected_sha_is_drift(self, quay_install):
+        quay_install["quay_expected_sha"].unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay binary SHA256" in result.stderr
+        assert "missing expected hash" in result.stderr
 
     def test_missing_quay_data_dir_is_drift(self, quay_install):
         shutil.rmtree(quay_install["quay_dir"])
@@ -998,7 +1047,7 @@ class TestSetupHermesVerifyQuay:
     def test_unregistered_repo_id_is_drift(self, quay_install):
         # Stub now returns an empty registration list — the bare clone
         # exists but quay never had `repo add` run against it.
-        _write_quay_stub(quay_install["quay_bin"], QUAY_VERSION, [])
+        _write_live_quay_stub(quay_install, QUAY_VERSION, [])
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert f"[DRIFT] quay repo {quay_install['quay_repo_id']}" in result.stderr
@@ -1008,8 +1057,8 @@ class TestSetupHermesVerifyQuay:
         """A binary whose `repo list` returns non-JSON should produce ONE
         named drift, not N misleading 'not registered' drifts. Catches
         binary crashes / data-dir corruption / format drift early."""
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [],
             repo_list_override="garbage not json",
@@ -1042,10 +1091,10 @@ class TestSetupHermesVerifyQuay:
             "  for prop in \"${props[@]}\"; do\n"
             "    case \"$prop\" in\n"
             "      ActiveState)\n"
-            "        if [[ \"$unit\" == \"quay-tick.timer\" ]]; then echo inactive\n"
-            "        else echo active; fi ;;\n"
-            "      LoadState)     echo loaded ;;\n"
-            "      UnitFileState) echo enabled ;;\n"
+            "        if [[ \"$unit\" == \"quay-tick.timer\" ]]; then echo ActiveState=inactive\n"
+            "        else echo ActiveState=active; fi ;;\n"
+            "      LoadState)     echo LoadState=loaded ;;\n"
+            "      UnitFileState) echo UnitFileState=enabled ;;\n"
             "    esac\n"
             "  done\n"
             "  exit 0\n"
@@ -1113,8 +1162,8 @@ class TestSetupHermesVerifyTagVocab:
         # on the next install run, otherwise removal silently doesn't
         # happen and the live vocab keeps growing.
         repo_id = quay_install["quay_repo_id"]
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             repo_tags={
@@ -1137,8 +1186,8 @@ class TestSetupHermesVerifyTagVocab:
             "      tags:\n"
             "        area: [bonding-curve]\n",
         )
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             repo_tags={
@@ -1166,8 +1215,8 @@ class TestSetupHermesVerifyTagVocab:
             "      tags:\n"
             "        area: [vesting, bonding-curve]\n",  # unsorted in values
         )
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             repo_tags={
@@ -1200,8 +1249,8 @@ class TestSetupHermesVerifyTagVocab:
 
     def test_deployment_drift_remove_from_values_surfaces(self, quay_install):
         repo_id = quay_install["quay_repo_id"]
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             deployment_tags={
@@ -1230,8 +1279,8 @@ class TestSetupHermesVerifyTagVocab:
             "      required: true\n"
             "      values: [bugfix]\n",
         )
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             deployment_tags={
@@ -1256,8 +1305,8 @@ class TestSetupHermesVerifyTagVocab:
             "      required: true\n"
             "      values: [bugfix, refactor]\n",
         )
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             deployment_tags={
@@ -1279,7 +1328,7 @@ class TestSetupHermesVerifyTagVocab:
         # as spurious drift. The "not registered" line is the actionable
         # signal — tag-vocab follow-up must be gated.
         repo_id = quay_install["quay_repo_id"]
-        _write_quay_stub(quay_install["quay_bin"], QUAY_VERSION, [])
+        _write_live_quay_stub(quay_install, QUAY_VERSION, [])
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "not registered" in result.stderr
@@ -1305,8 +1354,8 @@ class TestSetupHermesVerifyTagVocab:
             "    risk:\n"
             "      values: [pii]\n",
         )
-        _write_quay_stub(
-            quay_install["quay_bin"], QUAY_VERSION, [repo_id],
+        _write_live_quay_stub(
+            quay_install, QUAY_VERSION, [repo_id],
             tags_supported=False,
         )
         result = _run_verify_quay(quay_install)
@@ -1327,8 +1376,8 @@ class TestSetupHermesVerifyTagVocab:
             "        area: [vesting]\n"
             "        layer: [foo]\n",  # only in values
         )
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             repo_tags={
@@ -1354,8 +1403,8 @@ class TestSetupHermesVerifyTagVocab:
         # MUST surface it as drift rather than silently coercing
         # truthy-string to True (and showing [OK]).
         repo_id = quay_install["quay_repo_id"]
-        _write_quay_stub(
-            quay_install["quay_bin"],
+        _write_live_quay_stub(
+            quay_install,
             QUAY_VERSION,
             [repo_id],
             repo_tags={
@@ -1394,6 +1443,7 @@ class TestSetupHermesVerifyTagVocab:
             "exit 0\n"
         )
         quay_stub.chmod(0o755)
+        _write_expected_quay_sha(quay_install["quay_expected_sha"], quay_stub)
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert f"[DRIFT] quay repo {repo_id} tag vocab" in result.stderr
