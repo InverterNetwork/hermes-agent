@@ -726,6 +726,17 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
+            # Register the generic skill-invoke action handler. Any Block Kit
+            # button whose action_id matches `skill:<name>` (where <name>
+            # mirrors the skill-name allowlist from agent/skill_commands.py)
+            # dispatches as if the operator had typed `/<name> <value>` in
+            # the channel. Skills opt into this by including such a button
+            # in their threaded posts; nothing else changes about the skill
+            # contract.
+            self._app.action(re.compile(r"^skill:[a-z0-9][a-z0-9._-]*$"))(
+                self._handle_skill_invoke_action
+            )
+
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
             _apply_slack_proxy(self._handler.client, proxy_url)
@@ -2775,6 +2786,76 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
 
         # (approval state already consumed by atomic pop above)
+
+    # ----- Generic skill-invoke action button -----
+
+    async def _handle_skill_invoke_action(self, ack, body, action) -> None:
+        """Handle a generic `skill:<name>` Block Kit button click.
+
+        Translates the click into a slash-command-equivalent dispatch so the
+        target skill sees the same MessageEvent shape as if the operator had
+        typed ``/<skill-name> <args>`` in the channel. This is the standard
+        ergonomic surface for skills that need operator confirmation on a
+        prior bot post (e.g. ``feedback-intake`` posts a proposal with a
+        "File these requests" button bound to ``skill:file-cr``).
+
+        Authz mirrors ``_handle_approval_action``: button clicks bypass the
+        normal message auth flow, so SLACK_ALLOWED_USERS gates clicks too.
+        """
+        await ack()
+        action_id = action.get("action_id", "")
+        if not action_id.startswith("skill:"):
+            logger.debug(
+                "[Slack] skill-invoke handler got non-skill action_id: %s",
+                action_id,
+            )
+            return
+        skill_name = action_id[len("skill:") :]
+        if not skill_name:
+            logger.warning(
+                "[Slack] skill-invoke action with empty skill name: %s",
+                action_id,
+            )
+            return
+        args = action.get("value", "") or ""
+
+        user = body.get("user", {})
+        user_id = user.get("id", "")
+        user_name = user.get("name", "unknown")
+        channel = body.get("channel", {})
+        channel_id = channel.get("id", "")
+        team_id = body.get("team", {}).get("id", "")
+
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized skill-invoke click by %s (%s) for %s — ignoring",
+                    user_name,
+                    user_id,
+                    action_id,
+                )
+                return
+
+        logger.info(
+            "[Slack] skill-invoke button click: action=%s skill=%s user=%s channel=%s",
+            action_id,
+            skill_name,
+            user_id,
+            channel_id,
+        )
+
+        # Reuse the slash-command dispatch path — the skill sees the same
+        # MessageEvent shape it would have seen from a typed `/<skill> <args>`.
+        fake_command = {
+            "command": f"/{skill_name}",
+            "text": args,
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "team_id": team_id,
+        }
+        await self._handle_slash_command(fake_command)
 
     # ----- Thread context fetching -----
 
