@@ -390,7 +390,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.0"
+  version: "v0.3.2"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
@@ -409,23 +409,32 @@ quay:
   # (no patch is produced) and the file would shadow worker traces in the
   # same worktree.
   #
-  # To switch to codex: (1) install codex CLI on krustentier under the agent
-  # user with ChatGPT-subscription auth; (2) uncomment the `codex:`
-  # invocation block below with concrete flags; (3) flip `worker:` /
-  # `reviewer:` here.
+  # `codex exec` runs under ChatGPT-subscription auth (`codex login`), NOT
+  # an OPENAI_API_KEY env. `--dangerously-bypass-approvals-and-sandbox` is
+  # the parallel to claude's `--permission-mode bypassPermissions`: quay
+  # already isolates each attempt in its own worktree + tmux pane, so the
+  # codex-side sandbox would just duplicate that and block legitimate tool
+  # calls (gh, git, build). `--json` emits a JSONL event stream that
+  # doubles as the tool trace; redirect to `.quay-tool-trace.log` so the
+  # tmux stale-kill check picks up freshness (src/adapters/tmux.ts
+  # logFreshness watches that file). Codex does not emit a single-object
+  # usage envelope like claude's `--output-format json`, so `.quay-usage.json`
+  # is omitted from the redirect — the usage artifact stays absent for
+  # codex attempts; observability lives in the tool trace + tmux pane log.
+  #
+  # To switch back to claude: flip `worker:` / `reviewer:` here. Both
+  # invocation registrations stay in place so per-repo overrides can mix
+  # (e.g. claude worker + codex reviewer as a second-opinion pair).
   agents:
-    worker: claude
-    reviewer: claude
+    worker: codex
+    reviewer: codex
     invocations:
       claude:
         worker: "claude --permission-mode bypassPermissions --output-format json --debug --debug-file .quay-tool-trace.log < {prompt_file} > .quay-usage.json"
         reviewer: "claude --permission-mode bypassPermissions --output-format json < {prompt_file} > .quay-usage.json"
-      # codex:
-      #   # Codex runs under ChatGPT-subscription auth (`codex login`), NOT
-      #   # an OPENAI_API_KEY env. Concrete subscription-mode flags TBD —
-      #   # confirm with whoever owns the codex CLI install on krustentier.
-      #   worker: "codex ... < {prompt_file} > .quay-usage.json"
-      #   reviewer: "codex ... < {prompt_file} > .quay-usage.json"
+      codex:
+        worker: "codex exec --json --dangerously-bypass-approvals-and-sandbox < {prompt_file} > .quay-tool-trace.log"
+        reviewer: "codex exec --json --dangerously-bypass-approvals-and-sandbox < {prompt_file} > .quay-tool-trace.log"
   # Pinned runtime managers the installer must guarantee on PATH before
   # quay bootstraps a worktree. Keys must match every distinct
   # `repos[].quay.package_manager` value in this file. linux_x64_sha256
