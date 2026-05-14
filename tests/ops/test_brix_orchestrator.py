@@ -36,7 +36,7 @@ class FakeQuayClient:
             text="Worker needs product guidance.",
             kind="blocker",
         )
-        self.submitted: list[tuple[object, str]] = []
+        self.submitted: list[tuple[object, str, str]] = []
         self.completed: list[object] = []
         self.released: list[tuple[object, str]] = []
 
@@ -70,12 +70,16 @@ class FakeQuayClient:
 class FakeSlackClient:
     def __init__(self, reply=None) -> None:
         self.reply = reply
-        self.questions: list[tuple[str, str]] = []
+        self.questions: list[tuple[str, str, str | None]] = []
         self.waits: list[tuple[object, float, float]] = []
 
-    def post_question(self, channel_id: str, text: str, *, handoff, task):
-        self.questions.append((channel_id, text))
-        return brix.SlackPostRef(channel_id=channel_id, ts="1000.000000", thread_ts="1000.000000")
+    def post_question(self, channel_id: str, text: str, *, thread_ts=None, handoff, task):
+        self.questions.append((channel_id, text, thread_ts))
+        return brix.SlackPostRef(
+            channel_id=channel_id,
+            ts="1000.000000",
+            thread_ts=thread_ts or "1000.000000",
+        )
 
     def wait_for_reply(self, ref, *, timeout_seconds: float, poll_interval_seconds: float):
         self.waits.append((ref, timeout_seconds, poll_interval_seconds))
@@ -146,7 +150,7 @@ def test_drain_one_submits_direct_next_brief_without_slack():
     assert result.metrics["direct_briefs_submitted"] == 1
 
 
-def test_drain_one_posts_slack_question_and_maps_reply_to_next_brief():
+def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
     handoff = brix.Handoff(
         handoff_id="handoff-2",
         task_id="task-2",
@@ -160,11 +164,17 @@ def test_drain_one_posts_slack_question_and_maps_reply_to_next_brief():
         ts="1001.000000",
         permalink="https://example.slack/thread",
     )
-    quay = FakeQuayClient(handoff)
+    task = brix.TaskContext(
+        task_id=handoff.task_id,
+        title="Fix stuck worker",
+        issue="BRIX-1405",
+        repo_id="hermes-agent",
+        metadata={"slack_thread_ref": "GPRIVATE123:999.000000"},
+    )
+    quay = FakeQuayClient(handoff, task=task)
     slack = FakeSlackClient(reply)
     config = brix.OrchestratorConfig(
         enabled=True,
-        default_slack_channel="C1234567890",
         reply_timeout_seconds=60,
         poll_interval_seconds=2,
     )
@@ -178,7 +188,8 @@ def test_drain_one_posts_slack_question_and_maps_reply_to_next_brief():
     result = drainer.drain_one()
 
     assert result.status == "submitted_from_human_reply"
-    assert slack.questions[0][0] == "C1234567890"
+    assert slack.questions[0][0] == "GPRIVATE123"
+    assert slack.questions[0][2] == "999.000000"
     assert "Worker could not choose the migration path" in slack.questions[0][1]
     assert "Worker needs product guidance" in slack.questions[0][1]
     assert slack.waits[0][1:] == (60, 2)
@@ -186,13 +197,48 @@ def test_drain_one_posts_slack_question_and_maps_reply_to_next_brief():
     assert "Use the following human guidance" in submitted
     assert "U123" in submitted
     assert "Use the existing importer" in submitted
-    assert quay.escalated[2] is None
-    assert quay.recorded_reply[2] == "C1234567890:1000.000000"
+    assert quay.escalated[2] == "GPRIVATE123:999.000000"
+    assert quay.recorded_reply[2] == "GPRIVATE123:999.000000"
     assert quay.submitted[0][2] == "advice_answered"
     assert quay.completed == [handoff]
     assert quay.released == []
     assert result.metrics["slack_questions_posted"] == 1
     assert result.metrics["human_briefs_submitted"] == 1
+
+
+def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
+    handoff = brix.Handoff(
+        handoff_id="handoff-fallback",
+        task_id="task-fallback",
+        artifact_id="artifact-fallback",
+        summary="Worker needs a product decision.",
+    )
+    reply = brix.SlackReply(
+        text="Use the default route.",
+        user_id="U123",
+        ts="1001.000000",
+    )
+    quay = FakeQuayClient(handoff)
+    slack = FakeSlackClient(reply)
+    config = brix.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="C1234567890",
+    )
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "submitted_from_human_reply"
+    assert slack.questions[0][0] == "C1234567890"
+    assert slack.questions[0][2] is None
+    assert quay.escalated[2] == "C1234567890:1000.000000"
+    assert quay.recorded_reply[2] == "C1234567890:1000.000000"
+    assert quay.submitted[0][2] == "advice_answered"
 
 
 def test_missing_default_slack_channel_releases_claim():

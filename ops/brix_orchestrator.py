@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """BRIX orchestrator-side handoff drain loop.
 
-This file deliberately stops at the Quay adapter boundary. AST-121 owns the
-final Quay CLI/API contract; BRIX owns the runner shape, locking, Slack
-question/reply flow, and how a human reply becomes the next brief text.
+BRIX owns the runner shape, locking, Slack question/reply flow, and how a human
+reply becomes the next brief text. Quay owns durable task, claim, artifact, and
+handoff state behind the CLI adapter below.
 """
 
 from __future__ import annotations
@@ -36,9 +36,8 @@ class LockBusy(RuntimeError):
 class Handoff:
     """A claimed orchestrator handoff.
 
-    The field names here are BRIX-local and intentionally small. The AST-121
-    adapter can map Quay's eventual JSON/API shape onto this object without
-    leaking those details into the Slack/human loop.
+    The field names here are BRIX-local and intentionally small so the Quay CLI
+    adapter does not leak storage details into the Slack/human loop.
     """
 
     handoff_id: str
@@ -118,6 +117,19 @@ class SlackPostRef:
     channel_id: str
     ts: str
     thread_ts: str
+
+
+@dataclass(frozen=True)
+class SlackRoute:
+    channel_id: str
+    thread_ts: str | None = None
+    source: str = ""
+
+    @property
+    def thread_ref(self) -> str | None:
+        if not self.thread_ts:
+            return None
+        return f"{self.channel_id}:{self.thread_ts}"
 
 
 @dataclass(frozen=True)
@@ -253,6 +265,7 @@ class SlackQuestionClient(Protocol):
         channel_id: str,
         text: str,
         *,
+        thread_ts: str | None = None,
         handoff: Handoff,
         task: TaskContext,
     ) -> SlackPostRef:
@@ -266,59 +279,6 @@ class SlackQuestionClient(Protocol):
         poll_interval_seconds: float,
     ) -> SlackReply | None:
         """Poll the question thread and return the first human reply."""
-
-
-class PendingQuayClient:
-    """No-op adapter until AST-121 finalizes the Quay handoff contract."""
-
-    def __init__(self, logger: logging.Logger | None = None) -> None:
-        self._logger = logger or LOGGER
-
-    def claim_handoff(self, worker_id: str) -> Handoff | None:
-        log_event(
-            self._logger,
-            "quay_adapter_pending",
-            worker_id=worker_id,
-            dependency="AST-121",
-        )
-        return None
-
-    def get_task_context(self, task_id: str) -> TaskContext:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
-
-    def get_artifact(self, handoff: Handoff) -> Artifact | None:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
-
-    def escalate_human(
-        self,
-        handoff: Handoff,
-        question: str,
-        thread_ref: str | None,
-    ) -> None:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
-
-    def record_human_reply(
-        self,
-        handoff: Handoff,
-        reply: SlackReply,
-        thread_ref: str,
-    ) -> None:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
-
-    def submit_brief(
-        self,
-        handoff: Handoff,
-        brief: str,
-        *,
-        reason: str,
-    ) -> None:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
-
-    def complete_claim(self, handoff: Handoff) -> None:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
-
-    def release_claim(self, handoff: Handoff, reason: str) -> None:
-        raise NotImplementedError("AST-121 must provide the Quay adapter")
 
 
 class QuayCommandError(RuntimeError):
@@ -341,7 +301,7 @@ class QuayCommandError(RuntimeError):
 
 
 class QuayCliClient:
-    """Adapter for the AST-121 Quay CLI contract."""
+    """Adapter for the Quay orchestrator handoff CLI contract."""
 
     def __init__(
         self,
@@ -495,7 +455,7 @@ class QuayCliClient:
             )
 
     def complete_claim(self, handoff: Handoff) -> None:
-        # AST-121's submit-brief completes the claimed handoff transactionally.
+        # Quay submit-brief completes the claimed handoff transactionally.
         return None
 
     def release_claim(self, handoff: Handoff, reason: str) -> None:
@@ -577,12 +537,14 @@ class SlackWebApiClient:
         channel_id: str,
         text: str,
         *,
+        thread_ts: str | None = None,
         handoff: Handoff,
         task: TaskContext,
     ) -> SlackPostRef:
         payload = {
             "channel": channel_id,
             "text": text,
+            "thread_ts": thread_ts,
             "unfurl_links": False,
             "unfurl_media": False,
             "metadata": {
@@ -597,7 +559,7 @@ class SlackWebApiClient:
         ts = str(data.get("ts") or "")
         if not ts:
             raise RuntimeError("Slack chat.postMessage returned no ts")
-        return SlackPostRef(channel_id=channel_id, ts=ts, thread_ts=ts)
+        return SlackPostRef(channel_id=channel_id, ts=ts, thread_ts=thread_ts or ts)
 
     def wait_for_reply(
         self,
@@ -673,6 +635,7 @@ class MissingSlackClient:
         channel_id: str,
         text: str,
         *,
+        thread_ts: str | None = None,
         handoff: Handoff,
         task: TaskContext,
     ) -> SlackPostRef:
@@ -793,8 +756,8 @@ class HandoffDrainer:
                 metrics=self.metrics.as_dict(),
             )
 
-        channel_id = (self.config.default_slack_channel or "").strip()
-        if not channel_id:
+        route = resolve_slack_route(handoff, task, self.config)
+        if route is None:
             reason = "missing_default_slack_channel"
             self.quay.release_claim(handoff, reason=reason)
             self.metrics.claims_released += 1
@@ -813,14 +776,18 @@ class HandoffDrainer:
             )
 
         question = build_human_question(handoff, task, artifact)
-        self.quay.escalate_human(handoff, question, None)
+        if route.thread_ref:
+            self.quay.escalate_human(handoff, question, route.thread_ref)
         post_ref = self.slack.post_question(
-            channel_id,
+            route.channel_id,
             question,
+            thread_ts=route.thread_ts,
             handoff=handoff,
             task=task,
         )
         thread_ref = slack_thread_ref(post_ref)
+        if not route.thread_ref:
+            self.quay.escalate_human(handoff, question, thread_ref)
         self.metrics.slack_questions_posted += 1
         log_event(
             self.logger,
@@ -829,6 +796,7 @@ class HandoffDrainer:
             task_id=handoff.task_id,
             channel_id=post_ref.channel_id,
             thread_ts=post_ref.thread_ts,
+            route_source=route.source,
         )
 
         reply = self.slack.wait_for_reply(
@@ -937,6 +905,84 @@ def human_reply_to_brief(
 
 def slack_thread_ref(ref: SlackPostRef) -> str:
     return f"{ref.channel_id}:{ref.thread_ts}"
+
+
+def resolve_slack_route(
+    handoff: Handoff,
+    task: TaskContext,
+    config: OrchestratorConfig,
+) -> SlackRoute | None:
+    route = _route_from_metadata(task.metadata, source="task")
+    if route is not None:
+        return route
+    route = _route_from_metadata(handoff.metadata, source="handoff")
+    if route is not None:
+        return route
+    channel_id = (config.default_slack_channel or "").strip()
+    if channel_id:
+        return SlackRoute(channel_id=channel_id, source="fallback_channel")
+    return None
+
+
+def _route_from_metadata(metadata: Mapping[str, Any], *, source: str) -> SlackRoute | None:
+    keys = (
+        "slack_thread_ref",
+        "thread_ref",
+        "original_slack_thread_ref",
+        "source_slack_thread_ref",
+    )
+    for key in keys:
+        route = _coerce_slack_route(metadata.get(key), source=f"{source}.{key}")
+        if route is not None:
+            return route
+
+    nested_keys = (
+        "slack",
+        "slack_thread",
+        "original_slack_thread",
+        "source_slack_thread",
+    )
+    for key in nested_keys:
+        route = _coerce_slack_route(metadata.get(key), source=f"{source}.{key}")
+        if route is not None:
+            return route
+    return None
+
+
+def _coerce_slack_route(value: Any, *, source: str) -> SlackRoute | None:
+    if isinstance(value, str):
+        parsed = _parse_slack_thread_ref(value)
+        if parsed is None:
+            return None
+        channel_id, thread_ts = parsed
+        return SlackRoute(channel_id=channel_id, thread_ts=thread_ts, source=source)
+    if not isinstance(value, Mapping):
+        return None
+
+    for key in ("slack_thread_ref", "thread_ref", "original_thread_ref"):
+        route = _coerce_slack_route(value.get(key), source=f"{source}.{key}")
+        if route is not None:
+            return route
+
+    channel = value.get("channel_id") or value.get("channel")
+    thread = value.get("thread_ts") or value.get("ts")
+    if isinstance(channel, str) and isinstance(thread, str):
+        channel = channel.strip()
+        thread = thread.strip()
+        if channel and thread:
+            return SlackRoute(channel_id=channel, thread_ts=thread, source=source)
+    return None
+
+
+def _parse_slack_thread_ref(value: str) -> tuple[str, str] | None:
+    left, sep, right = value.strip().partition(":")
+    if not sep:
+        return None
+    channel_id = left.strip()
+    thread_ts = right.strip()
+    if not channel_id or not thread_ts:
+        return None
+    return channel_id, thread_ts
 
 
 def load_config(path: Path | None) -> OrchestratorConfig:

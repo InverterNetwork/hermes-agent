@@ -732,8 +732,7 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
     """Validate BRIX orchestrator config under ``quay.orchestrator``.
 
     This is not rendered into Quay's config. It is the BRIX-owned sidecar
-    runner configuration, kept separate so AST-121 can change Quay's handoff
-    contract without churn here.
+    runner configuration for Slack fallback routing and polling.
     """
     defaults: dict[str, Any] = {
         "enabled": False,

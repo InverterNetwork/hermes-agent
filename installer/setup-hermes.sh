@@ -931,9 +931,9 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
   chmod 0644 "$QUAY_CONFIG_OUT"
 
-  # BRIX orchestrator config is separate from quay/config.toml because the
-  # final Quay handoff adapter contract is owned by AST-121. The sidecar
-  # runner reads this file for Slack fallback routing and polling knobs.
+  # BRIX orchestrator config is separate from quay/config.toml because these
+  # are sidecar runtime knobs. The runner reads this file for Slack fallback
+  # routing and polling settings.
   BRIX_ORCHESTRATOR_CONFIG_OUT="$TARGET_DIR/quay/orchestrator.json"
   echo "==> rendering $BRIX_ORCHESTRATOR_CONFIG_OUT from $VALUES_FILE"
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
@@ -1522,9 +1522,9 @@ elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
 fi
 
 # ---------- brix-orchestrator ----------
-# Sidecar runner for AST-121 durable orchestrator handoffs. Installed only
-# when quay.orchestrator.enabled=true; by default the files ship dormant so
-# the Quay contract can land without this timer calling a placeholder adapter.
+# Sidecar runner for durable orchestrator handoffs. Installed only when
+# quay.orchestrator.enabled=true; by default the files ship dormant until the
+# deployment opts into BRIX-owned Slack posting and reply polling.
 
 BRIX_ORCH_SERVICE_SRC="$OPS_DIR/brix-orchestrator.service"
 BRIX_ORCH_TIMER_SRC="$OPS_DIR/brix-orchestrator.timer"

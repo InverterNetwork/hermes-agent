@@ -204,10 +204,11 @@
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
 #   quay.orchestrator          — BRIX-owned sidecar runner for durable Quay
-#                                 orchestrator handoffs. This intentionally
-#                                 renders to <target>/quay/orchestrator.json,
-#                                 not quay/config.toml, because AST-121 still
-#                                 owns the final Quay handoff contract.
+#                                 orchestrator handoffs. This renders to
+#                                 <target>/quay/orchestrator.json, not
+#                                 quay/config.toml, because these are sidecar
+#                                 runtime knobs rather than Quay substrate
+#                                 settings.
 #                                 `default_slack_channel` is the deployment
 #                                 fallback channel for human questions when
 #                                 the task has no original Slack thread.
@@ -493,9 +494,8 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # BRIX orchestrator sidecar. Keep disabled until AST-121 lands the final
-  # Quay handoff adapter; BRIX-1405 wires the timer/service/config/Slack loop
-  # around a small adapter interface now to avoid contract churn later.
+  # BRIX orchestrator sidecar. Keep disabled until the deployment is ready for
+  # BRIX-owned Slack posting/reply polling over durable Quay handoffs.
   orchestrator:
     enabled: false
     default_slack_channel: ""

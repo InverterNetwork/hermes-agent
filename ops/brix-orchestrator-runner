@@ -3,7 +3,7 @@
 #
 # This is intentionally separate from quay-tick. Quay remains the
 # deterministic task runner; BRIX owns the orchestrator-side human-advice
-# loop once AST-121 supplies the final Quay adapter contract.
+# Slack post/reply loop.
 
 set -u
 
