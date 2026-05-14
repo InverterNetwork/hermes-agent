@@ -103,12 +103,23 @@ class RecordingQuayRunner:
         command = argv[1:]
         if command[:4] == ["handoff", "list", "--status", "pending"]:
             return FakeCompletedProcess(
-                '[{"handoff_id":7,"task_id":"task-cli","reason":"worker_blocker","payload_json":"{\\"summary\\":\\"needs guidance\\"}","status":"pending"}]\n'
+                '[{"handoff_id":7,"task_id":"task-cli","reason":"worker_blocker",'
+                '"state_event_id":99,"idempotency_key":"task-cli:99:worker_blocker",'
+                '"payload_json":"{\\"attempt_id\\":1,\\"artifact_id\\":42,'
+                '\\"blocker_content_hash\\":\\"hash\\",\\"blocker_bytes\\":24,'
+                '\\"budget_exhausted_artifact_id\\":null}","status":"pending",'
+                '"claim_id":null,"claimed_at":null,"completed_at":null,'
+                '"created_at":"2026-05-14T00:00:00.000Z",'
+                '"updated_at":"2026-05-14T00:00:00.000Z"}]\n'
             )
         if command == ["task", "claim", "task-cli"]:
             return FakeCompletedProcess('{"task_id":"task-cli","claim_id":"claim-1","state":"claimed-by-orchestrator"}\n')
         if command == ["task", "get", "task-cli"]:
-            return FakeCompletedProcess('{"task_id":"task-cli","repo_id":"repo-1","external_ref":"BRIX-1405","branch_name":"quay/task"}\n')
+            return FakeCompletedProcess(
+                '{"task_id":"task-cli","repo_id":"repo-1","state":"claimed-by-orchestrator",'
+                '"external_ref":"BRIX-1405","branch_name":"quay/task",'
+                '"slack_thread_ref":"GPRIVATE123:999.000000"}\n'
+            )
         if command == ["artifact", "get", "task-cli", "blocker"]:
             return FakeCompletedProcess("blocked on product input\n")
         if command[0] in {"escalate-human", "record-human-reply", "submit-brief"}:
@@ -151,27 +162,14 @@ def test_drain_one_submits_direct_next_brief_without_slack():
 
 
 def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
-    handoff = brix.Handoff(
-        handoff_id="handoff-2",
-        task_id="task-2",
-        repo_id="brix-indexer",
-        artifact_id="artifact-2",
-        summary="Worker could not choose the migration path.",
-    )
+    runner = RecordingQuayRunner()
+    quay = brix.QuayCliClient(command="/bin/quay", runner=runner)
     reply = brix.SlackReply(
         text="Use the existing importer and keep the old endpoint as a fallback.",
         user_id="U123",
         ts="1001.000000",
         permalink="https://example.slack/thread",
     )
-    task = brix.TaskContext(
-        task_id=handoff.task_id,
-        title="Fix stuck worker",
-        issue="BRIX-1405",
-        repo_id="hermes-agent",
-        metadata={"slack_thread_ref": "GPRIVATE123:999.000000"},
-    )
-    quay = FakeQuayClient(handoff, task=task)
     slack = FakeSlackClient(reply)
     config = brix.OrchestratorConfig(
         enabled=True,
@@ -190,18 +188,19 @@ def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
     assert result.status == "submitted_from_human_reply"
     assert slack.questions[0][0] == "GPRIVATE123"
     assert slack.questions[0][2] == "999.000000"
-    assert "Worker could not choose the migration path" in slack.questions[0][1]
-    assert "Worker needs product guidance" in slack.questions[0][1]
+    assert "Quay handoff reason: worker_blocker" in slack.questions[0][1]
+    assert "blocked on product input" in slack.questions[0][1]
     assert slack.waits[0][1:] == (60, 2)
-    submitted = quay.submitted[0][1]
-    assert "Use the following human guidance" in submitted
-    assert "U123" in submitted
-    assert "Use the existing importer" in submitted
-    assert quay.escalated[2] == "GPRIVATE123:999.000000"
-    assert quay.recorded_reply[2] == "GPRIVATE123:999.000000"
-    assert quay.submitted[0][2] == "advice_answered"
-    assert quay.completed == [handoff]
-    assert quay.released == []
+    calls = [" ".join(call[1:]) for call in runner.calls]
+    assert "escalate-human task-cli --claim-id claim-1" in calls[4]
+    assert "--thread-ref GPRIVATE123:999.000000" in calls[4]
+    assert "record-human-reply task-cli --claim-id claim-1" in calls[5]
+    assert "--thread-ref GPRIVATE123:999.000000" in calls[5]
+    assert "submit-brief task-cli --claim-id claim-1" in calls[6]
+    assert "--reason advice_answered" in calls[6]
+    assert "Use the following human guidance" in runner.file_payloads[2]
+    assert "U123" in runner.file_payloads[2]
+    assert "Use the existing importer" in runner.file_payloads[2]
     assert result.metrics["slack_questions_posted"] == 1
     assert result.metrics["human_briefs_submitted"] == 1
 
@@ -341,9 +340,10 @@ def test_quay_cli_client_uses_ast_121_human_reply_contract():
     assert handoff is not None
     assert handoff.claim_id == "claim-1"
     assert handoff.artifact_id == "blocker"
-    assert handoff.summary == "needs guidance"
+    assert handoff.summary == "Quay handoff reason: worker_blocker"
     task = client.get_task_context(handoff.task_id)
     assert task.repo_id == "repo-1"
+    assert task.metadata["slack_thread_ref"] == "GPRIVATE123:999.000000"
     artifact = client.get_artifact(handoff)
     assert artifact.text == "blocked on product input\n"
 

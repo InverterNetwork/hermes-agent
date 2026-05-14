@@ -32,7 +32,7 @@ Seven units live here:
 * **`brix-orchestrator`** — optional BRIX sidecar for durable Quay
   orchestrator handoffs. It is gated by `quay.orchestrator.enabled` and
   reads `<HERMES_HOME>/quay/orchestrator.json` for Slack fallback
-  routing while AST-121 finalizes the Quay adapter contract.
+  routing and polling while using the Quay CLI for handoff state.
 * **`hermes-reviewer-token`** — 30-min oneshot that refreshes
   `/run/hermes/reviewer-gh-token` from a *second* GitHub App (the
   reviewer identity), so quay's reviewer worker can post APPROVE reviews
@@ -63,7 +63,7 @@ Seven units live here:
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
-| `ops/brix_orchestrator.py`                 | BRIX handoff drain loop. Defines the small Quay adapter interface, Slack fallback-channel question/reply flow, JSON event logging, metrics, and lock wrapper. The shipped real Quay adapter is a no-op boundary until AST-121 lands. |
+| `ops/brix_orchestrator.py`                 | BRIX handoff drain loop. Defines the Quay CLI adapter, Slack question/reply flow with original-thread routing plus fallback-channel support, JSON event logging, metrics, and lock wrapper. |
 | `ops/brix-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/brix-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `brix_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
 | `ops/brix-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `BRIX_ORCHESTRATOR_CONFIG`; reads `auth/quay.env` and `auth/slack.env`. |
 | `ops/brix-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
