@@ -320,7 +320,9 @@ slack:
     # SLACK_ALLOWED_USERS on every install via auth/gateway-runtime.env, so
     # the operator stops re-typing this on re-runs/rotations. Empty list /
     # unset disables the gate (bot accepts every authorized user — risky in
-    # public workspaces; keep populated for production).
+    # public workspaces; keep populated for production). An explicit empty
+    # list writes SLACK_ALLOWED_USERS= to clear stale legacy auth/slack.env
+    # allowlists.
     allowed_users: []
     # If non-empty, the bot ONLY responds in these channels (whitelist).
     # Empty list / unset disables the gate. "*" anywhere disables it too.

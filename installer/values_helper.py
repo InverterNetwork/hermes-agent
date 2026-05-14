@@ -528,9 +528,11 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
     Always rewritten — values.yaml is the source of truth and the file is a
-    reflection. Operator hand-edits live in ``/etc/default/hermes-gateway``
-    or in actual secret files (``auth/slack.env``, ``auth/hermes.env``),
-    not here.
+    reflection. If ``slack.runtime.allowed_users`` is present but empty, emit
+    an explicit ``SLACK_ALLOWED_USERS=`` so this later-loaded env file clears
+    stale allowlists from legacy ``auth/slack.env`` files. Operator hand-edits
+    live in ``/etc/default/hermes-gateway`` or in actual secret files
+    (``auth/slack.env``, ``auth/hermes.env``), not here.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -544,8 +546,8 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
 
     runtime = (data.get("slack") or {}).get("runtime") or {}
     if isinstance(runtime, dict):
-        au = runtime.get("allowed_users")
-        if au:
+        if "allowed_users" in runtime:
+            au = runtime.get("allowed_users")
             if not isinstance(au, list):
                 sys.stderr.write(
                     "values_helper.py: slack.runtime.allowed_users must be a list\n"
