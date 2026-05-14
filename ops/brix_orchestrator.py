@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -664,7 +665,7 @@ class HermesConversationDecider:
             skip_context_files=True,
             skip_memory=True,
             platform="brix-orchestrator",
-            session_id=f"brix-orchestrator:{handoff.task_id}:{handoff.claim_id or handoff.handoff_id}",
+            session_id=orchestrator_session_id(handoff),
         )
 
     def _resolve_runtime(self) -> Mapping[str, Any]:
@@ -1770,6 +1771,19 @@ def decision_error_retry_message() -> str:
         "orchestrator error. No need to rephrase; I will retry this thread "
         "when the runtime is healthy."
     )
+
+
+def orchestrator_session_id(handoff: Handoff) -> str:
+    """Return a short stable session id for provider prompt-cache keys."""
+    raw = ":".join(
+        [
+            handoff.task_id,
+            handoff.claim_id or "",
+            handoff.handoff_id,
+        ]
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"brix-orch-{digest}"
 
 
 def slack_thread_ref(ref: SlackPostRef) -> str:

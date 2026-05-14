@@ -701,6 +701,43 @@ def test_orchestrator_decider_resolves_runtime_before_building_agent(monkeypatch
     assert kwargs["credential_pool"] == "pool"
     assert kwargs["model"] == "default-for-openai-codex"
     assert kwargs["platform"] == "brix-orchestrator"
+    assert kwargs["session_id"].startswith("brix-orch-")
+    assert len(kwargs["session_id"]) <= 64
+
+
+def test_orchestrator_decider_uses_short_session_id_for_long_quay_ids():
+    FakeAgent.instances = []
+    long_handoff = brix.Handoff(
+        handoff_id="handoff-with-a-long-human-readable-id",
+        task_id="5bb225ff-fde7-40d9-acac-1a9f8e88e5d9",
+        claim_id="1f6f9630-291f-4a9b-a169-eb2d7690da14",
+    )
+    decider = brix.HermesConversationDecider(
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=FakeAgent,
+    )
+
+    decider.decide(
+        handoff=long_handoff,
+        task=brix.TaskContext(task_id=long_handoff.task_id),
+        artifact=brix.Artifact(artifact_id="artifact-runtime", text="blocked"),
+        question="What should happen?",
+        replies=[
+            brix.SlackReply(
+                text="I will fix CI manually and report back.",
+                user_id="U123",
+                ts="1001.000000",
+            )
+        ],
+        posted_messages=[],
+    )
+
+    session_id = FakeAgent.instances[0].kwargs["session_id"]
+    assert session_id.startswith("brix-orch-")
+    assert len(session_id) <= 64
+    assert long_handoff.task_id not in session_id
+    assert long_handoff.claim_id not in session_id
 
 
 def test_orchestrator_decider_lets_shared_resolver_handle_unset_provider(monkeypatch):
