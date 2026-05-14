@@ -27,8 +27,10 @@ from tools.send_message_tool import (
     _send_discord,
     _send_matrix_via_adapter,
     _send_signal,
+    _send_slack,
     _send_telegram,
     _send_to_platform,
+    _validate_slack_blocks,
     send_message_tool,
 )
 
@@ -478,6 +480,100 @@ class TestSendToPlatformChunking:
         assert result["success"] is True
         sent_text = send.await_args.args[2]
         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
+
+    def test_slack_thread_ts_forwarded_when_set(self, monkeypatch):
+        # When the caller passes slack_thread_ts, _send_slack must receive it
+        # as a kwarg so chat.postMessage threads under the given root ts.
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "hello in thread",
+                    slack_thread_ts="1715420800.123456",
+                )
+            )
+        assert result["success"] is True
+        send.assert_awaited_once()
+        assert send.await_args.kwargs.get("thread_ts") == "1715420800.123456"
+        assert "blocks" not in send.await_args.kwargs
+
+    def test_slack_blocks_forwarded_and_chunking_disabled(self, monkeypatch):
+        # Block Kit posts skip chunking; the chunked text becomes the fallback.
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}},
+            {"type": "actions", "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Go"},
+                 "action_id": "skill:file-cr", "value": "1|1"}
+            ]},
+        ]
+        long_msg = "word " * 10000  # well over Slack's chunking limit
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    long_msg,
+                    slack_blocks=blocks,
+                )
+            )
+        assert result["success"] is True
+        # Single shot, not chunked.
+        assert send.await_count == 1
+        assert send.await_args.kwargs.get("blocks") == blocks
+
+    def test_slack_blocks_clamp_oversized_fallback_text(self, monkeypatch):
+        # Slack's chat.postMessage rejects `text` > 40000 chars. When blocks
+        # are set, chunking is bypassed, so the fallback text must be clamped
+        # in-place or the whole post fails server-side.
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        huge = "x" * 80_000
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}}]
+        with patch("tools.send_message_tool._send_slack", send):
+            asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    huge,
+                    slack_blocks=blocks,
+                )
+            )
+        sent_text = send.await_args.args[2]
+        assert len(sent_text) <= 40_000
+        assert sent_text.endswith("…")
+
+    def test_slack_no_extra_kwargs_when_unset(self, monkeypatch):
+        # When neither slack_thread_ts nor slack_blocks is set, _send_slack
+        # is called with exactly the three positional args — guards the
+        # existing test assertions against accidental kwarg leakage.
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_slack", send):
+            asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "plain hello",
+                )
+            )
+        send.assert_awaited_once_with("***", "C123", "plain hello")
 
     def test_telegram_media_attaches_to_last_chunk(self):
 
@@ -954,6 +1050,107 @@ class TestSendDiscordThreadId:
             result = self._run("tok", "111", "hi")
         assert "error" in result
         assert "403" in result["error"]
+
+
+class TestValidateSlackBlocks:
+    """Action-id pattern + block-count cap enforcement."""
+
+    def _btn(self, action_id):
+        return {
+            "type": "actions",
+            "elements": [
+                {"type": "button", "text": {"type": "plain_text", "text": "Go"},
+                 "action_id": action_id, "value": "1"}
+            ],
+        }
+
+    def test_valid_skill_action_id_passes(self):
+        assert _validate_slack_blocks([self._btn("skill:file-cr")]) is None
+
+    def test_uppercase_action_id_rejected(self):
+        err = _validate_slack_blocks([self._btn("skill:File-CR")])
+        assert err is not None
+        assert "skill:" in err
+
+    def test_non_skill_prefix_rejected(self):
+        err = _validate_slack_blocks([self._btn("foo:bar")])
+        assert err is not None
+        assert "skill" in err.lower()
+
+    def test_nested_action_id_in_static_select_rejected(self):
+        # A static_select with a per-option action_id that does NOT match the
+        # skill pattern must be caught even though it lives deep in the tree.
+        block = {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "*pick*"},
+            "accessory": {
+                "type": "static_select",
+                "options": [
+                    {"text": {"type": "plain_text", "text": "A"},
+                     "value": "a", "action_id": "exfil:admin"}
+                ],
+            },
+        }
+        err = _validate_slack_blocks([block])
+        assert err is not None
+        assert "exfil:admin" in err
+
+    def test_block_count_cap(self):
+        blocks = [self._btn("skill:file-cr") for _ in range(51)]
+        err = _validate_slack_blocks(blocks)
+        assert err is not None
+        assert "50" in err
+
+    def test_block_count_at_cap_allowed(self):
+        blocks = [self._btn("skill:file-cr") for _ in range(50)]
+        assert _validate_slack_blocks(blocks) is None
+
+
+class TestSendSlackPayload:
+    """_send_slack's chat.postMessage payload includes optional thread_ts and blocks."""
+
+    @staticmethod
+    def _build_mock(response_data=None):
+        mock_resp = MagicMock()
+        mock_resp.json = AsyncMock(
+            return_value=response_data or {"ok": True, "ts": "1715420900.000100"}
+        )
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=mock_resp)
+        return mock_session
+
+    def test_plain_send_omits_thread_ts_and_blocks(self):
+        mock_session = self._build_mock()
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            asyncio.run(_send_slack("tok", "C123", "hi"))
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert payload["channel"] == "C123"
+        assert payload["text"] == "hi"
+        assert "thread_ts" not in payload
+        assert "blocks" not in payload
+
+    def test_thread_ts_included_when_set(self):
+        mock_session = self._build_mock()
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            asyncio.run(_send_slack("tok", "C123", "hi", thread_ts="1715420800.123456"))
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert payload["thread_ts"] == "1715420800.123456"
+        assert "blocks" not in payload
+
+    def test_blocks_included_when_set(self):
+        mock_session = self._build_mock()
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}}]
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            asyncio.run(_send_slack("tok", "C123", "fallback text", blocks=blocks))
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert payload["blocks"] == blocks
+        # Plain-text fallback survives so non-block-rendering clients still see something.
+        assert payload["text"] == "fallback text"
 
 
 class TestSendToPlatformDiscordThread:
