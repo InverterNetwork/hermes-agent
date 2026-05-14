@@ -582,9 +582,15 @@ class HermesConversationDecider:
         *,
         logger: logging.Logger | None = None,
         agent_factory: Any | None = None,
+        runtime_resolver: Any | None = None,
+        default_model_resolver: Any | None = None,
+        agent_class: Any | None = None,
     ) -> None:
         self._logger = logger or LOGGER
         self._agent_factory = agent_factory
+        self._runtime_resolver = runtime_resolver
+        self._default_model_resolver = default_model_resolver
+        self._agent_class = agent_class
 
     def decide(
         self,
@@ -632,9 +638,22 @@ class HermesConversationDecider:
     def _build_agent(self, handoff: Handoff) -> Any:
         if self._agent_factory is not None:
             return self._agent_factory()
-        from run_agent import AIAgent
+        runtime = self._resolve_runtime()
+        agent_class = self._agent_class
+        if agent_class is None:
+            from run_agent import AIAgent
 
-        return AIAgent(
+            agent_class = AIAgent
+
+        return agent_class(
+            model=self._resolve_model(runtime),
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            acp_command=runtime.get("command"),
+            acp_args=list(runtime.get("args") or []),
+            credential_pool=runtime.get("credential_pool"),
             max_iterations=2,
             quiet_mode=True,
             enabled_toolsets=[],
@@ -643,6 +662,55 @@ class HermesConversationDecider:
             platform="brix-orchestrator",
             session_id=f"brix-orchestrator:{handoff.task_id}:{handoff.claim_id or handoff.handoff_id}",
         )
+
+    def _resolve_runtime(self) -> Mapping[str, Any]:
+        resolver = self._runtime_resolver
+        if resolver is None:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            resolver = resolve_runtime_provider
+        requested = (
+            os.getenv("BRIX_ORCHESTRATOR_PROVIDER")
+            or os.getenv("HERMES_INFERENCE_PROVIDER")
+            or None
+        )
+        runtime = resolver(requested=requested)
+        if not isinstance(runtime, Mapping):
+            raise RuntimeError("orchestrator provider resolver returned invalid runtime")
+        return runtime
+
+    def _resolve_model(self, runtime: Mapping[str, Any]) -> str:
+        runtime_model = runtime.get("model")
+        if isinstance(runtime_model, str) and runtime_model.strip():
+            return runtime_model.strip()
+
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            model_cfg = cfg.get("model") if isinstance(cfg, Mapping) else {}
+            if isinstance(model_cfg, Mapping):
+                configured = (
+                    str(model_cfg.get("default") or model_cfg.get("model") or "")
+                    .strip()
+                )
+                if configured:
+                    return configured
+        except Exception:
+            pass
+
+        provider = str(runtime.get("provider") or "").strip()
+        if not provider:
+            return ""
+        resolver = self._default_model_resolver
+        if resolver is None:
+            from hermes_cli.models import get_default_model_for_provider
+
+            resolver = get_default_model_for_provider
+        try:
+            return str(resolver(provider) or "").strip()
+        except Exception:
+            return ""
 
 
 class SlackWebApiClient:
@@ -1644,8 +1712,9 @@ def build_resume_ack(
 
 def decision_error_retry_message() -> str:
     return (
-        "I could not decide from that reply because of an internal error. "
-        "Please send the worker instruction clearly and I will retry."
+        "I received the reply, but my decision engine hit an internal "
+        "orchestrator error. No need to rephrase; I will retry this thread "
+        "when the runtime is healthy."
     )
 
 

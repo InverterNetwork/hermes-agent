@@ -193,6 +193,19 @@ def ask(message: str) -> brix.ConversationDecision:
     return brix.ConversationDecision(action="ask", message=message)
 
 
+class FakeAgent:
+    instances = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.prompts = []
+        FakeAgent.instances.append(self)
+
+    def run_conversation(self, prompt, **kwargs):
+        self.prompts.append((prompt, kwargs))
+        return {"final_response": '{"action":"ready","brief":"Resume with the answer."}'}
+
+
 class FakeCompletedProcess:
     def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
         self.stdout = stdout
@@ -574,7 +587,8 @@ def test_orchestrator_decider_error_prompts_once_and_keeps_waiting():
     assert result.status == "submitted_from_human_reply"
     assert len(slack.questions) == 1
     assert len(slack.acks) == 2
-    assert "internal error" in slack.acks[0][1]
+    assert "decision engine hit an internal orchestrator error" in slack.acks[0][1]
+    assert "No need to rephrase" in slack.acks[0][1]
     assert "Quay resumed" in slack.acks[1][1]
     assert quay.escalations[0][2] == "C1234567890:1000.000000"
     assert quay.released == []
@@ -627,9 +641,65 @@ def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
     assert retry.status == "human_reply_timeout"
     assert len(slack.questions) == 1
     assert len(slack.acks) == 1
-    assert "internal error" in slack.acks[0][1]
+    assert "decision engine hit an internal orchestrator error" in slack.acks[0][1]
+    assert "No need to rephrase" in slack.acks[0][1]
     assert slack.validations == [("C1234567890", "1000.000000")]
     assert len(decider.calls) == 1
+
+
+def test_orchestrator_decider_resolves_runtime_before_building_agent(monkeypatch):
+    FakeAgent.instances = []
+    calls = []
+
+    def runtime_resolver(*, requested=None):
+        calls.append(requested)
+        return {
+            "api_key": "token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": "codex-acp",
+            "args": ["--json"],
+            "credential_pool": "pool",
+        }
+
+    monkeypatch.setenv("BRIX_ORCHESTRATOR_PROVIDER", "openai-codex")
+    decider = brix.HermesConversationDecider(
+        runtime_resolver=runtime_resolver,
+        default_model_resolver=lambda provider: f"default-for-{provider}",
+        agent_class=FakeAgent,
+    )
+    decision = decider.decide(
+        handoff=brix.Handoff(handoff_id="handoff-runtime", task_id="task-runtime"),
+        task=brix.TaskContext(task_id="task-runtime"),
+        artifact=brix.Artifact(artifact_id="artifact-runtime", text="blocked"),
+        question="What should happen?",
+        replies=[
+            brix.SlackReply(
+                text="Resume with the answer.",
+                user_id="U123",
+                ts="1001.000000",
+            )
+        ],
+        posted_messages=[],
+    )
+
+    assert decision == brix.ConversationDecision(
+        action="ready",
+        brief="Resume with the answer.",
+    )
+    assert calls == ["openai-codex"]
+    assert len(FakeAgent.instances) == 1
+    kwargs = FakeAgent.instances[0].kwargs
+    assert kwargs["api_key"] == "token"
+    assert kwargs["base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert kwargs["provider"] == "openai-codex"
+    assert kwargs["api_mode"] == "codex_responses"
+    assert kwargs["acp_command"] == "codex-acp"
+    assert kwargs["acp_args"] == ["--json"]
+    assert kwargs["credential_pool"] == "pool"
+    assert kwargs["model"] == "default-for-openai-codex"
+    assert kwargs["platform"] == "brix-orchestrator"
 
 
 def test_fake_quay_rejects_double_human_escalation_without_reply():
