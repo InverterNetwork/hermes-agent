@@ -1,0 +1,12 @@
+[Unit]
+Description=Run BRIX orchestrator handoff drain
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=true
+Unit=brix-orchestrator.service
+
+[Install]
+WantedBy=timers.target
