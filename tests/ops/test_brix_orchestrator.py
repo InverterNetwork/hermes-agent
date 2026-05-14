@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 from pathlib import Path
@@ -36,13 +37,20 @@ class FakeQuayClient:
             text="Worker needs product guidance.",
             kind="blocker",
         )
+        self.escalations: list[tuple[object, str, str | None]] = []
         self.submitted: list[tuple[object, str, str]] = []
         self.completed: list[object] = []
         self.released: list[tuple[object, str]] = []
+        self.state = "pending" if handoff is not None else "empty"
+        self.last_thread_ref: str | None = None
 
     def claim_handoff(self, worker_id: str):
+        if self.state != "pending":
+            return None
         handoff = self._handoff
         self._handoff = None
+        if handoff is not None:
+            self.state = "claimed"
         return handoff
 
     def get_task_context(self, task_id: str):
@@ -52,38 +60,137 @@ class FakeQuayClient:
         return self.artifact
 
     def escalate_human(self, handoff, question: str, thread_ref: str) -> None:
+        if self.state != "claimed":
+            raise RuntimeError(f"wrong_state: cannot escalate from {self.state}")
+        self.state = "waiting_human"
+        self.last_thread_ref = thread_ref
         self.escalated = (handoff, question, thread_ref)
+        self.escalations.append((handoff, question, thread_ref))
 
     def record_human_reply(self, handoff, reply, thread_ref: str) -> None:
+        if self.state != "waiting_human":
+            raise RuntimeError(f"wrong_state: cannot record reply from {self.state}")
+        self.state = "claimed"
         self.recorded_reply = (handoff, reply, thread_ref)
 
     def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+        if self.state != "claimed":
+            raise RuntimeError(f"wrong_state: cannot submit brief from {self.state}")
+        self.state = "queued"
         self.submitted.append((handoff, brief, reason))
 
     def complete_claim(self, handoff) -> None:
+        if self.state != "queued":
+            raise RuntimeError(f"wrong_state: cannot complete from {self.state}")
+        self.state = "completed"
         self.completed.append(handoff)
 
     def release_claim(self, handoff, reason: str) -> None:
+        if self.state not in {"claimed", "waiting_human"}:
+            raise RuntimeError(f"wrong_state: cannot release from {self.state}")
+        self.state = "pending"
         self.released.append((handoff, reason))
+        if self.last_thread_ref:
+            handoff_metadata = dict(handoff.metadata)
+            handoff_metadata.setdefault("slack_thread_ref", self.last_thread_ref)
+            handoff = dataclasses.replace(handoff, metadata=handoff_metadata)
+            task_metadata = dict(self.task.metadata)
+            task_metadata.setdefault("slack_thread_ref", self.last_thread_ref)
+            self.task = dataclasses.replace(self.task, metadata=task_metadata)
+        self._handoff = handoff
 
 
 class FakeSlackClient:
-    def __init__(self, reply=None) -> None:
-        self.reply = reply
+    def __init__(
+        self,
+        reply=None,
+        *,
+        wait_results=None,
+        post_error=None,
+        validate_results=None,
+    ) -> None:
+        self.wait_results = list(wait_results or ([] if reply is None else [reply]))
+        self.post_error = post_error
+        self.validate_results = list(validate_results or [])
+        self.validations: list[tuple[str, str]] = []
         self.questions: list[tuple[str, str, str | None]] = []
         self.waits: list[tuple[object, float, float]] = []
+        self.acks: list[tuple[object, str]] = []
+        self.thread_floor_ts: dict[tuple[str, str], str] = {}
+
+    def validate_thread(self, channel_id: str, thread_ts: str):
+        self.validations.append((channel_id, thread_ts))
+        if self.validate_results:
+            result = self.validate_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            if isinstance(result, brix.SlackPostRef):
+                return result
+        floor_ts = self.thread_floor_ts.get((channel_id, thread_ts), thread_ts)
+        return brix.SlackPostRef(
+            channel_id=channel_id,
+            ts=floor_ts,
+            thread_ts=thread_ts,
+        )
 
     def post_question(self, channel_id: str, text: str, *, thread_ts=None, handoff, task):
+        if self.post_error:
+            raise self.post_error
         self.questions.append((channel_id, text, thread_ts))
-        return brix.SlackPostRef(
+        ref = brix.SlackPostRef(
             channel_id=channel_id,
             ts="1000.000000",
             thread_ts=thread_ts or "1000.000000",
         )
+        self.thread_floor_ts[(ref.channel_id, ref.thread_ts)] = ref.ts
+        return ref
 
-    def wait_for_reply(self, ref, *, timeout_seconds: float, poll_interval_seconds: float):
+    def wait_for_reply(self, ref, *, after_ts: str, timeout_seconds: float, poll_interval_seconds: float):
         self.waits.append((ref, timeout_seconds, poll_interval_seconds))
-        return self.reply
+        if self.wait_results:
+            while self.wait_results:
+                result = self.wait_results.pop(0)
+                if isinstance(result, Exception):
+                    raise result
+                if result is None:
+                    return None
+                if result.ts and brix._slack_ts_key(result.ts) <= brix._slack_ts_key(after_ts):
+                    continue
+                return result
+        return None
+
+    def post_thread_message(self, ref, text: str, *, handoff, task):
+        self.acks.append((ref, text))
+        post_ref = brix.SlackPostRef(
+            channel_id=ref.channel_id,
+            ts="1002.000000",
+            thread_ts=ref.thread_ts,
+        )
+        self.thread_floor_ts[(post_ref.channel_id, post_ref.thread_ts)] = post_ref.ts
+        return post_ref
+
+
+class FakeDecider:
+    def __init__(self, decisions=None) -> None:
+        self.decisions = list(decisions or [])
+        self.calls = []
+
+    def decide(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.decisions:
+            decision = self.decisions.pop(0)
+            if isinstance(decision, Exception):
+                raise decision
+            return decision
+        return brix.ConversationDecision(action="wait")
+
+
+def ready(brief: str) -> brix.ConversationDecision:
+    return brix.ConversationDecision(action="ready", brief=brief)
+
+
+def ask(message: str) -> brix.ConversationDecision:
+    return brix.ConversationDecision(action="ask", message=message)
 
 
 class FakeCompletedProcess:
@@ -161,7 +268,7 @@ def test_drain_one_submits_direct_next_brief_without_slack():
     assert result.metrics["direct_briefs_submitted"] == 1
 
 
-def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
+def test_drain_one_reattaches_to_original_thread_without_reposting_question():
     runner = RecordingQuayRunner()
     quay = brix.QuayCliClient(command="/bin/quay", runner=runner)
     reply = brix.SlackReply(
@@ -171,6 +278,9 @@ def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
         permalink="https://example.slack/thread",
     )
     slack = FakeSlackClient(reply)
+    decider = FakeDecider([
+        ready("Use the existing importer and keep the old endpoint as a fallback.")
+    ])
     config = brix.OrchestratorConfig(
         enabled=True,
         reply_timeout_seconds=60,
@@ -181,16 +291,22 @@ def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
         slack=slack,
         config=config,
         worker_id="test-worker",
+        decider=decider,
     )
 
     result = drainer.drain_one()
 
     assert result.status == "submitted_from_human_reply"
-    assert slack.questions[0][0] == "GPRIVATE123"
-    assert slack.questions[0][2] == "999.000000"
-    assert "Quay handoff reason: worker_blocker" in slack.questions[0][1]
-    assert "blocked on product input" in slack.questions[0][1]
-    assert slack.waits[0][1:] == (60, 2)
+    assert slack.validations == [("GPRIVATE123", "999.000000")]
+    assert slack.questions == []
+    assert slack.waits[0][0] == brix.SlackPostRef(
+        channel_id="GPRIVATE123",
+        ts="999.000000",
+        thread_ts="999.000000",
+    )
+    assert slack.waits[0][1] <= 60
+    assert slack.waits[0][1] > 59
+    assert slack.waits[0][2] == 2
     calls = [" ".join(call[1:]) for call in runner.calls]
     assert "escalate-human task-cli --claim-id claim-1" in calls[4]
     assert "--thread-ref GPRIVATE123:999.000000" in calls[4]
@@ -198,10 +314,16 @@ def test_drain_one_posts_slack_question_to_original_thread_without_fallback():
     assert "--thread-ref GPRIVATE123:999.000000" in calls[5]
     assert "submit-brief task-cli --claim-id claim-1" in calls[6]
     assert "--reason advice_answered" in calls[6]
+    assert "Quay handoff reason: worker_blocker" in runner.file_payloads[0]
+    assert "blocked on product input" in runner.file_payloads[0]
+    assert "resume the worker once the path is clear" in runner.file_payloads[0]
+    assert "resume:" not in runner.file_payloads[0]
     assert "Use the following human guidance" in runner.file_payloads[2]
     assert "U123" in runner.file_payloads[2]
     assert "Use the existing importer" in runner.file_payloads[2]
-    assert result.metrics["slack_questions_posted"] == 1
+    assert slack.acks
+    assert "Quay resumed for BRIX-1405" in slack.acks[0][1]
+    assert result.metrics["slack_questions_posted"] == 0
     assert result.metrics["human_briefs_submitted"] == 1
 
 
@@ -219,6 +341,7 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
     )
     quay = FakeQuayClient(handoff)
     slack = FakeSlackClient(reply)
+    decider = FakeDecider([ready("Use the default route.")])
     config = brix.OrchestratorConfig(
         enabled=True,
         default_slack_channel="C1234567890",
@@ -228,6 +351,7 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
         slack=slack,
         config=config,
         worker_id="test-worker",
+        decider=decider,
     )
 
     result = drainer.drain_one()
@@ -238,6 +362,7 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
     assert quay.escalated[2] == "C1234567890:1000.000000"
     assert quay.recorded_reply[2] == "C1234567890:1000.000000"
     assert quay.submitted[0][2] == "advice_answered"
+    assert slack.acks
 
 
 def test_missing_default_slack_channel_releases_claim():
@@ -264,6 +389,7 @@ def test_human_reply_timeout_releases_claim():
     handoff = brix.Handoff(handoff_id="handoff-4", task_id="task-4")
     quay = FakeQuayClient(handoff)
     slack = FakeSlackClient(reply=None)
+    decider = FakeDecider([ready("Use the existing thread on retry.")])
     drainer = brix.HandoffDrainer(
         quay=quay,
         slack=slack,
@@ -274,6 +400,7 @@ def test_human_reply_timeout_releases_claim():
             poll_interval_seconds=1,
         ),
         worker_id="test-worker",
+        decider=decider,
     )
 
     result = drainer.drain_one()
@@ -283,6 +410,426 @@ def test_human_reply_timeout_releases_claim():
     assert quay.completed == []
     assert quay.released == [(handoff, "human_reply_timeout")]
     assert slack.questions
+    slack.wait_results.append(
+        brix.SlackReply(
+            text="Use the existing thread on retry.",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+
+    retry = drainer.drain_one()
+
+    assert retry.status == "submitted_from_human_reply"
+    assert len(slack.questions) == 1
+    assert slack.validations == [("C1234567890", "1000.000000")]
+    assert quay.recorded_reply[2] == "C1234567890:1000.000000"
+    assert quay.submitted[0][2] == "advice_answered"
+
+
+def test_plain_thread_chatter_does_not_resume_quay():
+    handoff = brix.Handoff(handoff_id="handoff-chatter", task_id="task-chatter")
+    quay = FakeQuayClient(handoff)
+    slack = FakeSlackClient(
+        brix.SlackReply(
+            text="Could I fix CI and ping you here?",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+            reply_timeout_seconds=1,
+            poll_interval_seconds=1,
+        ),
+        worker_id="test-worker",
+        decider=FakeDecider([brix.ConversationDecision(action="wait")]),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "human_reply_timeout"
+    assert not hasattr(quay, "recorded_reply")
+    assert quay.submitted == []
+    assert slack.acks == []
+    assert quay.released == [(handoff, "human_reply_timeout")]
+
+
+def test_orchestrator_ready_decision_records_submits_and_acks():
+    handoff = brix.Handoff(handoff_id="handoff-resume", task_id="task-resume")
+    quay = FakeQuayClient(handoff)
+    slack = FakeSlackClient(
+        brix.SlackReply(
+            text="CI is blocked because the auth fixture is only available in CI.",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+    decider = FakeDecider([ready("Use the CI-only auth fixture.")])
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+        ),
+        worker_id="test-worker",
+        decider=decider,
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "submitted_from_human_reply"
+    assert quay.recorded_reply[1].text == "CI is blocked because the auth fixture is only available in CI."
+    assert quay.submitted[0][1].endswith("Use the CI-only auth fixture.")
+    assert quay.submitted[0][2] == "advice_answered"
+    assert quay.completed == [handoff]
+    assert slack.acks
+    assert "Quay resumed for BRIX-1405" in slack.acks[0][1]
+    assert "Use the CI-only auth fixture" in slack.acks[0][1]
+
+
+def test_orchestrator_can_ask_for_confirmation_before_resuming():
+    handoff = brix.Handoff(handoff_id="handoff-confirm", task_id="task-confirm")
+    quay = FakeQuayClient(handoff)
+    slack = FakeSlackClient(
+        wait_results=[
+            brix.SlackReply(
+                text="I think we should use the CI-only auth fixture.",
+                user_id="U123",
+                ts="1001.000000",
+            ),
+            brix.SlackReply(
+                text="Yes, that's the right worker instruction.",
+                user_id="U123",
+                ts="1003.000000",
+            ),
+        ]
+    )
+    decider = FakeDecider(
+        [
+            ask("I would tell the worker to use the CI-only auth fixture. Is that right?"),
+            ready("Use the CI-only auth fixture."),
+        ]
+    )
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+        ),
+        worker_id="test-worker",
+        decider=decider,
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "submitted_from_human_reply"
+    assert len(decider.calls) == 2
+    assert "I would tell the worker" in slack.acks[0][1]
+    assert quay.recorded_reply[1].text == "Yes, that's the right worker instruction."
+    assert quay.submitted[0][1].endswith("Use the CI-only auth fixture.")
+
+
+def test_orchestrator_decider_error_prompts_once_and_keeps_waiting():
+    handoff = brix.Handoff(handoff_id="handoff-decider", task_id="task-decider")
+    quay = FakeQuayClient(handoff)
+    slack = FakeSlackClient(
+        wait_results=[
+            brix.SlackReply(
+                text="The fixture is only available in CI.",
+                user_id="U123",
+                ts="1001.000000",
+            ),
+            brix.SlackReply(
+                text="Tell the worker to use the CI-only auth fixture.",
+                user_id="U123",
+                ts="1003.000000",
+            ),
+        ]
+    )
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+        ),
+        worker_id="test-worker",
+        decider=FakeDecider(
+            [
+                RuntimeError("model unavailable"),
+                ready("Use the CI-only auth fixture."),
+            ]
+        ),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "submitted_from_human_reply"
+    assert len(slack.questions) == 1
+    assert len(slack.acks) == 2
+    assert "internal error" in slack.acks[0][1]
+    assert "Quay resumed" in slack.acks[1][1]
+    assert quay.escalations[0][2] == "C1234567890:1000.000000"
+    assert quay.released == []
+    assert quay.submitted[0][1].endswith("Use the CI-only auth fixture.")
+    assert quay.completed == [handoff]
+    assert result.metrics["errors"] == 1
+    assert result.metrics["claims_released"] == 0
+
+
+def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
+    handoff = brix.Handoff(
+        handoff_id="handoff-decider-timeout",
+        task_id="task-decider-timeout",
+    )
+    quay = FakeQuayClient(handoff)
+    slack = FakeSlackClient(
+        wait_results=[
+            brix.SlackReply(
+                text="The fixture is only available in CI.",
+                user_id="U123",
+                ts="1001.000000",
+            ),
+        ]
+    )
+    decider = FakeDecider([RuntimeError("model unavailable")])
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+            reply_timeout_seconds=1,
+            poll_interval_seconds=1,
+        ),
+        worker_id="test-worker",
+        decider=decider,
+    )
+
+    result = drainer.drain_one()
+    slack.wait_results.append(
+        brix.SlackReply(
+            text="The fixture is only available in CI.",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+    retry = drainer.drain_one()
+
+    assert result.status == "human_reply_timeout"
+    assert retry.status == "human_reply_timeout"
+    assert len(slack.questions) == 1
+    assert len(slack.acks) == 1
+    assert "internal error" in slack.acks[0][1]
+    assert slack.validations == [("C1234567890", "1000.000000")]
+    assert len(decider.calls) == 1
+
+
+def test_fake_quay_rejects_double_human_escalation_without_reply():
+    handoff = brix.Handoff(handoff_id="handoff-stateful", task_id="task-stateful")
+    quay = FakeQuayClient(handoff)
+
+    assert quay.claim_handoff("test-worker") == handoff
+    quay.escalate_human(handoff, "Question", "C1234567890:1000.000000")
+
+    with pytest.raises(RuntimeError, match="wrong_state"):
+        quay.escalate_human(handoff, "Fallback question", "CFALLBACK1:1000.000000")
+
+
+def test_orchestrator_decision_parser_accepts_ready_ask_and_invalid_json():
+    assert brix.parse_decision_response('{"action":"ready","brief":"do the thing"}') == brix.ConversationDecision(
+        action="ready",
+        brief="do the thing",
+    )
+    assert brix.parse_decision_response('```json\n{"action":"ask","message":"Can I tell the worker X?"}\n```') == brix.ConversationDecision(
+        action="ask",
+        message="Can I tell the worker X?",
+    )
+    assert brix.parse_decision_response("not json") == brix.ConversationDecision(action="wait")
+
+
+def test_human_question_mentions_author_from_task_or_handoff_metadata():
+    task = brix.TaskContext(
+        task_id="task-author",
+        title="Needs author",
+        metadata={"author": {"slack_id": "U1234567"}},
+    )
+    handoff = brix.Handoff(
+        handoff_id="handoff-author",
+        task_id="task-author",
+        metadata={"contributor": {"slack_id": "U7654321"}},
+    )
+
+    question = brix.build_human_question(handoff, task, None)
+
+    assert "Contributor: <@U1234567>" in question
+
+
+def test_human_question_mentions_legacy_flash_tag_author_on_fallback_route():
+    task = brix.TaskContext(task_id="task-legacy", title="Legacy flash")
+    handoff = brix.Handoff(
+        handoff_id="handoff-legacy",
+        task_id="task-legacy",
+        metadata={"source": {"flash": {"author_slack_id": "<@UFLASH1>"}}},
+    )
+
+    question = brix.build_human_question(handoff, task, None)
+    route = brix.resolve_slack_route(
+        handoff,
+        task,
+        brix.OrchestratorConfig(enabled=True, default_slack_channel="C1234567890"),
+    )
+
+    assert "Contributor: <@UFLASH1>" in question
+    assert route == brix.SlackRoute(channel_id="C1234567890", source="fallback_channel")
+
+
+def test_stale_metadata_route_falls_back_and_records_fallback_thread():
+    handoff = brix.Handoff(handoff_id="handoff-stale", task_id="task-stale")
+    task = brix.TaskContext(
+        task_id=handoff.task_id,
+        title="Fix stale route",
+        issue="BRIX-1396",
+        metadata={"slack_thread_ref": "CSTALE1234:1778757925.556349"},
+    )
+    quay = FakeQuayClient(handoff, task=task)
+    slack = FakeSlackClient(
+        validate_results=[
+            brix.SlackApiError("conversations.replies", "thread_not_found"),
+        ],
+        wait_results=[
+            brix.SlackReply(
+                text="The fallback thread has the context we need.",
+                user_id="U123",
+                ts="1001.000000",
+            ),
+        ]
+    )
+    decider = FakeDecider([ready("Use the fallback thread.")])
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+        decider=decider,
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "submitted_from_human_reply"
+    assert slack.validations == [("CSTALE1234", "1778757925.556349")]
+    assert len(slack.questions) == 1
+    assert slack.questions[0][0] == "CFALLBACK1"
+    assert slack.questions[0][2] is None
+    assert quay.escalations == [
+        (handoff, slack.questions[0][1], "CFALLBACK1:1000.000000")
+    ]
+    assert quay.recorded_reply[2] == "CFALLBACK1:1000.000000"
+
+
+def test_stale_metadata_route_without_fallback_releases_and_does_not_bubble():
+    handoff = brix.Handoff(handoff_id="handoff-stale", task_id="task-stale")
+    task = brix.TaskContext(
+        task_id=handoff.task_id,
+        title="Fix stale route",
+        issue="BRIX-1396",
+        metadata={"slack_thread_ref": "CSTALE1234:1778757925.556349"},
+    )
+    quay = FakeQuayClient(handoff, task=task)
+    slack = FakeSlackClient(
+        validate_results=[
+            brix.SlackApiError("conversations.replies", "thread_not_found"),
+        ]
+    )
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "stale_slack_thread_ref"
+    assert slack.validations == [("CSTALE1234", "1778757925.556349")]
+    assert slack.questions == []
+    assert quay.escalations == []
+    assert quay.submitted == []
+    assert quay.released == [(handoff, "stale_slack_thread_ref")]
+
+
+def test_failed_record_human_reply_does_not_post_success_ack():
+    class FailingRecordQuay(FakeQuayClient):
+        def record_human_reply(self, handoff, reply, thread_ref: str) -> None:
+            raise RuntimeError("record failed")
+
+    handoff = brix.Handoff(handoff_id="handoff-record-fails", task_id="task-record-fails")
+    quay = FailingRecordQuay(handoff)
+    slack = FakeSlackClient(
+        brix.SlackReply(
+            text="Try the fixture.",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+    decider = FakeDecider([ready("Try the fixture.")])
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+        ),
+        worker_id="test-worker",
+        decider=decider,
+    )
+
+    with pytest.raises(RuntimeError, match="record failed"):
+        drainer.drain_one()
+
+    assert slack.acks == []
+
+
+def test_failed_submit_brief_does_not_post_success_ack():
+    class FailingSubmitQuay(FakeQuayClient):
+        def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+            raise RuntimeError("submit failed")
+
+    handoff = brix.Handoff(handoff_id="handoff-submit-fails", task_id="task-submit-fails")
+    quay = FailingSubmitQuay(handoff)
+    slack = FakeSlackClient(
+        brix.SlackReply(
+            text="Try the fixture.",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+    decider = FakeDecider([ready("Try the fixture.")])
+    drainer = brix.HandoffDrainer(
+        quay=quay,
+        slack=slack,
+        config=brix.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C1234567890",
+        ),
+        worker_id="test-worker",
+        decider=decider,
+    )
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        drainer.drain_one()
+
+    assert slack.acks == []
 
 
 def test_file_lock_is_nonblocking(tmp_path: Path):

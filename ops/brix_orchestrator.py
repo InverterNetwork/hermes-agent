@@ -140,6 +140,24 @@ class SlackReply:
     permalink: str | None = None
 
 
+@dataclass(frozen=True)
+class ConversationDecision:
+    """Orchestrator decision for a human discussion turn."""
+
+    action: str
+    brief: str = ""
+    message: str = ""
+
+
+class SlackApiError(RuntimeError):
+    """Typed Slack Web API failure."""
+
+    def __init__(self, method: str, error: str) -> None:
+        self.method = method
+        self.error = error
+        super().__init__(f"Slack API {method} returned error: {error}")
+
+
 @dataclass
 class RunMetrics:
     handoffs_claimed: int = 0
@@ -260,6 +278,9 @@ class QuayClient(Protocol):
 
 
 class SlackQuestionClient(Protocol):
+    def validate_thread(self, channel_id: str, thread_ts: str) -> SlackPostRef:
+        """Prove a stored Slack thread exists and return the polling floor."""
+
     def post_question(
         self,
         channel_id: str,
@@ -275,10 +296,35 @@ class SlackQuestionClient(Protocol):
         self,
         ref: SlackPostRef,
         *,
+        after_ts: str,
         timeout_seconds: float,
         poll_interval_seconds: float,
     ) -> SlackReply | None:
-        """Poll the question thread and return the first human reply."""
+        """Poll the question thread and return the next human reply."""
+
+    def post_thread_message(
+        self,
+        ref: SlackPostRef,
+        text: str,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+    ) -> SlackPostRef:
+        """Post a human-visible message in the same thread."""
+
+
+class ConversationDecider(Protocol):
+    def decide(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        replies: list[SlackReply],
+        posted_messages: list[str],
+    ) -> ConversationDecision:
+        """Decide whether the discussion is ready, needs a follow-up, or should wait."""
 
 
 class QuayCommandError(RuntimeError):
@@ -523,6 +569,82 @@ class QuayCliClient:
         return metadata
 
 
+class HermesConversationDecider:
+    """LLM-backed BRIX orchestrator decision step.
+
+    Humans talk normally in Slack. This component decides whether that
+    discussion has enough information to resume the worker, or whether the
+    orchestrator should ask/confirm one more thing.
+    """
+
+    def __init__(
+        self,
+        *,
+        logger: logging.Logger | None = None,
+        agent_factory: Any | None = None,
+    ) -> None:
+        self._logger = logger or LOGGER
+        self._agent_factory = agent_factory
+
+    def decide(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        replies: list[SlackReply],
+        posted_messages: list[str],
+    ) -> ConversationDecision:
+        if not replies:
+            return ConversationDecision(action="wait")
+
+        agent = self._build_agent(handoff)
+        prompt = build_orchestrator_decision_prompt(
+            handoff=handoff,
+            task=task,
+            artifact=artifact,
+            question=question,
+            replies=replies,
+            posted_messages=posted_messages,
+        )
+        result = agent.run_conversation(
+            prompt,
+            system_message=ORCHESTRATOR_DECISION_SYSTEM,
+            conversation_history=[],
+            task_id=f"brix-orchestrator:{handoff.task_id}",
+        )
+        text = ""
+        if isinstance(result, Mapping):
+            text = str(result.get("final_response") or "")
+        else:
+            text = str(result or "")
+        decision = parse_decision_response(text)
+        log_event(
+            self._logger,
+            "orchestrator_conversation_decision",
+            handoff_id=handoff.handoff_id,
+            task_id=handoff.task_id,
+            action=decision.action,
+        )
+        return decision
+
+    def _build_agent(self, handoff: Handoff) -> Any:
+        if self._agent_factory is not None:
+            return self._agent_factory()
+        from run_agent import AIAgent
+
+        return AIAgent(
+            max_iterations=2,
+            quiet_mode=True,
+            enabled_toolsets=[],
+            skip_context_files=True,
+            skip_memory=True,
+            platform="brix-orchestrator",
+            session_id=f"brix-orchestrator:{handoff.task_id}:{handoff.claim_id or handoff.handoff_id}",
+        )
+
+
 class SlackWebApiClient:
     """Small stdlib Slack Web API client used by the standalone runner."""
 
@@ -531,6 +653,26 @@ class SlackWebApiClient:
             raise ValueError("Slack token is required")
         self._token = token
         self._logger = logger or LOGGER
+
+    def validate_thread(self, channel_id: str, thread_ts: str) -> SlackPostRef:
+        data = self._api(
+            "conversations.replies",
+            {"channel": channel_id, "ts": thread_ts, "limit": 200},
+        )
+        messages = data.get("messages") or []
+        if not messages:
+            raise SlackApiError("conversations.replies", "thread_not_found")
+        floor_ts = thread_ts
+        for msg in messages:
+            if not isinstance(msg, Mapping):
+                continue
+            ts = str(msg.get("ts") or "")
+            if not ts:
+                continue
+            if msg.get("subtype") == "bot_message" or msg.get("bot_id"):
+                if _slack_ts_key(ts) > _slack_ts_key(floor_ts):
+                    floor_ts = ts
+        return SlackPostRef(channel_id=channel_id, ts=floor_ts, thread_ts=thread_ts)
 
     def post_question(
         self,
@@ -565,10 +707,12 @@ class SlackWebApiClient:
         self,
         ref: SlackPostRef,
         *,
+        after_ts: str,
         timeout_seconds: float,
         poll_interval_seconds: float,
     ) -> SlackReply | None:
         deadline = time.monotonic() + timeout_seconds
+        floor_ts = after_ts or ref.ts
         while time.monotonic() <= deadline:
             replies = self._api(
                 "conversations.replies",
@@ -578,7 +722,7 @@ class SlackWebApiClient:
                 if not isinstance(msg, Mapping):
                     continue
                 ts = str(msg.get("ts") or "")
-                if not ts or _slack_ts_key(ts) <= _slack_ts_key(ref.ts):
+                if not ts or _slack_ts_key(ts) <= _slack_ts_key(floor_ts):
                     continue
                 if msg.get("subtype") == "bot_message" or msg.get("bot_id"):
                     continue
@@ -593,6 +737,29 @@ class SlackWebApiClient:
                 )
             time.sleep(poll_interval_seconds)
         return None
+
+    def post_thread_message(
+        self,
+        ref: SlackPostRef,
+        text: str,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+    ) -> SlackPostRef:
+        data = self._api(
+            "chat.postMessage",
+            {
+                "channel": ref.channel_id,
+                "text": text,
+                "thread_ts": ref.thread_ts,
+                "unfurl_links": False,
+                "unfurl_media": False,
+            },
+        )
+        ts = str(data.get("ts") or "")
+        if not ts:
+            raise SlackApiError("chat.postMessage", "missing_ts")
+        return SlackPostRef(channel_id=ref.channel_id, ts=ts, thread_ts=ref.thread_ts)
 
     def _api(self, method: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         body = urllib.parse.urlencode(
@@ -615,20 +782,23 @@ class SlackWebApiClient:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"Slack API {method} failed: {exc}") from exc
+            raise SlackApiError(method, f"transport_error:{exc}") from exc
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Slack API {method} returned invalid JSON") from exc
         if not isinstance(parsed, dict) or not parsed.get("ok"):
             err = parsed.get("error") if isinstance(parsed, dict) else "invalid_response"
-            raise RuntimeError(f"Slack API {method} returned error: {err}")
+            raise SlackApiError(method, str(err or "unknown_error"))
         return parsed
 
 
 class MissingSlackClient:
     def __init__(self, token_env: str) -> None:
         self.token_env = token_env
+
+    def validate_thread(self, channel_id: str, thread_ts: str) -> SlackPostRef:
+        raise RuntimeError(f"Slack token env var {self.token_env} is not set")
 
     def post_question(
         self,
@@ -645,9 +815,20 @@ class MissingSlackClient:
         self,
         ref: SlackPostRef,
         *,
+        after_ts: str,
         timeout_seconds: float,
         poll_interval_seconds: float,
     ) -> SlackReply | None:
+        raise RuntimeError(f"Slack token env var {self.token_env} is not set")
+
+    def post_thread_message(
+        self,
+        ref: SlackPostRef,
+        text: str,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+    ) -> SlackPostRef:
         raise RuntimeError(f"Slack token env var {self.token_env} is not set")
 
 
@@ -698,12 +879,14 @@ class HandoffDrainer:
         slack: SlackQuestionClient,
         config: OrchestratorConfig,
         worker_id: str,
+        decider: ConversationDecider | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.quay = quay
         self.slack = slack
         self.config = config
         self.worker_id = worker_id
+        self.decider = decider or HermesConversationDecider(logger=logger or LOGGER)
         self.logger = logger or LOGGER
         self.metrics = RunMetrics()
 
@@ -723,6 +906,29 @@ class HandoffDrainer:
 
         try:
             result = self._handle_claimed_handoff(handoff)
+        except SlackApiError as exc:
+            self.metrics.errors += 1
+            reason = f"slack_api_error:{exc.method}:{exc.error}"
+            try:
+                self.quay.release_claim(handoff, reason=reason)
+                self.metrics.claims_released += 1
+            except Exception:
+                self.logger.exception("failed to release claim after Slack API error")
+            log_event(
+                self.logger,
+                "claim_released",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                reason=reason,
+                slack_method=exc.method,
+                slack_error=exc.error,
+            )
+            return DrainResult(
+                status="slack_api_error",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                metrics=self.metrics.as_dict(),
+            )
         except Exception as exc:
             self.metrics.errors += 1
             reason = f"runner_error: {type(exc).__name__}: {exc}"
@@ -776,35 +982,24 @@ class HandoffDrainer:
             )
 
         question = build_human_question(handoff, task, artifact)
-        if route.thread_ref:
-            self.quay.escalate_human(handoff, question, route.thread_ref)
-        post_ref = self.slack.post_question(
-            route.channel_id,
-            question,
-            thread_ts=route.thread_ts,
+        question_result = self._post_question_and_wait(
             handoff=handoff,
             task=task,
+            artifact=artifact,
+            question=question,
+            route=route,
         )
-        thread_ref = slack_thread_ref(post_ref)
-        if not route.thread_ref:
-            self.quay.escalate_human(handoff, question, thread_ref)
-        self.metrics.slack_questions_posted += 1
-        log_event(
-            self.logger,
-            "slack_question_posted",
-            handoff_id=handoff.handoff_id,
-            task_id=handoff.task_id,
-            channel_id=post_ref.channel_id,
-            thread_ts=post_ref.thread_ts,
-            route_source=route.source,
-        )
+        if question_result is None:
+            return self._handle_stale_slack_route(
+                handoff=handoff,
+                task=task,
+                artifact=artifact,
+                question=question,
+                stale_route=route,
+            )
 
-        reply = self.slack.wait_for_reply(
-            post_ref,
-            timeout_seconds=self.config.reply_timeout_seconds,
-            poll_interval_seconds=self.config.poll_interval_seconds,
-        )
-        if reply is None:
+        post_ref, thread_ref, reply, decision = question_result
+        if reply is None or decision is None:
             reason = "human_reply_timeout"
             self.quay.release_claim(handoff, reason=reason)
             self.metrics.claims_released += 1
@@ -823,12 +1018,321 @@ class HandoffDrainer:
                 metrics=self.metrics.as_dict(),
             )
 
+        return self._submit_human_resume(
+            handoff=handoff,
+            task=task,
+            post_ref=post_ref,
+            thread_ref=thread_ref,
+            reply=reply,
+            decision=decision,
+        )
+
+    def _post_question_and_wait(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        route: SlackRoute,
+    ) -> tuple[SlackPostRef, str, SlackReply | None, ConversationDecision | None] | None:
+        prepared = self._prepare_thread_before_escalation(
+            handoff=handoff,
+            task=task,
+            question=question,
+            route=route,
+        )
+        if prepared is None:
+            return None
+
+        post_ref, posted_question = prepared
+        thread_ref = slack_thread_ref(post_ref)
+        self.quay.escalate_human(handoff, question, thread_ref)
+        if posted_question:
+            self.metrics.slack_questions_posted += 1
+            log_event(
+                self.logger,
+                "slack_question_posted",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                channel_id=post_ref.channel_id,
+                thread_ts=post_ref.thread_ts,
+                route_source=route.source,
+            )
+        else:
+            log_event(
+                self.logger,
+                "slack_thread_attached",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                channel_id=post_ref.channel_id,
+                thread_ts=post_ref.thread_ts,
+                route_source=route.source,
+            )
+
+        reply, decision = self._drive_human_discussion(
+            handoff=handoff,
+            task=task,
+            artifact=artifact,
+            question=question,
+            post_ref=post_ref,
+        )
+        return post_ref, thread_ref, reply, decision
+
+    def _prepare_thread_before_escalation(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        question: str,
+        route: SlackRoute,
+    ) -> tuple[SlackPostRef, bool] | None:
+        try:
+            if route.thread_ref:
+                thread_ts = route.thread_ts or ""
+                return self.slack.validate_thread(route.channel_id, thread_ts), False
+            post_ref = self.slack.post_question(
+                route.channel_id,
+                question,
+                thread_ts=route.thread_ts,
+                handoff=handoff,
+                task=task,
+            )
+            return post_ref, True
+        except SlackApiError as exc:
+            if exc.error == "thread_not_found" and route_is_metadata(route):
+                log_event(
+                    self.logger,
+                    "slack_route_stale",
+                    handoff_id=handoff.handoff_id,
+                    task_id=handoff.task_id,
+                    route_source=route.source,
+                    channel_id=route.channel_id,
+                    thread_ts=route.thread_ts,
+                    slack_method=exc.method,
+                    slack_error=exc.error,
+                )
+                return None
+            raise
+
+    def _drive_human_discussion(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        post_ref: SlackPostRef,
+    ) -> tuple[SlackReply | None, ConversationDecision | None]:
+        replies: list[SlackReply] = []
+        posted_messages: list[str] = []
+        decision_error_prompted = False
+        after_ts = post_ref.ts
+        deadline = time.monotonic() + self.config.reply_timeout_seconds
+
+        while time.monotonic() <= deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            reply = self.slack.wait_for_reply(
+                post_ref,
+                after_ts=after_ts,
+                timeout_seconds=remaining,
+                poll_interval_seconds=self.config.poll_interval_seconds,
+            )
+            if reply is None:
+                return None, None
+
+            replies.append(reply)
+            after_ts = reply.ts or after_ts
+            try:
+                decision = normalize_decision(
+                    self.decider.decide(
+                        handoff=handoff,
+                        task=task,
+                        artifact=artifact,
+                        question=question,
+                        replies=list(replies),
+                        posted_messages=list(posted_messages),
+                    )
+                )
+            except Exception as exc:
+                self.metrics.errors += 1
+                log_event(
+                    self.logger,
+                    "orchestrator_decision_error",
+                    handoff_id=handoff.handoff_id,
+                    task_id=handoff.task_id,
+                    reply_ts=reply.ts,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                if not decision_error_prompted:
+                    message = decision_error_retry_message()
+                    self.slack.post_thread_message(
+                        post_ref,
+                        message,
+                        handoff=handoff,
+                        task=task,
+                    )
+                    posted_messages.append(message)
+                    decision_error_prompted = True
+                    log_event(
+                        self.logger,
+                        "orchestrator_decision_retry_prompt_posted",
+                        handoff_id=handoff.handoff_id,
+                        task_id=handoff.task_id,
+                        reply_ts=reply.ts,
+                    )
+                continue
+            if decision.action == "ready" and decision.brief.strip():
+                return reply, decision
+            if decision.action == "ask" and decision.message.strip():
+                message = decision.message.strip()
+                self.slack.post_thread_message(
+                    post_ref,
+                    message,
+                    handoff=handoff,
+                    task=task,
+                )
+                posted_messages.append(message)
+                log_event(
+                    self.logger,
+                    "orchestrator_followup_posted",
+                    handoff_id=handoff.handoff_id,
+                    task_id=handoff.task_id,
+                    reply_ts=reply.ts,
+                )
+                continue
+            log_event(
+                self.logger,
+                "orchestrator_waiting_for_more_context",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                reply_ts=reply.ts,
+                action=decision.action,
+            )
+
+        return None, None
+
+    def _handle_stale_slack_route(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        stale_route: SlackRoute,
+    ) -> DrainResult:
+        fallback_channel = (self.config.default_slack_channel or "").strip()
+        if fallback_channel:
+            fallback_route = SlackRoute(
+                channel_id=fallback_channel,
+                thread_ts=None,
+                source="fallback_channel",
+            )
+            log_event(
+                self.logger,
+                "slack_route_fallback",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                stale_route_source=stale_route.source,
+                stale_channel_id=stale_route.channel_id,
+                stale_thread_ts=stale_route.thread_ts,
+                fallback_channel_id=fallback_channel,
+                reason="stale_slack_thread_ref",
+            )
+            question_result = self._post_question_and_wait(
+                handoff=handoff,
+                task=task,
+                artifact=artifact,
+                question=question,
+                route=fallback_route,
+            )
+            if question_result is None:
+                raise RuntimeError("fallback Slack route was unexpectedly stale")
+            post_ref, thread_ref, reply, decision = question_result
+            if reply is None or decision is None:
+                reason = "human_reply_timeout"
+                self.quay.release_claim(handoff, reason=reason)
+                self.metrics.claims_released += 1
+                log_event(
+                    self.logger,
+                    "claim_released",
+                    handoff_id=handoff.handoff_id,
+                    task_id=handoff.task_id,
+                    thread_ref=thread_ref,
+                    reason=reason,
+                    route_source=fallback_route.source,
+                    channel_id=post_ref.channel_id,
+                    thread_ts=post_ref.thread_ts,
+                )
+                return DrainResult(
+                    status=reason,
+                    handoff_id=handoff.handoff_id,
+                    task_id=handoff.task_id,
+                    metrics=self.metrics.as_dict(),
+                )
+            return self._submit_human_resume(
+                handoff=handoff,
+                task=task,
+                post_ref=post_ref,
+                thread_ref=thread_ref,
+                reply=reply,
+                decision=decision,
+            )
+
+        reason = "stale_slack_thread_ref"
+        self.quay.release_claim(handoff, reason=reason)
+        self.metrics.claims_released += 1
+        log_event(
+            self.logger,
+            "claim_released",
+            handoff_id=handoff.handoff_id,
+            task_id=handoff.task_id,
+            reason=reason,
+            route_source=stale_route.source,
+            channel_id=stale_route.channel_id,
+            thread_ts=stale_route.thread_ts,
+        )
+        return DrainResult(
+            status=reason,
+            handoff_id=handoff.handoff_id,
+            task_id=handoff.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _submit_human_resume(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        post_ref: SlackPostRef,
+        thread_ref: str,
+        reply: SlackReply,
+        decision: ConversationDecision,
+    ) -> DrainResult:
         self.metrics.human_replies_ingested += 1
         self.quay.record_human_reply(handoff, reply, thread_ref)
-        next_brief = human_reply_to_brief(reply, handoff=handoff, task=task)
+        accepted_brief = decision.brief.strip()
+        if not accepted_brief:
+            raise RuntimeError("orchestrator marked discussion ready without a worker brief")
+        next_brief = human_reply_to_brief(
+            reply,
+            accepted_brief=accepted_brief,
+            handoff=handoff,
+            task=task,
+        )
         self.quay.submit_brief(handoff, next_brief, reason="advice_answered")
         self.quay.complete_claim(handoff)
         self.metrics.human_briefs_submitted += 1
+        self._post_resume_ack(
+            post_ref=post_ref,
+            handoff=handoff,
+            task=task,
+            reply=reply,
+            accepted_brief=accepted_brief,
+        )
         log_event(
             self.logger,
             "brief_submitted_from_human_reply",
@@ -844,6 +1348,35 @@ class HandoffDrainer:
             metrics=self.metrics.as_dict(),
         )
 
+    def _post_resume_ack(
+        self,
+        *,
+        post_ref: SlackPostRef,
+        handoff: Handoff,
+        task: TaskContext,
+        reply: SlackReply,
+        accepted_brief: str,
+    ) -> None:
+        ack = build_resume_ack(task=task, reply=reply, accepted_brief=accepted_brief)
+        try:
+            self.slack.post_thread_message(
+                post_ref,
+                ack,
+                handoff=handoff,
+                task=task,
+            )
+        except Exception as exc:
+            log_event(
+                self.logger,
+                "slack_ack_failed",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                channel_id=post_ref.channel_id,
+                thread_ts=post_ref.thread_ts,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
 
 def choose_direct_brief(handoff: Handoff) -> str | None:
     if handoff.next_brief and handoff.next_brief.strip():
@@ -852,6 +1385,85 @@ def choose_direct_brief(handoff: Handoff) -> str | None:
         val = handoff.metadata.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
+    return None
+
+
+def resolve_author_mention(handoff: Handoff, task: TaskContext) -> str | None:
+    user_id = _find_slack_user_id(task.metadata) or _find_slack_user_id(handoff.metadata)
+    if not user_id:
+        return None
+    return f"<@{user_id}>"
+
+
+def _find_slack_user_id(value: Any) -> str | None:
+    if isinstance(value, str):
+        return _extract_slack_user_id(value)
+    if isinstance(value, Mapping):
+        preferred_keys = (
+            "contributor_slack_id",
+            "contributor_slack_user_id",
+            "author_slack_id",
+            "author_slack_user_id",
+            "requester_slack_id",
+            "requester_slack_user_id",
+            "creator_slack_id",
+            "creator_slack_user_id",
+            "slack_user_id",
+            "slack_id",
+            "author.slack_id",
+        )
+        for key in preferred_keys:
+            found = _find_slack_user_id(value.get(key))
+            if found:
+                return found
+        for key in (
+            "contributor",
+            "author",
+            "requester",
+            "creator",
+            "created_by",
+            "submitted_by",
+            "submitter",
+            "source_author",
+            "authors",
+            "contributors",
+            "slack",
+            "ticket",
+            "source",
+            "flash",
+        ):
+            found = _find_slack_user_id(value.get(key))
+            if found:
+                return found
+        for key, nested in value.items():
+            key_text = str(key).lower()
+            if any(token in key_text for token in ("author", "contributor", "requester", "creator", "slack")):
+                found = _find_slack_user_id(nested)
+                if found:
+                    return found
+    if isinstance(value, list):
+        for item in value:
+            found = _find_slack_user_id(item)
+            if found:
+                return found
+    return None
+
+
+def _extract_slack_user_id(text: str) -> str | None:
+    raw = (text or "").strip()
+    if raw.startswith("<@") and raw.endswith(">"):
+        raw = raw[2:-1].split("|", 1)[0].strip()
+    for prefix in ("U", "W"):
+        if raw.startswith(prefix) and len(raw) >= 7 and raw.replace("_", "").isalnum():
+            return raw
+    marker = "<@"
+    start = raw.find(marker)
+    if start >= 0:
+        end = raw.find(">", start + len(marker))
+        if end > start:
+            candidate = raw[start + len(marker) : end].split("|", 1)[0].strip()
+            if candidate.startswith(("U", "W")) and len(candidate) >= 7:
+                return candidate
     return None
 
 
@@ -870,6 +1482,9 @@ def build_human_question(
         "A Quay task needs human guidance before the next worker brief.",
         f"Task: {task.title or task.task_id}",
     ]
+    author_mention = resolve_author_mention(handoff, task)
+    if author_mention:
+        lines.append(f"Contributor: {author_mention}")
     if task.issue:
         lines.append(f"Issue: {task.issue}")
     if task.repo_id or handoff.repo_id:
@@ -878,13 +1493,118 @@ def build_human_question(
         lines.extend(["", "Handoff summary:", handoff.summary.strip()])
     if artifact and artifact.text.strip():
         lines.extend(["", "Blocker/context:", artifact.text.strip()])
-    lines.extend(["", "Reply in this thread with the guidance to use as the next brief."])
+    lines.extend(
+        [
+            "",
+            "Discuss freely in this thread. I will resume the worker once the path is clear.",
+        ]
+    )
     return "\n".join(lines)
+
+
+ORCHESTRATOR_DECISION_SYSTEM = (
+    "You are the BRIX orchestrator deciding whether a blocked worker can resume. "
+    "Read the Slack discussion and return only JSON. "
+    "Use action='ready' only when the worker can continue with a clear, "
+    "self-contained brief. Use action='ask' when there is remaining doubt; "
+    "message must summarize the worker-facing instruction you would send and ask "
+    "for confirmation or the missing detail without mentioning Quay internals. "
+    "Use action='wait' when the latest message does not add enough signal. "
+    "Schema: {\"action\":\"wait\"} or {\"action\":\"ask\",\"message\":\"...\"} "
+    "or {\"action\":\"ready\",\"brief\":\"...\"}."
+)
+
+
+def build_orchestrator_decision_prompt(
+    *,
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+    question: str,
+    replies: list[SlackReply],
+    posted_messages: list[str],
+) -> str:
+    payload = {
+        "task": {
+            "task_id": task.task_id,
+            "title": task.title,
+            "issue": task.issue,
+            "repo_id": task.repo_id or handoff.repo_id,
+        },
+        "handoff": {
+            "handoff_id": handoff.handoff_id,
+            "reason": handoff.reason,
+            "summary": handoff.summary,
+        },
+        "question_posted_to_humans": question,
+        "blocker_context": artifact.text if artifact else "",
+        "orchestrator_messages_already_posted": posted_messages,
+        "human_replies": [
+            {
+                "text": reply.text,
+                "user_id": reply.user_id,
+                "ts": reply.ts,
+                "permalink": reply.permalink,
+            }
+            for reply in replies
+        ],
+    }
+    return (
+        "Decide the next orchestrator action for this blocked worker discussion.\n"
+        "Return only the JSON object described in the system message.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def parse_decision_response(text: str) -> ConversationDecision:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = _strip_json_fence(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                return ConversationDecision(action="wait")
+        else:
+            return ConversationDecision(action="wait")
+    if not isinstance(data, Mapping):
+        return ConversationDecision(action="wait")
+    return normalize_decision(
+        ConversationDecision(
+            action=str(data.get("action") or "wait"),
+            brief=str(data.get("brief") or ""),
+            message=str(data.get("message") or ""),
+        )
+    )
+
+
+def _strip_json_fence(text: str) -> str:
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def normalize_decision(decision: ConversationDecision) -> ConversationDecision:
+    action = (decision.action or "wait").strip().lower()
+    if action in {"ready", "resume", "continue"}:
+        return ConversationDecision(action="ready", brief=decision.brief.strip())
+    if action in {"ask", "question", "confirm"}:
+        return ConversationDecision(action="ask", message=decision.message.strip())
+    return ConversationDecision(action="wait")
 
 
 def human_reply_to_brief(
     reply: SlackReply,
     *,
+    accepted_brief: str,
     handoff: Handoff,
     task: TaskContext,
 ) -> str:
@@ -900,11 +1620,41 @@ def human_reply_to_brief(
         header.append(f"Human reply: {who}{suffix}")
     if reply.permalink:
         header.append(f"Slack reference: {reply.permalink}")
-    return "\n".join(header + ["", reply.text.strip()])
+    return "\n".join(header + ["", accepted_brief.strip()])
+
+
+def build_resume_ack(
+    *,
+    task: TaskContext,
+    reply: SlackReply,
+    accepted_brief: str,
+) -> str:
+    target = task.issue or task.title or task.task_id
+    source = f"<@{reply.user_id}>" if reply.user_id else "the Slack thread"
+    if reply.ts:
+        source = f"{source} at {reply.ts}"
+    preview = accepted_brief.strip()
+    if len(preview) > 500:
+        preview = preview[:497].rstrip() + "..."
+    return (
+        f"Quay resumed for {target} from {source}.\n\n"
+        f"Accepted brief:\n> {preview}"
+    )
+
+
+def decision_error_retry_message() -> str:
+    return (
+        "I could not decide from that reply because of an internal error. "
+        "Please send the worker instruction clearly and I will retry."
+    )
 
 
 def slack_thread_ref(ref: SlackPostRef) -> str:
     return f"{ref.channel_id}:{ref.thread_ts}"
+
+
+def route_is_metadata(route: SlackRoute) -> bool:
+    return route.source.startswith(("task.", "handoff."))
 
 
 def resolve_slack_route(
