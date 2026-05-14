@@ -413,7 +413,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.5"
+  version: "v0.3.6"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
@@ -497,11 +497,11 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # BRIX orchestrator sidecar. Keep disabled until the deployment is ready for
-  # BRIX-owned Slack posting/reply polling over durable Quay handoffs.
+  # BRIX orchestrator sidecar. Drains durable Quay handoffs into the
+  # deployment feedback channel when the task has no original Slack thread.
   orchestrator:
-    enabled: false
-    default_slack_channel: ""
+    enabled: true
+    default_slack_channel: "C0B4LLZ5Z2L"
     slack_token_env: SLACK_BOT_TOKEN
     quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
