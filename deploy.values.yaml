@@ -338,6 +338,7 @@ slack:
     allowed_channels:
       - C0B23MZ0USV
       - C0B4LLZ5Z2L
+      - C0B3WAWLL0L
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: ""
