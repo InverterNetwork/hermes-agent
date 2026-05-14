@@ -1560,6 +1560,17 @@ EOF
     chown root:root /etc/default/quay-orchestrator
     chmod 0644 /etc/default/quay-orchestrator
   fi
+  if [[ -f /etc/default/quay-orchestrator ]]; then
+    sed -i \
+      -e 's/BRIX_ORCHESTRATOR_CONFIG=/QUAY_ORCHESTRATOR_CONFIG=/g' \
+      -e 's/BRIX_ORCHESTRATOR_PYTHON=/QUAY_ORCHESTRATOR_PYTHON=/g' \
+      -e 's/BRIX_ORCHESTRATOR_SCRIPT=/QUAY_ORCHESTRATOR_SCRIPT=/g' \
+      -e 's/BRIX_ORCHESTRATOR_ENABLED=/QUAY_ORCHESTRATOR_ENABLED=/g' \
+      -e 's/BRIX_ORCHESTRATOR_LOCK=/QUAY_ORCHESTRATOR_LOCK=/g' \
+      -e 's/BRIX_ORCHESTRATOR_PROVIDER=/QUAY_ORCHESTRATOR_PROVIDER=/g' \
+      -e 's/BRIX_ORCHESTRATOR_WORKER_ID=/QUAY_ORCHESTRATOR_WORKER_ID=/g' \
+      /etc/default/quay-orchestrator
+  fi
 
   if command -v systemctl >/dev/null 2>&1; then
     echo "==> installing systemd timer for quay-orchestrator (user=$AGENT_USER)"
