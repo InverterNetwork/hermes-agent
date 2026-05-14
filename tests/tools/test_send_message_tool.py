@@ -22,6 +22,7 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
+    _build_slack_blocks_from_interactive_actions,
     _derive_forum_thread_name,
     _parse_target_ref,
     _send_discord,
@@ -30,7 +31,7 @@ from tools.send_message_tool import (
     _send_slack,
     _send_telegram,
     _send_to_platform,
-    _validate_slack_blocks,
+    _validate_interactive_actions,
     send_message_tool,
 )
 
@@ -503,18 +504,17 @@ class TestSendToPlatformChunking:
         assert send.await_args.kwargs.get("thread_ts") == "1715420800.123456"
         assert "blocks" not in send.await_args.kwargs
 
-    def test_slack_blocks_forwarded_and_chunking_disabled(self, monkeypatch):
-        # Block Kit posts skip chunking; the chunked text becomes the fallback.
+    def test_slack_interactive_actions_compose_blocks_and_disable_chunking(self, monkeypatch):
+        # interactive_actions are composed into Block Kit internally; the post
+        # goes in one shot regardless of message length, and the composed blocks
+        # arrive at _send_slack as the `blocks` kwarg.
         _ensure_slack_mock(monkeypatch)
         import gateway.platforms.slack as slack_mod
         monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
         send = AsyncMock(return_value={"success": True, "message_id": "1"})
-        blocks = [
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}},
-            {"type": "actions", "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Go"},
-                 "action_id": "skill:file-cr", "value": "1|1"}
-            ]},
+        actions = [
+            {"label": "File this", "action_id": "skill:file-cr", "value": "1|1",
+             "text": "*1.* Title", "style": "primary"},
         ]
         long_msg = "word " * 10000  # well over Slack's chunking limit
         with patch("tools.send_message_tool._send_slack", send):
@@ -524,24 +524,30 @@ class TestSendToPlatformChunking:
                     SimpleNamespace(enabled=True, token="***", extra={}),
                     "C123",
                     long_msg,
-                    slack_blocks=blocks,
+                    slack_interactive_actions=actions,
                 )
             )
         assert result["success"] is True
         # Single shot, not chunked.
         assert send.await_count == 1
-        assert send.await_args.kwargs.get("blocks") == blocks
+        composed = send.await_args.kwargs.get("blocks")
+        assert composed is not None
+        # Lead-in section + divider + per-item section (because text was set) + actions.
+        assert [b["type"] for b in composed] == [
+            "section", "divider", "section", "actions",
+        ]
+        assert composed[-1]["elements"][0]["action_id"] == "skill:file-cr"
 
-    def test_slack_blocks_clamp_oversized_fallback_text(self, monkeypatch):
-        # Slack's chat.postMessage rejects `text` > 40000 chars. When blocks
-        # are set, chunking is bypassed, so the fallback text must be clamped
-        # in-place or the whole post fails server-side.
+    def test_slack_interactive_actions_clamp_oversized_fallback_text(self, monkeypatch):
+        # Slack's chat.postMessage rejects `text` > 40000 chars. When
+        # interactive_actions are set, chunking is bypassed, so the fallback
+        # text must be clamped in-place or the whole post fails server-side.
         _ensure_slack_mock(monkeypatch)
         import gateway.platforms.slack as slack_mod
         monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
         send = AsyncMock(return_value={"success": True, "message_id": "1"})
         huge = "x" * 80_000
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}}]
+        actions = [{"label": "Go", "action_id": "skill:file-cr", "value": "v"}]
         with patch("tools.send_message_tool._send_slack", send):
             asyncio.run(
                 _send_to_platform(
@@ -549,7 +555,7 @@ class TestSendToPlatformChunking:
                     SimpleNamespace(enabled=True, token="***", extra={}),
                     "C123",
                     huge,
-                    slack_blocks=blocks,
+                    slack_interactive_actions=actions,
                 )
             )
         sent_text = send.await_args.args[2]
@@ -1052,58 +1058,148 @@ class TestSendDiscordThreadId:
         assert "403" in result["error"]
 
 
-class TestValidateSlackBlocks:
-    """Action-id pattern + block-count cap enforcement."""
+class TestSendMessageSchemaShape:
+    """Schema well-formedness — OpenAI function-calling validators reject
+    arrays without an `items` schema. Lock it in so a future schema edit
+    can't ship a tool definition the LLM provider rejects with HTTP 400."""
 
-    def _btn(self, action_id):
-        return {
-            "type": "actions",
-            "elements": [
-                {"type": "button", "text": {"type": "plain_text", "text": "Go"},
-                 "action_id": action_id, "value": "1"}
-            ],
-        }
+    def test_every_array_property_declares_items(self):
+        from tools.send_message_tool import SEND_MESSAGE_SCHEMA
 
-    def test_valid_skill_action_id_passes(self):
-        assert _validate_slack_blocks([self._btn("skill:file-cr")]) is None
+        properties = SEND_MESSAGE_SCHEMA["parameters"]["properties"]
+        for name, prop in properties.items():
+            if prop.get("type") == "array":
+                assert "items" in prop, (
+                    f"Schema property '{name}' is type=array but missing 'items'. "
+                    f"OpenAI/Anthropic function-calling validators reject this with HTTP 400."
+                )
+                assert isinstance(prop["items"], dict), (
+                    f"Schema property '{name}'.items must be a JSONSchema object, "
+                    f"got {type(prop['items']).__name__}"
+                )
+
+
+class TestValidateInteractiveActions:
+    """Validation rules on the interactive_actions list."""
+
+    def _item(self, **kwargs):
+        base = {"label": "File this", "action_id": "skill:file-cr", "value": "1|1"}
+        base.update(kwargs)
+        return base
+
+    def test_valid_minimal_passes(self):
+        assert _validate_interactive_actions([self._item()]) is None
+
+    def test_optional_text_and_style_pass(self):
+        assert (
+            _validate_interactive_actions(
+                [self._item(text="*1.* Title\nCustomer: X", style="primary")]
+            )
+            is None
+        )
+
+    def test_missing_label_rejected(self):
+        err = _validate_interactive_actions([{"action_id": "skill:x", "value": "v"}])
+        assert err is not None
+        assert "label" in err
+
+    def test_missing_action_id_rejected(self):
+        err = _validate_interactive_actions([{"label": "x", "value": "v"}])
+        assert err is not None
+        assert "action_id" in err
+
+    def test_missing_value_rejected(self):
+        err = _validate_interactive_actions(
+            [{"label": "x", "action_id": "skill:x"}]
+        )
+        assert err is not None
+        assert "value" in err
 
     def test_uppercase_action_id_rejected(self):
-        err = _validate_slack_blocks([self._btn("skill:File-CR")])
-        assert err is not None
-        assert "skill:" in err
-
-    def test_non_skill_prefix_rejected(self):
-        err = _validate_slack_blocks([self._btn("foo:bar")])
+        err = _validate_interactive_actions(
+            [self._item(action_id="skill:File-CR")]
+        )
         assert err is not None
         assert "skill" in err.lower()
 
-    def test_nested_action_id_in_static_select_rejected(self):
-        # A static_select with a per-option action_id that does NOT match the
-        # skill pattern must be caught even though it lives deep in the tree.
-        block = {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "*pick*"},
-            "accessory": {
-                "type": "static_select",
-                "options": [
-                    {"text": {"type": "plain_text", "text": "A"},
-                     "value": "a", "action_id": "exfil:admin"}
-                ],
-            },
-        }
-        err = _validate_slack_blocks([block])
+    def test_non_skill_action_id_rejected(self):
+        err = _validate_interactive_actions(
+            [self._item(action_id="exfil:admin")]
+        )
         assert err is not None
         assert "exfil:admin" in err
 
-    def test_block_count_cap(self):
-        blocks = [self._btn("skill:file-cr") for _ in range(51)]
-        err = _validate_slack_blocks(blocks)
+    def test_invalid_style_rejected(self):
+        err = _validate_interactive_actions([self._item(style="warning")])
         assert err is not None
-        assert "50" in err
+        assert "style" in err
 
-    def test_block_count_at_cap_allowed(self):
-        blocks = [self._btn("skill:file-cr") for _ in range(50)]
-        assert _validate_slack_blocks(blocks) is None
+    def test_count_cap(self):
+        items = [self._item(value=f"v{i}") for i in range(13)]
+        err = _validate_interactive_actions(items)
+        assert err is not None
+        assert "12" in err
+
+    def test_count_at_cap_allowed(self):
+        items = [self._item(value=f"v{i}") for i in range(12)]
+        assert _validate_interactive_actions(items) is None
+
+    def test_non_dict_item_rejected(self):
+        err = _validate_interactive_actions(["not-a-dict"])
+        assert err is not None
+
+
+class TestBuildSlackBlocksFromInteractiveActions:
+    """Block Kit composition from interactive_actions items."""
+
+    def test_lead_in_and_single_button(self):
+        blocks = _build_slack_blocks_from_interactive_actions(
+            "*Proposed 1 Customer Request.*",
+            [{"label": "File this", "action_id": "skill:file-cr", "value": "1|1"}],
+        )
+        # section (lead-in), divider, actions (no per-item text).
+        assert blocks[0]["type"] == "section"
+        assert blocks[0]["text"]["text"] == "*Proposed 1 Customer Request.*"
+        assert blocks[1]["type"] == "divider"
+        assert blocks[2]["type"] == "actions"
+        btn = blocks[2]["elements"][0]
+        assert btn["text"]["text"] == "File this"
+        assert btn["action_id"] == "skill:file-cr"
+        assert btn["value"] == "1|1"
+        assert "style" not in btn
+
+    def test_per_item_text_and_style(self):
+        blocks = _build_slack_blocks_from_interactive_actions(
+            "",
+            [{
+                "label": "File this",
+                "action_id": "skill:file-cr",
+                "value": "1|1",
+                "text": "*1.* Title\nCustomer: X",
+                "style": "primary",
+            }],
+        )
+        # No lead-in: divider, section (item text), actions (styled button).
+        assert blocks[0]["type"] == "divider"
+        assert blocks[1]["type"] == "section"
+        assert blocks[1]["text"]["text"] == "*1.* Title\nCustomer: X"
+        assert blocks[2]["type"] == "actions"
+        assert blocks[2]["elements"][0]["style"] == "primary"
+
+    def test_multiple_actions_compose_into_triples(self):
+        blocks = _build_slack_blocks_from_interactive_actions(
+            "*lead-in*",
+            [
+                {"label": "F1", "action_id": "skill:file-cr", "value": "1|1", "text": "a"},
+                {"label": "F2", "action_id": "skill:file-cr", "value": "1|2", "text": "b"},
+            ],
+        )
+        # section + (divider, section, actions) * 2 = 7 blocks.
+        assert len(blocks) == 7
+        assert [b["type"] for b in blocks] == [
+            "section", "divider", "section", "actions",
+            "divider", "section", "actions",
+        ]
 
 
 class TestSendSlackPayload:
