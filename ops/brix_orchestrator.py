@@ -584,12 +584,16 @@ class HermesConversationDecider:
         agent_factory: Any | None = None,
         runtime_resolver: Any | None = None,
         default_model_resolver: Any | None = None,
+        model_catalog_resolver: Any | None = None,
+        model_normalizer: Any | None = None,
         agent_class: Any | None = None,
     ) -> None:
         self._logger = logger or LOGGER
         self._agent_factory = agent_factory
         self._runtime_resolver = runtime_resolver
         self._default_model_resolver = default_model_resolver
+        self._model_catalog_resolver = model_catalog_resolver
+        self._model_normalizer = model_normalizer
         self._agent_class = agent_class
 
     def decide(
@@ -669,20 +673,19 @@ class HermesConversationDecider:
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
             resolver = resolve_runtime_provider
-        requested = (
-            os.getenv("BRIX_ORCHESTRATOR_PROVIDER")
-            or os.getenv("HERMES_INFERENCE_PROVIDER")
-            or None
-        )
+        requested = os.getenv("BRIX_ORCHESTRATOR_PROVIDER", "").strip() or None
         runtime = resolver(requested=requested)
         if not isinstance(runtime, Mapping):
             raise RuntimeError("orchestrator provider resolver returned invalid runtime")
         return runtime
 
     def _resolve_model(self, runtime: Mapping[str, Any]) -> str:
+        provider = str(runtime.get("provider") or "").strip()
         runtime_model = runtime.get("model")
         if isinstance(runtime_model, str) and runtime_model.strip():
-            return runtime_model.strip()
+            resolved = self._provider_compatible_model(runtime_model, provider)
+            if resolved:
+                return resolved
 
         try:
             from hermes_cli.config import load_config
@@ -690,16 +693,67 @@ class HermesConversationDecider:
             cfg = load_config()
             model_cfg = cfg.get("model") if isinstance(cfg, Mapping) else {}
             if isinstance(model_cfg, Mapping):
+                configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+                if configured_provider == "auto":
+                    configured_provider = ""
+                runtime_provider = provider.lower()
                 configured = (
                     str(model_cfg.get("default") or model_cfg.get("model") or "")
                     .strip()
                 )
-                if configured:
-                    return configured
+                if (
+                    configured
+                    and (not configured_provider or configured_provider == runtime_provider)
+                ):
+                    resolved = self._provider_compatible_model(configured, provider)
+                    if resolved:
+                        return resolved
         except Exception:
             pass
 
-        provider = str(runtime.get("provider") or "").strip()
+        return self._default_model_for_provider(provider)
+
+    def _provider_compatible_model(self, model: str, provider: str) -> str:
+        model = str(model or "").strip()
+        if not model:
+            return ""
+        if not provider:
+            return model
+        normalized = self._normalize_model_for_provider(model, provider)
+        if not normalized:
+            return ""
+        if self._model_in_provider_catalog(normalized, provider):
+            return normalized
+        return ""
+
+    def _normalize_model_for_provider(self, model: str, provider: str) -> str:
+        normalizer = self._model_normalizer
+        if normalizer is None:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+
+            normalizer = normalize_model_for_provider
+        try:
+            return str(normalizer(model, provider) or "").strip()
+        except Exception:
+            return str(model or "").strip()
+
+    def _model_in_provider_catalog(self, model: str, provider: str) -> bool:
+        resolver = self._model_catalog_resolver
+        if resolver is None:
+            from hermes_cli.models import provider_model_ids
+
+            resolver = provider_model_ids
+        try:
+            catalog = [str(item).strip() for item in (resolver(provider) or [])]
+        except Exception:
+            return True
+        catalog = [item for item in catalog if item]
+        if not catalog:
+            return True
+        model_lower = model.lower()
+        return any(item.lower() == model_lower for item in catalog)
+
+    def _default_model_for_provider(self, provider: str) -> str:
         if not provider:
             return ""
         resolver = self._default_model_resolver

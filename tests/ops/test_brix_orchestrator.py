@@ -664,6 +664,7 @@ def test_orchestrator_decider_resolves_runtime_before_building_agent(monkeypatch
         }
 
     monkeypatch.setenv("BRIX_ORCHESTRATOR_PROVIDER", "openai-codex")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "anthropic")
     decider = brix.HermesConversationDecider(
         runtime_resolver=runtime_resolver,
         default_model_resolver=lambda provider: f"default-for-{provider}",
@@ -700,6 +701,67 @@ def test_orchestrator_decider_resolves_runtime_before_building_agent(monkeypatch
     assert kwargs["credential_pool"] == "pool"
     assert kwargs["model"] == "default-for-openai-codex"
     assert kwargs["platform"] == "brix-orchestrator"
+
+
+def test_orchestrator_decider_lets_shared_resolver_handle_unset_provider(monkeypatch):
+    calls = []
+
+    def runtime_resolver(*, requested=None):
+        calls.append(requested)
+        return {"provider": "openai-codex"}
+
+    monkeypatch.delenv("BRIX_ORCHESTRATOR_PROVIDER", raising=False)
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "anthropic")
+
+    decider = brix.HermesConversationDecider(runtime_resolver=runtime_resolver)
+
+    assert decider._resolve_runtime() == {"provider": "openai-codex"}
+    assert calls == [None]
+
+
+def test_orchestrator_decider_falls_back_from_stale_config_model(monkeypatch):
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "openai-codex",
+                "default": "anthropic/claude-sonnet-4.6",
+            }
+        },
+    )
+    decider = brix.HermesConversationDecider(
+        default_model_resolver=lambda provider: f"default-for-{provider}",
+        model_catalog_resolver=lambda provider: ["gpt-5.3-codex", "gpt-5.4"],
+    )
+
+    assert (
+        decider._resolve_model({"provider": "openai-codex"})
+        == "default-for-openai-codex"
+    )
+
+
+def test_orchestrator_decider_uses_normalized_compatible_config_model(monkeypatch):
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "openai-codex",
+                "default": "openai/gpt-5.4",
+            }
+        },
+    )
+    decider = brix.HermesConversationDecider(
+        default_model_resolver=lambda provider: f"default-for-{provider}",
+        model_catalog_resolver=lambda provider: ["gpt-5.3-codex", "gpt-5.4"],
+    )
+
+    assert decider._resolve_model({"provider": "openai-codex"}) == "gpt-5.4"
 
 
 def test_fake_quay_rejects_double_human_escalation_without_reply():
