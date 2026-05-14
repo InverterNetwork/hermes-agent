@@ -238,7 +238,8 @@ class RecordingQuayRunner:
             return FakeCompletedProcess(
                 '{"task_id":"task-cli","repo_id":"repo-1","state":"claimed-by-orchestrator",'
                 '"external_ref":"BRIX-1405","branch_name":"quay/task",'
-                '"slack_thread_ref":"GPRIVATE123:999.000000"}\n'
+                '"slack_thread_ref":"GPRIVATE123:999.000000",'
+                '"authors_json":"[{\\"slack_id\\":\\"U06TDC56VJB\\"}]"}\n'
             )
         if command == ["artifact", "get", "task-cli", "blocker"]:
             return FakeCompletedProcess("blocked on product input\n")
@@ -352,7 +353,14 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
         user_id="U123",
         ts="1001.000000",
     )
-    quay = FakeQuayClient(handoff)
+    task = brix.TaskContext(
+        task_id=handoff.task_id,
+        title="Fix stuck worker",
+        issue="BRIX-1405",
+        repo_id="hermes-agent",
+        metadata={"authors_json": '[{"slack_id":"U06TDC56VJB"}]'},
+    )
+    quay = FakeQuayClient(handoff, task=task)
     slack = FakeSlackClient(reply)
     decider = FakeDecider([ready("Use the default route.")])
     config = brix.OrchestratorConfig(
@@ -371,6 +379,7 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
 
     assert result.status == "submitted_from_human_reply"
     assert slack.questions[0][0] == "C1234567890"
+    assert "Contributor: <@U06TDC56VJB>" in slack.questions[0][1]
     assert slack.questions[0][2] is None
     assert quay.escalated[2] == "C1234567890:1000.000000"
     assert quay.recorded_reply[2] == "C1234567890:1000.000000"
@@ -860,6 +869,20 @@ def test_human_question_mentions_legacy_flash_tag_author_on_fallback_route():
     assert route == brix.SlackRoute(channel_id="C1234567890", source="fallback_channel")
 
 
+def test_human_question_omits_contributor_without_author_metadata():
+    task = brix.TaskContext(
+        task_id="task-no-author",
+        title="No author",
+        metadata={"authors_json": "not-json"},
+    )
+    handoff = brix.Handoff(handoff_id="handoff-no-author", task_id=task.task_id)
+
+    question = brix.build_human_question(handoff, task, None)
+
+    assert "Contributor:" not in question
+    assert "<@" not in question
+
+
 def test_stale_metadata_route_falls_back_and_records_fallback_thread():
     handoff = brix.Handoff(handoff_id="handoff-stale", task_id="task-stale")
     task = brix.TaskContext(
@@ -1060,6 +1083,7 @@ def test_quay_cli_client_uses_ast_121_human_reply_contract():
     task = client.get_task_context(handoff.task_id)
     assert task.repo_id == "repo-1"
     assert task.metadata["slack_thread_ref"] == "GPRIVATE123:999.000000"
+    assert task.metadata["authors"] == [{"slack_id": "U06TDC56VJB"}]
     artifact = client.get_artifact(handoff)
     assert artifact.text == "blocked on product input\n"
 
