@@ -717,7 +717,7 @@ def _check_codex_prereqs(s: _State) -> None:
     """Codex CLI host-prep checks — fire only when the active quay agent
     invocation path references `codex`. setup-hermes.sh provisions the binary
     in a root-owned managed path; verify confirms the binary is runnable and the
-    operator completed `codex login` when token material is present. ChatGPT
+    operator completed `codex login` with usable token material. ChatGPT
     subscription auth — never OPENAI_API_KEY."""
     rc, out, _ = _run([
         *_sudo_prefix_for(s.agent_owner), "bash", "-c", "codex --version",
@@ -766,9 +766,9 @@ def _check_codex_prereqs(s: _State) -> None:
     # pass verify while workers fail at runtime.
     auth_path = codex_dir / "auth.json"
     if not auth_path.is_file():
-        s.v_ok(
-            f"codex auth pending: missing {auth_path} "
-            f"(run `sudo -u {s.agent_owner} -H codex login`)",
+        s.v_drift(
+            "codex auth",
+            f"missing {auth_path} — run `sudo -u {s.agent_owner} -H codex login`",
         )
         return
     try:
@@ -1101,6 +1101,12 @@ def _check_systemd(s: _State) -> None:
     ]
     if s.quay_version:
         timers.append("quay-tick.timer")
+        if _values_get(
+            s.values_file,
+            s.values_helper,
+            "quay.orchestrator.enabled",
+        ) == "true":
+            timers.append("brix-orchestrator.timer")
     # Reviewer timer is install-gated by the reviewer auth block having
     # staged /etc/hermes/reviewer.env; presence of that file is the
     # ground truth (same probe we use for _check_reviewer_token).
@@ -1342,15 +1348,16 @@ def run(
     if values_file.is_file() and values_helper.is_file():
         quay_version = _values_get(values_file, values_helper, "quay.version")
         if quay_version:
-            agent_invocation = _values_get(
-                values_file, values_helper, "quay.agent_invocation",
+            rc, active_out, _ = _values_helper_run(
+                values_helper, "active-agent-invocations", values_file=values_file,
             )
-            try:
-                from .config import _codex_invocation_active, load_values
-
-                codex_required = _codex_invocation_active(load_values(values_file))
-            except Exception:
-                codex_required = "codex" in agent_invocation
+            if rc == 0:
+                agent_invocation = active_out
+            else:
+                agent_invocation = _values_get(
+                    values_file, values_helper, "quay.agent_invocation",
+                )
+            codex_required = "codex" in agent_invocation
 
     quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
 

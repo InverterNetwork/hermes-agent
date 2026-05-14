@@ -359,11 +359,16 @@ QUAY_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/quay"
 QUAY_EXPECTED_SHA_DST="$QUAY_EXPECTED_SHA_DIR/SHA256SUM.expected"
 QUAY_ENABLED=0
 QUAY_EXPECTED_SHA=""
+BRIX_ORCHESTRATOR_ENABLED=0
 
 if [[ -z "$QUAY_VERSION" ]]; then
   echo "==> quay.version unset in $VALUES_FILE; skipping quay provisioning"
 else
   QUAY_ENABLED=1
+  BRIX_ORCHESTRATOR_ENABLED_RAW="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.orchestrator.enabled 2>/dev/null || true)"
+  if [[ "$BRIX_ORCHESTRATOR_ENABLED_RAW" == "true" ]]; then
+    BRIX_ORCHESTRATOR_ENABLED=1
+  fi
   case "$(uname -m)" in
     x86_64)  QUAY_ARCH="amd64" ;;
     aarch64) QUAY_ARCH="arm64" ;;
@@ -434,36 +439,30 @@ fi
 PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
   ensure-runtimes --values "$VALUES_FILE"
 
-# ---------- codex worker CLI ----------
-# If the active quay worker/reviewer invocation references the Codex CLI,
-# install the pinned static binary under the agent user and expose it via
-# /usr/local/bin/codex. Auth is still interactive and remains operator-side.
-if [[ "$QUAY_ENABLED" -eq 1 ]]; then
-  PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
-    ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
-fi
-
-# ---------- agent CLI prerequisite checks ----------
-# Fail loud here (before any user-side provisioning) rather than letting
-# the agent invoke fail with a cryptic "command not found" hours later.
+# ---------- agent CLI provisioning / prerequisite checks ----------
 # Each agent the deployment may invoke (claude, codex) gets its own gate,
-# triggered by a substring match against quay.agent_invocation.
+# triggered by a substring match against active quay agent invocations.
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
-  agent_invocation="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.agent_invocation)"
-  if [[ "$agent_invocation" == *claude* ]]; then
-    if ! sudo -u "$AGENT_USER" -H bash -c 'command -v claude' >/dev/null 2>&1; then
-      echo "FAIL: quay.agent_invocation references 'claude' but the claude binary is not on PATH for $AGENT_USER" >&2
-      echo "      Install it (as $AGENT_USER) before re-running setup-hermes.sh:" >&2
-      echo "        sudo -u $AGENT_USER -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'" >&2
-      echo "        sudo ln -sf ~$AGENT_USER/.local/bin/claude /usr/local/bin/claude" >&2
-      echo "        sudo -u $AGENT_USER -H claude login" >&2
-      echo "      See ops/README.md → 'Pre-install: claude CLI' for details." >&2
+  agent_invocations="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" active-agent-invocations)"
+  if [[ "$agent_invocations" == *codex* ]]; then
+    # Binary is root-managed; `codex login` remains an operator step under
+    # the agent user's home so OAuth material stays agent-owned.
+    PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+      ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
+  fi
+  if [[ "$agent_invocations" == *claude* ]]; then
+    echo "==> provisioning claude CLI for $AGENT_USER"
+    sudo -u "$AGENT_USER" -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+    CLAUDE_AGENT_BIN="$AGENT_HOME/.local/bin/claude"
+    if [[ ! -x "$CLAUDE_AGENT_BIN" ]]; then
+      echo "FAIL: claude installer completed but $CLAUDE_AGENT_BIN is missing or not executable" >&2
       exit 1
     fi
+    ln -sf "$CLAUDE_AGENT_BIN" /usr/local/bin/claude
   fi
-  if [[ "$agent_invocation" == *codex* ]]; then
+  if [[ "$agent_invocations" == *codex* ]]; then
     if ! sudo -u "$AGENT_USER" -H bash -c 'command -v codex' >/dev/null 2>&1; then
-      echo "FAIL: quay.agent_invocation references 'codex' but the codex binary is not on PATH for $AGENT_USER" >&2
+      echo "FAIL: an active quay invocation references 'codex' but the codex binary is not on PATH for $AGENT_USER" >&2
       echo "      setup-hermes.sh should have installed the pinned codex binary from quay.codex;" >&2
       echo "      check the ensure-codex error above, then run codex login as $AGENT_USER." >&2
       exit 1
@@ -932,6 +931,16 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
     render-quay-config --out "$QUAY_CONFIG_OUT" --force
   chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
   chmod 0644 "$QUAY_CONFIG_OUT"
+
+  # BRIX orchestrator config is separate from quay/config.toml because these
+  # are sidecar runtime knobs. The runner reads this file for Slack fallback
+  # routing and polling settings.
+  BRIX_ORCHESTRATOR_CONFIG_OUT="$TARGET_DIR/quay/orchestrator.json"
+  echo "==> rendering $BRIX_ORCHESTRATOR_CONFIG_OUT from $VALUES_FILE"
+  python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+    render-brix-orchestrator-config --out "$BRIX_ORCHESTRATOR_CONFIG_OUT" --force
+  chown "$AGENT_USER:$AGENT_USER" "$BRIX_ORCHESTRATOR_CONFIG_OUT"
+  chmod 0644 "$BRIX_ORCHESTRATOR_CONFIG_OUT"
 
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/quay/repos"
 fi
@@ -1511,6 +1520,56 @@ elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
     || echo "==> WARNING: $QUAY_TICK_SRC missing; skipping quay-tick install" >&2
   [[ -f "$QUAY_TICK_RUNNER_SRC" ]] \
     || echo "==> WARNING: $QUAY_TICK_RUNNER_SRC missing; skipping quay-tick install" >&2
+fi
+
+# ---------- brix-orchestrator ----------
+# Sidecar runner for durable orchestrator handoffs. Installed only when
+# quay.orchestrator.enabled=true; by default the files ship dormant until the
+# deployment opts into BRIX-owned Slack posting and reply polling.
+
+BRIX_ORCH_SERVICE_SRC="$OPS_DIR/brix-orchestrator.service"
+BRIX_ORCH_TIMER_SRC="$OPS_DIR/brix-orchestrator.timer"
+BRIX_ORCH_RUNNER_SRC="$OPS_DIR/brix-orchestrator-runner"
+BRIX_ORCH_RUNNER_DST="/usr/local/sbin/brix-orchestrator-runner"
+
+if [[ "$QUAY_ENABLED" -eq 1 && "$BRIX_ORCHESTRATOR_ENABLED" -eq 1 && -f "$BRIX_ORCH_SERVICE_SRC" && -f "$BRIX_ORCH_TIMER_SRC" && -f "$BRIX_ORCH_RUNNER_SRC" ]]; then
+  echo "==> installing brix-orchestrator-runner at $BRIX_ORCH_RUNNER_DST"
+  install -o root -g root -m 0755 "$BRIX_ORCH_RUNNER_SRC" "$BRIX_ORCH_RUNNER_DST"
+
+  install -d -o root -g root -m 0755 /etc/default
+  if [[ -f /etc/default/brix-orchestrator ]]; then
+    echo "==> /etc/default/brix-orchestrator already present (preserving)"
+  else
+    echo "==> seeding /etc/default/brix-orchestrator"
+    cat >/etc/default/brix-orchestrator <<'EOF'
+# Generated by setup-hermes.sh - overrides for brix-orchestrator.service.
+# Edits here survive re-runs of the installer. Default Slack routing and
+# poll/timeout knobs come from <HERMES_HOME>/quay/orchestrator.json.
+EOF
+    chown root:root /etc/default/brix-orchestrator
+    chmod 0644 /etc/default/brix-orchestrator
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd timer for brix-orchestrator (user=$AGENT_USER)"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        "$BRIX_ORCH_SERVICE_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/brix-orchestrator.service
+    install -o root -g root -m 0644 \
+      "$BRIX_ORCH_TIMER_SRC" /etc/systemd/system/brix-orchestrator.timer
+    systemctl daemon-reload
+    systemctl enable --now brix-orchestrator.timer
+  else
+    echo "==> systemctl not present; skipping brix-orchestrator timer enable" >&2
+  fi
+elif [[ "$QUAY_ENABLED" -eq 1 && "$BRIX_ORCHESTRATOR_ENABLED" -eq 1 ]]; then
+  [[ -f "$BRIX_ORCH_SERVICE_SRC" ]] \
+    || echo "==> WARNING: $BRIX_ORCH_SERVICE_SRC missing; skipping brix-orchestrator install" >&2
+  [[ -f "$BRIX_ORCH_TIMER_SRC" ]] \
+    || echo "==> WARNING: $BRIX_ORCH_TIMER_SRC missing; skipping brix-orchestrator install" >&2
+  [[ -f "$BRIX_ORCH_RUNNER_SRC" ]] \
+    || echo "==> WARNING: $BRIX_ORCH_RUNNER_SRC missing; skipping brix-orchestrator install" >&2
 fi
 
 # ---------- hermes-reviewer-token ----------

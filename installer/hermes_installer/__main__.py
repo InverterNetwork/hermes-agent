@@ -4,8 +4,8 @@
   ``repos[].quay.package_manager`` entries declare. Idempotent. Refuses
   on SHA mismatch or missing pin. Requires euid 0 unless
   ``--skip-root-check`` is passed (tests only).
-* ``ensure-codex`` — provision the pinned Codex CLI for the agent user
-  when the active quay agent invocation path references ``codex``.
+* ``ensure-codex`` — provision the pinned Codex CLI as a root-managed
+  binary when the active quay agent invocation path references ``codex``.
 * ``verify`` — read-only health check. Inspects the live install for drift
   and exits 0 (no drift) or 1 (drift detected). No root required.
 """

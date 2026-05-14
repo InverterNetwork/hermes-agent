@@ -206,7 +206,7 @@ class TestRenderGatewayRuntimeEnv:
         text = out.read_text()
         assert "SLACK_ALLOWED_USERS=U01ABC2DEF,U02GHI3JKL" in text
 
-    def test_empty_list_omits_line(self, tmp_path: Path):
+    def test_empty_list_clears_stale_env(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
             "slack:\n  runtime:\n    allowed_users: []\n", encoding="utf-8"
@@ -215,7 +215,7 @@ class TestRenderGatewayRuntimeEnv:
         r = _run(values, "render-gateway-runtime-env", "--out", str(out))
         assert r.returncode == 0, r.stderr
         text = out.read_text()
-        assert "SLACK_ALLOWED_USERS" not in text
+        assert "SLACK_ALLOWED_USERS=\n" in text
 
     def test_missing_slack_section_still_creates_file(self, tmp_path: Path):
         # The installer chowns/chmods the output path right after; the helper
@@ -488,6 +488,144 @@ class TestMergeConfigModel:
         r = _run(values, "merge-config-model", "--out", str(config))
         assert r.returncode == 1
         assert "not valid YAML" in r.stderr
+
+    def test_writes_vision_pin_when_set(self, tmp_path: Path):
+        # Pinning vision_provider + vision_model from values lands in
+        # auxiliary.vision.{provider,model} so the gateway's vision_analyze
+        # path resolves a client at runtime.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_provider: codex\n"
+            "  vision_model: gpt-5.3-codex\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["auxiliary"]["vision"]["provider"] == "codex"
+        assert loaded["auxiliary"]["vision"]["model"] == "gpt-5.3-codex"
+
+    def test_drops_stale_vision_pin_when_values_empty(self, tmp_path: Path):
+        # Removing the pin from values must clear the rendered config so the
+        # gateway returns to auto-detect on the next install. Same declarative
+        # drop semantics as model.base_url.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai-codex\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: stale-provider\n"
+            "    model: stale-model\n"
+            "  web_extract:\n"
+            "    provider: openrouter\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        # vision sub-block fully removed, but operator-set web_extract preserved.
+        assert "vision" not in loaded["auxiliary"]
+        assert loaded["auxiliary"]["web_extract"]["provider"] == "openrouter"
+
+    def test_drops_auxiliary_when_only_vision_was_present(self, tmp_path: Path):
+        # When clearing vision leaves auxiliary empty, drop auxiliary too,
+        # so the rendered config doesn't accumulate `auxiliary: {}` litter.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai-codex\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: stale\n"
+            "    model: stale\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert "auxiliary" not in loaded
+
+    def test_vision_provider_only_drops_model(self, tmp_path: Path):
+        # Providers with sensible vision defaults (openrouter, nous) don't
+        # need an explicit model. Accept provider-only and clear any stale
+        # model so the provider's own default takes effect.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_provider: openrouter\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n  vision:\n    provider: codex\n    model: stale-model\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["auxiliary"]["vision"]["provider"] == "openrouter"
+        assert "model" not in loaded["auxiliary"]["vision"]
+
+    def test_preserves_operator_keys_inside_vision_block(self, tmp_path: Path):
+        # Operator hand-added vision-task keys (e.g. timeout) must survive
+        # when values drops the merged provider/model pins. Guards against a
+        # future refactor swapping `vision_block.pop(...)` for a wholesale
+        # reset.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai-codex\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: stale\n"
+            "    model: stale\n"
+            "    timeout: 45\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        # Operator's timeout survives; merged keys cleared.
+        assert loaded["auxiliary"]["vision"] == {"timeout": 45}
+
+    def test_rejects_non_string_vision_provider(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_provider: 123\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.vision_provider" in r.stderr
+
+    def test_rejects_non_string_vision_model(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_model: [list, not, string]\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.vision_model" in r.stderr
 
 
 class TestRenderQuayConfig:
@@ -862,6 +1000,79 @@ class TestRenderQuayConfig:
         assert not out.exists()
 
 
+class TestRenderBrixOrchestratorConfig:
+    def test_absent_block_renders_disabled_defaults(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert json.loads(out.read_text()) == {
+            "default_slack_channel": "",
+            "enabled": False,
+            "poll_interval_seconds": 15,
+            "quay_command": "/usr/local/bin/quay",
+            "reply_timeout_seconds": 1800,
+            "slack_token_env": "SLACK_BOT_TOKEN",
+        }
+
+    def test_renders_enabled_channel_and_polling_knobs(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  orchestrator:\n"
+            "    enabled: true\n"
+            "    default_slack_channel: C1234567890\n"
+            "    slack_token_env: QUAY_SLACK_TOKEN\n"
+            "    quay_command: /usr/local/bin/quay-as-hermes\n"
+            "    reply_timeout_seconds: 120\n"
+            "    poll_interval_seconds: 5\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        cfg = json.loads(out.read_text())
+        assert cfg["enabled"] is True
+        assert cfg["default_slack_channel"] == "C1234567890"
+        assert cfg["slack_token_env"] == "QUAY_SLACK_TOKEN"
+        assert cfg["quay_command"] == "/usr/local/bin/quay-as-hermes"
+        assert cfg["reply_timeout_seconds"] == 120
+        assert cfg["poll_interval_seconds"] == 5
+
+    def test_invalid_channel_fails(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  orchestrator:\n"
+            "    default_slack_channel: not-a-channel\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "default_slack_channel" in r.stderr
+        assert not out.exists()
+
+    def test_validate_schema_checks_orchestrator_shape(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  orchestrator:\n"
+            '    enabled: "yes"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "quay.orchestrator.enabled must be a bool" in r.stderr
+
+
 class TestRenderQuayConfigAgents:
     """`quay.agents` block: emits `[agents]` plus a
     `[agents.invocations.<id>]` table per agent id. Legacy
@@ -913,6 +1124,64 @@ class TestRenderQuayConfigAgents:
         assert 'reviewer = "claude --bar < {prompt_file}"' in text
         assert "[agents.invocations.codex]" in text
         assert 'worker = "codex --baz < {prompt_file}"' in text
+
+    def test_active_agent_invocations_legacy_uses_agent_invocation(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "active-agent-invocations")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == "claude < {prompt_file}\n"
+
+    def test_active_agent_invocations_resolves_only_configured_roles(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude legacy < {prompt_file}"\n'
+            "  agents:\n"
+            "    worker: codex\n"
+            "    reviewer: claude\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude inactive-worker < {prompt_file}"\n'
+            '        reviewer: "claude review < {prompt_file}"\n'
+            "      codex:\n"
+            '        worker: "codex exec < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "active-agent-invocations")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == [
+            "codex exec < {prompt_file}",
+            "claude review < {prompt_file}",
+        ]
+
+    def test_active_agent_invocations_codex_only_excludes_legacy_claude(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude legacy < {prompt_file}"\n'
+            "  agents:\n"
+            "    worker: codex\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude inactive < {prompt_file}"\n'
+            "      codex:\n"
+            '        worker: "codex exec < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "active-agent-invocations")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == "codex exec < {prompt_file}\n"
 
     def test_legacy_agent_invocation_still_required_with_new_block(
         self, tmp_path: Path

@@ -39,6 +39,7 @@ from gateway.platforms.helpers import MessageDeduplicator
 from gateway.slack_triggers import (
     SlackTriggerConfigError,
     SlackTriggerRouter,
+    STATUS_SKIPPED_NOT_TOP_LEVEL,
     STATUS_FAILED,
     STATUS_FINISHED,
     STATUS_STARTED,
@@ -725,6 +726,17 @@ class SlackAdapter(BasePlatformAdapter):
                 "hermes_confirm_cancel",
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
+
+            # Register the generic skill-invoke action handler. Any Block Kit
+            # button whose action_id matches `skill:<name>` (where <name>
+            # mirrors the skill-name allowlist from agent/skill_commands.py)
+            # dispatches as if the operator had typed `/<name> <value>` in
+            # the channel. Skills opt into this by including such a button
+            # in their threaded posts; nothing else changes about the skill
+            # contract.
+            self._app.action(re.compile(r"^skill:[a-z0-9][a-z0-9-]*$"))(
+                self._handle_skill_invoke_action
+            )
 
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
@@ -2032,8 +2044,9 @@ class SlackAdapter(BasePlatformAdapter):
         Returns ``True`` when the event was consumed (the trigger fired,
         or was deliberately skipped for trigger-specific reasons like
         rate-limit, dedup, or bot-gate). Returns ``False`` when the
-        channel isn't trigger-bound — the caller falls through to the
-        normal Slack message path.
+        channel isn't trigger-bound, or when a trigger-bound thread reply
+        was skipped by the top-level filter and should continue through
+        the normal Slack discussion/session path.
         """
         router = self._trigger_router
         if router is None:
@@ -2059,9 +2072,10 @@ class SlackAdapter(BasePlatformAdapter):
             # Channel isn't trigger-bound — fall through to normal flow.
             return False
         if trigger is None:
-            # Channel IS trigger-bound but this event is skipped (top-level
-            # filter, bot gate, dedup, rate-limit). Consume so it doesn't
-            # re-enter the normal flow.
+            # Channel IS trigger-bound but this event is skipped by the
+            # trigger router. Most skip reasons are consumed here so they
+            # don't re-enter the normal flow; top-level-filter skips fall
+            # through below so existing handoff threads can stay interactive.
             bound = router.get(channel_id)
             logger.info(
                 "[Slack][trigger] channel=%s skill=%s ts=%s status=%s",
@@ -2070,6 +2084,14 @@ class SlackAdapter(BasePlatformAdapter):
                 message_ts,
                 status,
             )
+            if status == STATUS_SKIPPED_NOT_TOP_LEVEL:
+                # This prevents retriggering the entry skill while still
+                # allowing humans to continue the bot-created handoff thread.
+                # Bot-authored replies stay consumed here so bot-id-only
+                # Slack events cannot fall into the normal session path.
+                if is_bot_message(bot_id=bot_id, subtype=subtype):
+                    return True
+                return False
             return True
 
         # Trigger matched — build envelope and dispatch.
@@ -2775,6 +2797,77 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve gateway approval from Slack button: %s", exc)
 
         # (approval state already consumed by atomic pop above)
+
+    # ----- Generic skill-invoke action button -----
+
+    async def _handle_skill_invoke_action(self, ack, body, action) -> None:
+        """Handle a generic `skill:<name>` Block Kit button click.
+
+        Translates the click into a slash-command-equivalent dispatch so the
+        target skill sees the same MessageEvent shape as if the operator had
+        typed ``/<skill-name> <args>`` in the channel. This is the standard
+        ergonomic surface for skills that need operator confirmation on a
+        prior bot post (e.g. ``feedback-intake`` posts a proposal with a
+        "File these requests" button bound to ``skill:file-cr``).
+
+        Authz mirrors ``_handle_approval_action``: button clicks bypass the
+        normal message auth flow, so SLACK_ALLOWED_USERS gates clicks too.
+        """
+        await ack()
+        action_id = action.get("action_id", "")
+        if not action_id.startswith("skill:"):
+            logger.debug(
+                "[Slack] skill-invoke handler got non-skill action_id: %s",
+                action_id,
+            )
+            return
+        skill_name = action_id[len("skill:") :]
+        if not skill_name:
+            logger.warning(
+                "[Slack] skill-invoke action with empty skill name: %s",
+                action_id,
+            )
+            return
+        args = action.get("value", "") or ""
+
+        user = body.get("user", {})
+        user_id = user.get("id", "")
+        user_name = user.get("name", "unknown")
+        channel = body.get("channel", {})
+        channel_id = channel.get("id", "")
+        team_id = body.get("team", {}).get("id", "")
+
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized skill-invoke click by %s (%s) for %s — ignoring",
+                    user_name,
+                    user_id,
+                    action_id,
+                )
+                return
+
+        logger.info(
+            "[Slack] skill-invoke button click: action=%s skill=%s user=%s channel=%s",
+            action_id,
+            skill_name,
+            user_id,
+            channel_id,
+        )
+
+        # Reuse the slash-command dispatch path — the skill sees the same
+        # MessageEvent shape it would have seen from a typed `/<skill> <args>`.
+        fake_command = {
+            "command": f"/{skill_name}",
+            "text": args,
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "team_id": team_id,
+            "response_url": body.get("response_url", ""),
+        }
+        await self._handle_slash_command(fake_command)
 
     # ----- Thread context fetching -----
 

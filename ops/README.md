@@ -1,6 +1,6 @@
-# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick
+# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + brix-orchestrator
 
-Five units live here:
+Seven units live here:
 
 * **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
   repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
@@ -29,6 +29,10 @@ Five units live here:
   `/usr/local/bin/quay tick`. `QUAY_DATA_DIR` points at
   `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
   carrying a `quay:` block.
+* **`brix-orchestrator`** — optional BRIX sidecar for durable Quay
+  orchestrator handoffs. It is gated by `quay.orchestrator.enabled` and
+  reads `<HERMES_HOME>/quay/orchestrator.json` for Slack fallback
+  routing and polling while using the Quay CLI for handoff state.
 * **`hermes-reviewer-token`** — 30-min oneshot that refreshes
   `/run/hermes/reviewer-gh-token` from a *second* GitHub App (the
   reviewer identity), so quay's reviewer worker can post APPROVE reviews
@@ -59,6 +63,10 @@ Five units live here:
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
+| `ops/brix_orchestrator.py`                 | BRIX handoff drain loop. Defines the Quay CLI adapter, Slack question/discussion flow with original-thread routing plus fallback-channel support, orchestrator decision handling, JSON event logging, metrics, and lock wrapper. |
+| `ops/brix-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/brix-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `brix_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
+| `ops/brix-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `BRIX_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. |
+| `ops/brix-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
 | `ops/hermes-reviewer-token.service`        | systemd service unit (oneshot). Mints the reviewer App's installation token via `installer/hermes_github_token.py write-token` and writes it to `/run/hermes/reviewer-gh-token`. `User=__AGENT_USER__` and `__TARGET_DIR__` templated by `setup-hermes.sh`. |
 | `ops/hermes-reviewer-token.timer`          | systemd timer unit. `OnBootSec=30s` + 30-min steady cadence. |
 | `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
@@ -83,28 +91,22 @@ installer is the supported path.
 Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
 `installer/setup-hermes.sh`.
 
-## Pre-install: claude CLI (quay workers)
+## Pre-install: claude auth (quay workers)
 
-`quay-tick` shells out to `claude` to run the agent worker. Install it as the
-agent user before running `setup-hermes.sh` (the installer fails loud if
-`quay.agent_invocation` references `claude` and the binary is absent).
+`quay-tick` shells out to `claude` to run the agent worker. When an active
+quay invocation references `claude`, `setup-hermes.sh` installs the CLI as the
+agent user and reconciles `/usr/local/bin/claude` to
+`~<agent>/.local/bin/claude`.
 
-Install (lands in `~<agent>/.local/bin/`):
-
-```sh
-sudo -u <agent> -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-sudo ln -sf ~<agent>/.local/bin/claude /usr/local/bin/claude
-```
-
-Log in (subscription mode — interactive; complete before running the installer):
+Log in once after the installer has provisioned the binary (subscription mode
+— interactive browser OAuth):
 
 ```sh
 sudo -u <agent> -H claude login
 ```
 
-The symlink makes `claude` available system-wide so root-owned scripts can
-invoke it. The login caches credentials under `~<agent>/.claude/` and is
-read by the worker process which runs as the agent user.
+The login caches credentials under `~<agent>/.claude/` and is read by the
+worker process which runs as the agent user.
 
 ## Pre-install: codex CLI (quay workers)
 
@@ -122,8 +124,8 @@ vs. `~<agent>/.hermes/auth.json`) — the codex CLI manages its own session.
 
 Install is automatic during `setup-hermes.sh`: the installer downloads the
 `openai/codex` GitHub release asset pinned at `quay.codex.version`, verifies
-`quay.codex.linux_x64_sha256`, installs it as
-`~<agent>/.local/bin/codex`, and creates `/usr/local/bin/codex` as a
+`quay.codex.linux_x64_sha256`, installs it as a root-owned managed binary
+beside `/usr/local/bin/codex`, and exposes `/usr/local/bin/codex` as a
 root-owned symlink. The remaining manual step is authentication.
 
 Log in after the installer has restored the binary (interactive — opens a
@@ -481,10 +483,10 @@ of the registered repos live at `<HERMES_HOME>/quay/repos/<id>.git`.
 
 ## Worker auth
 
-The worker (`agent_invocation` in `quay/config.toml`) needs an LLM
-credential, which depends on whether the invocation calls `claude` or
-`codex`. See the pre-install sections above for the install + login
-bootstrap; this section just covers the runtime credential model.
+The worker (`agent_invocation` / active `agents.invocations.*` entry in
+`quay/config.toml`) needs an LLM credential, which depends on whether the
+invocation calls `claude` or `codex`. See the pre-install sections above for
+the login bootstrap; this section just covers the runtime credential model.
 
 ### Claude worker (`agent_invocation` calls `claude`)
 
