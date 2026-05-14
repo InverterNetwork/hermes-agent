@@ -1100,6 +1100,12 @@ def _check_systemd(s: _State) -> None:
     ]
     if s.quay_version:
         timers.append("quay-tick.timer")
+        if _values_get(
+            s.values_file,
+            s.values_helper,
+            "quay.orchestrator.enabled",
+        ) == "true":
+            timers.append("brix-orchestrator.timer")
     # Reviewer timer is install-gated by the reviewer auth block having
     # staged /etc/hermes/reviewer.env; presence of that file is the
     # ground truth (same probe we use for _check_reviewer_token).

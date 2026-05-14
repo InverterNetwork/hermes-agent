@@ -183,8 +183,8 @@ class TestRouterEvaluate:
 
     def test_thread_reply_skipped_loop_prevention(self):
         """A threaded reply has thread_ts set and != ts — the load-bearing
-        loop-prevention guarantee. Without this the entry skill's own
-        reply would re-trigger the router."""
+        loop-prevention guarantee. Human replies can still fall through
+        to the normal Slack discussion/session path."""
         router, _ = _make_router()
         parent_ts = "1700000000.000050"
         reply_ts = "1700000000.000100"
@@ -194,6 +194,22 @@ class TestRouterEvaluate:
         )
         assert trigger is None
         assert status == STATUS_SKIPPED_NOT_TOP_LEVEL
+
+    def test_threaded_self_message_skipped_before_top_level_filter(self):
+        """Bot-id-only self replies must remain consumed instead of being
+        classified as human discussion fallthrough candidates."""
+        router, _ = _make_router(accept_from_bots=True)
+        router._bot_id = "B_BOT"
+        trigger, status = router.evaluate(
+            channel_id=CHAN,
+            message_ts="1700000000.000100",
+            thread_ts="1700000000.000050",
+            bot_id="B_BOT",
+            user_id=None,
+            subtype="bot_message",
+        )
+        assert trigger is None
+        assert status == STATUS_SKIPPED_SELF
 
     def test_bot_message_skipped_by_default(self):
         router, _ = _make_router()

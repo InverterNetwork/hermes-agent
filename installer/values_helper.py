@@ -37,6 +37,11 @@ Subcommands:
                                   when no ``quay.agents`` block exists; otherwise
                                   resolves ``quay.agents.<role>`` through
                                   ``quay.agents.invocations.<id>.<role>``.
+  render-brix-orchestrator-config <out>
+                                — write ~/.hermes/quay/orchestrator.json from
+                                  quay.orchestrator. This is BRIX-side config
+                                  for fallback Slack routing and polling; it
+                                  intentionally does not enter quay config.toml.
   render-gateway-org-defaults --out <path>
                                 — write a compact org-defaults seed file
                                   derived from `repos[]` + `linear.teams`.
@@ -355,10 +360,19 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     interactive command approval prompts, but the hardline blocklist remains
     enforced.
 
+    Also pins ``auxiliary.vision.{provider,model}`` from
+    ``gateway.vision_provider`` / ``gateway.vision_model`` when set;
+    unset/empty drops the key declaratively (same model as
+    ``model.base_url``) so removing the pin from values actually takes
+    effect on the next install. When both keys end up empty the
+    surrounding ``auxiliary.vision`` and ``auxiliary`` blocks drop so
+    the seeded config doesn't accumulate empty mappings.
+
     Roundtrips through PyYAML, so YAML-level comments inside config.yaml
     are not preserved (matching ``hermes_cli.config.save_config``'s existing
-    behavior). Operator-added *keys* survive — only the model.provider and
-    model.base_url scalars are touched.
+    behavior). Operator-added *keys* survive: only the touched scalars
+    (``model.provider``, ``model.base_url``, ``approvals.mode``,
+    ``auxiliary.vision.{provider,model}``) are rewritten.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -377,6 +391,18 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     if base_url is not None and not isinstance(base_url, str):
         sys.stderr.write(
             "values_helper.py: gateway.model_base_url, if set, must be a string\n"
+        )
+        return 1
+    vision_provider = gateway.get("vision_provider")
+    vision_model = gateway.get("vision_model")
+    if vision_provider is not None and not isinstance(vision_provider, str):
+        sys.stderr.write(
+            "values_helper.py: gateway.vision_provider, if set, must be a string\n"
+        )
+        return 1
+    if vision_model is not None and not isinstance(vision_model, str):
+        sys.stderr.write(
+            "values_helper.py: gateway.vision_model, if set, must be a string\n"
         )
         return 1
     approvals_mode, approvals_err = _validate_gateway_approvals_mode(gateway)
@@ -423,6 +449,29 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
             approvals_block = {}
         approvals_block["mode"] = approvals_mode
         existing["approvals"] = approvals_block
+
+    auxiliary_block = existing.get("auxiliary")
+    if not isinstance(auxiliary_block, dict):
+        auxiliary_block = {}
+    vision_block = auxiliary_block.get("vision")
+    if not isinstance(vision_block, dict):
+        vision_block = {}
+    if vision_provider:
+        vision_block["provider"] = vision_provider
+    else:
+        vision_block.pop("provider", None)
+    if vision_model:
+        vision_block["model"] = vision_model
+    else:
+        vision_block.pop("model", None)
+    if vision_block:
+        auxiliary_block["vision"] = vision_block
+    else:
+        auxiliary_block.pop("vision", None)
+    if auxiliary_block:
+        existing["auxiliary"] = auxiliary_block
+    else:
+        existing.pop("auxiliary", None)
 
     # Re-emit the standard header so the file's intro text doesn't quietly
     # vanish after the first merge (the round-trip strips any prior
@@ -533,9 +582,11 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
     Always rewritten — values.yaml is the source of truth and the file is a
-    reflection. Operator hand-edits live in ``/etc/default/hermes-gateway``
-    or in actual secret files (``auth/slack.env``, ``auth/hermes.env``),
-    not here.
+    reflection. If ``slack.runtime.allowed_users`` is present but empty, emit
+    an explicit ``SLACK_ALLOWED_USERS=`` so this later-loaded env file clears
+    stale allowlists from legacy ``auth/slack.env`` files. Operator hand-edits
+    live in ``/etc/default/hermes-gateway`` or in actual secret files
+    (``auth/slack.env``, ``auth/hermes.env``), not here.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -549,8 +600,8 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
 
     runtime = (data.get("slack") or {}).get("runtime") or {}
     if isinstance(runtime, dict):
-        au = runtime.get("allowed_users")
-        if au:
+        if "allowed_users" in runtime:
+            au = runtime.get("allowed_users")
             if not isinstance(au, list):
                 sys.stderr.write(
                     "values_helper.py: slack.runtime.allowed_users must be a list\n"
@@ -599,6 +650,8 @@ _AGENT_ROLE_KEYS = ("worker", "reviewer")
 # single agent entry. Reject dots here so the renderer can keep emitting a
 # bare header without quoting.
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_SLACK_CHANNEL_RE = re.compile(r"^[CDG][A-Z0-9]{2,}$")
 
 
 def _validate_quay_agents_block(
@@ -724,6 +777,107 @@ def _toml_basic_string(s: str) -> str:
     raw U+007F (DEL) would round-trip through ``json.dumps`` unescaped.
     """
     return json.dumps(s, ensure_ascii=False)
+
+
+def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str | None]:
+    """Validate BRIX orchestrator config under ``quay.orchestrator``.
+
+    This is not rendered into Quay's config. It is the BRIX-owned sidecar
+    runner configuration for Slack fallback routing and polling.
+    """
+    defaults: dict[str, Any] = {
+        "enabled": False,
+        "default_slack_channel": "",
+        "slack_token_env": "SLACK_BOT_TOKEN",
+        "quay_command": "/usr/local/bin/quay",
+        "reply_timeout_seconds": 1800,
+        "poll_interval_seconds": 15,
+    }
+    if block is None:
+        return defaults, None
+    if not isinstance(block, dict):
+        return defaults, "quay.orchestrator must be a mapping when present"
+
+    allowed = set(defaults)
+    unknown = sorted(set(block) - allowed)
+    if unknown:
+        return defaults, (
+            f"quay.orchestrator has unknown key(s): {unknown!r} "
+            f"(allowed: {sorted(allowed)!r})"
+        )
+
+    out = dict(defaults)
+    if "enabled" in block:
+        if not isinstance(block["enabled"], bool):
+            return defaults, (
+                "quay.orchestrator.enabled must be a bool "
+                f"(got {type(block['enabled']).__name__}: {block['enabled']!r})"
+            )
+        out["enabled"] = block["enabled"]
+
+    if "default_slack_channel" in block:
+        channel = block["default_slack_channel"]
+        if channel is None:
+            channel = ""
+        if not isinstance(channel, str):
+            return defaults, (
+                "quay.orchestrator.default_slack_channel must be a string "
+                f"(got {type(channel).__name__}: {channel!r})"
+            )
+        if channel and not _SLACK_CHANNEL_RE.match(channel):
+            return defaults, (
+                "quay.orchestrator.default_slack_channel must be a Slack "
+                "channel/conversation id like C0123ABCDEF"
+            )
+        out["default_slack_channel"] = channel
+
+    if "slack_token_env" in block:
+        env_name = block["slack_token_env"]
+        if not isinstance(env_name, str) or not _ENV_NAME_RE.match(env_name):
+            return defaults, (
+                "quay.orchestrator.slack_token_env must be an env var name "
+                "matching [A-Z_][A-Z0-9_]*"
+            )
+        out["slack_token_env"] = env_name
+
+    if "quay_command" in block:
+        cmd = block["quay_command"]
+        if not isinstance(cmd, str) or not cmd:
+            return defaults, "quay.orchestrator.quay_command must be a non-empty string"
+        out["quay_command"] = cmd
+
+    for key in ("reply_timeout_seconds", "poll_interval_seconds"):
+        if key not in block:
+            continue
+        raw = block[key]
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            return defaults, f"quay.orchestrator.{key} must be a positive integer"
+        out[key] = raw
+
+    return out, None
+
+
+def cmd_render_brix_orchestrator_config(args: argparse.Namespace) -> int:
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+    if out_path.exists() and not args.force:
+        sys.stdout.write(f"preserved: {out_path}\n")
+        return 0
+
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+
+    cfg, err = _validate_quay_orchestrator_block(quay.get("orchestrator"))
+    if err is not None:
+        sys.stderr.write(f"values_helper.py: {err}\n")
+        return 1
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sys.stdout.write(f"wrote: {out_path}\n")
+    return 0
 
 
 def cmd_render_quay_config(args: argparse.Namespace) -> int:
@@ -1634,6 +1788,12 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
     if ag_err is not None:
         sys.stderr.write(f"values_helper.py: {ag_err}\n")
         return 1
+    _, orch_err = _validate_quay_orchestrator_block(
+        quay_top.get("orchestrator") if quay_top else None
+    )
+    if orch_err is not None:
+        sys.stderr.write(f"values_helper.py: {orch_err}\n")
+        return 1
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -1825,6 +1985,15 @@ def main(argv: list[str] | None = None) -> int:
         help="emit active quay agent invocation commands, one per line",
     )
     p_active_inv.set_defaults(func=cmd_active_agent_invocations)
+
+    p_brix_orch = sub.add_parser(
+        "render-brix-orchestrator-config",
+        help="write <target>/quay/orchestrator.json from quay.orchestrator",
+    )
+    p_brix_orch.add_argument("--out", required=True, help="output JSON path")
+    p_brix_orch.add_argument("--force", action="store_true",
+                             help="overwrite an existing file")
+    p_brix_orch.set_defaults(func=cmd_render_brix_orchestrator_config)
 
     p_org_defaults = sub.add_parser(
         "render-gateway-org-defaults",

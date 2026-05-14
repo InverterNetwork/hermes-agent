@@ -1972,6 +1972,8 @@ class TestThreadReplyHandling:
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
+        a._resolve_user_name = AsyncMock(return_value="User")
+        a._fetch_thread_parent_text = AsyncMock(return_value="")
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
         return a
@@ -2083,6 +2085,113 @@ class TestThreadReplyHandling:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.fixture()
+    def trigger_adapter_with_session_store(self, mock_session_store):
+        """Create an adapter with a trigger-bound channel and session store."""
+        config = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "triggers": [
+                    {
+                        "channel_id": "C0FEEDBACK",
+                        "channel_name": "feedback",
+                        "skill": "feedback-intake",
+                    }
+                ]
+            },
+        )
+        a = SlackAdapter(config)
+        a._app = MagicMock()
+        a._app.client = AsyncMock()
+        a._bot_user_id = "U_BOT"
+        a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._running = True
+        a._resolve_user_name = AsyncMock(return_value="User")
+        a._fetch_thread_parent_text = AsyncMock(return_value="")
+        a.handle_message = AsyncMock()
+        a.set_session_store(mock_session_store)
+        mock_session_store.config.thread_sessions_per_user = False
+        return a
+
+    @pytest.mark.asyncio
+    async def test_trigger_bound_thread_reply_with_session_falls_through_to_discussion(
+        self, trigger_adapter_with_session_store, mock_session_store
+    ):
+        """Trigger-bound channel replies must not be swallowed by the router.
+
+        The top-level trigger should still reject thread replies so the entry
+        skill does not re-fire, but those replies are the human discussion path
+        for blocker handoffs and must continue through normal session routing.
+        """
+        session_key = "agent:main:slack:group:C0FEEDBACK:1700000000.000050"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "Can you clarify the failure mode?",
+            "user": "U_REVIEWER",
+            "channel": "C0FEEDBACK",
+            "ts": "1700000000.000100",
+            "thread_ts": "1700000000.000050",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await trigger_adapter_with_session_store._handle_slack_message(event)
+
+        trigger_adapter_with_session_store.handle_message.assert_awaited_once()
+        msg_event = trigger_adapter_with_session_store.handle_message.await_args.args[0]
+        assert msg_event.text == "Can you clarify the failure mode?"
+        assert msg_event.source.thread_id == "1700000000.000050"
+        assert msg_event.reply_to_message_id == "1700000000.000050"
+
+    @pytest.mark.asyncio
+    async def test_trigger_bound_thread_reply_without_session_stays_ignored(
+        self, trigger_adapter_with_session_store, mock_session_store
+    ):
+        """Falling through from the trigger router must not make every
+        arbitrary trigger-channel thread reply invoke the bot."""
+        mock_session_store._entries = {}
+        event = {
+            "text": "Unrelated thread chatter",
+            "user": "U_REVIEWER",
+            "channel": "C0FEEDBACK",
+            "ts": "1700000000.000200",
+            "thread_ts": "1700000000.000050",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await trigger_adapter_with_session_store._handle_slack_message(event)
+
+        trigger_adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_trigger_bound_thread_reply_from_self_bot_id_only_is_consumed(
+        self, trigger_adapter_with_session_store, mock_session_store
+    ):
+        """Bot-id-only self replies in a trigger-created thread must not
+        fall through into an active session and echo back into the agent."""
+        trigger_adapter_with_session_store.config.extra["allow_bots"] = "all"
+        trigger_adapter_with_session_store._trigger_router.set_bot_id("B_BOT")
+        session_key = "agent:main:slack:group:C0FEEDBACK:1700000000.000050"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "Filed BRIX-1406",
+            "bot_id": "B_BOT",
+            "subtype": "bot_message",
+            "channel": "C0FEEDBACK",
+            "ts": "1700000000.000300",
+            "thread_ts": "1700000000.000050",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await trigger_adapter_with_session_store._handle_slack_message(event)
+
+        trigger_adapter_with_session_store.handle_message.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

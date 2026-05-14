@@ -40,6 +40,25 @@
 #                                 base URL. Leave empty to use the provider
 #                                 default; set only for self-hosted endpoints
 #                                 or routing through a gateway.
+#   gateway.vision_provider    : optional override for the auxiliary vision
+#                                 task (vision_analyze tool plus Slack-channel
+#                                 image pre-analysis). Empty/unset leaves the
+#                                 task on its auto-detect path (openrouter,
+#                                 then nous, then main). Pin when the main
+#                                 provider's auto path can't resolve a
+#                                 vision-capable model on its own. For
+#                                 example, openai-codex with no explicit
+#                                 model silently fails vision; pinning codex
+#                                 plus a model here lands it. Merged into
+#                                 config.yaml as auxiliary.vision.provider on
+#                                 every install; unset drops the key.
+#   gateway.vision_model       : optional model id paired with
+#                                 gateway.vision_provider. Required by some
+#                                 providers (codex has no safe default, the
+#                                 allow-list shifts). Leave empty for
+#                                 providers that ship a sensible default
+#                                 (openrouter, nous). Same declarative-drop
+#                                 semantics as the vision_provider pin.
 #   gateway.approvals_mode     — optional values-driven command approval mode
 #                                 merged into <target>/config.yaml as
 #                                 approvals.mode on every install. Valid:
@@ -203,6 +222,15 @@
 #                                 SLACK_TOKEN is staged by stage-secrets.sh
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
+#   quay.orchestrator          — BRIX-owned sidecar runner for durable Quay
+#                                 orchestrator handoffs. This renders to
+#                                 <target>/quay/orchestrator.json, not
+#                                 quay/config.toml, because these are sidecar
+#                                 runtime knobs rather than Quay substrate
+#                                 settings.
+#                                 `default_slack_channel` is the deployment
+#                                 fallback channel for human questions when
+#                                 the task has no original Slack thread.
 #
 #   slack_triggers             — list of (channel, entry-skill) bindings that
 #                                 turn top-level Slack messages in a channel
@@ -259,6 +287,10 @@ gateway:
   # Empty = use the provider's default endpoint. Set only for routing
   # through a self-hosted gateway or an org-internal proxy.
   model_base_url: ""
+  # See schema header (gateway.vision_provider / gateway.vision_model)
+  # for why this is pinned. Empty values fall back to auto-detect.
+  vision_provider: codex
+  vision_model: gpt-5.3-codex
   # Optional: merge into <target>/config.yaml as approvals.mode on every
   # install. Set to "off" to bypass dangerous-command approval prompts for
   # trusted internal Slack deployments. The hardline blocklist still applies
@@ -320,12 +352,16 @@ slack:
     # SLACK_ALLOWED_USERS on every install via auth/gateway-runtime.env, so
     # the operator stops re-typing this on re-runs/rotations. Empty list /
     # unset disables the gate (bot accepts every authorized user — risky in
-    # public workspaces; keep populated for production).
+    # public workspaces; keep populated for production). An explicit empty
+    # list writes SLACK_ALLOWED_USERS= to clear stale legacy auth/slack.env
+    # allowlists.
     allowed_users: []
     # If non-empty, the bot ONLY responds in these channels (whitelist).
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
       - C0B23MZ0USV
+      - C0B4LLZ5Z2L
+      - C0B3WAWLL0L
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: ""
@@ -401,7 +437,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.4"
+  version: "v0.3.6"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
@@ -485,6 +521,15 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
+  # BRIX orchestrator sidecar. Drains durable Quay handoffs into the
+  # deployment feedback channel when the task has no original Slack thread.
+  orchestrator:
+    enabled: true
+    default_slack_channel: "C0B3WAWLL0L"
+    slack_token_env: SLACK_BOT_TOKEN
+    quay_command: /usr/local/bin/quay
+    reply_timeout_seconds: 1800
+    poll_interval_seconds: 15
   # Quay pr-review subsystem. `enabled: true` alone only activates
   # ad-hoc /review on human-owned PRs; `gate_quay_owned_done: true` is what
   # opens the `pr-open → done → pr-review` path for quay-spawned tasks
@@ -521,14 +566,13 @@ quay:
 # Populate `channel_id` from the actual Slack channel id (visible in
 # the URL: https://app.slack.com/client/<team>/<channel_id>); the
 # `feedback-intake` skill is shipped in hermes-state.
-slack_triggers: []
-  # Example (uncomment and fill in once the feedback channel id is known):
-  # - channel_id: C0XXXXXXXXX
-  #   channel_name: feedback              # comment-only, for readability
-  #   skill: feedback-intake
-  #   require_top_level: true
-  #   accept_from_bots: false
-  #   rate_limit:
-  #     max_per_hour: 30
-  #     on_overflow: skip
-  #   default_repo: iTRY-monorepo
+slack_triggers:
+  - channel_id: C0B4LLZ5Z2L
+    channel_name: brix-feedback-sandbox
+    skill: feedback-intake
+    require_top_level: true
+    accept_from_bots: false
+    rate_limit:
+      max_per_hour: 30
+      on_overflow: skip
+    default_repo: iTRY-monorepo
