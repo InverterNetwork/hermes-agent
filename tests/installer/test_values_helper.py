@@ -1125,6 +1125,64 @@ class TestRenderQuayConfigAgents:
         assert "[agents.invocations.codex]" in text
         assert 'worker = "codex --baz < {prompt_file}"' in text
 
+    def test_active_agent_invocations_legacy_uses_agent_invocation(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "active-agent-invocations")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == "claude < {prompt_file}\n"
+
+    def test_active_agent_invocations_resolves_only_configured_roles(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude legacy < {prompt_file}"\n'
+            "  agents:\n"
+            "    worker: codex\n"
+            "    reviewer: claude\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude inactive-worker < {prompt_file}"\n'
+            '        reviewer: "claude review < {prompt_file}"\n'
+            "      codex:\n"
+            '        worker: "codex exec < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "active-agent-invocations")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.splitlines() == [
+            "codex exec < {prompt_file}",
+            "claude review < {prompt_file}",
+        ]
+
+    def test_active_agent_invocations_codex_only_excludes_legacy_claude(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude legacy < {prompt_file}"\n'
+            "  agents:\n"
+            "    worker: codex\n"
+            "    invocations:\n"
+            "      claude:\n"
+            '        worker: "claude inactive < {prompt_file}"\n'
+            "      codex:\n"
+            '        worker: "codex exec < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "active-agent-invocations")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == "codex exec < {prompt_file}\n"
+
     def test_legacy_agent_invocation_still_required_with_new_block(
         self, tmp_path: Path
     ):

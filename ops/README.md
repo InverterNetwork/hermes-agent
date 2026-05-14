@@ -91,28 +91,22 @@ installer is the supported path.
 Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
 `installer/setup-hermes.sh`.
 
-## Pre-install: claude CLI (quay workers)
+## Pre-install: claude auth (quay workers)
 
-`quay-tick` shells out to `claude` to run the agent worker. Install it as the
-agent user before running `setup-hermes.sh` (the installer fails loud if
-`quay.agent_invocation` references `claude` and the binary is absent).
+`quay-tick` shells out to `claude` to run the agent worker. When an active
+quay invocation references `claude`, `setup-hermes.sh` installs the CLI as the
+agent user and reconciles `/usr/local/bin/claude` to
+`~<agent>/.local/bin/claude`.
 
-Install (lands in `~<agent>/.local/bin/`):
-
-```sh
-sudo -u <agent> -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-sudo ln -sf ~<agent>/.local/bin/claude /usr/local/bin/claude
-```
-
-Log in (subscription mode — interactive; complete before running the installer):
+Log in once after the installer has provisioned the binary (subscription mode
+— interactive browser OAuth):
 
 ```sh
 sudo -u <agent> -H claude login
 ```
 
-The symlink makes `claude` available system-wide so root-owned scripts can
-invoke it. The login caches credentials under `~<agent>/.claude/` and is
-read by the worker process which runs as the agent user.
+The login caches credentials under `~<agent>/.claude/` and is read by the
+worker process which runs as the agent user.
 
 ## Pre-install: codex CLI (quay workers)
 
@@ -504,10 +498,10 @@ of the registered repos live at `<HERMES_HOME>/quay/repos/<id>.git`.
 
 ## Worker auth
 
-The worker (`agent_invocation` in `quay/config.toml`) needs an LLM
-credential, which depends on whether the invocation calls `claude` or
-`codex`. See the pre-install sections above for the install + login
-bootstrap; this section just covers the runtime credential model.
+The worker (`agent_invocation` / active `agents.invocations.*` entry in
+`quay/config.toml`) needs an LLM credential, which depends on whether the
+invocation calls `claude` or `codex`. See the pre-install sections above for
+the login bootstrap; this section just covers the runtime credential model.
 
 ### Claude worker (`agent_invocation` calls `claude`)
 

@@ -32,6 +32,11 @@ Subcommands:
                                   leave the provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
+  active-agent-invocations     — emit one active quay agent invocation command
+                                  per line. Uses legacy ``quay.agent_invocation``
+                                  when no ``quay.agents`` block exists; otherwise
+                                  resolves ``quay.agents.<role>`` through
+                                  ``quay.agents.invocations.<id>.<role>``.
   render-brix-orchestrator-config <out>
                                 — write ~/.hermes/quay/orchestrator.json from
                                   quay.orchestrator. This is BRIX-side config
@@ -1020,6 +1025,44 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _active_quay_agent_invocations(data: dict) -> tuple[list[str] | None, str | None]:
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        return None, "quay must be a mapping"
+
+    agent_invocation = quay.get("agent_invocation")
+    if not isinstance(agent_invocation, str) or not agent_invocation:
+        return None, "quay.agent_invocation is required (non-empty string)"
+
+    agents_block, agents_err = _validate_quay_agents_block(quay.get("agents"))
+    if agents_err is not None:
+        return None, agents_err
+    if agents_block is None:
+        return [agent_invocation], None
+
+    active: list[str] = []
+    for role in _AGENT_ROLE_KEYS:
+        agent_id = agents_block.get(role)
+        if not isinstance(agent_id, str):
+            continue
+        invocation = agents_block["invocations"][agent_id][role]
+        if invocation not in active:
+            active.append(invocation)
+    return active, None
+
+
+def cmd_active_agent_invocations(args: argparse.Namespace) -> int:
+    data = _load(Path(args.values))
+    invocations, err = _active_quay_agent_invocations(data)
+    if err is not None:
+        sys.stderr.write(f"values_helper.py: {err}\n")
+        return 1
+    sys.stdout.write("\n".join(invocations or []))
+    if invocations:
+        sys.stdout.write("\n")
+    return 0
+
+
 # `id` is interpolated into both the code-mirror path
 # ($HERMES_HOME/code/<id>/) and the bare-clone path
 # ($HERMES_HOME/quay/repos/<id>.git) by setup-hermes.sh. Reject anything
@@ -1936,6 +1979,12 @@ def main(argv: list[str] | None = None) -> int:
     p_quay.add_argument("--force", action="store_true",
                         help="overwrite an existing file")
     p_quay.set_defaults(func=cmd_render_quay_config)
+
+    p_active_inv = sub.add_parser(
+        "active-agent-invocations",
+        help="emit active quay agent invocation commands, one per line",
+    )
+    p_active_inv.set_defaults(func=cmd_active_agent_invocations)
 
     p_brix_orch = sub.add_parser(
         "render-brix-orchestrator-config",
