@@ -1,9 +1,10 @@
 """Install the pinned Codex CLI for quay agent workers.
 
 Codex is not a runtime manager for repository bootstrap; it is the worker
-binary quay shells out to. That means the executable belongs under the
-agent user's home (so the user can own its CLI state), with a root-owned
-system symlink for root-owned wrappers and PATH probes.
+binary quay shells out to. The executable is root-owned and installed
+next to the system symlink so root-run maintenance never executes an
+agent-writable binary. The agent-owned CLI state remains under
+``~<agent>/.codex``.
 """
 
 from __future__ import annotations
@@ -44,10 +45,10 @@ def ensure_codex(
 
     pw = _agent_user(agent_user)
     home = agent_home or Path(pw.pw_dir)
-    install_path = home / ".local" / "bin" / "codex"
+    install_path = _managed_install_path(symlink_path)
     _ensure_codex_auth_dir(home / ".codex", pw.pw_uid, pw.pw_gid)
 
-    if _codex_at_pinned_version(install_path, pin.version, pw.pw_uid, pw.pw_gid):
+    if _codex_at_pinned_version(install_path, pin.version):
         _ensure_symlink(install_path, symlink_path)
         info(f"codex {pin.version} already at {install_path}; no-op")
         return
@@ -82,8 +83,8 @@ def ensure_codex(
             )
 
         source_path = _extract_codex(archive_path, tmp, pin.version)
-        _ensure_agent_bin_dir(install_path.parent, pw.pw_uid, pw.pw_gid)
-        _atomic_install_for_user(source_path, install_path, pw.pw_uid, pw.pw_gid)
+        _ensure_root_install_dir(install_path.parent)
+        _atomic_install_root(source_path, install_path)
 
     _ensure_symlink(install_path, symlink_path)
     info(f"codex {pin.version} installed at {install_path}")
@@ -96,28 +97,48 @@ def _agent_user(agent_user: str) -> pwd.struct_passwd:
         fail(f"agent user not found: {agent_user}")
 
 
+def _managed_install_path(symlink_path: Path) -> Path:
+    return symlink_path.with_name(f".{symlink_path.name}.hermes-managed")
+
+
 def _extract_codex(archive_path: Path, tmp: Path, version: str) -> Path:
     extract_dir = tmp / "extract"
     extract_dir.mkdir()
     try:
         with tarfile.open(archive_path, "r:gz") as tf:
-            tf.extractall(extract_dir)
+            members = tf.getmembers()
+            if len(members) != 1:
+                fail(
+                    f"codex {version}: expected exactly one archive member "
+                    f"{_ASSET_NAME!r}, found {len(members)}"
+                )
+            member = members[0]
+            if member.name != _ASSET_NAME or not member.isfile():
+                fail(
+                    f"codex {version}: archive member must be regular file "
+                    f"{_ASSET_NAME!r}"
+                )
+            member_path = extract_dir / _ASSET_NAME
+            src = tf.extractfile(member)
+            if src is None:
+                fail(f"codex {version}: archive member {_ASSET_NAME!r} unreadable")
+            with src, member_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
     except tarfile.TarError as exc:
         fail(f"codex {version}: not a valid tar.gz ({exc})")
 
-    member_path = extract_dir / _ASSET_NAME
     if not member_path.is_file():
         fail(f"codex {version}: archive member {_ASSET_NAME!r} missing after extract")
     return member_path
 
 
-def _atomic_install_for_user(src: Path, dst: Path, uid: int, gid: int) -> None:
+def _atomic_install_root(src: Path, dst: Path) -> None:
     staged = dst.with_name(dst.name + ".hermes-staging")
     try:
         shutil.copy2(src, staged)
         os.chmod(staged, 0o755)
         try:
-            os.chown(staged, uid, gid)
+            os.chown(staged, 0, 0)
         except PermissionError:
             pass
         os.replace(staged, dst)
@@ -126,14 +147,13 @@ def _atomic_install_for_user(src: Path, dst: Path, uid: int, gid: int) -> None:
         raise
 
 
-def _ensure_agent_bin_dir(bin_dir: Path, uid: int, gid: int) -> None:
+def _ensure_root_install_dir(bin_dir: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
-    for path in (bin_dir.parent, bin_dir):
-        try:
-            os.chown(path, uid, gid)
-        except PermissionError:
-            pass
-        os.chmod(path, 0o755)
+    try:
+        os.chown(bin_dir, 0, 0)
+    except PermissionError:
+        pass
+    os.chmod(bin_dir, 0o755)
 
 
 def _ensure_codex_auth_dir(codex_dir: Path, uid: int, gid: int) -> None:
@@ -169,8 +189,6 @@ def _ensure_symlink(target: Path, link: Path) -> None:
 def _codex_at_pinned_version(
     install_path: Path,
     pinned_version: str,
-    uid: int,
-    gid: int,
 ) -> bool:
     if not install_path.exists():
         return False
@@ -178,7 +196,7 @@ def _codex_at_pinned_version(
     if not (st.st_mode & stat.S_IXUSR):
         return False
     if os.geteuid() == 0:
-        if st.st_uid != uid or st.st_gid != gid or (st.st_mode & 0o777) != 0o755:
+        if st.st_uid != 0 or st.st_gid != 0 or (st.st_mode & 0o777) != 0o755:
             return False
     try:
         out = subprocess.run(

@@ -4,7 +4,7 @@
   ``repos[].quay.package_manager`` entries declare. Idempotent. Refuses
   on SHA mismatch or missing pin. Requires euid 0 unless
   ``--skip-root-check`` is passed (tests only).
-* ``ensure-codex`` — provision the pinned Codex CLI under the agent user
+* ``ensure-codex`` — provision the pinned Codex CLI for the agent user
   when the active quay agent invocation path references ``codex``.
 * ``verify`` — read-only health check. Inspects the live install for drift
   and exits 0 (no drift) or 1 (drift detected). No root required.
@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         help="provision pinned Codex CLI when active quay agents reference codex",
     )
     ec.add_argument("--values", required=True, type=Path, help="path to deploy.values.yaml")
-    ec.add_argument("--agent-user", required=True, help="agent user that owns ~/.local/bin/codex")
+    ec.add_argument("--agent-user", required=True, help="agent user that owns ~/.codex state")
     ec.add_argument(
         "--symlink-path",
         type=Path,

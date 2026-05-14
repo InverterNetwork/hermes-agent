@@ -716,7 +716,7 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
 def _check_codex_prereqs(s: _State) -> None:
     """Codex CLI host-prep checks — fire only when the active quay agent
     invocation path references `codex`. setup-hermes.sh provisions the binary
-    under the agent user; verify confirms the binary is runnable and the
+    in a root-owned managed path; verify confirms the binary is runnable and the
     operator completed `codex login` when token material is present. ChatGPT
     subscription auth — never OPENAI_API_KEY."""
     rc, out, _ = _run([
