@@ -48,11 +48,17 @@ class FakeQuayClient:
     def get_task_context(self, task_id: str):
         return self.task
 
-    def get_artifact(self, artifact_id: str):
+    def get_artifact(self, handoff):
         return self.artifact
 
-    def submit_brief(self, handoff, brief: str) -> None:
-        self.submitted.append((handoff, brief))
+    def escalate_human(self, handoff, question: str, thread_ref: str) -> None:
+        self.escalated = (handoff, question, thread_ref)
+
+    def record_human_reply(self, handoff, reply, thread_ref: str) -> None:
+        self.recorded_reply = (handoff, reply, thread_ref)
+
+    def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+        self.submitted.append((handoff, brief, reason))
 
     def complete_claim(self, handoff) -> None:
         self.completed.append(handoff)
@@ -76,6 +82,43 @@ class FakeSlackClient:
         return self.reply
 
 
+class FakeCompletedProcess:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class RecordingQuayRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.file_payloads: list[str] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        command = argv[1:]
+        if command[:4] == ["handoff", "list", "--status", "pending"]:
+            return FakeCompletedProcess(
+                '[{"handoff_id":7,"task_id":"task-cli","reason":"worker_blocker","payload_json":"{\\"summary\\":\\"needs guidance\\"}","status":"pending"}]\n'
+            )
+        if command == ["task", "claim", "task-cli"]:
+            return FakeCompletedProcess('{"task_id":"task-cli","claim_id":"claim-1","state":"claimed-by-orchestrator"}\n')
+        if command == ["task", "get", "task-cli"]:
+            return FakeCompletedProcess('{"task_id":"task-cli","repo_id":"repo-1","external_ref":"BRIX-1405","branch_name":"quay/task"}\n')
+        if command == ["artifact", "get", "task-cli", "blocker"]:
+            return FakeCompletedProcess("blocked on product input\n")
+        if command[0] in {"escalate-human", "record-human-reply", "submit-brief"}:
+            for flag in ("--question-file", "--reply-file", "--brief-file"):
+                if flag in command:
+                    self.file_payloads.append(Path(command[command.index(flag) + 1]).read_text())
+            if command[0] == "escalate-human":
+                return FakeCompletedProcess('{"task_id":"task-cli","state":"waiting_human","artifact_id":1,"escalation_seq":1,"escalation_nonce":"n","thread_ref":"C1:1"}\n')
+            if command[0] == "record-human-reply":
+                return FakeCompletedProcess('{"task_id":"task-cli","state":"claimed-by-orchestrator","artifact_id":2}\n')
+            return FakeCompletedProcess('{"task_id":"task-cli","state":"queued","attempt_id":3}\n')
+        raise AssertionError(f"unexpected quay command: {command!r}")
+
+
 def test_drain_one_submits_direct_next_brief_without_slack():
     handoff = brix.Handoff(
         handoff_id="handoff-1",
@@ -94,7 +137,9 @@ def test_drain_one_submits_direct_next_brief_without_slack():
     result = drainer.drain_one()
 
     assert result.status == "submitted_direct"
-    assert quay.submitted == [(handoff, "Apply the reviewer suggestion and rerun tests.")]
+    assert quay.submitted == [
+        (handoff, "Apply the reviewer suggestion and rerun tests.", "blocker_resolved")
+    ]
     assert quay.completed == [handoff]
     assert quay.released == []
     assert slack.questions == []
@@ -141,6 +186,9 @@ def test_drain_one_posts_slack_question_and_maps_reply_to_next_brief():
     assert "Use the following human guidance" in submitted
     assert "U123" in submitted
     assert "Use the existing importer" in submitted
+    assert quay.escalated[2] is None
+    assert quay.recorded_reply[2] == "C1234567890:1000.000000"
+    assert quay.submitted[0][2] == "advice_answered"
     assert quay.completed == [handoff]
     assert quay.released == []
     assert result.metrics["slack_questions_posted"] == 1
@@ -200,9 +248,27 @@ def test_file_lock_is_nonblocking(tmp_path: Path):
                 pass
 
 
-def test_cli_pending_adapter_noops_without_slack_token(tmp_path: Path, monkeypatch, capsys):
+def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+):
+    quay = tmp_path / "quay"
+    quay.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1 $2 $3\" == \"handoff list --status\" ]]; then\n"
+        "  printf '[]\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    quay.chmod(0o755)
     config = tmp_path / "orchestrator.json"
-    config.write_text('{"enabled": true}\n', encoding="utf-8")
+    config.write_text(
+        '{"enabled": true, "quay_command": "' + str(quay) + '"}\n',
+        encoding="utf-8",
+    )
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     monkeypatch.delenv("SLACK_TOKEN", raising=False)
 
@@ -219,3 +285,35 @@ def test_cli_pending_adapter_noops_without_slack_token(tmp_path: Path, monkeypat
     assert rc == 0
     out = capsys.readouterr().out
     assert '"status": "no_handoff"' in out
+
+
+def test_quay_cli_client_uses_ast_121_human_reply_contract():
+    runner = RecordingQuayRunner()
+    client = brix.QuayCliClient(command="/bin/quay", runner=runner)
+
+    handoff = client.claim_handoff("worker-1")
+    assert handoff is not None
+    assert handoff.claim_id == "claim-1"
+    assert handoff.artifact_id == "blocker"
+    assert handoff.summary == "needs guidance"
+    task = client.get_task_context(handoff.task_id)
+    assert task.repo_id == "repo-1"
+    artifact = client.get_artifact(handoff)
+    assert artifact.text == "blocked on product input\n"
+
+    client.escalate_human(handoff, "Question?", None)
+    client.record_human_reply(
+        handoff,
+        brix.SlackReply(text="Answer.", user_id="U1", ts="1001.000000"),
+        "C123:1000.000000",
+    )
+    client.submit_brief(handoff, "Next brief.", reason="advice_answered")
+
+    calls = [" ".join(call[1:]) for call in runner.calls]
+    assert "escalate-human task-cli --claim-id claim-1" in calls[4]
+    assert "--thread-ref" not in calls[4]
+    assert "record-human-reply task-cli --claim-id claim-1" in calls[5]
+    assert "--message-ts 1001.000000 --author U1" in calls[5]
+    assert "submit-brief task-cli --claim-id claim-1" in calls[6]
+    assert "--reason advice_answered" in calls[6]
+    assert runner.file_payloads == ["Question?", "Answer.", "Next brief."]

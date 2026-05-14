@@ -13,10 +13,13 @@ import dataclasses
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -42,6 +45,8 @@ class Handoff:
     task_id: str
     repo_id: str | None = None
     artifact_id: str | None = None
+    claim_id: str | None = None
+    reason: str = ""
     summary: str = ""
     next_brief: str | None = None
     human_question: str | None = None
@@ -57,6 +62,8 @@ class Handoff:
             task_id=str(raw.get("task_id") or ""),
             repo_id=_optional_str(raw.get("repo_id")),
             artifact_id=_optional_str(raw.get("artifact_id")),
+            claim_id=_optional_str(raw.get("claim_id")),
+            reason=str(raw.get("reason") or ""),
             summary=str(raw.get("summary") or ""),
             next_brief=_optional_str(raw.get("next_brief")),
             human_question=_optional_str(raw.get("human_question")),
@@ -150,6 +157,7 @@ class OrchestratorConfig:
     enabled: bool = False
     default_slack_channel: str = ""
     slack_token_env: str = "SLACK_BOT_TOKEN"
+    quay_command: str = "/usr/local/bin/quay"
     reply_timeout_seconds: float = 1800.0
     poll_interval_seconds: float = 15.0
     lock_path: Path | None = None
@@ -160,6 +168,7 @@ class OrchestratorConfig:
             enabled=_as_bool(raw.get("enabled"), default=False),
             default_slack_channel=str(raw.get("default_slack_channel") or ""),
             slack_token_env=str(raw.get("slack_token_env") or "SLACK_BOT_TOKEN"),
+            quay_command=str(raw.get("quay_command") or "/usr/local/bin/quay"),
             reply_timeout_seconds=_positive_float(
                 raw.get("reply_timeout_seconds"), default=1800.0
             ),
@@ -189,6 +198,7 @@ class OrchestratorConfig:
             enabled=enabled,
             default_slack_channel=channel,
             slack_token_env=token_env,
+            quay_command=os.getenv("BRIX_QUAY_COMMAND") or self.quay_command,
             reply_timeout_seconds=timeout,
             poll_interval_seconds=interval,
             lock_path=Path(lock_env) if lock_env else self.lock_path,
@@ -202,10 +212,32 @@ class QuayClient(Protocol):
     def get_task_context(self, task_id: str) -> TaskContext:
         """Return enough task context for a human-readable Slack question."""
 
-    def get_artifact(self, artifact_id: str) -> Artifact:
+    def get_artifact(self, handoff: Handoff) -> Artifact | None:
         """Return the blocker/context artifact referenced by a handoff."""
 
-    def submit_brief(self, handoff: Handoff, brief: str) -> None:
+    def escalate_human(
+        self,
+        handoff: Handoff,
+        question: str,
+        thread_ref: str | None,
+    ) -> None:
+        """Persist the human question/audit boundary before waiting."""
+
+    def record_human_reply(
+        self,
+        handoff: Handoff,
+        reply: SlackReply,
+        thread_ref: str,
+    ) -> None:
+        """Persist the human reply before submitting the follow-up brief."""
+
+    def submit_brief(
+        self,
+        handoff: Handoff,
+        brief: str,
+        *,
+        reason: str,
+    ) -> None:
         """Submit the next worker brief for a claimed handoff."""
 
     def complete_claim(self, handoff: Handoff) -> None:
@@ -254,10 +286,32 @@ class PendingQuayClient:
     def get_task_context(self, task_id: str) -> TaskContext:
         raise NotImplementedError("AST-121 must provide the Quay adapter")
 
-    def get_artifact(self, artifact_id: str) -> Artifact:
+    def get_artifact(self, handoff: Handoff) -> Artifact | None:
         raise NotImplementedError("AST-121 must provide the Quay adapter")
 
-    def submit_brief(self, handoff: Handoff, brief: str) -> None:
+    def escalate_human(
+        self,
+        handoff: Handoff,
+        question: str,
+        thread_ref: str | None,
+    ) -> None:
+        raise NotImplementedError("AST-121 must provide the Quay adapter")
+
+    def record_human_reply(
+        self,
+        handoff: Handoff,
+        reply: SlackReply,
+        thread_ref: str,
+    ) -> None:
+        raise NotImplementedError("AST-121 must provide the Quay adapter")
+
+    def submit_brief(
+        self,
+        handoff: Handoff,
+        brief: str,
+        *,
+        reason: str,
+    ) -> None:
         raise NotImplementedError("AST-121 must provide the Quay adapter")
 
     def complete_claim(self, handoff: Handoff) -> None:
@@ -265,6 +319,248 @@ class PendingQuayClient:
 
     def release_claim(self, handoff: Handoff, reason: str) -> None:
         raise NotImplementedError("AST-121 must provide the Quay adapter")
+
+
+class QuayCommandError(RuntimeError):
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        code: str | None = None,
+    ) -> None:
+        self.argv = argv
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.code = code
+        suffix = f" ({code})" if code else ""
+        super().__init__(f"quay command failed{suffix}: {' '.join(argv)}")
+
+
+class QuayCliClient:
+    """Adapter for the AST-121 Quay CLI contract."""
+
+    def __init__(
+        self,
+        *,
+        command: str = "/usr/local/bin/quay",
+        logger: logging.Logger | None = None,
+        runner: Any | None = None,
+    ) -> None:
+        self.command = command
+        self._logger = logger or LOGGER
+        self._runner = runner or subprocess.run
+
+    def claim_handoff(self, worker_id: str) -> Handoff | None:
+        rows = self._run_json(["handoff", "list", "--status", "pending"])
+        if not isinstance(rows, list):
+            raise RuntimeError("quay handoff list did not return a JSON array")
+
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            task_id = str(row.get("task_id") or "")
+            if not task_id:
+                continue
+            try:
+                claim = self._run_json(["task", "claim", task_id])
+            except QuayCommandError as exc:
+                if exc.code in {"wrong_state", "cancelled", "unknown_task"}:
+                    log_event(
+                        self._logger,
+                        "handoff_claim_skipped",
+                        worker_id=worker_id,
+                        task_id=task_id,
+                        error_code=exc.code,
+                    )
+                    continue
+                raise
+            if not isinstance(claim, Mapping):
+                raise RuntimeError("quay task claim did not return a JSON object")
+
+            metadata = self._handoff_metadata(row)
+            metadata["quay_handoff"] = dict(row)
+            metadata["worker_id"] = worker_id
+            reason = str(row.get("reason") or "")
+            return Handoff(
+                handoff_id=str(row.get("handoff_id") or row.get("id") or ""),
+                task_id=task_id,
+                artifact_id=_artifact_kind_for_reason(reason),
+                claim_id=str(claim.get("claim_id") or ""),
+                reason=reason,
+                summary=_summary_for_handoff(row, metadata),
+                metadata=metadata,
+            )
+        return None
+
+    def get_task_context(self, task_id: str) -> TaskContext:
+        raw = self._run_json(["task", "get", task_id])
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("quay task get did not return a JSON object")
+        return TaskContext(
+            task_id=str(raw.get("task_id") or task_id),
+            title=str(raw.get("external_ref") or raw.get("branch_name") or task_id),
+            issue=str(raw.get("external_ref") or ""),
+            repo_id=_optional_str(raw.get("repo_id")),
+            metadata=dict(raw),
+        )
+
+    def get_artifact(self, handoff: Handoff) -> Artifact | None:
+        if not handoff.artifact_id:
+            return None
+        try:
+            text = self._run_text(["artifact", "get", handoff.task_id, handoff.artifact_id])
+        except QuayCommandError as exc:
+            if exc.code == "unknown_artifact":
+                log_event(
+                    self._logger,
+                    "artifact_missing",
+                    task_id=handoff.task_id,
+                    artifact_kind=handoff.artifact_id,
+                )
+                return None
+            raise
+        return Artifact(
+            artifact_id=handoff.artifact_id,
+            text=text,
+            kind=handoff.artifact_id,
+        )
+
+    def escalate_human(
+        self,
+        handoff: Handoff,
+        question: str,
+        thread_ref: str | None,
+    ) -> None:
+        claim_id = self._claim_id(handoff)
+        with _temp_text_file(question) as path:
+            argv = [
+                "escalate-human",
+                handoff.task_id,
+                "--claim-id",
+                claim_id,
+                "--question-file",
+                str(path),
+            ]
+            if thread_ref:
+                argv.extend(["--thread-ref", thread_ref])
+            self._run_json(argv)
+
+    def record_human_reply(
+        self,
+        handoff: Handoff,
+        reply: SlackReply,
+        thread_ref: str,
+    ) -> None:
+        claim_id = self._claim_id(handoff)
+        argv = [
+            "record-human-reply",
+            handoff.task_id,
+            "--claim-id",
+            claim_id,
+            "--reply-file",
+        ]
+        with _temp_text_file(reply.text) as path:
+            argv.append(str(path))
+            argv.extend(["--thread-ref", thread_ref])
+            if reply.ts:
+                argv.extend(["--message-ts", reply.ts])
+            if reply.user_id:
+                argv.extend(["--author", reply.user_id])
+            self._run_json(argv)
+
+    def submit_brief(
+        self,
+        handoff: Handoff,
+        brief: str,
+        *,
+        reason: str,
+    ) -> None:
+        claim_id = self._claim_id(handoff)
+        with _temp_text_file(brief) as path:
+            self._run_json(
+                [
+                    "submit-brief",
+                    handoff.task_id,
+                    "--claim-id",
+                    claim_id,
+                    "--brief-file",
+                    str(path),
+                    "--reason",
+                    reason,
+                ]
+            )
+
+    def complete_claim(self, handoff: Handoff) -> None:
+        # AST-121's submit-brief completes the claimed handoff transactionally.
+        return None
+
+    def release_claim(self, handoff: Handoff, reason: str) -> None:
+        claim_id = self._claim_id(handoff)
+        self._run_json(
+            [
+                "task",
+                "release-claim",
+                handoff.task_id,
+                "--claim-id",
+                claim_id,
+            ]
+        )
+
+    def _claim_id(self, handoff: Handoff) -> str:
+        if handoff.claim_id:
+            return handoff.claim_id
+        raw = handoff.metadata.get("claim_id")
+        if isinstance(raw, str) and raw:
+            return raw
+        raise RuntimeError(f"handoff {handoff.handoff_id} has no claim_id")
+
+    def _run_json(self, argv: list[str]) -> Any:
+        text = self._run_text(argv)
+        if not text.strip():
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"quay returned invalid JSON for {' '.join(argv)}") from exc
+
+    def _run_text(self, argv: list[str]) -> str:
+        full_argv = [self.command, *argv]
+        proc = self._runner(
+            full_argv,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        stdout = getattr(proc, "stdout", "") or ""
+        stderr = getattr(proc, "stderr", "") or ""
+        returncode = int(getattr(proc, "returncode", 0))
+        if returncode != 0:
+            raise QuayCommandError(
+                full_argv,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                code=_cli_error_code(stderr),
+            )
+        return stdout
+
+    def _handoff_metadata(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        payload = row.get("payload_json")
+        if isinstance(payload, str) and payload:
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                parsed = {"raw_payload_json": payload}
+            if isinstance(parsed, Mapping):
+                metadata.update(dict(parsed))
+            else:
+                metadata["payload"] = parsed
+        return metadata
 
 
 class SlackWebApiClient:
@@ -477,11 +773,11 @@ class HandoffDrainer:
 
     def _handle_claimed_handoff(self, handoff: Handoff) -> DrainResult:
         task = self.quay.get_task_context(handoff.task_id)
-        artifact = self.quay.get_artifact(handoff.artifact_id) if handoff.artifact_id else None
+        artifact = self.quay.get_artifact(handoff) if handoff.artifact_id else None
 
         brief = choose_direct_brief(handoff)
         if brief:
-            self.quay.submit_brief(handoff, brief)
+            self.quay.submit_brief(handoff, brief, reason="blocker_resolved")
             self.quay.complete_claim(handoff)
             self.metrics.direct_briefs_submitted += 1
             log_event(
@@ -517,12 +813,14 @@ class HandoffDrainer:
             )
 
         question = build_human_question(handoff, task, artifact)
+        self.quay.escalate_human(handoff, question, None)
         post_ref = self.slack.post_question(
             channel_id,
             question,
             handoff=handoff,
             task=task,
         )
+        thread_ref = slack_thread_ref(post_ref)
         self.metrics.slack_questions_posted += 1
         log_event(
             self.logger,
@@ -547,6 +845,7 @@ class HandoffDrainer:
                 "claim_released",
                 handoff_id=handoff.handoff_id,
                 task_id=handoff.task_id,
+                thread_ref=thread_ref,
                 reason=reason,
             )
             return DrainResult(
@@ -557,8 +856,9 @@ class HandoffDrainer:
             )
 
         self.metrics.human_replies_ingested += 1
+        self.quay.record_human_reply(handoff, reply, thread_ref)
         next_brief = human_reply_to_brief(reply, handoff=handoff, task=task)
-        self.quay.submit_brief(handoff, next_brief)
+        self.quay.submit_brief(handoff, next_brief, reason="advice_answered")
         self.quay.complete_claim(handoff)
         self.metrics.human_briefs_submitted += 1
         log_event(
@@ -635,6 +935,10 @@ def human_reply_to_brief(
     return "\n".join(header + ["", reply.text.strip()])
 
 
+def slack_thread_ref(ref: SlackPostRef) -> str:
+    return f"{ref.channel_id}:{ref.thread_ts}"
+
+
 def load_config(path: Path | None) -> OrchestratorConfig:
     raw: dict[str, Any] = {}
     if path and path.is_file():
@@ -667,6 +971,10 @@ def build_slack_client(config: OrchestratorConfig) -> SlackQuestionClient:
     return SlackWebApiClient(token=token, logger=LOGGER)
 
 
+def build_quay_client(config: OrchestratorConfig) -> QuayClient:
+    return QuayCliClient(command=config.quay_command, logger=LOGGER)
+
+
 def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
     record = {"event": event, **fields}
     logger.info(json.dumps(record, sort_keys=True))
@@ -685,7 +993,7 @@ def run_drain_one(args: argparse.Namespace) -> int:
         lock_path = Path(args.lock_path) if args.lock_path else default_lock_path(config)
         with FileLock(lock_path):
             drainer = HandoffDrainer(
-                quay=PendingQuayClient(LOGGER),
+                quay=build_quay_client(config),
                 slack=build_slack_client(config),
                 config=config,
                 worker_id=args.worker_id,
@@ -739,6 +1047,60 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _artifact_kind_for_reason(reason: str) -> str | None:
+    if reason == "worker_blocker":
+        return "blocker"
+    if reason == "human_reply_ingested":
+        return "slack_reply"
+    return None
+
+
+def _summary_for_handoff(row: Mapping[str, Any], metadata: Mapping[str, Any]) -> str:
+    for key in ("summary", "message", "reason"):
+        val = metadata.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    reason = str(row.get("reason") or "")
+    if reason:
+        return f"Quay handoff reason: {reason}"
+    return ""
+
+
+def _cli_error_code(stderr: str) -> str | None:
+    first = stderr.strip().splitlines()[0] if stderr.strip() else ""
+    if not first:
+        return None
+    try:
+        parsed = json.loads(first)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    code = parsed.get("error")
+    return str(code) if isinstance(code, str) and code else None
+
+
+@contextmanager
+def _temp_text_file(text: str):
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="brix-orchestrator-",
+        suffix=".md",
+        delete=False,
+    )
+    path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(text)
+        yield path
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _as_bool(value: Any, *, default: bool) -> bool:

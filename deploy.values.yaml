@@ -500,6 +500,7 @@ quay:
     enabled: false
     default_slack_channel: ""
     slack_token_env: SLACK_BOT_TOKEN
+    quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
     poll_interval_seconds: 15
   # Quay pr-review subsystem. `enabled: true` alone only activates

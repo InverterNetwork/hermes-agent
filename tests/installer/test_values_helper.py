@@ -877,6 +877,7 @@ class TestRenderBrixOrchestratorConfig:
             "default_slack_channel": "",
             "enabled": False,
             "poll_interval_seconds": 15,
+            "quay_command": "/usr/local/bin/quay",
             "reply_timeout_seconds": 1800,
             "slack_token_env": "SLACK_BOT_TOKEN",
         }
@@ -890,6 +891,7 @@ class TestRenderBrixOrchestratorConfig:
             "    enabled: true\n"
             "    default_slack_channel: C1234567890\n"
             "    slack_token_env: QUAY_SLACK_TOKEN\n"
+            "    quay_command: /usr/local/bin/quay-as-hermes\n"
             "    reply_timeout_seconds: 120\n"
             "    poll_interval_seconds: 5\n",
             encoding="utf-8",
@@ -901,6 +903,7 @@ class TestRenderBrixOrchestratorConfig:
         assert cfg["enabled"] is True
         assert cfg["default_slack_channel"] == "C1234567890"
         assert cfg["slack_token_env"] == "QUAY_SLACK_TOKEN"
+        assert cfg["quay_command"] == "/usr/local/bin/quay-as-hermes"
         assert cfg["reply_timeout_seconds"] == 120
         assert cfg["poll_interval_seconds"] == 5
 

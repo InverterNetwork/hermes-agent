@@ -739,6 +739,7 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
         "enabled": False,
         "default_slack_channel": "",
         "slack_token_env": "SLACK_BOT_TOKEN",
+        "quay_command": "/usr/local/bin/quay",
         "reply_timeout_seconds": 1800,
         "poll_interval_seconds": 15,
     }
@@ -788,6 +789,12 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
                 "matching [A-Z_][A-Z0-9_]*"
             )
         out["slack_token_env"] = env_name
+
+    if "quay_command" in block:
+        cmd = block["quay_command"]
+        if not isinstance(cmd, str) or not cmd:
+            return defaults, "quay.orchestrator.quay_command must be a non-empty string"
+        out["quay_command"] = cmd
 
     for key in ("reply_timeout_seconds", "poll_interval_seconds"):
         if key not in block:
