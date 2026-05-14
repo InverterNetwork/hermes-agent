@@ -1,6 +1,6 @@
-# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick
+# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + brix-orchestrator
 
-Five units live here:
+Seven units live here:
 
 * **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
   repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
@@ -29,6 +29,10 @@ Five units live here:
   `/usr/local/bin/quay tick`. `QUAY_DATA_DIR` points at
   `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
   carrying a `quay:` block.
+* **`brix-orchestrator`** — optional BRIX sidecar for durable Quay
+  orchestrator handoffs. It is gated by `quay.orchestrator.enabled` and
+  reads `<HERMES_HOME>/quay/orchestrator.json` for Slack fallback
+  routing while AST-121 finalizes the Quay adapter contract.
 * **`hermes-reviewer-token`** — 30-min oneshot that refreshes
   `/run/hermes/reviewer-gh-token` from a *second* GitHub App (the
   reviewer identity), so quay's reviewer worker can post APPROVE reviews
@@ -59,6 +63,10 @@ Five units live here:
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
+| `ops/brix_orchestrator.py`                 | BRIX handoff drain loop. Defines the small Quay adapter interface, Slack fallback-channel question/reply flow, JSON event logging, metrics, and lock wrapper. The shipped real Quay adapter is a no-op boundary until AST-121 lands. |
+| `ops/brix-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/brix-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `brix_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
+| `ops/brix-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `BRIX_ORCHESTRATOR_CONFIG`; reads `auth/quay.env` and `auth/slack.env`. |
+| `ops/brix-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
 | `ops/hermes-reviewer-token.service`        | systemd service unit (oneshot). Mints the reviewer App's installation token via `installer/hermes_github_token.py write-token` and writes it to `/run/hermes/reviewer-gh-token`. `User=__AGENT_USER__` and `__TARGET_DIR__` templated by `setup-hermes.sh`. |
 | `ops/hermes-reviewer-token.timer`          | systemd timer unit. `OnBootSec=30s` + 30-min steady cadence. |
 | `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |

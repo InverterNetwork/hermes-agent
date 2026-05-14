@@ -1,0 +1,23 @@
+[Unit]
+Description=BRIX orchestrator handoff drain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__AGENT_USER__
+Group=__AGENT_USER__
+Environment=HERMES_HOME=__TARGET_DIR__
+Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
+Environment=BRIX_ORCHESTRATOR_CONFIG=__TARGET_DIR__/quay/orchestrator.json
+EnvironmentFile=-__TARGET_DIR__/auth/quay.env
+EnvironmentFile=-__TARGET_DIR__/auth/slack.env
+EnvironmentFile=-/etc/default/brix-orchestrator
+ExecStart=/usr/local/sbin/brix-orchestrator-runner
+Restart=no
+# The runner may wait for a human Slack reply. Keep this above the default
+# reply_timeout_seconds rendered into orchestrator.json.
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

@@ -862,6 +862,76 @@ class TestRenderQuayConfig:
         assert not out.exists()
 
 
+class TestRenderBrixOrchestratorConfig:
+    def test_absent_block_renders_disabled_defaults(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert json.loads(out.read_text()) == {
+            "default_slack_channel": "",
+            "enabled": False,
+            "poll_interval_seconds": 15,
+            "reply_timeout_seconds": 1800,
+            "slack_token_env": "SLACK_BOT_TOKEN",
+        }
+
+    def test_renders_enabled_channel_and_polling_knobs(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  orchestrator:\n"
+            "    enabled: true\n"
+            "    default_slack_channel: C1234567890\n"
+            "    slack_token_env: QUAY_SLACK_TOKEN\n"
+            "    reply_timeout_seconds: 120\n"
+            "    poll_interval_seconds: 5\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        cfg = json.loads(out.read_text())
+        assert cfg["enabled"] is True
+        assert cfg["default_slack_channel"] == "C1234567890"
+        assert cfg["slack_token_env"] == "QUAY_SLACK_TOKEN"
+        assert cfg["reply_timeout_seconds"] == 120
+        assert cfg["poll_interval_seconds"] == 5
+
+    def test_invalid_channel_fails(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  orchestrator:\n"
+            "    default_slack_channel: not-a-channel\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "default_slack_channel" in r.stderr
+        assert not out.exists()
+
+    def test_validate_schema_checks_orchestrator_shape(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  orchestrator:\n"
+            '    enabled: "yes"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "quay.orchestrator.enabled must be a bool" in r.stderr
+
+
 class TestRenderQuayConfigAgents:
     """`quay.agents` block: emits `[agents]` plus a
     `[agents.invocations.<id>]` table per agent id. Legacy

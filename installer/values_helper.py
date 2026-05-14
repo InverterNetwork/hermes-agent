@@ -32,6 +32,11 @@ Subcommands:
                                   leave the provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
+  render-brix-orchestrator-config <out>
+                                — write ~/.hermes/quay/orchestrator.json from
+                                  quay.orchestrator. This is BRIX-side config
+                                  for fallback Slack routing and polling; it
+                                  intentionally does not enter quay config.toml.
   render-gateway-org-defaults --out <path>
                                 — write a compact org-defaults seed file
                                   derived from `repos[]` + `linear.teams`.
@@ -594,6 +599,8 @@ _AGENT_ROLE_KEYS = ("worker", "reviewer")
 # single agent entry. Reject dots here so the renderer can keep emitting a
 # bare header without quoting.
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_SLACK_CHANNEL_RE = re.compile(r"^[CDG][A-Z0-9]{2,}$")
 
 
 def _validate_quay_agents_block(
@@ -719,6 +726,101 @@ def _toml_basic_string(s: str) -> str:
     raw U+007F (DEL) would round-trip through ``json.dumps`` unescaped.
     """
     return json.dumps(s, ensure_ascii=False)
+
+
+def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str | None]:
+    """Validate BRIX orchestrator config under ``quay.orchestrator``.
+
+    This is not rendered into Quay's config. It is the BRIX-owned sidecar
+    runner configuration, kept separate so AST-121 can change Quay's handoff
+    contract without churn here.
+    """
+    defaults: dict[str, Any] = {
+        "enabled": False,
+        "default_slack_channel": "",
+        "slack_token_env": "SLACK_BOT_TOKEN",
+        "reply_timeout_seconds": 1800,
+        "poll_interval_seconds": 15,
+    }
+    if block is None:
+        return defaults, None
+    if not isinstance(block, dict):
+        return defaults, "quay.orchestrator must be a mapping when present"
+
+    allowed = set(defaults)
+    unknown = sorted(set(block) - allowed)
+    if unknown:
+        return defaults, (
+            f"quay.orchestrator has unknown key(s): {unknown!r} "
+            f"(allowed: {sorted(allowed)!r})"
+        )
+
+    out = dict(defaults)
+    if "enabled" in block:
+        if not isinstance(block["enabled"], bool):
+            return defaults, (
+                "quay.orchestrator.enabled must be a bool "
+                f"(got {type(block['enabled']).__name__}: {block['enabled']!r})"
+            )
+        out["enabled"] = block["enabled"]
+
+    if "default_slack_channel" in block:
+        channel = block["default_slack_channel"]
+        if channel is None:
+            channel = ""
+        if not isinstance(channel, str):
+            return defaults, (
+                "quay.orchestrator.default_slack_channel must be a string "
+                f"(got {type(channel).__name__}: {channel!r})"
+            )
+        if channel and not _SLACK_CHANNEL_RE.match(channel):
+            return defaults, (
+                "quay.orchestrator.default_slack_channel must be a Slack "
+                "channel/conversation id like C0123ABCDEF"
+            )
+        out["default_slack_channel"] = channel
+
+    if "slack_token_env" in block:
+        env_name = block["slack_token_env"]
+        if not isinstance(env_name, str) or not _ENV_NAME_RE.match(env_name):
+            return defaults, (
+                "quay.orchestrator.slack_token_env must be an env var name "
+                "matching [A-Z_][A-Z0-9_]*"
+            )
+        out["slack_token_env"] = env_name
+
+    for key in ("reply_timeout_seconds", "poll_interval_seconds"):
+        if key not in block:
+            continue
+        raw = block[key]
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+            return defaults, f"quay.orchestrator.{key} must be a positive integer"
+        out[key] = raw
+
+    return out, None
+
+
+def cmd_render_brix_orchestrator_config(args: argparse.Namespace) -> int:
+    data = _load(Path(args.values))
+    out_path = Path(args.out)
+    if out_path.exists() and not args.force:
+        sys.stdout.write(f"preserved: {out_path}\n")
+        return 0
+
+    quay = data.get("quay") or {}
+    if not isinstance(quay, dict):
+        sys.stderr.write("values_helper.py: quay must be a mapping\n")
+        return 1
+
+    cfg, err = _validate_quay_orchestrator_block(quay.get("orchestrator"))
+    if err is not None:
+        sys.stderr.write(f"values_helper.py: {err}\n")
+        return 1
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    sys.stdout.write(f"wrote: {out_path}\n")
+    return 0
 
 
 def cmd_render_quay_config(args: argparse.Namespace) -> int:
@@ -1591,6 +1693,12 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
     if ag_err is not None:
         sys.stderr.write(f"values_helper.py: {ag_err}\n")
         return 1
+    _, orch_err = _validate_quay_orchestrator_block(
+        quay_top.get("orchestrator") if quay_top else None
+    )
+    if orch_err is not None:
+        sys.stderr.write(f"values_helper.py: {orch_err}\n")
+        return 1
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -1776,6 +1884,15 @@ def main(argv: list[str] | None = None) -> int:
     p_quay.add_argument("--force", action="store_true",
                         help="overwrite an existing file")
     p_quay.set_defaults(func=cmd_render_quay_config)
+
+    p_brix_orch = sub.add_parser(
+        "render-brix-orchestrator-config",
+        help="write <target>/quay/orchestrator.json from quay.orchestrator",
+    )
+    p_brix_orch.add_argument("--out", required=True, help="output JSON path")
+    p_brix_orch.add_argument("--force", action="store_true",
+                             help="overwrite an existing file")
+    p_brix_orch.set_defaults(func=cmd_render_brix_orchestrator_config)
 
     p_org_defaults = sub.add_parser(
         "render-gateway-org-defaults",

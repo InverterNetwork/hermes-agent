@@ -203,6 +203,14 @@
 #                                 SLACK_TOKEN is staged by stage-secrets.sh
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
+#   quay.orchestrator          — BRIX-owned sidecar runner for durable Quay
+#                                 orchestrator handoffs. This intentionally
+#                                 renders to <target>/quay/orchestrator.json,
+#                                 not quay/config.toml, because AST-121 still
+#                                 owns the final Quay handoff contract.
+#                                 `default_slack_channel` is the deployment
+#                                 fallback channel for human questions when
+#                                 the task has no original Slack thread.
 #
 #   slack_triggers             — list of (channel, entry-skill) bindings that
 #                                 turn top-level Slack messages in a channel
@@ -485,6 +493,15 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
+  # BRIX orchestrator sidecar. Keep disabled until AST-121 lands the final
+  # Quay handoff adapter; BRIX-1405 wires the timer/service/config/Slack loop
+  # around a small adapter interface now to avoid contract churn later.
+  orchestrator:
+    enabled: false
+    default_slack_channel: ""
+    slack_token_env: SLACK_BOT_TOKEN
+    reply_timeout_seconds: 1800
+    poll_interval_seconds: 15
   # Quay pr-review subsystem. `enabled: true` alone only activates
   # ad-hoc /review on human-owned PRs; `gate_quay_owned_done: true` is what
   # opens the `pr-open → done → pr-review` path for quay-spawned tasks

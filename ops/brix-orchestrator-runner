@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# brix-orchestrator-runner - drain one orchestrator handoff.
+#
+# This is intentionally separate from quay-tick. Quay remains the
+# deterministic task runner; BRIX owns the orchestrator-side human-advice
+# loop once AST-121 supplies the final Quay adapter contract.
+
+set -u
+
+home="${HERMES_HOME:-$HOME/.hermes}"
+config="${BRIX_ORCHESTRATOR_CONFIG:-$home/quay/orchestrator.json}"
+py="${BRIX_ORCHESTRATOR_PYTHON:-$home/hermes-agent/venv/bin/python}"
+script="${BRIX_ORCHESTRATOR_SCRIPT:-$home/hermes-agent/ops/brix_orchestrator.py}"
+
+if [[ ! -x "$py" ]]; then
+  py="python3"
+fi
+
+exec "$py" "$script" drain-one --config "$config" "$@"
