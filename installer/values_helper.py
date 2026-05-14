@@ -355,10 +355,19 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     interactive command approval prompts, but the hardline blocklist remains
     enforced.
 
+    Also pins ``auxiliary.vision.{provider,model}`` from
+    ``gateway.vision_provider`` / ``gateway.vision_model`` when set;
+    unset/empty drops the key declaratively (same model as
+    ``model.base_url``) so removing the pin from values actually takes
+    effect on the next install. When both keys end up empty the
+    surrounding ``auxiliary.vision`` and ``auxiliary`` blocks drop so
+    the seeded config doesn't accumulate empty mappings.
+
     Roundtrips through PyYAML, so YAML-level comments inside config.yaml
     are not preserved (matching ``hermes_cli.config.save_config``'s existing
-    behavior). Operator-added *keys* survive — only the model.provider and
-    model.base_url scalars are touched.
+    behavior). Operator-added *keys* survive: only the touched scalars
+    (``model.provider``, ``model.base_url``, ``approvals.mode``,
+    ``auxiliary.vision.{provider,model}``) are rewritten.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -377,6 +386,18 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     if base_url is not None and not isinstance(base_url, str):
         sys.stderr.write(
             "values_helper.py: gateway.model_base_url, if set, must be a string\n"
+        )
+        return 1
+    vision_provider = gateway.get("vision_provider")
+    vision_model = gateway.get("vision_model")
+    if vision_provider is not None and not isinstance(vision_provider, str):
+        sys.stderr.write(
+            "values_helper.py: gateway.vision_provider, if set, must be a string\n"
+        )
+        return 1
+    if vision_model is not None and not isinstance(vision_model, str):
+        sys.stderr.write(
+            "values_helper.py: gateway.vision_model, if set, must be a string\n"
         )
         return 1
     approvals_mode, approvals_err = _validate_gateway_approvals_mode(gateway)
@@ -423,6 +444,29 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
             approvals_block = {}
         approvals_block["mode"] = approvals_mode
         existing["approvals"] = approvals_block
+
+    auxiliary_block = existing.get("auxiliary")
+    if not isinstance(auxiliary_block, dict):
+        auxiliary_block = {}
+    vision_block = auxiliary_block.get("vision")
+    if not isinstance(vision_block, dict):
+        vision_block = {}
+    if vision_provider:
+        vision_block["provider"] = vision_provider
+    else:
+        vision_block.pop("provider", None)
+    if vision_model:
+        vision_block["model"] = vision_model
+    else:
+        vision_block.pop("model", None)
+    if vision_block:
+        auxiliary_block["vision"] = vision_block
+    else:
+        auxiliary_block.pop("vision", None)
+    if auxiliary_block:
+        existing["auxiliary"] = auxiliary_block
+    else:
+        existing.pop("auxiliary", None)
 
     # Re-emit the standard header so the file's intro text doesn't quietly
     # vanish after the first merge (the round-trip strips any prior
