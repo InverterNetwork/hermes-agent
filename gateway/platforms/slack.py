@@ -2846,17 +2846,6 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id,
         )
 
-        # A button click in a configured slack_triggers channel is already
-        # an authorized surface — the trigger router has explicit consent
-        # for that channel. Signal the slash-command path to skip the
-        # global allowed_channels check; without this, clicks die at the
-        # allowlist with no operator feedback whenever the trigger channel
-        # is not also in allowed_channels.
-        bypass_allowlist = (
-            self._trigger_router is not None
-            and channel_id in self._trigger_router.channel_ids
-        )
-
         # Reuse the slash-command dispatch path — the skill sees the same
         # MessageEvent shape it would have seen from a typed `/<skill> <args>`.
         fake_command = {
@@ -2866,7 +2855,6 @@ class SlackAdapter(BasePlatformAdapter):
             "channel_id": channel_id,
             "team_id": team_id,
             "response_url": body.get("response_url", ""),
-            "_bypass_channel_allowlist": bypass_allowlist,
         }
         await self._handle_slash_command(fake_command)
 
@@ -3100,12 +3088,9 @@ class SlackAdapter(BasePlatformAdapter):
         # session key.
         is_dm = str(channel_id).startswith("D")
 
-        if not command.get("_bypass_channel_allowlist") and self._channel_blocked_by_allowlist(channel_id, is_dm):
+        if self._channel_blocked_by_allowlist(channel_id, is_dm):
             # Slash already got an upstream ack so Slack won't render
             # "dispatch_failed" — silent drop is the right shape.
-            # The bypass flag is set by _handle_skill_invoke_action when
-            # the click originated in a slack_triggers-bound channel; such
-            # channels are pre-authorized regardless of allowed_channels.
             logger.debug("[Slack] Ignoring slash command in non-allowed channel: %s", channel_id)
             return
 

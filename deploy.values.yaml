@@ -315,6 +315,7 @@ slack:
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
       - C0B23MZ0USV
+      - C0B0LSP8H1B
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: ""
