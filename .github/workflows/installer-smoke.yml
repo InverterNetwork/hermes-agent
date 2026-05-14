@@ -61,6 +61,13 @@ jobs:
             /srv/hermes/repos/hermes-state/skills/.gitkeep \
             /srv/hermes/repos/hermes-state/memories/.gitkeep \
             /srv/hermes/repos/hermes-state/cron/output/.gitkeep
+          # Stub every skill referenced by deploy.values.yaml's slack_triggers
+          # so values_helper.py's existence check passes without needing the
+          # real hermes-state repo. The validator only checks for SKILL.md
+          # presence in a directory matching the skill name. Add a new stub
+          # here whenever a new slack_triggers entry lands.
+          sudo install -d /srv/hermes/repos/hermes-state/skills/feedback-intake
+          sudo touch /srv/hermes/repos/hermes-state/skills/feedback-intake/SKILL.md
           echo '{}' | sudo tee /srv/hermes/repos/hermes-state/cron/jobs.json > /dev/null
           sudo git -C /srv/hermes/repos/hermes-state \
             -c user.email=ci@example.com -c user.name=ci add -A
