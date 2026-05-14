@@ -62,6 +62,7 @@ class _State:
     values_helper: Path
     quay_version: str
     agent_invocation: str
+    codex_required: bool = False
     quay_tags_supported: bool = False
     total: int = 0
     drift: int = 0
@@ -713,11 +714,11 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
 
 
 def _check_codex_prereqs(s: _State) -> None:
-    """Codex CLI host-prep checks — fire only when quay.agent_invocation
-    references `codex`. Codex is operator-installed under the agent user
-    (mirrors the claude precedent, not rails-class), so verify confirms
-    the operator completed install + `codex login` rather than provisioning
-    the binary itself. ChatGPT subscription auth — never OPENAI_API_KEY."""
+    """Codex CLI host-prep checks — fire only when the active quay agent
+    invocation path references `codex`. setup-hermes.sh provisions the binary
+    under the agent user; verify confirms the binary is runnable and the
+    operator completed `codex login`. ChatGPT subscription auth — never
+    OPENAI_API_KEY."""
     rc, out, _ = _run([
         *_sudo_prefix_for(s.agent_owner), "bash", "-c", "codex --version",
     ])
@@ -725,7 +726,7 @@ def _check_codex_prereqs(s: _State) -> None:
         s.v_drift(
             "codex binary",
             f"`codex --version` failed for {s.agent_owner}; "
-            "install per ops/README.md → 'Pre-install: codex CLI'",
+            "re-run setup-hermes.sh to restore the pinned binary",
         )
         return
     s.v_ok(f"codex binary: {(out.splitlines() or [''])[0] or '?'}")
@@ -1337,12 +1338,19 @@ def run(
     )
     quay_version = ""
     agent_invocation = ""
+    codex_required = False
     if values_file.is_file() and values_helper.is_file():
         quay_version = _values_get(values_file, values_helper, "quay.version")
         if quay_version:
             agent_invocation = _values_get(
                 values_file, values_helper, "quay.agent_invocation",
             )
+            try:
+                from .config import _codex_invocation_active, load_values
+
+                codex_required = _codex_invocation_active(load_values(values_file))
+            except Exception:
+                codex_required = "codex" in agent_invocation
 
     quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
 
@@ -1378,6 +1386,7 @@ def run(
         values_helper=values_helper,
         quay_version=quay_version,
         agent_invocation=agent_invocation,
+        codex_required=codex_required,
         quay_tags_supported=quay_tags_supported,
     )
 
@@ -1413,7 +1422,7 @@ def run(
         )
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
-    if "codex" in s.agent_invocation:
+    if s.codex_required:
         _check_codex_prereqs(s)
     _check_per_entry_repos(s, repos_tsv)
     _check_deployment_tag_vocab(s)

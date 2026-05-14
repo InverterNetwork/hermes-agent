@@ -446,6 +446,15 @@ quay:
       codex:
         worker: "codex exec --json --dangerously-bypass-approvals-and-sandbox < {prompt_file} > .quay-tool-trace.log"
         reviewer: "codex exec --json --dangerously-bypass-approvals-and-sandbox < {prompt_file} > .quay-tool-trace.log"
+  # Pinned Codex CLI worker binary. The OpenAI Codex GitHub release uses
+  # `rust-v<version>` tags for static assets; the installer downloads the
+  # linux-x64 musl tarball, verifies the release API SHA256 digest pinned
+  # here, installs it as ~<agent>/.local/bin/codex, and creates
+  # /usr/local/bin/codex as a root-owned symlink. `codex login` remains an
+  # interactive operator step.
+  codex:
+    version: "rust-v0.130.0"
+    linux_x64_sha256: "16779e7b7857508a768a36d7d4e084eec336ec23946ed70a9b09489b8f861190"
   # Pinned runtime managers the installer must guarantee on PATH before
   # quay bootstraps a worktree. Keys must match every distinct
   # `repos[].quay.package_manager` value in this file. linux_x64_sha256
