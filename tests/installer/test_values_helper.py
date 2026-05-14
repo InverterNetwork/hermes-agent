@@ -1000,7 +1000,7 @@ class TestRenderQuayConfig:
         assert not out.exists()
 
 
-class TestRenderBrixOrchestratorConfig:
+class TestRenderQuayOrchestratorConfig:
     def test_absent_block_renders_disabled_defaults(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
@@ -1009,7 +1009,7 @@ class TestRenderBrixOrchestratorConfig:
             encoding="utf-8",
         )
         out = tmp_path / "orchestrator.json"
-        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        r = _run(values, "render-quay-orchestrator-config", "--out", str(out))
         assert r.returncode == 0, r.stderr
         assert json.loads(out.read_text()) == {
             "default_slack_channel": "",
@@ -1019,6 +1019,18 @@ class TestRenderBrixOrchestratorConfig:
             "reply_timeout_seconds": 1800,
             "slack_token_env": "SLACK_BOT_TOKEN",
         }
+
+    def test_legacy_command_alias_still_renders(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert json.loads(out.read_text())["enabled"] is False
 
     def test_renders_enabled_channel_and_polling_knobs(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
@@ -1035,7 +1047,7 @@ class TestRenderBrixOrchestratorConfig:
             encoding="utf-8",
         )
         out = tmp_path / "orchestrator.json"
-        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        r = _run(values, "render-quay-orchestrator-config", "--out", str(out))
         assert r.returncode == 0, r.stderr
         cfg = json.loads(out.read_text())
         assert cfg["enabled"] is True
@@ -1055,7 +1067,7 @@ class TestRenderBrixOrchestratorConfig:
             encoding="utf-8",
         )
         out = tmp_path / "orchestrator.json"
-        r = _run(values, "render-brix-orchestrator-config", "--out", str(out))
+        r = _run(values, "render-quay-orchestrator-config", "--out", str(out))
         assert r.returncode == 1
         assert "default_slack_channel" in r.stderr
         assert not out.exists()

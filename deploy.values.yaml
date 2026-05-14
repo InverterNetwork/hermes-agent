@@ -222,7 +222,7 @@
 #                                 SLACK_TOKEN is staged by stage-secrets.sh
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
-#   quay.orchestrator          — BRIX-owned sidecar runner for durable Quay
+#   quay.orchestrator          — Quay orchestrator sidecar for durable Quay
 #                                 orchestrator handoffs. This renders to
 #                                 <target>/quay/orchestrator.json, not
 #                                 quay/config.toml, because these are sidecar
@@ -530,7 +530,7 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # BRIX orchestrator sidecar. Drains durable Quay handoffs into the
+  # Quay orchestrator sidecar. Drains durable Quay handoffs into the
   # deployment feedback channel when the task has no original Slack thread.
   orchestrator:
     enabled: true

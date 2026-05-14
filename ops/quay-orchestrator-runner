@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# quay-orchestrator-runner - drain one orchestrator handoff.
+#
+# This is intentionally separate from quay-tick. Quay remains the
+# deterministic task runner; this owns the orchestrator-side human-advice
+# Slack post/reply loop.
+
+set -u
+
+home="${HERMES_HOME:-$HOME/.hermes}"
+config="${QUAY_ORCHESTRATOR_CONFIG:-${BRIX_ORCHESTRATOR_CONFIG:-$home/quay/orchestrator.json}}"
+py="${QUAY_ORCHESTRATOR_PYTHON:-${BRIX_ORCHESTRATOR_PYTHON:-$home/hermes-agent/venv/bin/python}}"
+script="${QUAY_ORCHESTRATOR_SCRIPT:-${BRIX_ORCHESTRATOR_SCRIPT:-$home/hermes-agent/ops/quay_orchestrator.py}}"
+
+if [[ ! -x "$py" ]]; then
+  py="python3"
+fi
+
+exec "$py" "$script" drain-one --config "$config" "$@"
