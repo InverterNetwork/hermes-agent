@@ -845,27 +845,52 @@ jobs:
             echo "non-default --target probe: OK"
           '
 
-      - name: codex-prereq fail-loud probe
-        # Verify that the installer exits non-zero and emits a useful message when
-        # an active quay invocation references 'codex' but the binary is absent.
-        # We remove the shim, run the installer, assert failure, then restore.
+      - name: codex worker CLI probe
+        # The installer should replace the CI shim with the pinned, root-managed
+        # Codex binary and expose it through /usr/local/bin/codex.
         run: |
+          set -euo pipefail
+          [[ -L /usr/local/bin/codex ]] || { echo "FAIL: /usr/local/bin/codex is not a symlink"; exit 1; }
+          target=$(readlink /usr/local/bin/codex)
+          [[ "$target" == "/usr/local/bin/.codex.hermes-managed" ]] \
+            || { echo "FAIL: /usr/local/bin/codex -> $target"; exit 1; }
+          [[ -x "$target" ]] || { echo "FAIL: managed codex binary missing or not executable at $target"; exit 1; }
+          mode=$(stat -c "%a" "$target")
+          owner=$(stat -c "%U:%G" "$target")
+          [[ "$mode" == "755" ]]        || { echo "FAIL: codex mode=$mode (expected 755)"; exit 1; }
+          [[ "$owner" == "root:root" ]] || { echo "FAIL: codex owner=$owner (expected root:root)"; exit 1; }
+          pin=$(python3 /srv/hermes/repos/hermes-agent/installer/values_helper.py \
+            --values /srv/hermes/repos/hermes-agent/deploy.values.yaml \
+            get quay.codex.version)
+          pin=${pin#rust-v}
+          actual=$(/usr/local/bin/codex --version 2>&1 | head -n1)
+          [[ "$actual" == *"$pin"* ]] \
+            || { echo "FAIL: codex --version='$actual' does not contain pin '$pin'"; exit 1; }
+          echo "codex worker CLI probe: OK ($actual)"
+
+      - name: codex auth verify fail-loud probe
+        # The binary is provisioned, but the OAuth session remains an operator
+        # step. Verify must fail loudly when active codex workers lack auth.json.
+        run: |
+          set -euo pipefail
+          sudo rm -f /home/hermes/.codex/auth.json
           set +e
-          sudo rm -f /usr/local/bin/codex
           out=$(sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
             --fork /srv/hermes/repos/hermes-agent \
             --state /srv/hermes/repos/hermes-state \
             --user hermes \
             --git-identity-email didier@ci \
-            --skip-prep 2>&1)
+            --verify 2>&1)
           rc=$?
           set -e
-          [[ $rc -ne 0 ]] || { echo "FAIL: installer should have exited non-zero when codex absent"; exit 1; }
-          echo "$out" | grep -q "codex" || { echo "FAIL: installer output should mention codex; got: $out"; exit 1; }
-          echo "codex-prereq fail-loud probe: OK"
-          # Restore the shim so subsequent steps (e.g. render summary) don't break.
-          printf '#!/bin/bash\necho codex-ci-shim\n' | sudo tee /usr/local/bin/codex > /dev/null
-          sudo chmod 0755 /usr/local/bin/codex
+          [[ $rc -ne 0 ]] || { echo "FAIL: verify should have exited non-zero when codex auth is absent"; exit 1; }
+          echo "$out" | grep -q "codex auth" || { echo "FAIL: verify output should mention codex auth; got: $out"; exit 1; }
+          sudo tee /home/hermes/.codex/auth.json > /dev/null <<'JSON'
+          {"tokens":{"access_token":"ci-access-token","refresh_token":"ci-refresh-token"}}
+          JSON
+          sudo chown hermes:hermes /home/hermes/.codex/auth.json
+          sudo chmod 0600 /home/hermes/.codex/auth.json
+          echo "codex auth verify fail-loud probe: OK"
 
       - name: render summary on failure
         if: failure()

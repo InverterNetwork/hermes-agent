@@ -7,7 +7,9 @@ from __future__ import annotations
 import pytest
 
 from installer.hermes_installer.config import (
+    CodexPin,
     RuntimeManagerPin,
+    required_codex_pin,
     required_runtime_managers,
 )
 
@@ -141,3 +143,69 @@ class TestRequiredRuntimeManagers:
             runtime_managers={"bun": VALID_BUN_PIN},
         )
         assert list(required_runtime_managers(values)) == ["bun"]
+
+
+VALID_CODEX_PIN = {
+    "version": "rust-v0.130.0",
+    "linux_x64_sha256": "16779e7b7857508a768a36d7d4e084eec336ec23946ed70a9b09489b8f861190",
+}
+
+
+def _codex_values(*, worker: str = "codex", invocations: dict | None = None) -> dict:
+    return {
+        "quay": {
+            "agent_invocation": "claude < {prompt_file}",
+            "codex": VALID_CODEX_PIN,
+            "agents": {
+                "worker": worker,
+                "invocations": invocations or {
+                    "codex": {
+                        "worker": "codex exec --json < {prompt_file}",
+                    },
+                    "claude": {
+                        "worker": "claude --print < {prompt_file}",
+                    },
+                },
+            },
+        },
+    }
+
+
+class TestRequiredCodexPin:
+    def test_active_codex_invocation_returns_pin(self):
+        assert required_codex_pin(_codex_values()) == CodexPin(
+            version=VALID_CODEX_PIN["version"],
+            linux_x64_sha256=VALID_CODEX_PIN["linux_x64_sha256"],
+        )
+
+    def test_claude_only_invocation_is_noop(self):
+        values = _codex_values(worker="claude")
+        assert required_codex_pin(values) is None
+
+    def test_legacy_agent_invocation_still_triggers(self):
+        values = {
+            "quay": {
+                "agent_invocation": "codex exec < {prompt_file}",
+                "codex": VALID_CODEX_PIN,
+            }
+        }
+        assert required_codex_pin(values) is not None
+
+    def test_unused_codex_invocation_does_not_trigger(self):
+        values = _codex_values(worker="claude")
+        assert required_codex_pin(values) is None
+
+    def test_missing_pin_fails_when_codex_active(self, capsys):
+        values = _codex_values()
+        del values["quay"]["codex"]
+        with pytest.raises(SystemExit) as excinfo:
+            required_codex_pin(values)
+        assert excinfo.value.code == 1
+        assert "quay.codex" in capsys.readouterr().err
+
+    def test_invalid_sha_fails_when_codex_active(self, capsys):
+        values = _codex_values()
+        values["quay"]["codex"]["linux_x64_sha256"] = "deadbeef"
+        with pytest.raises(SystemExit):
+            required_codex_pin(values)
+        assert "linux_x64_sha256" in capsys.readouterr().err

@@ -444,6 +444,12 @@ PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
 # triggered by a substring match against active quay agent invocations.
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   agent_invocations="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" active-agent-invocations)"
+  if [[ "$agent_invocations" == *codex* ]]; then
+    # Binary is root-managed; `codex login` remains an operator step under
+    # the agent user's home so OAuth material stays agent-owned.
+    PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+      ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
+  fi
   if [[ "$agent_invocations" == *claude* ]]; then
     echo "==> provisioning claude CLI for $AGENT_USER"
     sudo -u "$AGENT_USER" -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
@@ -457,10 +463,8 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   if [[ "$agent_invocations" == *codex* ]]; then
     if ! sudo -u "$AGENT_USER" -H bash -c 'command -v codex' >/dev/null 2>&1; then
       echo "FAIL: an active quay invocation references 'codex' but the codex binary is not on PATH for $AGENT_USER" >&2
-      echo "      Install + log in as $AGENT_USER (ChatGPT subscription auth, not OPENAI_API_KEY)" >&2
-      echo "      before re-running setup-hermes.sh." >&2
-      echo "      See ops/README.md → 'Pre-install: codex CLI' for the supported install paths" >&2
-      echo "      and the 'codex login' bootstrap." >&2
+      echo "      setup-hermes.sh should have installed the pinned codex binary from quay.codex;" >&2
+      echo "      check the ensure-codex error above, then run codex login as $AGENT_USER." >&2
       exit 1
     fi
   fi

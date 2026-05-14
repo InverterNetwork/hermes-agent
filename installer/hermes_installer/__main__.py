@@ -4,6 +4,8 @@
   ``repos[].quay.package_manager`` entries declare. Idempotent. Refuses
   on SHA mismatch or missing pin. Requires euid 0 unless
   ``--skip-root-check`` is passed (tests only).
+* ``ensure-codex`` — provision the pinned Codex CLI as a root-managed
+  binary when the active quay agent invocation path references ``codex``.
 * ``verify`` — read-only health check. Inspects the live install for drift
   and exits 0 (no drift) or 1 (drift detected). No root required.
 """
@@ -40,6 +42,24 @@ def main(argv: list[str] | None = None) -> int:
         help="directory to install runtime binaries into (default: /usr/local/bin)",
     )
     er.add_argument(
+        "--skip-root-check",
+        action="store_true",
+        help="bypass the euid==0 assertion (tests only)",
+    )
+
+    ec = sub.add_parser(
+        "ensure-codex",
+        help="provision pinned Codex CLI when active quay agents reference codex",
+    )
+    ec.add_argument("--values", required=True, type=Path, help="path to deploy.values.yaml")
+    ec.add_argument("--agent-user", required=True, help="agent user that owns ~/.codex state")
+    ec.add_argument(
+        "--symlink-path",
+        type=Path,
+        default=Path("/usr/local/bin/codex"),
+        help="system symlink to create (default: /usr/local/bin/codex)",
+    )
+    ec.add_argument(
         "--skip-root-check",
         action="store_true",
         help="bypass the euid==0 assertion (tests only)",
@@ -87,6 +107,17 @@ def main(argv: list[str] | None = None) -> int:
         values = load_values(args.values)
         pins = required_runtime_managers(values)
         ensure_runtimes(pins, install_dir=args.install_dir)
+        return 0
+
+    if args.cmd == "ensure-codex":
+        from .codex import ensure_codex
+        from .config import load_values, required_codex_pin
+
+        if not args.skip_root_check:
+            require_root()
+        values = load_values(args.values)
+        pin = required_codex_pin(values)
+        ensure_codex(pin, agent_user=args.agent_user, symlink_path=args.symlink_path)
         return 0
 
     if args.cmd == "verify":

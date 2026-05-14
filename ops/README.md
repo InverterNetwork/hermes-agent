@@ -111,40 +111,25 @@ worker process which runs as the agent user.
 ## Pre-install: codex CLI (quay workers)
 
 Alternative to claude for quay's worker invocation. Configure by pointing
-`quay.agent_invocation` in `deploy.values.yaml` at `codex` (e.g.
-`codex exec --json -- … < {prompt_file} > .quay-usage.json`) — the
-installer fails loud if the invocation references `codex` and the binary
-is absent on the agent user's `PATH`.
+the active `quay.agents.{worker,reviewer}` invocation in
+`deploy.values.yaml` at `codex` (e.g. `codex exec --json -- … <
+{prompt_file} > .quay-tool-trace.log`). The installer provisions the
+pinned static binary automatically when the active invocation references
+`codex`.
 
 Subscription model: **ChatGPT subscription via `codex login`**, *not* an
 `OPENAI_API_KEY`. This is the same subscription class as the gateway's
 `openai-codex` auth but a distinct credential store (`~<agent>/.codex/`
 vs. `~<agent>/.hermes/auth.json`) — the codex CLI manages its own session.
 
-Install (operator's choice — codex ships several distribution paths, and
-the installer doesn't provision the binary itself; the rails-class
-SHA-pinned install pattern used for the `quay` binary may be adopted in a
-follow-up once codex publishes stable static-binary releases). Two paths
-currently work:
+Install is automatic during `setup-hermes.sh`: the installer downloads the
+`openai/codex` GitHub release asset pinned at `quay.codex.version`, verifies
+`quay.codex.linux_x64_sha256`, installs it as a root-owned managed binary
+beside `/usr/local/bin/codex`, and exposes `/usr/local/bin/codex` as a
+root-owned symlink. The remaining manual step is authentication.
 
-```sh
-# Path A — npm (canonical upstream distribution today). Requires node+npm.
-sudo -u <agent> -H npm install -g @openai/codex
-
-# Path B — static binary from openai/codex GitHub releases.
-# Substitute the release tag and platform asset name as appropriate.
-sudo -u <agent> -H bash -c 'curl -fsSL <release-url> | tar xz -C ~/.local/bin/'
-```
-
-Symlink to a system path so root-owned scripts and `command -v codex`
-probes find it (parallel to claude):
-
-```sh
-sudo ln -sf $(sudo -u <agent> -H bash -c 'command -v codex') /usr/local/bin/codex
-```
-
-Log in (interactive — opens a browser flow on the local machine; complete
-before running the installer):
+Log in after the installer has restored the binary (interactive — opens a
+browser flow on the local machine):
 
 ```sh
 sudo -u <agent> -H codex login
