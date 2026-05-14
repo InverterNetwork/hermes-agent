@@ -489,6 +489,144 @@ class TestMergeConfigModel:
         assert r.returncode == 1
         assert "not valid YAML" in r.stderr
 
+    def test_writes_vision_pin_when_set(self, tmp_path: Path):
+        # Pinning vision_provider + vision_model from values lands in
+        # auxiliary.vision.{provider,model} so the gateway's vision_analyze
+        # path resolves a client at runtime.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_provider: codex\n"
+            "  vision_model: gpt-5.3-codex\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["auxiliary"]["vision"]["provider"] == "codex"
+        assert loaded["auxiliary"]["vision"]["model"] == "gpt-5.3-codex"
+
+    def test_drops_stale_vision_pin_when_values_empty(self, tmp_path: Path):
+        # Removing the pin from values must clear the rendered config so the
+        # gateway returns to auto-detect on the next install. Same declarative
+        # drop semantics as model.base_url.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai-codex\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: stale-provider\n"
+            "    model: stale-model\n"
+            "  web_extract:\n"
+            "    provider: openrouter\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        # vision sub-block fully removed, but operator-set web_extract preserved.
+        assert "vision" not in loaded["auxiliary"]
+        assert loaded["auxiliary"]["web_extract"]["provider"] == "openrouter"
+
+    def test_drops_auxiliary_when_only_vision_was_present(self, tmp_path: Path):
+        # When clearing vision leaves auxiliary empty, drop auxiliary too,
+        # so the rendered config doesn't accumulate `auxiliary: {}` litter.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai-codex\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: stale\n"
+            "    model: stale\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert "auxiliary" not in loaded
+
+    def test_vision_provider_only_drops_model(self, tmp_path: Path):
+        # Providers with sensible vision defaults (openrouter, nous) don't
+        # need an explicit model. Accept provider-only and clear any stale
+        # model so the provider's own default takes effect.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_provider: openrouter\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n  vision:\n    provider: codex\n    model: stale-model\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["auxiliary"]["vision"]["provider"] == "openrouter"
+        assert "model" not in loaded["auxiliary"]["vision"]
+
+    def test_preserves_operator_keys_inside_vision_block(self, tmp_path: Path):
+        # Operator hand-added vision-task keys (e.g. timeout) must survive
+        # when values drops the merged provider/model pins. Guards against a
+        # future refactor swapping `vision_block.pop(...)` for a wholesale
+        # reset.
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai-codex\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "auxiliary:\n"
+            "  vision:\n"
+            "    provider: stale\n"
+            "    model: stale\n"
+            "    timeout: 45\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        # Operator's timeout survives; merged keys cleared.
+        assert loaded["auxiliary"]["vision"] == {"timeout": 45}
+
+    def test_rejects_non_string_vision_provider(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_provider: 123\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.vision_provider" in r.stderr
+
+    def test_rejects_non_string_vision_model(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  vision_model: [list, not, string]\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.vision_model" in r.stderr
+
 
 class TestRenderQuayConfig:
     @pytest.fixture
