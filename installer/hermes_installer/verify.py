@@ -717,8 +717,8 @@ def _check_codex_prereqs(s: _State) -> None:
     """Codex CLI host-prep checks — fire only when the active quay agent
     invocation path references `codex`. setup-hermes.sh provisions the binary
     under the agent user; verify confirms the binary is runnable and the
-    operator completed `codex login`. ChatGPT subscription auth — never
-    OPENAI_API_KEY."""
+    operator completed `codex login` when token material is present. ChatGPT
+    subscription auth — never OPENAI_API_KEY."""
     rc, out, _ = _run([
         *_sudo_prefix_for(s.agent_owner), "bash", "-c", "codex --version",
     ])
@@ -766,9 +766,9 @@ def _check_codex_prereqs(s: _State) -> None:
     # pass verify while workers fail at runtime.
     auth_path = codex_dir / "auth.json"
     if not auth_path.is_file():
-        s.v_drift(
-            "codex auth",
-            f"missing {auth_path} — run `sudo -u {s.agent_owner} -H codex login`",
+        s.v_ok(
+            f"codex auth pending: missing {auth_path} "
+            f"(run `sudo -u {s.agent_owner} -H codex login`)",
         )
         return
     try:

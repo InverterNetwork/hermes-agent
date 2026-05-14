@@ -86,6 +86,7 @@ class TestEnsureCodex:
         assert (install_path.stat().st_mode & 0o777) == 0o755
         assert ((fake_agent / ".local").stat().st_mode & 0o777) == 0o755
         assert (install_path.parent.stat().st_mode & 0o777) == 0o755
+        assert ((fake_agent / ".codex").stat().st_mode & 0o777) == 0o700
         assert symlink.is_symlink()
         assert Path(os.readlink(symlink)) == install_path
 
@@ -127,6 +128,7 @@ class TestEnsureCodex:
         ensure_codex(pin, agent_user="agent", symlink_path=symlink)
 
         assert install_path.stat().st_mtime_ns == before_mtime
+        assert ((fake_agent / ".codex").stat().st_mode & 0o777) == 0o700
         assert symlink.is_symlink()
         assert Path(os.readlink(symlink)) == install_path
 

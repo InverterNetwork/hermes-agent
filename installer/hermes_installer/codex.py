@@ -45,6 +45,7 @@ def ensure_codex(
     pw = _agent_user(agent_user)
     home = agent_home or Path(pw.pw_dir)
     install_path = home / ".local" / "bin" / "codex"
+    _ensure_codex_auth_dir(home / ".codex", pw.pw_uid, pw.pw_gid)
 
     if _codex_at_pinned_version(install_path, pin.version, pw.pw_uid, pw.pw_gid):
         _ensure_symlink(install_path, symlink_path)
@@ -133,6 +134,18 @@ def _ensure_agent_bin_dir(bin_dir: Path, uid: int, gid: int) -> None:
         except PermissionError:
             pass
         os.chmod(path, 0o755)
+
+
+def _ensure_codex_auth_dir(codex_dir: Path, uid: int, gid: int) -> None:
+    # Auth tokens are operator-provisioned via `codex login`, but the
+    # directory itself must be private before any codex command can create it
+    # with a looser inherited umask.
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chown(codex_dir, uid, gid)
+    except PermissionError:
+        pass
+    os.chmod(codex_dir, 0o700)
 
 
 def _ensure_symlink(target: Path, link: Path) -> None:
