@@ -329,12 +329,15 @@ slack:
     # SLACK_ALLOWED_USERS on every install via auth/gateway-runtime.env, so
     # the operator stops re-typing this on re-runs/rotations. Empty list /
     # unset disables the gate (bot accepts every authorized user — risky in
-    # public workspaces; keep populated for production).
+    # public workspaces; keep populated for production). An explicit empty
+    # list writes SLACK_ALLOWED_USERS= to clear stale legacy auth/slack.env
+    # allowlists.
     allowed_users: []
     # If non-empty, the bot ONLY responds in these channels (whitelist).
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
       - C0B23MZ0USV
+      - C0B4LLZ5Z2L
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: ""
@@ -539,14 +542,13 @@ quay:
 # Populate `channel_id` from the actual Slack channel id (visible in
 # the URL: https://app.slack.com/client/<team>/<channel_id>); the
 # `feedback-intake` skill is shipped in hermes-state.
-slack_triggers: []
-  # Example (uncomment and fill in once the feedback channel id is known):
-  # - channel_id: C0XXXXXXXXX
-  #   channel_name: feedback              # comment-only, for readability
-  #   skill: feedback-intake
-  #   require_top_level: true
-  #   accept_from_bots: false
-  #   rate_limit:
-  #     max_per_hour: 30
-  #     on_overflow: skip
-  #   default_repo: iTRY-monorepo
+slack_triggers:
+  - channel_id: C0B4LLZ5Z2L
+    channel_name: brix-feedback-sandbox
+    skill: feedback-intake
+    require_top_level: true
+    accept_from_bots: false
+    rate_limit:
+      max_per_hour: 30
+      on_overflow: skip
+    default_repo: iTRY-monorepo

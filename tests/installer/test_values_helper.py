@@ -206,7 +206,7 @@ class TestRenderGatewayRuntimeEnv:
         text = out.read_text()
         assert "SLACK_ALLOWED_USERS=U01ABC2DEF,U02GHI3JKL" in text
 
-    def test_empty_list_omits_line(self, tmp_path: Path):
+    def test_empty_list_clears_stale_env(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
             "slack:\n  runtime:\n    allowed_users: []\n", encoding="utf-8"
@@ -215,7 +215,7 @@ class TestRenderGatewayRuntimeEnv:
         r = _run(values, "render-gateway-runtime-env", "--out", str(out))
         assert r.returncode == 0, r.stderr
         text = out.read_text()
-        assert "SLACK_ALLOWED_USERS" not in text
+        assert "SLACK_ALLOWED_USERS=\n" in text
 
     def test_missing_slack_section_still_creates_file(self, tmp_path: Path):
         # The installer chowns/chmods the output path right after; the helper
