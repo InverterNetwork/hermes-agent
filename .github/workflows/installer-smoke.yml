@@ -166,14 +166,24 @@ jobs:
               yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
           PY
 
-      - name: install claude shim (satisfies installer claude prerequisite check)
-        # The installer (ITRY-1311) fails loud when quay.agent_invocation
-        # references 'claude' but the binary isn't on PATH for the agent user.
-        # CI doesn't actually run claude — a no-op shim satisfies the check.
+      - name: install agent CLI shims (satisfies installer prerequisite checks)
+        # The installer fails loud when an active quay invocation references
+        # an agent CLI that is not on PATH for the agent user. CI doesn't
+        # actually run these CLIs — no-op shims satisfy the binary checks.
+        # Codex verify also requires the logged-in auth shape, so seed
+        # CI-only placeholder tokens with production-like permissions.
         run: |
           sudo install -d /usr/local/bin
           echo '#!/bin/bash' | sudo tee /usr/local/bin/claude > /dev/null
+          printf '#!/bin/bash\necho codex-ci-shim\n' | sudo tee /usr/local/bin/codex > /dev/null
           sudo chmod 0755 /usr/local/bin/claude
+          sudo chmod 0755 /usr/local/bin/codex
+          sudo install -d -o hermes -g hermes -m 0700 /home/hermes/.codex
+          sudo tee /home/hermes/.codex/auth.json > /dev/null <<'JSON'
+          {"tokens":{"access_token":"ci-access-token","refresh_token":"ci-refresh-token"}}
+          JSON
+          sudo chown hermes:hermes /home/hermes/.codex/auth.json
+          sudo chmod 0600 /home/hermes/.codex/auth.json
 
       - name: run installer (first run; should provision build deps + clone state)
         run: |
@@ -828,13 +838,13 @@ jobs:
             echo "non-default --target probe: OK"
           '
 
-      - name: claude-prereq fail-loud probe
+      - name: codex-prereq fail-loud probe
         # Verify that the installer exits non-zero and emits a useful message when
-        # quay.agent_invocation references 'claude' but the binary is absent.
+        # an active quay invocation references 'codex' but the binary is absent.
         # We remove the shim, run the installer, assert failure, then restore.
         run: |
           set +e
-          sudo rm -f /usr/local/bin/claude
+          sudo rm -f /usr/local/bin/codex
           out=$(sudo /srv/hermes/repos/hermes-agent/installer/setup-hermes.sh \
             --fork /srv/hermes/repos/hermes-agent \
             --state /srv/hermes/repos/hermes-state \
@@ -843,12 +853,12 @@ jobs:
             --skip-prep 2>&1)
           rc=$?
           set -e
-          [[ $rc -ne 0 ]] || { echo "FAIL: installer should have exited non-zero when claude absent"; exit 1; }
-          echo "$out" | grep -q "claude" || { echo "FAIL: installer output should mention claude; got: $out"; exit 1; }
-          echo "claude-prereq fail-loud probe: OK"
+          [[ $rc -ne 0 ]] || { echo "FAIL: installer should have exited non-zero when codex absent"; exit 1; }
+          echo "$out" | grep -q "codex" || { echo "FAIL: installer output should mention codex; got: $out"; exit 1; }
+          echo "codex-prereq fail-loud probe: OK"
           # Restore the shim so subsequent steps (e.g. render summary) don't break.
-          echo '#!/bin/bash' | sudo tee /usr/local/bin/claude > /dev/null
-          sudo chmod 0755 /usr/local/bin/claude
+          printf '#!/bin/bash\necho codex-ci-shim\n' | sudo tee /usr/local/bin/codex > /dev/null
+          sudo chmod 0755 /usr/local/bin/codex
 
       - name: render summary on failure
         if: failure()
