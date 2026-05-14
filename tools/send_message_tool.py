@@ -138,6 +138,14 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+            },
+            "thread_ts": {
+                "type": "string",
+                "description": "Slack-only. If set, posts as a threaded reply under the given message_ts (e.g. '1715420800.123456'). Ignored on other platforms."
+            },
+            "blocks": {
+                "type": "array",
+                "description": "Slack-only. Block Kit blocks array (https://api.slack.com/block-kit). When set, the post renders as interactive blocks; 'message' is used as the plain-text fallback for clients that can't render them. Chunking is disabled when blocks are provided (Slack accepts up to 50 blocks per message, each with its own length limits)."
             }
         },
         "required": []
@@ -164,10 +172,59 @@ def _handle_list():
         return json.dumps(_error(f"Failed to load channel directory: {e}"))
 
 
+_SLACK_BLOCKS_MAX_COUNT = 50
+_SLACK_TEXT_FALLBACK_MAX_CHARS = 39000
+_SKILL_ACTION_ID_RE = re.compile(r"^skill:[a-z0-9][a-z0-9._-]*$")
+
+
+def _walk_block_action_ids(node, found):
+    """Collect every action_id value in a Block Kit tree."""
+    if isinstance(node, dict):
+        if "action_id" in node:
+            found.append(node["action_id"])
+        for v in node.values():
+            _walk_block_action_ids(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_block_action_ids(v, found)
+
+
+def _validate_slack_blocks(blocks):
+    """Return an error string if the blocks payload should be rejected, else None.
+
+    Rejects action_ids that don't match `skill:<name>` so a malformed or
+    injected blocks tree can't smuggle a non-skill action_id past the
+    gateway's click handler. The block-count cap matches Slack's documented
+    limit.
+    """
+    if len(blocks) > _SLACK_BLOCKS_MAX_COUNT:
+        return f"'blocks' has {len(blocks)} entries; Slack accepts at most {_SLACK_BLOCKS_MAX_COUNT}"
+    found: list = []
+    _walk_block_action_ids(blocks, found)
+    for aid in found:
+        if not isinstance(aid, str) or not _SKILL_ACTION_ID_RE.fullmatch(aid):
+            return (
+                f"action_id {aid!r} does not match the skill-invocation pattern "
+                f"'skill:<name>'. Buttons posted via send_message must dispatch "
+                f"to a hermes skill."
+            )
+    return None
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    slack_thread_ts = args.get("thread_ts") or None
+    slack_blocks = args.get("blocks") or None
+    if slack_thread_ts is not None and not isinstance(slack_thread_ts, str):
+        return tool_error("'thread_ts' must be a string")
+    if slack_blocks is not None and not isinstance(slack_blocks, list):
+        return tool_error("'blocks' must be a JSON array of Block Kit block objects")
+    if slack_blocks:
+        blocks_err = _validate_slack_blocks(slack_blocks)
+        if blocks_err is not None:
+            return tool_error(blocks_err)
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -269,14 +326,18 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        _platform_kwargs: dict = {"thread_id": thread_id, "media_files": media_files}
+        if slack_thread_ts:
+            _platform_kwargs["slack_thread_ts"] = slack_thread_ts
+        if slack_blocks:
+            _platform_kwargs["slack_blocks"] = slack_blocks
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
+                **_platform_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -437,12 +498,29 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
     return {"error": f"No live adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    *,
+    slack_thread_ts=None,
+    slack_blocks=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
     using the same smart-splitting algorithm as the gateway adapters
     (preserves code-block boundaries, adds part indicators).
+
+    Slack-only kwargs:
+        slack_thread_ts: forwarded to chat.postMessage as thread_ts; threads
+            every chunk under the given root message.
+        slack_blocks: Block Kit blocks array. When set, chunking is disabled
+            (the blocks payload is sent as a single message with the chunked
+            text as plain-text fallback).
     """
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
@@ -621,10 +699,34 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
         )
 
+    # Block Kit posts go in a single shot; the chunked text becomes the
+    # plain-text fallback. Skip chunking so the buttons/sections land
+    # exactly as composed by the caller. Slack rejects chat.postMessage
+    # when `text` exceeds 40000 chars, so clamp the fallback before send.
+    if platform == Platform.SLACK and slack_blocks:
+        fallback = message
+        if len(fallback) > _SLACK_TEXT_FALLBACK_MAX_CHARS:
+            fallback = fallback[: _SLACK_TEXT_FALLBACK_MAX_CHARS - 1] + "…"
+        chunks = [fallback]
+
+    # Only forward Slack-specific kwargs when set so the simple-send call
+    # shape stays positional (existing test assertions on _send_slack expect
+    # exactly three positional args).
+    _slack_kwargs: dict = {}
+    if slack_thread_ts:
+        _slack_kwargs["thread_ts"] = slack_thread_ts
+    if slack_blocks:
+        _slack_kwargs["blocks"] = slack_blocks
+
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk)
+            result = await _send_slack(
+                pconfig.token,
+                chat_id,
+                chunk,
+                **_slack_kwargs,
+            )
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -1017,8 +1119,13 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         return _error(f"Discord send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message):
-    """Send via Slack Web API."""
+async def _send_slack(token, chat_id, message, *, thread_ts=None, blocks=None):
+    """Send via Slack Web API.
+
+    thread_ts: optional Slack message_ts to thread under.
+    blocks: optional Block Kit blocks array; included in the payload alongside
+        text (which stays as the plain-text fallback).
+    """
     try:
         import aiohttp
     except ImportError:
@@ -1031,6 +1138,10 @@ async def _send_slack(token, chat_id, message):
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+            if thread_ts:
+                payload["thread_ts"] = thread_ts
+            if blocks:
+                payload["blocks"] = blocks
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):
