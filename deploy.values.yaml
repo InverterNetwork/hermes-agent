@@ -315,7 +315,7 @@ slack:
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
       - C0B23MZ0USV
-      - C0B0LSP8H1B
+      - C0B4LLZ5Z2L
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: ""
@@ -512,8 +512,8 @@ quay:
 # the URL: https://app.slack.com/client/<team>/<channel_id>); the
 # `feedback-intake` skill is shipped in hermes-state.
 slack_triggers:
-  - channel_id: C0B0LSP8H1B
-    channel_name: brix-product-feedback   # comment-only, for readability
+  - channel_id: C0B4LLZ5Z2L
+    channel_name: brix-feedback-sandbox
     skill: feedback-intake
     require_top_level: true
     accept_from_bots: false
