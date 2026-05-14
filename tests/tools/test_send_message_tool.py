@@ -1052,6 +1052,27 @@ class TestSendDiscordThreadId:
         assert "403" in result["error"]
 
 
+class TestSendMessageSchemaShape:
+    """Schema well-formedness — OpenAI function-calling validators reject
+    arrays without an `items` schema. Lock it in so a future schema edit
+    can't ship a tool definition the LLM provider rejects with HTTP 400."""
+
+    def test_every_array_property_declares_items(self):
+        from tools.send_message_tool import SEND_MESSAGE_SCHEMA
+
+        properties = SEND_MESSAGE_SCHEMA["parameters"]["properties"]
+        for name, prop in properties.items():
+            if prop.get("type") == "array":
+                assert "items" in prop, (
+                    f"Schema property '{name}' is type=array but missing 'items'. "
+                    f"OpenAI/Anthropic function-calling validators reject this with HTTP 400."
+                )
+                assert isinstance(prop["items"], dict), (
+                    f"Schema property '{name}'.items must be a JSONSchema object, "
+                    f"got {type(prop['items']).__name__}"
+                )
+
+
 class TestValidateSlackBlocks:
     """Action-id pattern + block-count cap enforcement."""
 

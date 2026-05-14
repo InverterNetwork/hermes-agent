@@ -145,7 +145,8 @@ SEND_MESSAGE_SCHEMA = {
             },
             "blocks": {
                 "type": "array",
-                "description": "Slack-only. Block Kit blocks array (https://api.slack.com/block-kit). When set, the post renders as interactive blocks; 'message' is used as the plain-text fallback for clients that can't render them. Chunking is disabled when blocks are provided (Slack accepts up to 50 blocks per message, each with its own length limits)."
+                "description": "Slack-only. Block Kit blocks array (https://api.slack.com/block-kit). When set, the post renders as interactive blocks; 'message' is used as the plain-text fallback for clients that can't render them. Chunking is disabled when blocks are provided (Slack accepts up to 50 blocks per message, each with its own length limits).",
+                "items": {"type": "object"}
             }
         },
         "required": []
