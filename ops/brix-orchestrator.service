@@ -10,6 +10,7 @@ Group=__AGENT_USER__
 Environment=HERMES_HOME=__TARGET_DIR__
 Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
 Environment=BRIX_ORCHESTRATOR_CONFIG=__TARGET_DIR__/quay/orchestrator.json
+EnvironmentFile=-__TARGET_DIR__/auth/hermes.env
 EnvironmentFile=-__TARGET_DIR__/auth/quay.env
 EnvironmentFile=-__TARGET_DIR__/auth/slack.env
 EnvironmentFile=-/etc/default/brix-orchestrator

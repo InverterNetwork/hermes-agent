@@ -39,6 +39,7 @@ from gateway.platforms.helpers import MessageDeduplicator
 from gateway.slack_triggers import (
     SlackTriggerConfigError,
     SlackTriggerRouter,
+    STATUS_SKIPPED_NOT_TOP_LEVEL,
     STATUS_FAILED,
     STATUS_FINISHED,
     STATUS_STARTED,
@@ -2043,8 +2044,9 @@ class SlackAdapter(BasePlatformAdapter):
         Returns ``True`` when the event was consumed (the trigger fired,
         or was deliberately skipped for trigger-specific reasons like
         rate-limit, dedup, or bot-gate). Returns ``False`` when the
-        channel isn't trigger-bound — the caller falls through to the
-        normal Slack message path.
+        channel isn't trigger-bound, or when a trigger-bound thread reply
+        was skipped by the top-level filter and should continue through
+        the normal Slack discussion/session path.
         """
         router = self._trigger_router
         if router is None:
@@ -2070,9 +2072,10 @@ class SlackAdapter(BasePlatformAdapter):
             # Channel isn't trigger-bound — fall through to normal flow.
             return False
         if trigger is None:
-            # Channel IS trigger-bound but this event is skipped (top-level
-            # filter, bot gate, dedup, rate-limit). Consume so it doesn't
-            # re-enter the normal flow.
+            # Channel IS trigger-bound but this event is skipped by the
+            # trigger router. Most skip reasons are consumed here so they
+            # don't re-enter the normal flow; top-level-filter skips fall
+            # through below so existing handoff threads can stay interactive.
             bound = router.get(channel_id)
             logger.info(
                 "[Slack][trigger] channel=%s skill=%s ts=%s status=%s",
@@ -2081,6 +2084,14 @@ class SlackAdapter(BasePlatformAdapter):
                 message_ts,
                 status,
             )
+            if status == STATUS_SKIPPED_NOT_TOP_LEVEL:
+                # This prevents retriggering the entry skill while still
+                # allowing humans to continue the bot-created handoff thread.
+                # Bot-authored replies stay consumed here so bot-id-only
+                # Slack events cannot fall into the normal session path.
+                if is_bot_message(bot_id=bot_id, subtype=subtype):
+                    return True
+                return False
             return True
 
         # Trigger matched — build envelope and dispatch.

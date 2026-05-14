@@ -340,9 +340,6 @@ class SlackTriggerRouter:
         if trigger is None:
             return None, ""
 
-        if trigger.require_top_level and thread_ts and thread_ts != message_ts:
-            return None, STATUS_SKIPPED_NOT_TOP_LEVEL
-
         if is_bot_message(bot_id=bot_id, subtype=subtype):
             # Defense-in-depth: never re-trigger on our own posts even if
             # an operator misconfigures accept_from_bots: true. Match on
@@ -355,6 +352,9 @@ class SlackTriggerRouter:
                 return None, STATUS_SKIPPED_SELF
             if not trigger.accept_from_bots:
                 return None, STATUS_SKIPPED_BOT
+
+        if trigger.require_top_level and thread_ts and thread_ts != message_ts:
+            return None, STATUS_SKIPPED_NOT_TOP_LEVEL
 
         if self._dedup.is_duplicate(message_ts):
             return None, STATUS_SKIPPED_DUPLICATE
