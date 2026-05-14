@@ -501,7 +501,7 @@ quay:
   # deployment feedback channel when the task has no original Slack thread.
   orchestrator:
     enabled: true
-    default_slack_channel: "C0B4LLZ5Z2L"
+    default_slack_channel: "C0B3WAWLL0L"
     slack_token_env: SLACK_BOT_TOKEN
     quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
