@@ -142,37 +142,6 @@ SEND_MESSAGE_SCHEMA = {
             "thread_ts": {
                 "type": "string",
                 "description": "Slack-only. If set, posts as a threaded reply under the given message_ts (e.g. '1715420800.123456'). Ignored on other platforms."
-            },
-            "interactive_actions": {
-                "type": "array",
-                "description": "Slack-only. List of interactive button items. Each item is rendered under the 'message' lead-in as an optional Slack mrkdwn section plus a button that dispatches to a hermes skill. The tool composes the Block Kit internally; skills do not compose JSON. Chunking is disabled when interactive_actions are provided; 'message' becomes the plain-text fallback (clamped to ~40000 chars).",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "label": {
-                            "type": "string",
-                            "description": "Button label shown to the operator."
-                        },
-                        "action_id": {
-                            "type": "string",
-                            "description": "Must match '^skill:<name>$' (e.g. 'skill:file-cr'). The gateway's click handler dispatches the named skill on press."
-                        },
-                        "value": {
-                            "type": "string",
-                            "description": "Opaque payload passed verbatim to the dispatched skill (e.g. '<message_ts>|<index>')."
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Optional Slack mrkdwn text rendered above this item's button. Omit to show just the button under the lead-in."
-                        },
-                        "style": {
-                            "type": "string",
-                            "enum": ["primary", "danger"],
-                            "description": "Optional Block Kit button style."
-                        }
-                    },
-                    "required": ["label", "action_id", "value"]
-                }
             }
         },
         "required": []
@@ -199,97 +168,13 @@ def _handle_list():
         return json.dumps(_error(f"Failed to load channel directory: {e}"))
 
 
-_SLACK_TEXT_FALLBACK_MAX_CHARS = 39000
-_INTERACTIVE_ACTIONS_MAX_COUNT = 12
-_SKILL_ACTION_ID_RE = re.compile(r"^skill:[a-z0-9][a-z0-9._-]*$")
-_INTERACTIVE_ACTION_STYLES = ("primary", "danger")
-
-
-def _validate_interactive_actions(actions):
-    """Return an error string if the interactive_actions payload should be
-    rejected, else None.
-
-    Enforces the skill-invocation action_id pattern up front so the tool
-    is the only composer of action_id values that reach Slack. The count
-    cap leaves headroom under Slack's 50-block-per-message limit (each
-    item composes up to three blocks plus the lead-in section).
-    """
-    if len(actions) > _INTERACTIVE_ACTIONS_MAX_COUNT:
-        return (
-            f"'interactive_actions' has {len(actions)} items; "
-            f"max {_INTERACTIVE_ACTIONS_MAX_COUNT}"
-        )
-    for i, item in enumerate(actions):
-        if not isinstance(item, dict):
-            return f"'interactive_actions[{i}]' must be an object"
-        for key in ("label", "action_id", "value"):
-            val = item.get(key)
-            if not isinstance(val, str) or not val:
-                return (
-                    f"'interactive_actions[{i}].{key}' is required "
-                    f"(non-empty string)"
-                )
-        if not _SKILL_ACTION_ID_RE.fullmatch(item["action_id"]):
-            return (
-                f"interactive_actions[{i}].action_id {item['action_id']!r} "
-                f"does not match the skill-invocation pattern '^skill:<name>$'"
-            )
-        text = item.get("text")
-        if text is not None and not isinstance(text, str):
-            return f"'interactive_actions[{i}].text' must be a string when set"
-        style = item.get("style")
-        if style is not None and style not in _INTERACTIVE_ACTION_STYLES:
-            return (
-                f"'interactive_actions[{i}].style' must be one of "
-                f"{_INTERACTIVE_ACTION_STYLES} or omitted"
-            )
-    return None
-
-
-def _build_slack_blocks_from_interactive_actions(lead_in, actions):
-    """Compose Block Kit blocks: optional lead-in section, then one
-    divider + optional section + actions triple per item."""
-    blocks: list = []
-    if lead_in:
-        blocks.append(
-            {"type": "section", "text": {"type": "mrkdwn", "text": lead_in}}
-        )
-    for item in actions:
-        blocks.append({"type": "divider"})
-        if item.get("text"):
-            blocks.append(
-                {"type": "section", "text": {"type": "mrkdwn", "text": item["text"]}}
-            )
-        button = {
-            "type": "button",
-            "text": {"type": "plain_text", "text": item["label"]},
-            "action_id": item["action_id"],
-            "value": item["value"],
-        }
-        if item.get("style"):
-            button["style"] = item["style"]
-        blocks.append({"type": "actions", "elements": [button]})
-    return blocks
-
-
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
     slack_thread_ts = args.get("thread_ts") or None
-    slack_interactive_actions = args.get("interactive_actions") or None
     if slack_thread_ts is not None and not isinstance(slack_thread_ts, str):
         return tool_error("'thread_ts' must be a string")
-    if slack_interactive_actions is not None and not isinstance(
-        slack_interactive_actions, list
-    ):
-        return tool_error(
-            "'interactive_actions' must be a list of action-item objects"
-        )
-    if slack_interactive_actions:
-        actions_err = _validate_interactive_actions(slack_interactive_actions)
-        if actions_err is not None:
-            return tool_error(actions_err)
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -394,8 +279,6 @@ def _handle_send(args):
         _platform_kwargs: dict = {"thread_id": thread_id, "media_files": media_files}
         if slack_thread_ts:
             _platform_kwargs["slack_thread_ts"] = slack_thread_ts
-        if slack_interactive_actions:
-            _platform_kwargs["slack_interactive_actions"] = slack_interactive_actions
         result = _run_async(
             _send_to_platform(
                 platform,
@@ -572,7 +455,6 @@ async def _send_to_platform(
     media_files=None,
     *,
     slack_thread_ts=None,
-    slack_interactive_actions=None,
 ):
     """Route a message to the appropriate platform sender.
 
@@ -583,11 +465,6 @@ async def _send_to_platform(
     Slack-only kwargs:
         slack_thread_ts: forwarded to chat.postMessage as thread_ts; threads
             every chunk under the given root message.
-        slack_interactive_actions: list of {label, action_id, value, text?,
-            style?} items. The tool composes Block Kit internally
-            (lead-in section + per-item divider/section/actions). When set,
-            chunking is disabled; 'message' becomes the plain-text fallback
-            and is clamped to Slack's 40000-char text limit.
     """
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
@@ -766,27 +643,12 @@ async def _send_to_platform(
             "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
         )
 
-    # Compose Block Kit blocks from interactive_actions, clamp the fallback
-    # text (Slack rejects chat.postMessage when `text` exceeds 40000 chars),
-    # and disable chunking so the composed buttons land in a single post.
-    composed_blocks = None
-    if platform == Platform.SLACK and slack_interactive_actions:
-        fallback = message
-        if len(fallback) > _SLACK_TEXT_FALLBACK_MAX_CHARS:
-            fallback = fallback[: _SLACK_TEXT_FALLBACK_MAX_CHARS - 1] + "…"
-        composed_blocks = _build_slack_blocks_from_interactive_actions(
-            message, slack_interactive_actions
-        )
-        chunks = [fallback]
-
     # Only forward Slack-specific kwargs when set so the simple-send call
     # shape stays positional (existing test assertions on _send_slack expect
     # exactly three positional args).
     _slack_kwargs: dict = {}
     if slack_thread_ts:
         _slack_kwargs["thread_ts"] = slack_thread_ts
-    if composed_blocks:
-        _slack_kwargs["blocks"] = composed_blocks
 
     last_result = None
     for chunk in chunks:
@@ -1189,12 +1051,10 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         return _error(f"Discord send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message, *, thread_ts=None, blocks=None):
+async def _send_slack(token, chat_id, message, *, thread_ts=None):
     """Send via Slack Web API.
 
     thread_ts: optional Slack message_ts to thread under.
-    blocks: optional Block Kit blocks array; included in the payload alongside
-        text (which stays as the plain-text fallback).
     """
     try:
         import aiohttp
@@ -1210,8 +1070,6 @@ async def _send_slack(token, chat_id, message, *, thread_ts=None, blocks=None):
             payload = {"channel": chat_id, "text": message, "mrkdwn": True}
             if thread_ts:
                 payload["thread_ts"] = thread_ts
-            if blocks:
-                payload["blocks"] = blocks
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):
