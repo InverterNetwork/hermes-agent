@@ -384,6 +384,10 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `API_SERVER_PORT` | Port for the API server (default: `8642`) |
 | `API_SERVER_HOST` | Host/bind address for the API server (default: `127.0.0.1`). Use `0.0.0.0` for network access — requires `API_SERVER_KEY` and a narrow `API_SERVER_CORS_ORIGINS` allowlist. |
 | `API_SERVER_MODEL_NAME` | Model name advertised on `/v1/models`. Defaults to the profile name (or `hermes-agent` for the default profile). Useful for multi-user setups where frontends like Open WebUI need distinct model names per connection. |
+| `QUAY_REVIEW_PR_TOKEN` | Dedicated bearer token for authenticated `POST /quay/review-pr` enrollment from GitHub Actions. Required for that endpoint; do not reuse `API_SERVER_KEY`. |
+| `QUAY_REVIEW_PR_COMMAND` | Command used by `POST /quay/review-pr` to enroll a PR (default: `/usr/local/bin/quay-as-hermes`). |
+| `QUAY_REVIEW_PR_TIMEOUT_SECONDS` | Timeout for the local `quay review-pr` command (default: `60`). |
+| `QUAY_DATA_DIR` | Quay data directory used by `POST /quay/review-pr` and other Quay invocations. The API endpoint defaults to `<HERMES_HOME>/quay`; the default `quay-as-hermes` wrapper preserves an explicit override and otherwise falls back to its install target. |
 | `GATEWAY_PROXY_URL` | URL of a remote Hermes API server to forward messages to ([proxy mode](/docs/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos)). When set, the gateway handles platform I/O only — all agent work is delegated to the remote server. Also configurable via `gateway.proxy_url` in `config.yaml`. |
 | `GATEWAY_PROXY_KEY` | Bearer token for authenticating with the remote API server in proxy mode. Must match `API_SERVER_KEY` on the remote host. |
 | `MESSAGING_CWD` | Working directory for terminal commands in messaging mode (default: `~`) |

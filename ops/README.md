@@ -50,7 +50,7 @@ Six units live here:
 | `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
-| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-secrets.sh`. |
+| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`, `QUAY_REVIEW_PR_TOKEN`). Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints the worker GitHub App token via `installer/hermes_github_token.py` and exports it as `$GH_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
@@ -59,7 +59,7 @@ Six units live here:
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. |
 | `ops/quay-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
-| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
@@ -600,6 +600,8 @@ Prompts (gateway side, always):
 * `LINEAR_API_KEY` — required when quay is provisioned, optional
   otherwise; gates `quay enqueue --linear-issue` and the gateway's
   linear-create skill.
+* `QUAY_REVIEW_PR_TOKEN` — optional; enables authenticated
+  `POST /quay/review-pr` enrollment from GitHub Actions.
 
 Non-secret runtime config (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …)
 is **not** prompted here. It lives in `deploy.values.yaml` and is rendered
@@ -685,13 +687,14 @@ strips the environment by default, so `QUAY_DATA_DIR` doesn't survive
 the privilege drop, and quay's config-resolution order falls back to
 `~<agent>/.quay/config.toml` — a parallel SQLite + repos dir that
 diverges silently from what the systemd tick writes to. The wrapper
-drops privilege via `sudo -u <agent>`, pins `QUAY_DATA_DIR` and
-`HERMES_HOME`, sources `<HERMES_HOME>/auth/quay.env` for adapter
-tokens (LINEAR_API_KEY, SLACK_TOKEN, …), and mints `$GH_TOKEN` from
-the GitHub App helper before `exec`'ing `/usr/local/bin/quay "$@"`.
-That way ad-hoc operator invocations land in the same DB the tick
-uses *and* hit the same auth identity for any `gh` call quay shells
-out to (enqueue's PR-existence pre-flight, review-pr, …).
+drops privilege via `sudo -u <agent>`, defaults `QUAY_DATA_DIR` to the
+same path as the tick while preserving an explicit caller override, pins
+`HERMES_HOME`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens
+(LINEAR_API_KEY, SLACK_TOKEN, …), and mints `$GH_TOKEN` from the GitHub
+App helper before `exec`'ing `/usr/local/bin/quay "$@"`. That way ad-hoc
+operator invocations land in the same DB the tick uses *and* hit the same
+auth identity for any `gh` call quay shells out to (enqueue's PR-existence
+pre-flight, review-pr, …).
 
 For interactive sessions (`sudo -u <agent> -i`, `su - <agent>`), the
 profile.d drop-in at `/etc/profile.d/quay-data-dir.sh` exports

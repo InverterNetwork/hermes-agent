@@ -5,8 +5,10 @@
 # QUAY_DATA_DIR, so quay's config-resolution order falls back to
 # ~/.quay/config.toml — a parallel SQLite + repos dir under the agent's
 # home that diverges silently from what the systemd tick writes to.
-# This wrapper pins the data dir explicitly, so manual `repo add`,
-# `task list`, `enqueue`, etc. land in the same place as the unit.
+# This wrapper pins the data dir explicitly by default, so manual `repo add`,
+# `task list`, `enqueue`, etc. land in the same place as the unit. Callers
+# such as the gateway API server may still pass QUAY_DATA_DIR to target a
+# profile-specific Quay store.
 #
 # `cd /` is required because sudo inherits the caller's cwd by default;
 # from the canonical `ssh <host>; sudo …` flow that's /root (mode 0750,
@@ -80,11 +82,11 @@ exec /usr/local/bin/quay "$@"
 '
 
 if [ "$(id -un)" = "__AGENT_USER__" ]; then
-  export QUAY_DATA_DIR=__TARGET_DIR__/quay
+  export QUAY_DATA_DIR="${QUAY_DATA_DIR:-__TARGET_DIR__/quay}"
   export HERMES_HOME=__TARGET_DIR__
   exec sh -c "$AGENT_BODY" -- "$@"
 else
   exec sudo -u __AGENT_USER__ \
-       env QUAY_DATA_DIR=__TARGET_DIR__/quay HERMES_HOME=__TARGET_DIR__ \
+       env "QUAY_DATA_DIR=${QUAY_DATA_DIR:-__TARGET_DIR__/quay}" HERMES_HOME=__TARGET_DIR__ \
        sh -c "$AGENT_BODY" -- "$@"
 fi
