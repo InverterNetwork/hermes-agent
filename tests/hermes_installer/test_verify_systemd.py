@@ -26,7 +26,7 @@ class _FakeState:
     """Minimal stand-in for `_State`. Captures v_ok / v_drift calls."""
 
     rails_owner = "root"
-    quay_version = "v0.3.8"
+    quay_version = "v0.3.9"
     values_file = "/tmp/deploy.values.yaml"
     values_helper = "/tmp/values_helper.py"
     systemd_dir = "/tmp/systemd"
