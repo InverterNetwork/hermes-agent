@@ -1274,9 +1274,8 @@ def _check_reviewer_token(s: _State) -> None:
     # Per BRIX-1390 acceptance: token must answer `gh api /installation/
     # repositories` — proves the App identity is recognized for *some*
     # installation, without coupling to the specific repos[] entries
-    # (which the reviewer App's scope may be a strict subset of, e.g.
-    # didier-reviewer installed only on test-factory-code +
-    # brix-indexer + hermes-agent per the ticket).
+    # (which the reviewer App's scope may be a strict subset of whatever
+    # deployment.values currently declares as quay-managed repos).
     gh_api_base = s.args.gh_api_base or "https://api.github.com"
     api_url = f"{gh_api_base}/installation/repositories"
     http_code = _gh_api_http_code(token, api_url)

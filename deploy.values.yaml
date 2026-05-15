@@ -381,8 +381,27 @@ slack:
 # `team:` value must match a key in `linear.teams` above — typos fail
 # at install-time via `validate-schema`.
 repos:
-  - id: test-factory-code
-    url: https://github.com/InverterNetwork/test-factory-code
+  - id: brix-landing
+    url: https://github.com/InverterNetwork/brix-landing
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
+  - id: iTRY-frontends
+    url: https://github.com/InverterNetwork/iTRY-frontends
+    # GH default branch is `master` (not `main`).
+    base_branch: master
+    issue_tracker:
+      linear:
+        team: itry
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
+  - id: iTRY-monorepo
+    url: https://github.com/InverterNetwork/iTRY-monorepo
     base_branch: main
     issue_tracker:
       linear:
@@ -390,16 +409,6 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
-      # Per-repo tag vocab. Reconciled into quay via `quay repo apply-tags`
-      # on every install — declarative replace, dropping a namespace clears
-      # it. Presence of any vocab here flips quay's validator from
-      # charset-only to namespace enforcement for tickets targeting this
-      # repo (deployment-required namespaces below still apply on top).
-      tags:
-        area:
-          - copy
-          - script-output
-          - dependency
   - id: brix-indexer
     url: https://github.com/InverterNetwork/brix-indexer
     # GH default branch is `dev` (not `main`). The code-sync timer
@@ -419,18 +428,26 @@ repos:
       # `task:` namespace from quay.tag_namespaces below still applies.
       # Add per-repo vocab here once real ticket flow informs the
       # namespace shape; absence is the explicit "no vocab yet" signal.
-  - id: hermes-agent
-    url: https://github.com/InverterNetwork/hermes-agent
+  - id: erpc
+    url: https://github.com/InverterNetwork/erpc
     base_branch: main
     issue_tracker:
       linear:
-        team: brix
+        team: itry
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
+  - id: iTry-contracts
+    url: https://github.com/InverterNetwork/iTry-contracts
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: itry
     quay:
       package_manager: bun
-      install_cmd: "bun install"
-      # No per-repo tag vocab yet — deployment-wide `task:` namespace from
-      # quay.tag_namespaces still applies. Add vocab here once ticket flow
-      # against the installer/agent settles into a shape worth enforcing.
+      # Foundry-native repo; no package-manager bootstrap needed before
+      # worker execution, so keep install as an explicit no-op.
+      install_cmd: "true"
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
