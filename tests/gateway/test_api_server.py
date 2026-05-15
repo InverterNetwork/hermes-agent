@@ -336,9 +336,9 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(api_key: str = "", cors_origins=None, extra=None) -> APIServerAdapter:
     """Create an adapter with optional API key."""
-    extra = {}
+    extra = dict(extra or {})
     if api_key:
         extra["key"] = api_key
     if cors_origins is not None:
@@ -361,6 +361,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/quay/review-pr", adapter._handle_quay_review_pr)
     return app
 
 
@@ -372,6 +373,171 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+# ---------------------------------------------------------------------------
+# /quay/review-pr endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestQuayReviewPrEndpoint:
+    @pytest.mark.asyncio
+    async def test_requires_dedicated_token(self):
+        app = _create_app(_make_adapter())
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/review-pr",
+                headers={"Authorization": "Bearer review-secret"},
+                json={"repository": "InverterNetwork/hermes-agent", "pull_request": 104},
+            )
+
+            assert resp.status == 503
+            data = await resp.json()
+            assert data["error"]["code"] == "quay_review_pr_not_configured"
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_token(self):
+        adapter = _make_adapter(extra={"quay_review_pr_token": "review-secret"})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/review-pr",
+                headers={"Authorization": "Bearer wrong"},
+                json={"repository": "InverterNetwork/hermes-agent", "pull_request": 104},
+            )
+
+            assert resp.status == 401
+            data = await resp.json()
+            assert data["error"]["code"] == "invalid_quay_review_token"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("payload", "code", "param"),
+        [
+            ({"pull_request": 104}, "invalid_repository", "repository"),
+            ({"repository": "https://github.com/InverterNetwork/hermes-agent", "pull_request": 104}, "invalid_repository", "repository"),
+            ({"repository": "InverterNetwork/hermes-agent", "pull_request": "104"}, "invalid_pull_request", "pull_request"),
+            ({"repository": "InverterNetwork/hermes-agent", "pull_request": 104, "head_sha": "not-a-sha"}, "invalid_head_sha", "head_sha"),
+            ({"repository": "InverterNetwork/hermes-agent", "pull_request": 104, "event": "closed"}, "invalid_event", "event"),
+            ({"repository": "InverterNetwork/hermes-agent", "pull_request": 104, "tags": "task-feature"}, "invalid_tags", "tags"),
+        ],
+    )
+    async def test_validates_payload_shape(self, payload, code, param):
+        adapter = _make_adapter(extra={"quay_review_pr_token": "review-secret"})
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/review-pr",
+                headers={"Authorization": "Bearer review-secret"},
+                json=payload,
+            )
+
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["code"] == code
+            assert data["error"]["param"] == param
+
+    @pytest.mark.asyncio
+    async def test_invokes_quay_with_data_dir_and_returns_json(self, tmp_path):
+        call_log = tmp_path / "quay-call.json"
+        stub = tmp_path / "quay-stub.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            f"with open({str(call_log)!r}, 'w', encoding='utf-8') as fh:\n"
+            "    json.dump({\n"
+            "        'argv': sys.argv[1:],\n"
+            "        'quay_data_dir': os.environ.get('QUAY_DATA_DIR'),\n"
+            "        'cwd': os.getcwd(),\n"
+            "    }, fh)\n"
+            "print(json.dumps({\n"
+            "    'task_id': 'pr-review-hermes-agent-104',\n"
+            "    'attempt_id': 7,\n"
+            "    'scheduled': True,\n"
+            "    'skipped_reason': None,\n"
+            "    'review_verdict': None,\n"
+            "}))\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        quay_data_dir = tmp_path / "quay"
+        adapter = _make_adapter(
+            extra={
+                "quay_review_pr_token": "review-secret",
+                "quay_review_pr_command": str(stub),
+                "quay_data_dir": str(quay_data_dir),
+            }
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/review-pr",
+                headers={"Authorization": "Bearer review-secret"},
+                json={
+                    "repository": "InverterNetwork/hermes-agent",
+                    "pull_request": 104,
+                    "head_sha": "abc123",
+                    "event": "synchronize",
+                    "delivery_id": "run-123",
+                    "tags": ["task-feature", "task-feature"],
+                },
+            )
+
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {
+                "task_id": "pr-review-hermes-agent-104",
+                "attempt_id": 7,
+                "scheduled": True,
+                "skipped_reason": None,
+                "review_verdict": None,
+            }
+
+        call = json.loads(call_log.read_text(encoding="utf-8"))
+        assert call["argv"] == [
+            "review-pr",
+            "--pr",
+            "InverterNetwork/hermes-agent:104",
+            "--head-sha",
+            "abc123",
+            "--tag",
+            "task-feature",
+        ]
+        assert call["quay_data_dir"] == str(quay_data_dir)
+        assert call["cwd"] == "/"
+
+    @pytest.mark.asyncio
+    async def test_quay_nonzero_exit_returns_structured_error(self, tmp_path):
+        stub = tmp_path / "quay-fail.py"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "sys.stderr.write(json.dumps({'error': 'repo_not_configured', 'message': 'missing repo'}) + '\\n')\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        adapter = _make_adapter(
+            extra={
+                "quay_review_pr_token": "review-secret",
+                "quay_review_pr_command": str(stub),
+            }
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/review-pr",
+                headers={"Authorization": "Bearer review-secret"},
+                json={"repository": "InverterNetwork/hermes-agent", "pull_request": 104},
+            )
+
+            assert resp.status == 502
+            data = await resp.json()
+            assert data["error"]["code"] == "quay_command_failed"
+            assert data["error"]["exit_code"] == 2
+            assert data["error"]["quay"]["error"] == "repo_not_configured"
 
 
 # ---------------------------------------------------------------------------

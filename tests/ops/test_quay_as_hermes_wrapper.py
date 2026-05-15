@@ -101,7 +101,12 @@ def wrapper_env(tmp_path: Path) -> dict:
     }
 
 
-def _run_wrapper(wrapper: Path, env: dict) -> subprocess.CompletedProcess:
+def _run_wrapper(
+    wrapper: Path,
+    env: dict,
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     proc_env = os.environ.copy()
     proc_env["PATH"] = f"{env['bin']}{os.pathsep}{proc_env['PATH']}"
     # Wipe any GH_TOKEN already in the parent env so the wrapper's
@@ -109,6 +114,8 @@ def _run_wrapper(wrapper: Path, env: dict) -> subprocess.CompletedProcess:
     # quay.env reached quay becomes ambiguous.
     proc_env.pop("GH_TOKEN", None)
     proc_env.pop("GITHUB_TOKEN", None)
+    if extra_env:
+        proc_env.update(extra_env)
     return subprocess.run(
         [str(wrapper), "repo", "list"],
         env=proc_env, check=False, capture_output=True, text=True,
@@ -156,6 +163,28 @@ class TestQuayAsHermesWrapper:
         assert log["GH_TOKEN"] == "stub-from-envfile"
         assert log["LINEAR_API_KEY"] == "lin-stub"
 
+    def test_agent_path_preserves_quay_data_dir_override(self, wrapper_env):
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        override = wrapper_env["tmp"] / "profile-quay"
+        _render_wrapper(
+            wrapper,
+            agent_user=getpass.getuser(),
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(
+            wrapper,
+            wrapper_env,
+            extra_env={"QUAY_DATA_DIR": str(override)},
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        assert not wrapper_env["sudo_log"].exists()
+        log = _parse_quay_log(wrapper_env["quay_log"])
+        assert log["QUAY_DATA_DIR"] == str(override)
+        assert log["HERMES_HOME"] == str(wrapper_env["target"])
+
     def test_operator_path_drops_privileges_via_sudo(self, wrapper_env):
         """Counterpart to the agent-path test: when caller != AGENT_USER
         (operator on host, root via ssh), the wrapper must still go
@@ -185,3 +214,26 @@ class TestQuayAsHermesWrapper:
         assert log["QUAY_DATA_DIR"] == f"{wrapper_env['target']}/quay"
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
         assert log["GH_TOKEN"] == "stub-from-envfile"
+
+    def test_operator_path_preserves_quay_data_dir_override(self, wrapper_env):
+        other_user = "not-" + getpass.getuser()
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        override = wrapper_env["tmp"] / "profile-quay"
+        _render_wrapper(
+            wrapper,
+            agent_user=other_user,
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(
+            wrapper,
+            wrapper_env,
+            extra_env={"QUAY_DATA_DIR": str(override)},
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        assert wrapper_env["sudo_log"].exists()
+        log = _parse_quay_log(wrapper_env["quay_log"])
+        assert log["QUAY_DATA_DIR"] == str(override)
+        assert log["HERMES_HOME"] == str(wrapper_env["target"])
