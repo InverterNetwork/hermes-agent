@@ -151,6 +151,29 @@ def test_installer_renders_quay_config_with_force_on_every_run():
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
 
 
+def test_installer_translates_legacy_orchestrator_env_keys():
+    """Legacy /etc/default/brix-orchestrator overrides must keep winning
+    after migration. The new service sets QUAY_ORCHESTRATOR_CONFIG by default,
+    so copied BRIX_* keys have to be renamed in /etc/default/quay-orchestrator.
+    """
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    assert "/etc/default/brix-orchestrator /etc/default/quay-orchestrator" in content
+    assert "sed -i \\" in content
+    for name in (
+        "CONFIG",
+        "PYTHON",
+        "SCRIPT",
+        "ENABLED",
+        "LOCK",
+        "PROVIDER",
+        "WORKER_ID",
+    ):
+        assert (
+            f"s/BRIX_ORCHESTRATOR_{name}=/QUAY_ORCHESTRATOR_{name}=/g"
+            in content
+        )
+
+
 def test_installer_provisions_claude_cli_from_active_invocations():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
     assert "active-agent-invocations" in content
