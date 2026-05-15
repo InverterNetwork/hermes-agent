@@ -58,6 +58,9 @@ class _State:
     quay_runner: str
     quay_profile: str
     runtime_dir: str
+    systemd_dir: str
+    reviewer_env: str
+    reviewer_key: str
     values_file: Path
     values_helper: Path
     quay_version: str
@@ -1107,11 +1110,6 @@ def _check_systemd(s: _State) -> None:
             "quay.orchestrator.enabled",
         ) == "true":
             timers.append("quay-orchestrator.timer")
-    # Reviewer timer is install-gated by the reviewer auth block having
-    # staged /etc/hermes/reviewer.env; presence of that file is the
-    # ground truth (same probe we use for _check_reviewer_token).
-    if Path("/etc/hermes/reviewer.env").is_file():
-        timers.append("hermes-reviewer-token.timer")
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
         # systemctl emits properties in its own (alphabetical) order, not
@@ -1148,8 +1146,8 @@ def _check_systemd(s: _State) -> None:
         # ownership drift.
         base = u.removesuffix(".timer")
         for unit_file in (
-            Path(f"/etc/systemd/system/{base}.service"),
-            Path(f"/etc/systemd/system/{base}.timer"),
+            Path(s.systemd_dir) / f"{base}.service",
+            Path(s.systemd_dir) / f"{base}.timer",
         ):
             if unit_file.is_file():
                 so = _owner(unit_file)
@@ -1160,6 +1158,44 @@ def _check_systemd(s: _State) -> None:
                         f"{unit_file} ownership",
                         f"expected {s.rails_owner}, got {so}",
                     )
+
+    if s.quay_version:
+        _check_quay_tick_unit_architecture(s)
+        for legacy_unit in (
+            Path(s.systemd_dir) / "hermes-reviewer-token.service",
+            Path(s.systemd_dir) / "hermes-reviewer-token.timer",
+        ):
+            if legacy_unit.exists():
+                s.v_drift(
+                    legacy_unit.name,
+                    "legacy reviewer-token unit should be removed; "
+                    "quay-tick-runner now mints QUAY_REVIEWER_GH_TOKEN",
+                )
+
+
+def _check_quay_tick_unit_architecture(s: _State) -> None:
+    unit_file = Path(s.systemd_dir) / "quay-tick.service"
+    if not unit_file.is_file():
+        return
+    try:
+        text = unit_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        s.v_drift("quay-tick.service", f"unreadable: {exc}")
+        return
+    if "HERMES_REVIEWER_GH_CONFIG=" in text:
+        s.v_ok("quay-tick.service reviewer config env")
+    else:
+        s.v_drift(
+            "quay-tick.service reviewer config env",
+            "missing HERMES_REVIEWER_GH_CONFIG for reviewer token minting",
+        )
+    if "RuntimeDirectory=hermes" in text:
+        s.v_ok("quay-tick.service reviewer cache runtime dir")
+    else:
+        s.v_drift(
+            "quay-tick.service reviewer cache runtime dir",
+            "missing RuntimeDirectory=hermes for /run/hermes reviewer cache",
+        )
 
 
 def _gh_api_http_code(token: str, url: str) -> str:
@@ -1203,7 +1239,12 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
     # instead of `check` then `mint`.
     rc, mint_out, _ = _run([
         *_sudo_prefix_for(s.agent_owner),
-        "env", f"HERMES_HOME={target}", str(venv_py), str(helper_py), "mint",
+        "env",
+        f"HERMES_HOME={target}",
+        str(venv_py),
+        str(helper_py),
+        "mint",
+        "--no-cache",
     ])
     app_token = mint_out.strip() if rc == 0 else ""
     if app_token:
@@ -1233,19 +1274,17 @@ def _check_token_helper(s: _State, repos_tsv: str) -> None:
 
 
 def _check_reviewer_token(s: _State) -> None:
-    """Reviewer App auth: /etc/hermes/reviewer.{pem,env} on-disk perms,
-    /run/hermes/reviewer-gh-token freshness, and an App-installation API
-    probe with the minted token (the BRIX-1390 acceptance criterion).
+    """Reviewer App auth: /etc/hermes/reviewer.{pem,env} on-disk perms
+    plus an App-installation API probe with a token minted from that env.
 
-    Gated on presence of /etc/hermes/reviewer.env — that's what
-    setup-hermes.sh writes when the reviewer auth block runs. Hosts that
-    never staged a reviewer key skip every check here silently."""
-    etc_dir = Path("/etc/hermes")
-    env_file = etc_dir / "reviewer.env"
+    Gated on presence of reviewer.env — that's what setup-hermes.sh writes
+    when the reviewer auth block runs. Hosts that never staged a reviewer
+    key skip every check here silently."""
+    env_file = Path(s.reviewer_env)
     if not env_file.is_file():
         return
 
-    key_file = etc_dir / "reviewer.pem"
+    key_file = Path(s.reviewer_key)
     _check_mode_owner(
         s, "reviewer.pem", _stat_info(key_file), "640", s.rails_owner, s.agent_group,
     )
@@ -1253,23 +1292,42 @@ def _check_reviewer_token(s: _State) -> None:
         s, "reviewer.env", _stat_info(env_file), "640", s.rails_owner, s.agent_group,
     )
 
-    token_file = Path("/run/hermes/reviewer-gh-token")
-    info = _stat_info(token_file)
-    if info is None:
-        s.v_drift("reviewer-gh-token", f"missing: {token_file}")
+    target = s.args.target
+    rails = target / "hermes-agent"
+    helper_py = rails / "installer" / "hermes_github_token.py"
+    venv_py = rails / "venv" / "bin" / "python"
+    if not helper_py.is_file():
+        s.v_drift("reviewer token helper", f"missing helper at {helper_py}")
         return
-    _check_mode_owner(
-        s, "reviewer-gh-token", info, "600", s.agent_owner, s.agent_group,
-    )
-    try:
-        token = token_file.read_text().strip()
-    except OSError as exc:
-        s.v_drift("reviewer-gh-token", f"unreadable: {exc}")
+    if not (venv_py.exists() and os.access(venv_py, os.X_OK)):
+        s.v_drift("reviewer token helper", f"missing venv python at {venv_py}")
         return
-    if not token:
-        s.v_drift("reviewer-gh-token", "empty")
+
+    # Avoid the runtime cache so this read-only health check does not depend
+    # on /run/hermes existing outside the systemd tick.
+    rc, mint_out, _ = _run([
+        *_sudo_prefix_for(s.agent_owner),
+        "env",
+        "-u", "HERMES_GH_CONFIG",
+        "-u", "HERMES_GH_APP_ID",
+        "-u", "HERMES_GH_INSTALLATION_ID",
+        "-u", "HERMES_GH_APP_KEY",
+        "-u", "HERMES_GH_API",
+        "-u", "HERMES_GH_TOKEN_CACHE",
+        "-u", "HERMES_GH_TOKEN_OVERRIDE",
+        f"HERMES_HOME={target}",
+        f"HERMES_GH_CONFIG={env_file}",
+        str(venv_py),
+        str(helper_py),
+        "mint",
+        "--no-cache",
+    ])
+    token = mint_out.strip() if rc == 0 else ""
+    if token:
+        s.v_ok("reviewer token helper check passes")
+    else:
+        s.v_drift("reviewer token helper check", "mint failed")
         return
-    s.v_ok("reviewer-gh-token: non-empty")
 
     # Per BRIX-1390 acceptance: token must answer `gh api /installation/
     # repositories` — proves the App identity is recognized for *some*
@@ -1388,6 +1446,9 @@ def run(
         quay_runner=os.environ.get("HERMES_VERIFY_QUAY_RUNNER") or "/usr/local/sbin/quay-tick-runner",
         quay_profile=os.environ.get("HERMES_VERIFY_QUAY_PROFILE") or "/etc/profile.d/quay-data-dir.sh",
         runtime_dir=os.environ.get("HERMES_VERIFY_RUNTIME_DIR") or "/usr/local/bin",
+        systemd_dir=os.environ.get("HERMES_VERIFY_SYSTEMD_DIR") or "/etc/systemd/system",
+        reviewer_env=os.environ.get("HERMES_VERIFY_REVIEWER_ENV") or "/etc/hermes/reviewer.env",
+        reviewer_key=os.environ.get("HERMES_VERIFY_REVIEWER_KEY") or "/etc/hermes/reviewer.pem",
         values_file=values_file,
         values_helper=values_helper,
         quay_version=quay_version,

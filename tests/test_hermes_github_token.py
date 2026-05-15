@@ -124,6 +124,34 @@ def test_get_token_caches_and_refreshes(hermes_home, rsa_keypair, monkeypatch):
         assert calls["n"] == 2
 
 
+def test_get_token_no_cache_bypasses_and_does_not_write_cache(
+    hermes_home, rsa_keypair, monkeypatch
+):
+    priv, _ = rsa_keypair
+    key_path = hermes_home / "auth" / "github-app.pem"
+    key_path.write_text(priv)
+
+    monkeypatch.setenv("HERMES_GH_APP_ID", "1")
+    monkeypatch.setenv("HERMES_GH_INSTALLATION_ID", "1")
+    monkeypatch.setenv("HERMES_GH_APP_KEY", str(key_path))
+
+    calls = {"n": 0}
+
+    def fake_fetch(app_id, install_id, pem, *, api_base, session=None):
+        calls["n"] += 1
+        return {
+            "token": f"ghs_no_cache_{calls['n']}",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+
+    with patch.object(hgt, "fetch_installation_token", side_effect=fake_fetch):
+        assert hgt.get_token(use_cache=False) == "ghs_no_cache_1"
+        assert hgt.get_token(use_cache=False) == "ghs_no_cache_2"
+
+    assert calls["n"] == 2
+    assert not (hermes_home / "cache" / "github-token.json").exists()
+
+
 def test_cache_file_permissions(hermes_home, rsa_keypair, monkeypatch):
     priv, _ = rsa_keypair
     key_path = hermes_home / "auth" / "github-app.pem"
@@ -156,22 +184,6 @@ def test_credential_protocol_get(hermes_home, monkeypatch):
     )
     assert "username=x-access-token" in out
     assert "password=ghs_z" in out
-
-
-def test_write_token_to_file_atomic_and_mode_0600(hermes_home, tmp_path, monkeypatch):
-    # write-token is what hermes-reviewer-token.service runs each tick. The
-    # output file must end up with mode 0600 and no trailing newline — the
-    # consumer (`gh auth login --with-token` / quay's `gh_token_file`)
-    # reads the whole file as the token.
-    monkeypatch.setenv("HERMES_GH_TOKEN_OVERRIDE", "ghs_reviewer_xyz")
-    out_path = tmp_path / "run-hermes" / "reviewer-gh-token"
-    hgt.write_token_to_file(out_path)
-
-    assert out_path.read_text() == "ghs_reviewer_xyz"
-    mode = os.stat(out_path).st_mode & 0o777
-    assert mode == 0o600, f"token file mode {oct(mode)} (expected 0600)"
-    # The temp file must be gone (rename is atomic on POSIX).
-    assert not out_path.with_suffix(out_path.suffix + ".tmp").exists()
 
 
 def test_credential_protocol_no_op(hermes_home):
