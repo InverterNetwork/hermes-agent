@@ -2059,9 +2059,7 @@ class SlackAdapter(BasePlatformAdapter):
         subtype = event.get("subtype") or None
 
         # In-thread @mention bypass. Operator is explicitly asking the
-        # agent to act on the thread's contents; route to the normal
-        # agent path, not the trigger router. Only applies to human
-        # messages (bot replies stay subject to the trigger gates).
+        # agent to act on the thread's contents.
         if (
             thread_ts
             and thread_ts != message_ts

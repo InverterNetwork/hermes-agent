@@ -197,6 +197,55 @@ class TestTriggerDispatch:
         assert handled is False
 
     @pytest.mark.asyncio
+    async def test_in_thread_bot_authored_mention_does_not_bypass(
+        self, adapter_with_trigger,
+    ):
+        """Bot-authored thread replies containing the bot mention text must
+        NOT trigger the bypass. The is_bot_message guard catches them at the
+        bypass branch, leaving them to the normal trigger-skip path (which
+        also short-circuits for bot messages). Guards against cross-bot
+        loops where another bot's message contains '<@U_BOT>'."""
+        event = {
+            "channel": CHAN,
+            "ts": "1700000000.000280",
+            "thread_ts": "1700000000.000100",
+            "user": "U_BOT",  # bot's own user id
+            "bot_id": "B_BOT",
+            "subtype": "bot_message",
+            "text": "<@U_BOT> here's a self-mention",
+            "team": "T1",
+        }
+        handled = await adapter_with_trigger._maybe_dispatch_slack_trigger(event)
+        # is_bot_message guard catches it before the bypass branch runs.
+        # The downstream SKIPPED_NOT_TOP_LEVEL branch then consumes it
+        # (bot path returns True per existing loop-prevention).
+        assert handled is True
+        adapter_with_trigger.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_in_thread_mention_with_unresolved_bot_uid_no_match(
+        self, adapter_with_trigger,
+    ):
+        """When _bot_user_id is empty (e.g. identity not yet resolved at
+        startup), the bypass must NOT fire on arbitrary text. The
+        `bot_uid and` truthy guard prevents the substring check from
+        running against an empty mention pattern '<@>'."""
+        adapter_with_trigger._bot_user_id = ""
+        event = {
+            "channel": CHAN,
+            "ts": "1700000000.000290",
+            "thread_ts": "1700000000.000100",
+            "user": "U_ALICE",
+            "text": "this text contains <@> as a literal",
+            "team": "T1",
+        }
+        handled = await adapter_with_trigger._maybe_dispatch_slack_trigger(event)
+        # Bypass branch skipped (bot_uid falsy). Falls through to router.evaluate,
+        # which returns SKIPPED_NOT_TOP_LEVEL for the thread reply; handler
+        # returns False (human thread-reply skip falls through to normal flow).
+        assert handled is False
+
+    @pytest.mark.asyncio
     async def test_top_level_mention_does_not_bypass(self, adapter_with_trigger):
         """An @mention at the top level in a trigger-bound channel still
         fires the trigger; the bypass only applies to thread replies.
