@@ -2044,9 +2044,18 @@ class SlackAdapter(BasePlatformAdapter):
         Returns ``True`` when the event was consumed (the trigger fired,
         or was deliberately skipped for trigger-specific reasons like
         rate-limit, dedup, or bot-gate). Returns ``False`` when the
-        channel isn't trigger-bound, or when a trigger-bound thread reply
-        was skipped by the top-level filter and should continue through
-        the normal Slack discussion/session path.
+        channel isn't trigger-bound, when a trigger-bound thread reply
+        was skipped by the top-level filter, or when an in-thread
+        @mention is the operator explicitly invoking the agent on a
+        trigger-spawned conversation.
+
+        In-thread @mention bypass: when a human replies in a thread
+        inside a trigger-bound channel and the message contains the
+        bot's @mention, the router is skipped entirely so the normal
+        agent path handles the operator command (e.g. `@bot file 1` on
+        a feedback-intake proposal post). Without this, the trigger
+        router's STATUS_SKIPPED_NOT_TOP_LEVEL path drops the message
+        before it can reach the agent.
         """
         router = self._trigger_router
         if router is None:
@@ -2059,6 +2068,31 @@ class SlackAdapter(BasePlatformAdapter):
         bot_id = event.get("bot_id") or None
         user_id = event.get("user") or None
         subtype = event.get("subtype") or None
+
+        # In-thread @mention bypass. Operator is explicitly asking the
+        # agent to act on the thread's contents; route to the normal
+        # agent path, not the trigger router. Only applies to human
+        # messages (bot replies stay subject to the trigger gates).
+        if (
+            thread_ts
+            and thread_ts != message_ts
+            and not is_bot_message(bot_id=bot_id, subtype=subtype)
+        ):
+            bound = router.get(channel_id)
+            if bound is not None:
+                team_id = event.get("team") or event.get("team_id") or ""
+                bot_uid = self._team_bot_user_ids.get(
+                    team_id, self._bot_user_id
+                )
+                if bot_uid and f"<@{bot_uid}>" in (event.get("text") or ""):
+                    logger.info(
+                        "[Slack][trigger] channel=%s skill=%s ts=%s "
+                        "status=bypassed_in_thread_mention",
+                        channel_id,
+                        bound.skill,
+                        message_ts,
+                    )
+                    return False
 
         trigger, status = router.evaluate(
             channel_id=channel_id,
