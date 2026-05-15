@@ -58,7 +58,7 @@ Seven units live here:
 | `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
-| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-secrets.sh`. |
+| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`, `QUAY_REVIEW_PR_TOKEN`). Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
@@ -597,6 +597,8 @@ Prompts (gateway side, always):
 * `LINEAR_API_KEY` — required when quay is provisioned, optional
   otherwise; gates `quay enqueue --linear-issue` and the gateway's
   linear-create skill.
+* `QUAY_REVIEW_PR_TOKEN` — optional; enables authenticated
+  `POST /quay/review-pr` enrollment from GitHub Actions.
 
 Non-secret runtime config (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …)
 is **not** prompted here. It lives in `deploy.values.yaml` and is rendered

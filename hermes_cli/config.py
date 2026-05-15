@@ -2252,6 +2252,14 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "QUAY_REVIEW_PR_TOKEN": {
+        "description": "Bearer token for authenticated POST /quay/review-pr enrollment from GitHub Actions.",
+        "prompt": "Quay review-pr endpoint token",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
     "API_SERVER_PORT": {
         "description": "Port for the API server (default: 8642).",
         "prompt": "API server port",
