@@ -84,12 +84,13 @@ class TaskContext:
         metadata = raw.get("metadata")
         if not isinstance(metadata, Mapping):
             metadata = {}
+        metadata = _task_metadata_with_authors(raw, metadata)
         return cls(
             task_id=str(raw.get("task_id") or raw.get("id") or ""),
             title=str(raw.get("title") or ""),
             issue=str(raw.get("issue") or raw.get("issue_id") or ""),
             repo_id=_optional_str(raw.get("repo_id")),
-            metadata=dict(metadata),
+            metadata=metadata,
         )
 
 
@@ -429,12 +430,13 @@ class QuayCliClient:
         raw = self._run_json(["task", "get", task_id])
         if not isinstance(raw, Mapping):
             raise RuntimeError("quay task get did not return a JSON object")
+        metadata = _task_metadata_with_authors(raw, raw)
         return TaskContext(
             task_id=str(raw.get("task_id") or task_id),
             title=str(raw.get("external_ref") or raw.get("branch_name") or task_id),
             issue=str(raw.get("external_ref") or ""),
             repo_id=_optional_str(raw.get("repo_id")),
-            metadata=dict(raw),
+            metadata=metadata,
         )
 
     def get_artifact(self, handoff: Handoff) -> Artifact | None:
@@ -1543,9 +1545,41 @@ def resolve_author_mention(handoff: Handoff, task: TaskContext) -> str | None:
     return f"<@{user_id}>"
 
 
+def _task_metadata_with_authors(
+    raw: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = dict(metadata)
+    authors = result.get("authors", raw.get("authors"))
+    if authors is None:
+        authors = _parse_json_value(result.get("authors_json") or raw.get("authors_json"))
+    elif isinstance(authors, str):
+        parsed_authors = _parse_json_value(authors)
+        if parsed_authors is not None:
+            authors = parsed_authors
+    if authors is not None:
+        result["authors"] = authors
+    return result
+
+
+def _parse_json_value(value: Any) -> Any:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
+
+
 def _find_slack_user_id(value: Any) -> str | None:
     if isinstance(value, str):
-        return _extract_slack_user_id(value)
+        found = _extract_slack_user_id(value)
+        if found:
+            return found
+        parsed = _parse_json_value(value)
+        if parsed is not None:
+            return _find_slack_user_id(parsed)
+        return None
     if isinstance(value, Mapping):
         preferred_keys = (
             "contributor_slack_id",
@@ -1559,6 +1593,7 @@ def _find_slack_user_id(value: Any) -> str | None:
             "slack_user_id",
             "slack_id",
             "author.slack_id",
+            "authors_json",
         )
         for key in preferred_keys:
             found = _find_slack_user_id(value.get(key))

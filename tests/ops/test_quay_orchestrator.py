@@ -238,7 +238,8 @@ class RecordingQuayRunner:
             return FakeCompletedProcess(
                 '{"task_id":"task-cli","repo_id":"repo-1","state":"claimed-by-orchestrator",'
                 '"external_ref":"BRIX-1405","branch_name":"quay/task",'
-                '"slack_thread_ref":"GPRIVATE123:999.000000"}\n'
+                '"slack_thread_ref":"GPRIVATE123:999.000000",'
+                '"authors_json":"[{\\"slack_id\\":\\"U06TDC56VJB\\"}]"}\n'
             )
         if command == ["artifact", "get", "task-cli", "blocker"]:
             return FakeCompletedProcess("blocked on product input\n")
@@ -260,10 +261,10 @@ def test_drain_one_submits_direct_next_brief_without_slack():
         task_id="task-1",
         next_brief="Apply the reviewer suggestion and rerun tests.",
     )
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient()
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(enabled=True),
         worker_id="test-worker",
@@ -272,18 +273,18 @@ def test_drain_one_submits_direct_next_brief_without_slack():
     result = drainer.drain_one()
 
     assert result.status == "submitted_direct"
-    assert quay.submitted == [
+    assert quay_client.submitted == [
         (handoff, "Apply the reviewer suggestion and rerun tests.", "blocker_resolved")
     ]
-    assert quay.completed == [handoff]
-    assert quay.released == []
+    assert quay_client.completed == [handoff]
+    assert quay_client.released == []
     assert slack.questions == []
     assert result.metrics["direct_briefs_submitted"] == 1
 
 
 def test_drain_one_reattaches_to_original_thread_without_reposting_question():
     runner = RecordingQuayRunner()
-    quay = quay.QuayCliClient(command="/bin/quay", runner=runner)
+    quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
     reply = quay.SlackReply(
         text="Use the existing importer and keep the old endpoint as a fallback.",
         user_id="U123",
@@ -300,7 +301,7 @@ def test_drain_one_reattaches_to_original_thread_without_reposting_question():
         poll_interval_seconds=2,
     )
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=config,
         worker_id="test-worker",
@@ -352,7 +353,14 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
         user_id="U123",
         ts="1001.000000",
     )
-    quay = FakeQuayClient(handoff)
+    task = quay.TaskContext(
+        task_id=handoff.task_id,
+        title="Fix stuck worker",
+        issue="BRIX-1405",
+        repo_id="hermes-agent",
+        metadata={"authors_json": '[{"slack_id":"U06TDC56VJB"}]'},
+    )
+    quay_client = FakeQuayClient(handoff, task=task)
     slack = FakeSlackClient(reply)
     decider = FakeDecider([ready("Use the default route.")])
     config = quay.OrchestratorConfig(
@@ -360,7 +368,7 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
         default_slack_channel="C1234567890",
     )
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=config,
         worker_id="test-worker",
@@ -371,19 +379,20 @@ def test_drain_one_falls_back_to_default_channel_and_persists_post_thread():
 
     assert result.status == "submitted_from_human_reply"
     assert slack.questions[0][0] == "C1234567890"
+    assert "Contributor: <@U06TDC56VJB>" in slack.questions[0][1]
     assert slack.questions[0][2] is None
-    assert quay.escalated[2] == "C1234567890:1000.000000"
-    assert quay.recorded_reply[2] == "C1234567890:1000.000000"
-    assert quay.submitted[0][2] == "advice_answered"
+    assert quay_client.escalated[2] == "C1234567890:1000.000000"
+    assert quay_client.recorded_reply[2] == "C1234567890:1000.000000"
+    assert quay_client.submitted[0][2] == "advice_answered"
     assert slack.acks
 
 
 def test_missing_default_slack_channel_releases_claim():
     handoff = quay.Handoff(handoff_id="handoff-3", task_id="task-3")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient()
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(enabled=True),
         worker_id="test-worker",
@@ -392,19 +401,19 @@ def test_missing_default_slack_channel_releases_claim():
     result = drainer.drain_one()
 
     assert result.status == "missing_default_slack_channel"
-    assert quay.submitted == []
-    assert quay.completed == []
-    assert quay.released == [(handoff, "missing_default_slack_channel")]
+    assert quay_client.submitted == []
+    assert quay_client.completed == []
+    assert quay_client.released == [(handoff, "missing_default_slack_channel")]
     assert slack.questions == []
 
 
 def test_human_reply_timeout_releases_claim():
     handoff = quay.Handoff(handoff_id="handoff-4", task_id="task-4")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient(reply=None)
     decider = FakeDecider([ready("Use the existing thread on retry.")])
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -419,9 +428,9 @@ def test_human_reply_timeout_releases_claim():
     result = drainer.drain_one()
 
     assert result.status == "human_reply_timeout"
-    assert quay.submitted == []
-    assert quay.completed == []
-    assert quay.released == [(handoff, "human_reply_timeout")]
+    assert quay_client.submitted == []
+    assert quay_client.completed == []
+    assert quay_client.released == [(handoff, "human_reply_timeout")]
     assert slack.questions
     slack.wait_results.append(
         quay.SlackReply(
@@ -436,13 +445,13 @@ def test_human_reply_timeout_releases_claim():
     assert retry.status == "submitted_from_human_reply"
     assert len(slack.questions) == 1
     assert slack.validations == [("C1234567890", "1000.000000")]
-    assert quay.recorded_reply[2] == "C1234567890:1000.000000"
-    assert quay.submitted[0][2] == "advice_answered"
+    assert quay_client.recorded_reply[2] == "C1234567890:1000.000000"
+    assert quay_client.submitted[0][2] == "advice_answered"
 
 
 def test_plain_thread_chatter_does_not_resume_quay():
     handoff = quay.Handoff(handoff_id="handoff-chatter", task_id="task-chatter")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient(
         quay.SlackReply(
             text="Could I fix CI and ping you here?",
@@ -451,7 +460,7 @@ def test_plain_thread_chatter_does_not_resume_quay():
         )
     )
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -466,15 +475,15 @@ def test_plain_thread_chatter_does_not_resume_quay():
     result = drainer.drain_one()
 
     assert result.status == "human_reply_timeout"
-    assert not hasattr(quay, "recorded_reply")
-    assert quay.submitted == []
+    assert not hasattr(quay_client, "recorded_reply")
+    assert quay_client.submitted == []
     assert slack.acks == []
-    assert quay.released == [(handoff, "human_reply_timeout")]
+    assert quay_client.released == [(handoff, "human_reply_timeout")]
 
 
 def test_orchestrator_ready_decision_records_submits_and_acks():
     handoff = quay.Handoff(handoff_id="handoff-resume", task_id="task-resume")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient(
         quay.SlackReply(
             text="CI is blocked because the auth fixture is only available in CI.",
@@ -484,7 +493,7 @@ def test_orchestrator_ready_decision_records_submits_and_acks():
     )
     decider = FakeDecider([ready("Use the CI-only auth fixture.")])
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -497,10 +506,10 @@ def test_orchestrator_ready_decision_records_submits_and_acks():
     result = drainer.drain_one()
 
     assert result.status == "submitted_from_human_reply"
-    assert quay.recorded_reply[1].text == "CI is blocked because the auth fixture is only available in CI."
-    assert quay.submitted[0][1].endswith("Use the CI-only auth fixture.")
-    assert quay.submitted[0][2] == "advice_answered"
-    assert quay.completed == [handoff]
+    assert quay_client.recorded_reply[1].text == "CI is blocked because the auth fixture is only available in CI."
+    assert quay_client.submitted[0][1].endswith("Use the CI-only auth fixture.")
+    assert quay_client.submitted[0][2] == "advice_answered"
+    assert quay_client.completed == [handoff]
     assert slack.acks
     assert "Quay resumed for BRIX-1405" in slack.acks[0][1]
     assert "Use the CI-only auth fixture" in slack.acks[0][1]
@@ -508,7 +517,7 @@ def test_orchestrator_ready_decision_records_submits_and_acks():
 
 def test_orchestrator_can_ask_for_confirmation_before_resuming():
     handoff = quay.Handoff(handoff_id="handoff-confirm", task_id="task-confirm")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient(
         wait_results=[
             quay.SlackReply(
@@ -530,7 +539,7 @@ def test_orchestrator_can_ask_for_confirmation_before_resuming():
         ]
     )
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -545,13 +554,13 @@ def test_orchestrator_can_ask_for_confirmation_before_resuming():
     assert result.status == "submitted_from_human_reply"
     assert len(decider.calls) == 2
     assert "I would tell the worker" in slack.acks[0][1]
-    assert quay.recorded_reply[1].text == "Yes, that's the right worker instruction."
-    assert quay.submitted[0][1].endswith("Use the CI-only auth fixture.")
+    assert quay_client.recorded_reply[1].text == "Yes, that's the right worker instruction."
+    assert quay_client.submitted[0][1].endswith("Use the CI-only auth fixture.")
 
 
 def test_orchestrator_decider_error_prompts_once_and_keeps_waiting():
     handoff = quay.Handoff(handoff_id="handoff-decider", task_id="task-decider")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient(
         wait_results=[
             quay.SlackReply(
@@ -567,7 +576,7 @@ def test_orchestrator_decider_error_prompts_once_and_keeps_waiting():
         ]
     )
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -590,10 +599,10 @@ def test_orchestrator_decider_error_prompts_once_and_keeps_waiting():
     assert "decision engine hit an internal orchestrator error" in slack.acks[0][1]
     assert "No need to rephrase" in slack.acks[0][1]
     assert "Quay resumed" in slack.acks[1][1]
-    assert quay.escalations[0][2] == "C1234567890:1000.000000"
-    assert quay.released == []
-    assert quay.submitted[0][1].endswith("Use the CI-only auth fixture.")
-    assert quay.completed == [handoff]
+    assert quay_client.escalations[0][2] == "C1234567890:1000.000000"
+    assert quay_client.released == []
+    assert quay_client.submitted[0][1].endswith("Use the CI-only auth fixture.")
+    assert quay_client.completed == [handoff]
     assert result.metrics["errors"] == 1
     assert result.metrics["claims_released"] == 0
 
@@ -603,7 +612,7 @@ def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
         handoff_id="handoff-decider-timeout",
         task_id="task-decider-timeout",
     )
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
     slack = FakeSlackClient(
         wait_results=[
             quay.SlackReply(
@@ -615,7 +624,7 @@ def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
     )
     decider = FakeDecider([RuntimeError("model unavailable")])
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -803,13 +812,13 @@ def test_orchestrator_decider_uses_normalized_compatible_config_model(monkeypatc
 
 def test_fake_quay_rejects_double_human_escalation_without_reply():
     handoff = quay.Handoff(handoff_id="handoff-stateful", task_id="task-stateful")
-    quay = FakeQuayClient(handoff)
+    quay_client = FakeQuayClient(handoff)
 
-    assert quay.claim_handoff("test-worker") == handoff
-    quay.escalate_human(handoff, "Question", "C1234567890:1000.000000")
+    assert quay_client.claim_handoff("test-worker") == handoff
+    quay_client.escalate_human(handoff, "Question", "C1234567890:1000.000000")
 
     with pytest.raises(RuntimeError, match="wrong_state"):
-        quay.escalate_human(handoff, "Fallback question", "CFALLBACK1:1000.000000")
+        quay_client.escalate_human(handoff, "Fallback question", "CFALLBACK1:1000.000000")
 
 
 def test_orchestrator_decision_parser_accepts_ready_ask_and_invalid_json():
@@ -860,6 +869,20 @@ def test_human_question_mentions_legacy_flash_tag_author_on_fallback_route():
     assert route == quay.SlackRoute(channel_id="C1234567890", source="fallback_channel")
 
 
+def test_human_question_omits_contributor_without_author_metadata():
+    task = quay.TaskContext(
+        task_id="task-no-author",
+        title="No author",
+        metadata={"authors_json": "not-json"},
+    )
+    handoff = quay.Handoff(handoff_id="handoff-no-author", task_id=task.task_id)
+
+    question = quay.build_human_question(handoff, task, None)
+
+    assert "Contributor:" not in question
+    assert "<@" not in question
+
+
 def test_stale_metadata_route_falls_back_and_records_fallback_thread():
     handoff = quay.Handoff(handoff_id="handoff-stale", task_id="task-stale")
     task = quay.TaskContext(
@@ -868,7 +891,7 @@ def test_stale_metadata_route_falls_back_and_records_fallback_thread():
         issue="BRIX-1396",
         metadata={"slack_thread_ref": "CSTALE1234:1778757925.556349"},
     )
-    quay = FakeQuayClient(handoff, task=task)
+    quay_client = FakeQuayClient(handoff, task=task)
     slack = FakeSlackClient(
         validate_results=[
             quay.SlackApiError("conversations.replies", "thread_not_found"),
@@ -883,7 +906,7 @@ def test_stale_metadata_route_falls_back_and_records_fallback_thread():
     )
     decider = FakeDecider([ready("Use the fallback thread.")])
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -900,10 +923,10 @@ def test_stale_metadata_route_falls_back_and_records_fallback_thread():
     assert len(slack.questions) == 1
     assert slack.questions[0][0] == "CFALLBACK1"
     assert slack.questions[0][2] is None
-    assert quay.escalations == [
+    assert quay_client.escalations == [
         (handoff, slack.questions[0][1], "CFALLBACK1:1000.000000")
     ]
-    assert quay.recorded_reply[2] == "CFALLBACK1:1000.000000"
+    assert quay_client.recorded_reply[2] == "CFALLBACK1:1000.000000"
 
 
 def test_stale_metadata_route_without_fallback_releases_and_does_not_bubble():
@@ -914,14 +937,14 @@ def test_stale_metadata_route_without_fallback_releases_and_does_not_bubble():
         issue="BRIX-1396",
         metadata={"slack_thread_ref": "CSTALE1234:1778757925.556349"},
     )
-    quay = FakeQuayClient(handoff, task=task)
+    quay_client = FakeQuayClient(handoff, task=task)
     slack = FakeSlackClient(
         validate_results=[
             quay.SlackApiError("conversations.replies", "thread_not_found"),
         ]
     )
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(enabled=True),
         worker_id="test-worker",
@@ -932,9 +955,9 @@ def test_stale_metadata_route_without_fallback_releases_and_does_not_bubble():
     assert result.status == "stale_slack_thread_ref"
     assert slack.validations == [("CSTALE1234", "1778757925.556349")]
     assert slack.questions == []
-    assert quay.escalations == []
-    assert quay.submitted == []
-    assert quay.released == [(handoff, "stale_slack_thread_ref")]
+    assert quay_client.escalations == []
+    assert quay_client.submitted == []
+    assert quay_client.released == [(handoff, "stale_slack_thread_ref")]
 
 
 def test_failed_record_human_reply_does_not_post_success_ack():
@@ -943,7 +966,7 @@ def test_failed_record_human_reply_does_not_post_success_ack():
             raise RuntimeError("record failed")
 
     handoff = quay.Handoff(handoff_id="handoff-record-fails", task_id="task-record-fails")
-    quay = FailingRecordQuay(handoff)
+    quay_client = FailingRecordQuay(handoff)
     slack = FakeSlackClient(
         quay.SlackReply(
             text="Try the fixture.",
@@ -953,7 +976,7 @@ def test_failed_record_human_reply_does_not_post_success_ack():
     )
     decider = FakeDecider([ready("Try the fixture.")])
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -975,7 +998,7 @@ def test_failed_submit_brief_does_not_post_success_ack():
             raise RuntimeError("submit failed")
 
     handoff = quay.Handoff(handoff_id="handoff-submit-fails", task_id="task-submit-fails")
-    quay = FailingSubmitQuay(handoff)
+    quay_client = FailingSubmitQuay(handoff)
     slack = FakeSlackClient(
         quay.SlackReply(
             text="Try the fixture.",
@@ -985,7 +1008,7 @@ def test_failed_submit_brief_does_not_post_success_ack():
     )
     decider = FakeDecider([ready("Try the fixture.")])
     drainer = quay.HandoffDrainer(
-        quay=quay,
+        quay=quay_client,
         slack=slack,
         config=quay.OrchestratorConfig(
             enabled=True,
@@ -1014,8 +1037,8 @@ def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(
     monkeypatch,
     capsys,
 ):
-    quay = tmp_path / "quay"
-    quay.write_text(
+    quay_bin = tmp_path / "quay"
+    quay_bin.write_text(
         "#!/usr/bin/env bash\n"
         "if [[ \"$1 $2 $3\" == \"handoff list --status\" ]]; then\n"
         "  printf '[]\\n'\n"
@@ -1024,10 +1047,10 @@ def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(
         "exit 99\n",
         encoding="utf-8",
     )
-    quay.chmod(0o755)
+    quay_bin.chmod(0o755)
     config = tmp_path / "orchestrator.json"
     config.write_text(
-        '{"enabled": true, "quay_command": "' + str(quay) + '"}\n',
+        '{"enabled": true, "quay_command": "' + str(quay_bin) + '"}\n',
         encoding="utf-8",
     )
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
@@ -1060,6 +1083,7 @@ def test_quay_cli_client_uses_ast_121_human_reply_contract():
     task = client.get_task_context(handoff.task_id)
     assert task.repo_id == "repo-1"
     assert task.metadata["slack_thread_ref"] == "GPRIVATE123:999.000000"
+    assert task.metadata["authors"] == [{"slack_id": "U06TDC56VJB"}]
     artifact = client.get_artifact(handoff)
     assert artifact.text == "blocked on product input\n"
 
