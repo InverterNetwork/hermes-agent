@@ -253,6 +253,85 @@ class TestRenderGatewayRuntimeEnv:
         assert r.returncode == 1
         assert "must be a list" in r.stderr
 
+    def test_writes_slack_allowed_channels(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_channels:\n"
+            "      - C0B23MZ0USV\n      - C0B4LLZ5Z2L\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "SLACK_ALLOWED_CHANNELS=C0B23MZ0USV,C0B4LLZ5Z2L" in out.read_text()
+
+    def test_empty_allowed_channels_clears_stale_env(self, tmp_path: Path):
+        # Mirrors allowed_users semantics: explicit empty wipes legacy
+        # SLACK_ALLOWED_CHANNELS lines in auth/slack.env.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_channels: []\n", encoding="utf-8"
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "SLACK_ALLOWED_CHANNELS=\n" in out.read_text()
+
+    def test_rejects_non_list_allowed_channels(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    allowed_channels: 'C_X,C_Y'\n", encoding="utf-8"
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "allowed_channels must be a list" in r.stderr
+
+    def test_writes_gateway_allow_all_users_true(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  model_provider: openai\n  allow_all_users: true\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "GATEWAY_ALLOW_ALL_USERS=true" in out.read_text()
+
+    def test_writes_gateway_allow_all_users_false(self, tmp_path: Path):
+        # Explicit false still emits the var so a later-loaded gateway-runtime.env
+        # wipes a stale GATEWAY_ALLOW_ALL_USERS=true from operator-staged files.
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  model_provider: openai\n  allow_all_users: false\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "GATEWAY_ALLOW_ALL_USERS=false" in out.read_text()
+
+    def test_omits_gateway_allow_all_users_when_absent(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  model_provider: openai\n", encoding="utf-8"
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "GATEWAY_ALLOW_ALL_USERS" not in out.read_text()
+
+    def test_rejects_non_bool_allow_all_users(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  model_provider: openai\n  allow_all_users: 'yes'\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "allow_all_users must be a bool" in r.stderr
+
     def test_writes_linear_team_env_vars(self, tmp_path: Path):
         # linear.teams.<key> → LINEAR_TEAM_<KEY>
         values = tmp_path / "values.yaml"

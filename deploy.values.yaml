@@ -26,7 +26,21 @@
 #                                 writes a comma-joined value into
 #                                 <target>/auth/gateway-runtime.env on every
 #                                 run, so re-installs and rotations don't ask
-#                                 the operator to re-type the list.
+#                                 the operator to re-type the list. Empty list
+#                                 emits an explicit `SLACK_ALLOWED_USERS=` so
+#                                 the later-loaded gateway-runtime.env wipes
+#                                 stale values from auth/slack.env that older
+#                                 stage-secrets.sh runs may have left behind.
+#   slack.runtime.allowed_channels — Slack channel IDs (C…/G…) the bot is
+#                                 permitted to respond in. Source of truth
+#                                 for SLACK_ALLOWED_CHANNELS; installer writes
+#                                 a comma-joined value into gateway-runtime.env.
+#                                 Same drift-fix semantics as allowed_users:
+#                                 empty list clears stale env values from
+#                                 legacy auth/slack.env. The trigger router
+#                                 ignores this gate (slack_triggers below run
+#                                 regardless), so only the normal agent flow
+#                                 honours the allowlist.
 #
 #   gateway.model_provider     — provider key persisted into <target>/config.yaml
 #                                 under model.provider (e.g. "openai-codex",
@@ -59,6 +73,18 @@
 #                                 providers that ship a sensible default
 #                                 (openrouter, nous). Same declarative-drop
 #                                 semantics as the vision_provider pin.
+#   gateway.allow_all_users    — optional bool. When true, sets
+#                                 GATEWAY_ALLOW_ALL_USERS=true in gateway-
+#                                 runtime.env, which disables the gateway's
+#                                 per-user allowlist check and trusts
+#                                 channel-level gating (slack.runtime.
+#                                 allowed_channels above) as the only authz
+#                                 layer. Right for deployments where private-
+#                                 channel membership is the access control:
+#                                 anyone the operator invited into a listed
+#                                 channel can talk to the bot. Leave false /
+#                                 unset to keep enforcement at the user level
+#                                 via slack.runtime.allowed_users.
 #   gateway.approvals_mode     — optional values-driven command approval mode
 #                                 merged into <target>/config.yaml as
 #                                 approvals.mode on every install. Valid:
@@ -291,6 +317,14 @@ gateway:
   # for why this is pinned. Empty values fall back to auto-detect.
   vision_provider: codex
   vision_model: gpt-5.3-codex
+  # Per-user authz is replaced by per-channel gating in this deployment:
+  # bot membership in a Slack channel is operator-controlled, and the
+  # slack.runtime.allowed_channels list below is the access boundary.
+  # Setting this to true emits GATEWAY_ALLOW_ALL_USERS=true into
+  # gateway-runtime.env so the user-level gate is bypassed. Flip to false
+  # only when a separate slack.runtime.allowed_users list is also
+  # maintained.
+  allow_all_users: true
   # Optional: merge into <target>/config.yaml as approvals.mode on every
   # install. Set to "off" to bypass dangerous-command approval prompts for
   # trusted internal Slack deployments. The hardline blocklist still applies
