@@ -4,7 +4,8 @@
 # Single staging script for all runtime secrets — three files on disk:
 #
 #   <HERMES_HOME>/auth/slack.env   — gateway, Slack tokens
-#   <HERMES_HOME>/auth/hermes.env  — gateway, adapter tokens (LINEAR_API_KEY)
+#   <HERMES_HOME>/auth/hermes.env  — gateway, adapter tokens
+#                                      (LINEAR_API_KEY, QUAY_REVIEW_PR_TOKEN)
 #   <HERMES_HOME>/auth/quay.env    — quay-tick worker tokens
 #
 # AUTH_DIR defaults to /home/${AGENT_USER}/.hermes/auth — the same path
@@ -82,6 +83,7 @@ existing_slack_bot=""
 existing_slack_app=""
 existing_linear=""
 existing_anthropic=""
+existing_quay_review_pr_token=""
 
 parse_existing_env "$SLACK_ENV"  existing_slack_bot   SLACK_BOT_TOKEN
 parse_existing_env "$SLACK_ENV"  existing_slack_app   SLACK_APP_TOKEN
@@ -91,6 +93,7 @@ parse_existing_env "$SLACK_ENV"  existing_slack_app   SLACK_APP_TOKEN
 # quay.env's. They should match — the prompt re-collapses them.
 parse_existing_env "$HERMES_ENV" existing_linear     LINEAR_API_KEY
 [[ -z "$existing_linear" ]] && parse_existing_env "$QUAY_ENV" existing_linear LINEAR_API_KEY
+parse_existing_env "$HERMES_ENV" existing_quay_review_pr_token QUAY_REVIEW_PR_TOKEN
 
 parse_existing_env "$QUAY_ENV"   existing_anthropic  ANTHROPIC_API_KEY
 
@@ -147,6 +150,12 @@ if (( manage_quay )); then
 fi
 prompt_value LINEAR "$linear_label" "$linear_required" "$existing_linear" "" 1
 
+# Quay PR review ingress — optional; when set, the gateway's API server
+# accepts POST /quay/review-pr with this bearer token and shells out to
+# local quay review-pr. Keep this out of deploy.values.yaml because it is
+# a shared secret used by GitHub Actions.
+prompt_value QUAY_REVIEW_PR_TOKEN "QUAY_REVIEW_PR_TOKEN (optional — enables POST /quay/review-pr)" 0 "$existing_quay_review_pr_token" "" 1
+
 # Quay-only secrets, prompted only on quay-provisioned deployments.
 # (SLACK_TOKEN is auto-populated from SLACK_BOT_TOKEN below — see header.)
 if (( manage_quay )); then
@@ -186,9 +195,16 @@ slack_content="SLACK_BOT_TOKEN=${SLACK_BOT}
 SLACK_APP_TOKEN=${SLACK_APP}"
 write_env "$SLACK_ENV" "$slack_content" slack_changed
 
-# hermes.env (gateway-side LINEAR_API_KEY, when set)
-if [[ -n "$LINEAR" ]]; then
-  write_env "$HERMES_ENV" "LINEAR_API_KEY=${LINEAR}" hermes_changed
+# hermes.env (gateway-side adapter tokens, when set)
+hermes_content=""
+[[ -n "$LINEAR" ]] && hermes_content+="LINEAR_API_KEY=${LINEAR}"
+if [[ -n "$QUAY_REVIEW_PR_TOKEN" ]]; then
+  [[ -n "$hermes_content" ]] && hermes_content+="
+"
+  hermes_content+="QUAY_REVIEW_PR_TOKEN=${QUAY_REVIEW_PR_TOKEN}"
+fi
+if [[ -n "$hermes_content" ]]; then
+  write_env "$HERMES_ENV" "$hermes_content" hermes_changed
 fi
 
 # quay.env — only on quay-provisioned hosts. quay-tick reads its env

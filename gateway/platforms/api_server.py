@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/stop    — interrupt a running agent
+- POST /quay/review-pr             — authenticated Quay PR review enrollment
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -49,6 +50,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,13 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+DEFAULT_QUAY_REVIEW_PR_COMMAND = "/usr/local/bin/quay-as-hermes"
+DEFAULT_QUAY_REVIEW_PR_TIMEOUT_SECONDS = 60.0
+_GITHUB_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GIT_SHA_RE = re.compile(r"^[A-Fa-f0-9]{6,64}$")
+_QUAY_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_QUAY_REVIEW_EVENTS = frozenset({"opened", "synchronize", "reopened"})
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -68,6 +77,15 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    """Parse a positive float with a safe fallback for malformed config."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _normalize_chat_content(
@@ -586,6 +604,29 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._quay_review_pr_token: str = str(
+            extra.get("quay_review_pr_token")
+            or os.getenv("QUAY_REVIEW_PR_TOKEN", "")
+        ).strip()
+        self._quay_review_pr_command: str = str(
+            extra.get("quay_review_pr_command")
+            or os.getenv("QUAY_REVIEW_PR_COMMAND", DEFAULT_QUAY_REVIEW_PR_COMMAND)
+        ).strip()
+        self._quay_review_pr_timeout_seconds: float = _coerce_positive_float(
+            extra.get(
+                "quay_review_pr_timeout_seconds",
+                os.getenv(
+                    "QUAY_REVIEW_PR_TIMEOUT_SECONDS",
+                    str(DEFAULT_QUAY_REVIEW_PR_TIMEOUT_SECONDS),
+                ),
+            ),
+            DEFAULT_QUAY_REVIEW_PR_TIMEOUT_SECONDS,
+        )
+        self._quay_data_dir: str = str(
+            extra.get("quay_data_dir") or os.getenv("QUAY_DATA_DIR", "")
+        ).strip()
+        if not self._quay_data_dir:
+            self._quay_data_dir = str(get_hermes_home() / "quay")
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -695,6 +736,32 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+            status=401,
+        )
+
+    def _check_quay_review_pr_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Validate the dedicated Quay PR-review bearer token."""
+        if not self._quay_review_pr_token:
+            return web.json_response(
+                _openai_error(
+                    "Quay PR review enrollment is not configured. "
+                    "Set QUAY_REVIEW_PR_TOKEN in the gateway environment.",
+                    code="quay_review_pr_not_configured",
+                ),
+                status=503,
+            )
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            if hmac.compare_digest(token, self._quay_review_pr_token):
+                return None
+
+        return web.json_response(
+            _openai_error(
+                "Invalid Quay review token",
+                code="invalid_quay_review_token",
+            ),
             status=401,
         )
 
@@ -848,6 +915,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
+                "quay_review_pr": bool(self._quay_review_pr_token),
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
@@ -862,12 +930,355 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "quay_review_pr": {"method": "POST", "path": "/quay/review-pr"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
             },
         })
+
+    def _validate_quay_review_pr_payload(
+        self,
+        body: Any,
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Validate POST /quay/review-pr input and return normalized fields."""
+        if not isinstance(body, dict):
+            return None, web.json_response(
+                _openai_error(
+                    "Request body must be a JSON object.",
+                    code="invalid_request_body",
+                ),
+                status=400,
+            )
+
+        repository = body.get("repository")
+        if not isinstance(repository, str) or not repository.strip():
+            return None, web.json_response(
+                _openai_error(
+                    "'repository' is required and must be an owner/repo string.",
+                    param="repository",
+                    code="invalid_repository",
+                ),
+                status=400,
+            )
+        repository = repository.strip()
+        if not _GITHUB_REPOSITORY_RE.fullmatch(repository):
+            return None, web.json_response(
+                _openai_error(
+                    "'repository' must be in owner/repo form.",
+                    param="repository",
+                    code="invalid_repository",
+                ),
+                status=400,
+            )
+
+        pull_request = body.get("pull_request")
+        if (
+            isinstance(pull_request, bool)
+            or not isinstance(pull_request, int)
+            or pull_request <= 0
+        ):
+            return None, web.json_response(
+                _openai_error(
+                    "'pull_request' is required and must be a positive integer.",
+                    param="pull_request",
+                    code="invalid_pull_request",
+                ),
+                status=400,
+            )
+
+        normalized: Dict[str, Any] = {
+            "repository": repository,
+            "pull_request": pull_request,
+        }
+
+        head_sha = body.get("head_sha")
+        if head_sha is not None:
+            if not isinstance(head_sha, str) or not head_sha.strip():
+                return None, web.json_response(
+                    _openai_error(
+                        "'head_sha' must be a non-empty Git SHA string when provided.",
+                        param="head_sha",
+                        code="invalid_head_sha",
+                    ),
+                    status=400,
+                )
+            head_sha = head_sha.strip()
+            if not _GIT_SHA_RE.fullmatch(head_sha):
+                return None, web.json_response(
+                    _openai_error(
+                        "'head_sha' must be a 6-64 character hexadecimal Git SHA.",
+                        param="head_sha",
+                        code="invalid_head_sha",
+                    ),
+                    status=400,
+                )
+            normalized["head_sha"] = head_sha
+
+        event = body.get("event")
+        if event is not None:
+            if not isinstance(event, str) or event not in _QUAY_REVIEW_EVENTS:
+                return None, web.json_response(
+                    _openai_error(
+                        "'event' must be one of opened, synchronize, or reopened.",
+                        param="event",
+                        code="invalid_event",
+                    ),
+                    status=400,
+                )
+            normalized["event"] = event
+
+        delivery_id = body.get("delivery_id")
+        if delivery_id is not None:
+            if (
+                not isinstance(delivery_id, str)
+                or not delivery_id.strip()
+                or len(delivery_id) > 256
+                or _CONTROL_CHAR_RE.search(delivery_id)
+            ):
+                return None, web.json_response(
+                    _openai_error(
+                        "'delivery_id' must be a non-empty string without control characters.",
+                        param="delivery_id",
+                        code="invalid_delivery_id",
+                    ),
+                    status=400,
+                )
+            normalized["delivery_id"] = delivery_id.strip()
+
+        tags = body.get("tags", [])
+        if tags is None:
+            tags = []
+        if not isinstance(tags, list):
+            return None, web.json_response(
+                _openai_error(
+                    "'tags' must be an array of strings when provided.",
+                    param="tags",
+                    code="invalid_tags",
+                ),
+                status=400,
+            )
+        # Preserve caller order while dropping duplicates; Quay handles final
+        # semantic validation against its configured vocabulary.
+        normalized_tags: List[str] = []
+        for idx, tag in enumerate(tags):
+            if not isinstance(tag, str) or not tag.strip():
+                return None, web.json_response(
+                    _openai_error(
+                        "'tags' entries must be non-empty strings.",
+                        param=f"tags[{idx}]",
+                        code="invalid_tag",
+                    ),
+                    status=400,
+                )
+            tag = tag.strip()
+            if _CONTROL_CHAR_RE.search(tag) or not _QUAY_TAG_RE.fullmatch(tag):
+                return None, web.json_response(
+                    _openai_error(
+                        "'tags' entries may contain only letters, numbers, '.', '_', ':', or '-'.",
+                        param=f"tags[{idx}]",
+                        code="invalid_tag",
+                    ),
+                    status=400,
+                )
+            if tag not in normalized_tags:
+                normalized_tags.append(tag)
+        normalized["tags"] = normalized_tags
+
+        return normalized, None
+
+    @staticmethod
+    def _parse_quay_json(text: str) -> Optional[Any]:
+        """Parse a Quay JSON stdout/stderr payload, allowing trailing newlines."""
+        stripped = text.strip()
+        if not stripped:
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            for line in reversed(stripped.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    async def _run_quay_review_pr(self, payload: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
+        """Invoke local Quay and return (HTTP status, response JSON)."""
+        if not self._quay_review_pr_command:
+            return 503, _openai_error(
+                "Quay review-pr command is not configured.",
+                code="quay_command_not_configured",
+            )
+
+        pr_ref = f"{payload['repository']}:{payload['pull_request']}"
+        argv = [
+            self._quay_review_pr_command,
+            "review-pr",
+            "--pr",
+            pr_ref,
+        ]
+        head_sha = payload.get("head_sha")
+        if head_sha:
+            argv.extend(["--head-sha", head_sha])
+        for tag in payload.get("tags", []):
+            argv.extend(["--tag", tag])
+
+        env = os.environ.copy()
+        env["QUAY_DATA_DIR"] = self._quay_data_dir
+        env.setdefault("HERMES_HOME", str(get_hermes_home()))
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd="/",
+            )
+        except FileNotFoundError:
+            return 503, _openai_error(
+                f"Quay command not found: {self._quay_review_pr_command}",
+                code="quay_command_not_found",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[api_server] quay review-pr spawn failed repo=%s pr=%s error=%s",
+                payload["repository"],
+                payload["pull_request"],
+                exc,
+            )
+            return 503, _openai_error(
+                f"Failed to start Quay review-pr command: {exc}",
+                code="quay_command_spawn_failed",
+            )
+
+        timed_out = False
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=self._quay_review_pr_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            proc.kill()
+            stdout_bytes, stderr_bytes = await proc.communicate()
+
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+
+        if timed_out:
+            logger.warning(
+                "[api_server] quay review-pr timed out repo=%s pr=%s head_sha=%s timeout=%.1fs",
+                payload["repository"],
+                payload["pull_request"],
+                payload.get("head_sha", ""),
+                self._quay_review_pr_timeout_seconds,
+            )
+            return 504, _openai_error(
+                "Quay review-pr command timed out.",
+                code="quay_command_timeout",
+            )
+
+        parsed_stdout = self._parse_quay_json(stdout_text)
+        if proc.returncode != 0:
+            parsed_error = self._parse_quay_json(stderr_text) or self._parse_quay_json(stdout_text)
+            logger.warning(
+                "[api_server] quay review-pr failed repo=%s pr=%s head_sha=%s exit=%s stderr_bytes=%d parsed_error=%s",
+                payload["repository"],
+                payload["pull_request"],
+                payload.get("head_sha", ""),
+                proc.returncode,
+                len(stderr_bytes),
+                isinstance(parsed_error, dict),
+            )
+            return 502, {
+                "error": {
+                    "message": "Quay review-pr command failed.",
+                    "type": "server_error",
+                    "code": "quay_command_failed",
+                    "exit_code": proc.returncode,
+                    "quay": parsed_error,
+                }
+            }
+
+        if not isinstance(parsed_stdout, dict):
+            logger.warning(
+                "[api_server] quay review-pr returned non-JSON output repo=%s pr=%s stdout_bytes=%d",
+                payload["repository"],
+                payload["pull_request"],
+                len(stdout_bytes),
+            )
+            return 502, _openai_error(
+                "Quay review-pr did not return a JSON object.",
+                code="quay_invalid_json",
+            )
+
+        return 200, parsed_stdout
+
+    async def _handle_quay_review_pr(self, request: "web.Request") -> "web.Response":
+        """POST /quay/review-pr — authenticated Quay PR review enrollment."""
+        auth_err = self._check_quay_review_pr_auth(request)
+        if auth_err:
+            logger.warning(
+                "[api_server] rejected quay review-pr request remote=%s status=%s",
+                request.remote,
+                auth_err.status,
+            )
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            logger.warning(
+                "[api_server] rejected quay review-pr request remote=%s status=400 reason=invalid_json",
+                request.remote,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Invalid JSON in request body.",
+                    code="invalid_json",
+                ),
+                status=400,
+            )
+
+        payload, error_response = self._validate_quay_review_pr_payload(body)
+        if error_response is not None:
+            logger.warning(
+                "[api_server] rejected quay review-pr request remote=%s status=%s reason=invalid_payload",
+                request.remote,
+                error_response.status,
+            )
+            return error_response
+        assert payload is not None
+
+        logger.info(
+            "[api_server] quay review-pr request repo=%s pr=%s head_sha=%s event=%s delivery=%s tags=%d",
+            payload["repository"],
+            payload["pull_request"],
+            payload.get("head_sha", ""),
+            payload.get("event", ""),
+            payload.get("delivery_id", ""),
+            len(payload.get("tags", [])),
+        )
+
+        status, result = await self._run_quay_review_pr(payload)
+        if status == 200:
+            logger.info(
+                "[api_server] quay review-pr result repo=%s pr=%s task_id=%s attempt_id=%s scheduled=%s skipped_reason=%s verdict=%s",
+                payload["repository"],
+                payload["pull_request"],
+                result.get("task_id"),
+                result.get("attempt_id"),
+                result.get("scheduled"),
+                result.get("skipped_reason"),
+                result.get("review_verdict"),
+            )
+        return web.json_response(result, status=status)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -2816,6 +3227,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_post("/quay/review-pr", self._handle_quay_review_pr)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
