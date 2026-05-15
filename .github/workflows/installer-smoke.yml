@@ -80,19 +80,14 @@ jobs:
 
       - name: stage fixture repos + patch values for repos[]
         # Real deploys point repos[].url at private GitHub repos. CI has
-        # no credentials for those, so fabricate five local non-bare repos:
-        #   * test-factory-code   — quay-managed (entry has a `quay:` block).
-        #   * brix-indexer        — quay-managed, base_branch: dev (private
-        #                           pnpm-based repo in the real fork; here a
-        #                           local fixture init'd on `dev` directly to
-        #                           exercise the second quay-managed entry +
-        #                           the pnpm plain-binary runtime-manager path).
-        #   * hermes-agent        — quay-managed self-host entry; the fork
-        #                           lists itself in repos[] so quay can take
-        #                           tickets that touch the installer. Stub
-        #                           with a local fixture so the auth-method
-        #                           precondition (github.com + quay → App
-        #                           creds) doesn't trip on CI.
+        # no credentials for those, so fabricate local non-bare repos for
+        # every quay-managed entry in deploy.values.yaml:
+        #   * brix-landing        — quay-managed, base_branch: main
+        #   * iTRY-frontends      — quay-managed, base_branch: master
+        #   * iTRY-monorepo       — quay-managed, base_branch: main
+        #   * brix-indexer        — quay-managed, base_branch: dev
+        #   * erpc                — quay-managed, base_branch: main
+        #   * iTry-contracts      — quay-managed, base_branch: main
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
         #                           repos[] loop.
@@ -107,9 +102,12 @@ jobs:
         # bypass the per-repo url.insteadOf rewrite (which is github.com-
         # only) and clone directly.
         run: |
-          QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/test-factory-code
+          BRIX_LANDING_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-landing
+          ITRY_FRONTENDS_FIXTURE=/srv/hermes/repos/quay-fixtures/iTRY-frontends
+          ITRY_MONOREPO_FIXTURE=/srv/hermes/repos/quay-fixtures/iTRY-monorepo
           BRIX_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-indexer
-          HERMES_FIXTURE=/srv/hermes/repos/quay-fixtures/hermes-agent
+          ERPC_FIXTURE=/srv/hermes/repos/quay-fixtures/erpc
+          ITRY_CONTRACTS_FIXTURE=/srv/hermes/repos/quay-fixtures/iTry-contracts
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
           git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
@@ -120,11 +118,15 @@ jobs:
             git_in "$1" add -A
             git_in "$1" commit -q -m "$2"
           }
-          init_fixture "$QUAY_FIXTURE" "init fixture"
+          init_fixture "$BRIX_LANDING_FIXTURE" "init fixture"
+          # iTRY-frontends real repo lives on `master`.
+          init_fixture "$ITRY_FRONTENDS_FIXTURE" "init fixture" master
+          init_fixture "$ITRY_MONOREPO_FIXTURE" "init fixture"
           # brix-indexer real repo lives on `dev`; init the fixture there
           # directly so the values entry's base_branch=dev resolves cleanly.
           init_fixture "$BRIX_FIXTURE" "init fixture" dev
-          init_fixture "$HERMES_FIXTURE" "init fixture"
+          init_fixture "$ERPC_FIXTURE" "init fixture"
+          init_fixture "$ITRY_CONTRACTS_FIXTURE" "init fixture"
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -145,16 +147,28 @@ jobs:
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$QUAY_FIXTURE" "$BRIX_FIXTURE" "$HERMES_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
-          quay_fixture, brix_fixture, hermes_fixture, code_fixture, dev_fixture = sys.argv[1:6]
+          (
+              brix_landing_fixture,
+              itry_frontends_fixture,
+              itry_monorepo_fixture,
+              brix_fixture,
+              erpc_fixture,
+              itry_contracts_fixture,
+              code_fixture,
+              dev_fixture,
+          ) = sys.argv[1:9]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
           rewrite = {
-              "test-factory-code": quay_fixture,
+              "brix-landing": brix_landing_fixture,
+              "iTRY-frontends": itry_frontends_fixture,
+              "iTRY-monorepo": itry_monorepo_fixture,
               "brix-indexer": brix_fixture,
-              "hermes-agent": hermes_fixture,
+              "erpc": erpc_fixture,
+              "iTry-contracts": itry_contracts_fixture,
           }
           for entry in data.get("repos", []):
               if entry.get("id") in rewrite:
@@ -385,8 +399,12 @@ jobs:
             [[ -d "$T/quay" ]]                              || { echo "FAIL: quay data dir missing"; exit 1; }
             [[ -f "$T/quay/config.toml" ]]                  || { echo "FAIL: quay config.toml missing"; exit 1; }
             for spec in \
-              test-factory-code:/srv/hermes/repos/quay-fixtures/test-factory-code \
-              brix-indexer:/srv/hermes/repos/quay-fixtures/brix-indexer; do
+              brix-landing:/srv/hermes/repos/quay-fixtures/brix-landing \
+              iTRY-frontends:/srv/hermes/repos/quay-fixtures/iTRY-frontends \
+              iTRY-monorepo:/srv/hermes/repos/quay-fixtures/iTRY-monorepo \
+              brix-indexer:/srv/hermes/repos/quay-fixtures/brix-indexer \
+              erpc:/srv/hermes/repos/quay-fixtures/erpc \
+              iTry-contracts:/srv/hermes/repos/quay-fixtures/iTry-contracts; do
               id="${spec%%:*}"
               fixture="${spec#*:}"
               [[ -d "$T/quay/repos/$id.git" ]] \
@@ -397,7 +415,7 @@ jobs:
             done
             registered=$(env QUAY_DATA_DIR="$T/quay" /usr/local/bin/quay repo list \
               | python3 -c "import json,sys;print(\"\\n\".join(r[\"repo_id\"] for r in json.load(sys.stdin)))")
-            for id in test-factory-code brix-indexer; do
+            for id in brix-landing iTRY-frontends iTRY-monorepo brix-indexer erpc iTry-contracts; do
               grep -Fxq "$id" <<< "$registered" \
                 || { echo "FAIL: $id not registered (got: $registered)"; exit 1; }
             done
@@ -409,9 +427,8 @@ jobs:
           '
 
       - name: code mirror probes (every repos[] entry has one)
-        # All four repos[] entries (quay-managed test-factory-code on main
-        # and brix-indexer on dev, code-only-fixture on main,
-        # non-default-branch-fixture on develop) must produce a working-
+        # All repos[] entries (the six quay-managed repos from values.yaml
+        # plus the two CI-only code-only fixtures) must produce a working-
         # tree clone at $T/code/<id>/, agent-owned, on origin/<base_branch>.
         # The mirror is what hermes-code-sync refreshes on its 5-min timer.
         run: |
@@ -420,8 +437,12 @@ jobs:
             [[ -d "$T/code" ]] || { echo "FAIL: code mirrors root missing at $T/code"; exit 1; }
             # Format: id:expected_base
             for spec in \
-              test-factory-code:main \
+              brix-landing:main \
+              iTRY-frontends:master \
+              iTRY-monorepo:main \
               brix-indexer:dev \
+              erpc:main \
+              iTry-contracts:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"
@@ -465,8 +486,12 @@ jobs:
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes
             for spec in \
-              test-factory-code:main \
+              brix-landing:main \
+              iTRY-frontends:master \
+              iTRY-monorepo:main \
               brix-indexer:dev \
+              erpc:main \
+              iTry-contracts:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"
