@@ -37,9 +37,9 @@ Subcommands:
                                   when no ``quay.agents`` block exists; otherwise
                                   resolves ``quay.agents.<role>`` through
                                   ``quay.agents.invocations.<id>.<role>``.
-  render-brix-orchestrator-config <out>
+  render-quay-orchestrator-config <out>
                                 — write ~/.hermes/quay/orchestrator.json from
-                                  quay.orchestrator. This is BRIX-side config
+                                  quay.orchestrator. This is sidecar config
                                   for fallback Slack routing and polling; it
                                   intentionally does not enter quay config.toml.
   render-gateway-org-defaults --out <path>
@@ -780,9 +780,9 @@ def _toml_basic_string(s: str) -> str:
 
 
 def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str | None]:
-    """Validate BRIX orchestrator config under ``quay.orchestrator``.
+    """Validate Quay orchestrator config under ``quay.orchestrator``.
 
-    This is not rendered into Quay's config. It is the BRIX-owned sidecar
+    This is not rendered into Quay's config. It is orchestrator sidecar
     runner configuration for Slack fallback routing and polling.
     """
     defaults: dict[str, Any] = {
@@ -857,7 +857,7 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
     return out, None
 
 
-def cmd_render_brix_orchestrator_config(args: argparse.Namespace) -> int:
+def cmd_render_quay_orchestrator_config(args: argparse.Namespace) -> int:
     data = _load(Path(args.values))
     out_path = Path(args.out)
     if out_path.exists() and not args.force:
@@ -1986,14 +1986,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_active_inv.set_defaults(func=cmd_active_agent_invocations)
 
-    p_brix_orch = sub.add_parser(
-        "render-brix-orchestrator-config",
+    p_quay_orch = sub.add_parser(
+        "render-quay-orchestrator-config",
         help="write <target>/quay/orchestrator.json from quay.orchestrator",
     )
-    p_brix_orch.add_argument("--out", required=True, help="output JSON path")
-    p_brix_orch.add_argument("--force", action="store_true",
+    p_quay_orch.add_argument("--out", required=True, help="output JSON path")
+    p_quay_orch.add_argument("--force", action="store_true",
                              help="overwrite an existing file")
-    p_brix_orch.set_defaults(func=cmd_render_brix_orchestrator_config)
+    p_quay_orch.set_defaults(func=cmd_render_quay_orchestrator_config)
+
+    p_quay_orch_legacy = sub.add_parser(
+        "render-brix-orchestrator-config",
+        help=argparse.SUPPRESS,
+    )
+    p_quay_orch_legacy.add_argument(
+        "--out",
+        required=True,
+        help=argparse.SUPPRESS,
+    )
+    p_quay_orch_legacy.add_argument(
+        "--force",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    p_quay_orch_legacy.set_defaults(func=cmd_render_quay_orchestrator_config)
 
     p_org_defaults = sub.add_parser(
         "render-gateway-org-defaults",

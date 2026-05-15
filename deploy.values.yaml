@@ -222,7 +222,7 @@
 #                                 SLACK_TOKEN is staged by stage-secrets.sh
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
-#   quay.orchestrator          — BRIX-owned sidecar runner for durable Quay
+#   quay.orchestrator          — Quay orchestrator sidecar for durable Quay
 #                                 orchestrator handoffs. This renders to
 #                                 <target>/quay/orchestrator.json, not
 #                                 quay/config.toml, because these are sidecar
@@ -437,7 +437,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.6"
+  version: "v0.3.7"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
@@ -530,7 +530,7 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # BRIX orchestrator sidecar. Drains durable Quay handoffs into the
+  # Quay orchestrator sidecar. Drains durable Quay handoffs into the
   # deployment feedback channel when the task has no original Slack thread.
   orchestrator:
     enabled: true

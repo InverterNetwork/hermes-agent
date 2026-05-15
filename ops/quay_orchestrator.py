@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""BRIX orchestrator-side handoff drain loop.
+"""Quay orchestrator-side handoff drain loop.
 
-BRIX owns the runner shape, locking, Slack question/reply flow, and how a human
-reply becomes the next brief text. Quay owns durable task, claim, artifact, and
-handoff state behind the CLI adapter below.
+This component owns the runner shape, locking, Slack question/reply flow, and
+how a human reply becomes the next brief text. Quay owns durable task, claim,
+artifact, and handoff state behind the CLI adapter below.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 
-LOGGER = logging.getLogger("brix.orchestrator")
+LOGGER = logging.getLogger("quay.orchestrator")
 
 
 class LockBusy(RuntimeError):
@@ -37,8 +37,8 @@ class LockBusy(RuntimeError):
 class Handoff:
     """A claimed orchestrator handoff.
 
-    The field names here are BRIX-local and intentionally small so the Quay CLI
-    adapter does not leak storage details into the Slack/human loop.
+    The field names here are orchestrator-local and intentionally small so the
+    Quay CLI adapter does not leak storage details into the Slack/human loop.
     """
 
     handoff_id: str
@@ -211,26 +211,48 @@ class OrchestratorConfig:
         )
 
     def with_env_overrides(self) -> "OrchestratorConfig":
-        channel = os.getenv("BRIX_DEFAULT_SLACK_CHANNEL") or self.default_slack_channel
+        channel = _env_first(
+            "QUAY_ORCHESTRATOR_DEFAULT_SLACK_CHANNEL",
+            "BRIX_DEFAULT_SLACK_CHANNEL",
+        ) or self.default_slack_channel
         enabled = self.enabled
-        if "BRIX_ORCHESTRATOR_ENABLED" in os.environ:
-            enabled = _as_bool(os.environ["BRIX_ORCHESTRATOR_ENABLED"], default=enabled)
-        token_env = os.getenv("BRIX_SLACK_TOKEN_ENV") or self.slack_token_env
+        enabled_env = _env_first(
+            "QUAY_ORCHESTRATOR_ENABLED",
+            "BRIX_ORCHESTRATOR_ENABLED",
+        )
+        if enabled_env is not None:
+            enabled = _as_bool(enabled_env, default=enabled)
+        token_env = _env_first(
+            "QUAY_ORCHESTRATOR_SLACK_TOKEN_ENV",
+            "BRIX_SLACK_TOKEN_ENV",
+        ) or self.slack_token_env
         timeout = _positive_float(
-            os.getenv("BRIX_REPLY_TIMEOUT_SECONDS"),
+            _env_first(
+                "QUAY_ORCHESTRATOR_REPLY_TIMEOUT_SECONDS",
+                "BRIX_REPLY_TIMEOUT_SECONDS",
+            ),
             default=self.reply_timeout_seconds,
         )
         interval = _positive_float(
-            os.getenv("BRIX_POLL_INTERVAL_SECONDS"),
+            _env_first(
+                "QUAY_ORCHESTRATOR_POLL_INTERVAL_SECONDS",
+                "BRIX_POLL_INTERVAL_SECONDS",
+            ),
             default=self.poll_interval_seconds,
         )
-        lock_env = os.getenv("BRIX_ORCHESTRATOR_LOCK")
+        lock_env = _env_first(
+            "QUAY_ORCHESTRATOR_LOCK",
+            "BRIX_ORCHESTRATOR_LOCK",
+        )
         return dataclasses.replace(
             self,
             enabled=enabled,
             default_slack_channel=channel,
             slack_token_env=token_env,
-            quay_command=os.getenv("BRIX_QUAY_COMMAND") or self.quay_command,
+            quay_command=_env_first(
+                "QUAY_ORCHESTRATOR_QUAY_COMMAND",
+                "BRIX_QUAY_COMMAND",
+            ) or self.quay_command,
             reply_timeout_seconds=timeout,
             poll_interval_seconds=interval,
             lock_path=Path(lock_env) if lock_env else self.lock_path,
@@ -573,7 +595,7 @@ class QuayCliClient:
 
 
 class HermesConversationDecider:
-    """LLM-backed BRIX orchestrator decision step.
+    """LLM-backed Quay orchestrator decision step.
 
     Humans talk normally in Slack. This component decides whether that
     discussion has enough information to resume the worker, or whether the
@@ -625,7 +647,7 @@ class HermesConversationDecider:
             prompt,
             system_message=ORCHESTRATOR_DECISION_SYSTEM,
             conversation_history=[],
-            task_id=f"brix-orchestrator:{handoff.task_id}",
+            task_id=f"quay-orchestrator:{handoff.task_id}",
         )
         text = ""
         if isinstance(result, Mapping):
@@ -666,7 +688,7 @@ class HermesConversationDecider:
             enabled_toolsets=[],
             skip_context_files=True,
             skip_memory=True,
-            platform="brix-orchestrator",
+            platform="quay-orchestrator",
             session_id=orchestrator_session_id(handoff),
         )
 
@@ -676,7 +698,10 @@ class HermesConversationDecider:
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
             resolver = resolve_runtime_provider
-        requested = os.getenv("BRIX_ORCHESTRATOR_PROVIDER", "").strip() or None
+        requested = (
+            _env_first("QUAY_ORCHESTRATOR_PROVIDER", "BRIX_ORCHESTRATOR_PROVIDER")
+            or ""
+        ).strip() or None
         runtime = resolver(requested=requested)
         if not isinstance(runtime, Mapping):
             raise RuntimeError("orchestrator provider resolver returned invalid runtime")
@@ -815,7 +840,7 @@ class SlackWebApiClient:
             "unfurl_links": False,
             "unfurl_media": False,
             "metadata": {
-                "event_type": "brix_orchestrator_handoff",
+                "event_type": "quay_orchestrator_handoff",
                 "event_payload": {
                     "handoff_id": handoff.handoff_id,
                     "task_id": task.task_id,
@@ -1661,7 +1686,7 @@ def build_human_question(
 
 
 ORCHESTRATOR_DECISION_SYSTEM = (
-    "You are the BRIX orchestrator deciding whether a blocked worker can resume. "
+    "You are the Quay orchestrator deciding whether a blocked worker can resume. "
     "Read the Slack discussion and return only JSON. "
     "Use action='ready' only when the worker can continue with a clear, "
     "self-contained brief. Use action='ask' when there is remaining doubt; "
@@ -1818,7 +1843,7 @@ def orchestrator_session_id(handoff: Handoff) -> str:
         ]
     )
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-    return f"brix-orch-{digest}"
+    return f"quay-orch-{digest}"
 
 
 def slack_thread_ref(ref: SlackPostRef) -> str:
@@ -1919,8 +1944,9 @@ def load_config(path: Path | None) -> OrchestratorConfig:
 
 
 def default_config_path() -> Path:
-    if os.getenv("BRIX_ORCHESTRATOR_CONFIG"):
-        return Path(os.environ["BRIX_ORCHESTRATOR_CONFIG"])
+    config = _env_first("QUAY_ORCHESTRATOR_CONFIG", "BRIX_ORCHESTRATOR_CONFIG")
+    if config:
+        return Path(config)
     home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
     return home / "quay" / "orchestrator.json"
 
@@ -1983,7 +2009,7 @@ def setup_logging(*, verbose: bool = False) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Drain BRIX/Quay orchestrator handoffs")
+    parser = argparse.ArgumentParser(description="Drain Quay orchestrator handoffs")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_drain = sub.add_parser("drain-one", help="claim and process one handoff")
@@ -1991,7 +2017,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_drain.add_argument("--lock-path", help="override the singleton lock path")
     p_drain.add_argument(
         "--worker-id",
-        default=os.getenv("BRIX_ORCHESTRATOR_WORKER_ID") or f"brix-orchestrator:{os.uname().nodename}",
+        default=_env_first(
+            "QUAY_ORCHESTRATOR_WORKER_ID",
+            "BRIX_ORCHESTRATOR_WORKER_ID",
+        )
+        or f"quay-orchestrator:{os.uname().nodename}",
         help="claim owner id passed to the Quay adapter",
     )
     p_drain.add_argument(
@@ -2015,6 +2045,14 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
 
 
 def _artifact_kind_for_reason(reason: str) -> str | None:
@@ -2055,7 +2093,7 @@ def _temp_text_file(text: str):
     handle = tempfile.NamedTemporaryFile(
         "w",
         encoding="utf-8",
-        prefix="brix-orchestrator-",
+        prefix="quay-orchestrator-",
         suffix=".md",
         delete=False,
     )
