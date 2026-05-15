@@ -1106,6 +1106,62 @@ class TestSetupHermesVerifyQuay:
         assert result.returncode == 1
         assert "[DRIFT] quay-tick.timer" in result.stderr
 
+    def test_reviewer_auth_mints_from_config_without_token_file(self, quay_install):
+        reviewer_env = quay_install["tmp"] / "reviewer.env"
+        reviewer_key = quay_install["tmp"] / "reviewer.pem"
+        reviewer_env.write_text("HERMES_GH_APP_ID=1\n", encoding="utf-8")
+        reviewer_key.write_text(
+            "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+            encoding="utf-8",
+        )
+        reviewer_env.chmod(0o640)
+        reviewer_key.chmod(0o640)
+
+        curl = quay_install["bin"] / "curl"
+        curl.write_text("#!/usr/bin/env bash\nprintf '200'\n", encoding="utf-8")
+        curl.chmod(0o755)
+
+        systemd_dir = quay_install["tmp"] / "systemd"
+        systemd_dir.mkdir()
+        (systemd_dir / "quay-tick.service").write_text(
+            "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env\n"
+            "RuntimeDirectory=hermes\n",
+            encoding="utf-8",
+        )
+
+        result = _run_verify_quay(
+            quay_install,
+            env_overrides={
+                "HERMES_VERIFY_REVIEWER_ENV": str(reviewer_env),
+                "HERMES_VERIFY_REVIEWER_KEY": str(reviewer_key),
+                "HERMES_VERIFY_SYSTEMD_DIR": str(systemd_dir),
+            },
+        )
+
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] reviewer token helper check passes" in result.stdout
+        assert "[OK] reviewer App installation scope: HTTP 200" in result.stdout
+        assert "[OK] quay-tick.service reviewer config env" in result.stdout
+        assert "reviewer-gh-token" not in result.stdout
+        assert "reviewer-gh-token" not in result.stderr
+
+    def test_legacy_reviewer_token_timer_is_drift(self, quay_install):
+        systemd_dir = quay_install["tmp"] / "systemd"
+        systemd_dir.mkdir()
+        (systemd_dir / "hermes-reviewer-token.timer").write_text(
+            "[Timer]\nOnUnitActiveSec=30min\n",
+            encoding="utf-8",
+        )
+
+        result = _run_verify_quay(
+            quay_install,
+            env_overrides={"HERMES_VERIFY_SYSTEMD_DIR": str(systemd_dir)},
+        )
+
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-reviewer-token.timer" in result.stderr
+        assert "QUAY_REVIEWER_GH_TOKEN" in result.stderr
+
 
 class TestSetupHermesVerifyTagVocab:
     """Drift detection for `repos[].quay.tags` and `quay.tag_namespaces`.

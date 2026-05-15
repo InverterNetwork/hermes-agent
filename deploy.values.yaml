@@ -351,9 +351,10 @@ auth:
   # separate identities (the operational pairing on krustentier is
   # didier-worker + didier-reviewer). First-install requires
   # --reviewer-app-key-path on the installer; the PEM persists at
-  # /etc/hermes/reviewer.pem and a systemd timer refreshes
-  # /run/hermes/reviewer-gh-token, which the quay reviewer worker reads
-  # per AST-109. Leave id/installation_id empty to skip reviewer wiring
+  # /etc/hermes/reviewer.pem. quay-tick-runner reads
+  # /etc/hermes/reviewer.env each tick, mints QUAY_REVIEWER_GH_TOKEN,
+  # and passes it into `quay tick` so reviewer attempts post as the
+  # reviewer App. Leave id/installation_id empty to skip reviewer wiring
   # entirely (the install still runs; reviewer worker just won't get a
   # distinct token).
   github_app_reviewer:
@@ -606,19 +607,17 @@ quay:
   # approving PRs it authored, so a separate reviewer identity is the
   # only way to unblock self-review.
   #
-  # `gh_token_file` points at the file the installer's
-  # hermes-reviewer-token timer keeps fresh (the timer mints a new
-  # installation token from `auth.github_app_reviewer` every ~50 min).
-  # Quay's tick exports the file's contents as $GH_TOKEN inside the
-  # reviewer tmux pane only (per AST-109), which is how the reviewer
-  # authenticates as a different App from the worker.
+  # quay-tick-runner mints the reviewer App token from
+  # `auth.github_app_reviewer` and passes it to `quay tick` as
+  # QUAY_REVIEWER_GH_TOKEN. Quay injects that token as GH_TOKEN inside
+  # reviewer attempts only, so reviewer and worker attempts keep separate
+  # GitHub App identities without a separate reviewer-token timer.
   #
   # `max_concurrent_reviewers` left at the binary default of 2.
   reviewer:
     enabled: true
     gate_quay_owned_done: true
     login: "app/didier-reviewer"
-    gh_token_file: "/run/hermes/reviewer-gh-token"
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the

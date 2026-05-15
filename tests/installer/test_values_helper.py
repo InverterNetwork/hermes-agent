@@ -1015,26 +1015,6 @@ class TestRenderQuayConfig:
         assert "quay.reviewer.login must be a non-empty string" in r.stderr
         assert not out.exists()
 
-    def test_reviewer_gh_token_file_quoted_as_basic_string(
-        self, tmp_path: Path
-    ):
-        values = tmp_path / "values.yaml"
-        values.write_text(
-            "quay:\n"
-            '  agent_invocation: "claude < {prompt_file}"\n'
-            "  reviewer:\n"
-            "    enabled: true\n"
-            '    gh_token_file: "/run/hermes/reviewer-gh-token"\n',
-            encoding="utf-8",
-        )
-        out = tmp_path / "config.toml"
-        r = _run(values, "render-quay-config", "--out", str(out))
-        assert r.returncode == 0, r.stderr
-        assert (
-            'gh_token_file = "/run/hermes/reviewer-gh-token"'
-            in out.read_text()
-        )
-
     def test_reviewer_gh_token_file_absent_omits_line(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
@@ -1049,33 +1029,20 @@ class TestRenderQuayConfig:
         assert r.returncode == 0, r.stderr
         assert "gh_token_file" not in out.read_text()
 
-    @pytest.mark.parametrize(
-        "yaml_value",
-        ["42", "true", '""', "null", "[/foo, /bar]"],
-    )
-    def test_reviewer_gh_token_file_must_be_nonempty_string(
-        self, tmp_path: Path, yaml_value: str
-    ):
-        # Silent-drop guard symmetric with login: a non-string value would
-        # otherwise be dropped at the emission site and quay would fall back
-        # to no token-file (using the worker pane's $GH_TOKEN), defeating the
-        # whole point of AST-109's per-pane reviewer identity.
+    def test_reviewer_gh_token_file_is_rejected(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
             "quay:\n"
             '  agent_invocation: "claude < {prompt_file}"\n'
             "  reviewer:\n"
             "    enabled: true\n"
-            f"    gh_token_file: {yaml_value}\n",
+            '    gh_token_file: "/run/hermes/reviewer-gh-token"\n',
             encoding="utf-8",
         )
         out = tmp_path / "config.toml"
         r = _run(values, "render-quay-config", "--out", str(out))
         assert r.returncode == 1
-        assert (
-            "quay.reviewer.gh_token_file must be a non-empty string"
-            in r.stderr
-        )
+        assert "quay.reviewer.gh_token_file is no longer supported" in r.stderr
         assert not out.exists()
 
 

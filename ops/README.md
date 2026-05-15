@@ -1,6 +1,6 @@
 # Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + quay-orchestrator
 
-Seven units live here:
+Six units live here:
 
 * **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
   repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
@@ -25,24 +25,16 @@ Seven units live here:
   to advance queued tasks (claim → worker → submit-brief). Installed
   only when `quay.version` is pinned in `deploy.values.yaml`; the unit
   invokes `/usr/local/sbin/quay-tick-runner`, a thin wrapper that mints
-  a fresh `$GH_TOKEN` from the GitHub App helper before `exec`'ing
-  `/usr/local/bin/quay tick`. `QUAY_DATA_DIR` points at
-  `<HERMES_HOME>/quay/`. Operates on the subset of `repos[]` entries
-  carrying a `quay:` block.
+  fresh worker and reviewer GitHub App tokens before `exec`'ing
+  `/usr/local/bin/quay tick`. The worker token is exported as
+  `$GH_TOKEN`; the reviewer token is exported as
+  `$QUAY_REVIEWER_GH_TOKEN` from `/etc/hermes/reviewer.env`.
+  `QUAY_DATA_DIR` points at `<HERMES_HOME>/quay/`. Operates on the
+  subset of `repos[]` entries carrying a `quay:` block.
 * **`quay-orchestrator`** — optional Quay sidecar for durable Quay
   orchestrator handoffs. It is gated by `quay.orchestrator.enabled` and
   reads `<HERMES_HOME>/quay/orchestrator.json` for Slack fallback
   routing and polling while using the Quay CLI for handoff state.
-* **`hermes-reviewer-token`** — 30-min oneshot that refreshes
-  `/run/hermes/reviewer-gh-token` from a *second* GitHub App (the
-  reviewer identity), so quay's reviewer worker can post APPROVE reviews
-  on PRs opened by the worker App without GitHub blocking the
-  self-review. Installed only when the operator passes
-  `--reviewer-app-key-path` on first install (the PEM persists at
-  `/etc/hermes/reviewer.pem`); IDs come from
-  `auth.github_app_reviewer.{id,installation_id}` in
-  `deploy.values.yaml`. See BRIX-1390 + AST-109 for the cross-component
-  design.
 
 ## Files
 
@@ -60,15 +52,13 @@ Seven units live here:
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
 | `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`). Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
-| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets a fresh `$GH_TOKEN` from the App helper. |
-| `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints a GitHub App installation token via `installer/hermes_github_token.py`, exports it as `$GH_TOKEN`, then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
+| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. |
+| `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints the worker GitHub App token via `installer/hermes_github_token.py` and exports it as `$GH_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
 | `ops/quay_orchestrator.py`                 | Quay handoff drain loop. Defines the Quay CLI adapter, Slack question/discussion flow with original-thread routing plus fallback-channel support, orchestrator decision handling, JSON event logging, metrics, and lock wrapper. |
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. |
 | `ops/quay-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
-| `ops/hermes-reviewer-token.service`        | systemd service unit (oneshot). Mints the reviewer App's installation token via `installer/hermes_github_token.py write-token` and writes it to `/run/hermes/reviewer-gh-token`. `User=__AGENT_USER__` and `__TARGET_DIR__` templated by `setup-hermes.sh`. |
-| `ops/hermes-reviewer-token.timer`          | systemd timer unit. `OnBootSec=30s` + 30-min steady cadence. |
 | `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
@@ -523,14 +513,23 @@ clone's `.git/config` covers `git push`; for code-only entries the
 `hermes` user's deploy key covers `git push`. Neither covers the API —
 that's `$GH_TOKEN`'s job, below.
 
-`quay-tick-runner` mints a short-lived GitHub App installation token at
-the top of every tick (via `installer/hermes_github_token.py mint`) and
-exports it as `$GH_TOKEN`. Both `gh` and `git push` over HTTPS read from
-that env var, so a single fresh token covers every API call the tick or
-its worker makes. The cache (5-min refresh margin) absorbs intra-tick
-churn; long-running worker subprocesses (>55 min) eventually inherit a
-stale env value — see the upstream-sync section above for the helper's
-override variables.
+`quay-tick-runner` mints a short-lived worker GitHub App installation
+token at the top of every tick (via `installer/hermes_github_token.py
+mint`) and exports it as `$GH_TOKEN`. Both `gh` and `git push` over
+HTTPS read from that env var, so a single fresh token covers every API
+call the tick or its worker makes.
+
+When `/etc/hermes/reviewer.env` exists, the runner also mints a token
+from the reviewer App credentials and exports it as
+`$QUAY_REVIEWER_GH_TOKEN`. Quay uses that token only for reviewer
+attempts, keeping reviewer reviews under the reviewer App while worker
+attempts continue to use `$GH_TOKEN`. The helper cache for reviewer
+tokens lives at `/run/hermes/reviewer-token-cache.json`; the tick service
+creates `/run/hermes` with `RuntimeDirectory=hermes`.
+
+The cache (5-min refresh margin) absorbs intra-tick churn; long-running
+subprocesses (>55 min) eventually inherit a stale env value — see the
+upstream-sync section above for the helper's override variables.
 
 The `quay-as-hermes` operator wrapper does the same mint inline so
 ad-hoc invocations (`quay-as-hermes enqueue --linear-issue …`) auth
@@ -564,12 +563,16 @@ sudo systemctl edit quay-tick.timer
 ## Environment
 
 The unit runs `/usr/local/sbin/quay-tick-runner` (which `exec`s
-`/usr/local/bin/quay tick` after minting `$GH_TOKEN`) with:
+`/usr/local/bin/quay tick` after minting `$GH_TOKEN` and, when
+configured, `$QUAY_REVIEWER_GH_TOKEN`) with:
 
 * `QUAY_DATA_DIR=<HERMES_HOME>/quay` — pinned by `Environment=` on the
   unit so the runtime path lives in exactly one place.
 * `HERMES_HOME=<HERMES_HOME>` — pinned on the unit so the GH-token helper
   finds `auth/github-app.{pem,env}` regardless of how the unit is invoked.
+* `HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env` — reviewer App
+  credentials rendered by `setup-hermes.sh` from
+  `auth.github_app_reviewer.*`; optional on hosts without reviewer wiring.
 * `<HERMES_HOME>/auth/quay.env` — adapter tokens (`LINEAR_API_KEY` etc.),
   staged out-of-band by `stage-secrets.sh`. The `EnvironmentFile=` line
   is prefixed with `-` so the unit starts even before tokens are staged

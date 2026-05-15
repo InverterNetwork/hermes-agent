@@ -29,6 +29,7 @@ class _FakeState:
     quay_version = "v0.3.7"
     values_file = "/tmp/deploy.values.yaml"
     values_helper = "/tmp/values_helper.py"
+    systemd_dir = "/tmp/systemd"
 
     def __init__(self):
         self.ok: list[str] = []

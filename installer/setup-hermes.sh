@@ -54,10 +54,11 @@
 # Reviewer App: pass --reviewer-app-key-path on first install to register a
 # *second* GitHub App identity used by quay's reviewer worker. IDs default
 # to deploy.values.yaml's auth.github_app_reviewer.{id, installation_id};
-# the key is persisted at /etc/hermes/reviewer.pem and a systemd timer
-# (hermes-reviewer-token.timer) keeps /run/hermes/reviewer-gh-token fresh
-# for the reviewer to consume per AST-109. Reviewer wiring is gated on
-# --auth-method=app and skipped when no key has ever been staged.
+# the key is persisted at /etc/hermes/reviewer.pem. quay-tick-runner reads
+# /etc/hermes/reviewer.env each tick, mints QUAY_REVIEWER_GH_TOKEN, and
+# passes it into `quay tick` so reviewer attempts post as the reviewer App.
+# Reviewer wiring is gated on --auth-method=app and skipped when no key has
+# ever been staged.
 
 set -euo pipefail
 
@@ -93,6 +94,7 @@ GH_API_BASE=""
 # via --reviewer-app-key-path on first install; subsequent re-runs reuse
 # the PEM persisted at /etc/hermes/reviewer.pem and the IDs from
 # auth.github_app_reviewer.{id,installation_id} in deploy.values.yaml.
+# quay-tick-runner consumes /etc/hermes/reviewer.env directly on each tick.
 # Reviewer wiring is skipped entirely when no key has ever been staged.
 # See BRIX-1390 / AST-109 for the cross-component design.
 REVIEWER_APP_ID=""
@@ -1594,41 +1596,20 @@ elif [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_ORCHESTRATOR_ENABLED" -eq 1 ]]; then
     || echo "==> WARNING: $QUAY_ORCH_RUNNER_SRC missing; skipping quay-orchestrator install" >&2
 fi
 
-# ---------- hermes-reviewer-token ----------
-# Periodic refresh of /run/hermes/reviewer-gh-token from the reviewer
-# GitHub App (separate identity from the worker App). Gated on the
-# reviewer auth block above having staged a key — no key, no timer.
-# Same install model as quay-tick: sed-templated User=/__TARGET_DIR__
-# substitutions, no /etc/default/ override (config lives in the
-# install-time-written /etc/hermes/reviewer.env).
-
-REVIEWER_TOKEN_SRC="$OPS_DIR/hermes-reviewer-token.service"
-REVIEWER_TOKEN_TIMER_SRC="$OPS_DIR/hermes-reviewer-token.timer"
-
-if [[ "$REVIEWER_ENABLED" -eq 1 && -f "$REVIEWER_TOKEN_SRC" && -f "$REVIEWER_TOKEN_TIMER_SRC" ]]; then
-  if command -v systemctl >/dev/null 2>&1; then
-    echo "==> installing systemd timer for hermes-reviewer-token (user=$AGENT_USER)"
-    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
-        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
-        "$REVIEWER_TOKEN_SRC" \
-      | install -o root -g root -m 0644 /dev/stdin \
-          /etc/systemd/system/hermes-reviewer-token.service
-    install -o root -g root -m 0644 \
-      "$REVIEWER_TOKEN_TIMER_SRC" \
-      /etc/systemd/system/hermes-reviewer-token.timer
-    systemctl daemon-reload
-    # `enable --now` also fires the service immediately (oneshot), so the
-    # token file lands before the next quay-tick attempts to read it.
-    systemctl enable --now hermes-reviewer-token.timer
-    systemctl start hermes-reviewer-token.service
-  else
-    echo "==> systemctl not present; skipping hermes-reviewer-token timer (units installed)" >&2
+# ---------- legacy hermes-reviewer-token cleanup ----------
+# Reviewer token refresh now happens inside quay-tick-runner so both App
+# tokens are handed to the same `quay tick` process. Disable and remove the
+# old timer on re-runs so upgraded hosts converge on the new architecture.
+if command -v systemctl >/dev/null 2>&1; then
+  if [[ -e /etc/systemd/system/hermes-reviewer-token.service \
+        || -e /etc/systemd/system/hermes-reviewer-token.timer ]]; then
+    echo "==> disabling legacy hermes-reviewer-token timer"
   fi
-elif [[ "$REVIEWER_ENABLED" -eq 1 ]]; then
-  [[ -f "$REVIEWER_TOKEN_SRC" ]] \
-    || echo "==> WARNING: $REVIEWER_TOKEN_SRC missing; skipping hermes-reviewer-token install" >&2
-  [[ -f "$REVIEWER_TOKEN_TIMER_SRC" ]] \
-    || echo "==> WARNING: $REVIEWER_TOKEN_TIMER_SRC missing; skipping hermes-reviewer-token install" >&2
+  systemctl disable --now hermes-reviewer-token.timer >/dev/null 2>&1 || true
+  systemctl stop hermes-reviewer-token.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/hermes-reviewer-token.service \
+        /etc/systemd/system/hermes-reviewer-token.timer
+  systemctl daemon-reload
 fi
 
 # ---------- hermes-gateway ----------
