@@ -30,7 +30,9 @@ The gateway runs:
 
 `QUAY_DATA_DIR` is pinned to `<HERMES_HOME>/quay` by default. The command
 defaults to `/usr/local/bin/quay-as-hermes`, which loads Quay adapter env and
-mints the GitHub App token the same way ad-hoc operator invocations do.
+mints the GitHub App token the same way ad-hoc operator invocations do. The
+wrapper preserves an explicit `QUAY_DATA_DIR` from the API server and otherwise
+falls back to its install target.
 
 ## Configuration
 

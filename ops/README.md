@@ -69,7 +69,7 @@ Seven units live here:
 | `ops/quay-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
 | `ops/hermes-reviewer-token.service`        | systemd service unit (oneshot). Mints the reviewer App's installation token via `installer/hermes_github_token.py write-token` and writes it to `/run/hermes/reviewer-gh-token`. `User=__AGENT_USER__` and `__TARGET_DIR__` templated by `setup-hermes.sh`. |
 | `ops/hermes-reviewer-token.timer`          | systemd timer unit. `OnBootSec=30s` + 30-min steady cadence. |
-| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Pins `QUAY_DATA_DIR`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
@@ -684,13 +684,14 @@ strips the environment by default, so `QUAY_DATA_DIR` doesn't survive
 the privilege drop, and quay's config-resolution order falls back to
 `~<agent>/.quay/config.toml` — a parallel SQLite + repos dir that
 diverges silently from what the systemd tick writes to. The wrapper
-drops privilege via `sudo -u <agent>`, pins `QUAY_DATA_DIR` and
-`HERMES_HOME`, sources `<HERMES_HOME>/auth/quay.env` for adapter
-tokens (LINEAR_API_KEY, SLACK_TOKEN, …), and mints `$GH_TOKEN` from
-the GitHub App helper before `exec`'ing `/usr/local/bin/quay "$@"`.
-That way ad-hoc operator invocations land in the same DB the tick
-uses *and* hit the same auth identity for any `gh` call quay shells
-out to (enqueue's PR-existence pre-flight, review-pr, …).
+drops privilege via `sudo -u <agent>`, defaults `QUAY_DATA_DIR` to the
+same path as the tick while preserving an explicit caller override, pins
+`HERMES_HOME`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens
+(LINEAR_API_KEY, SLACK_TOKEN, …), and mints `$GH_TOKEN` from the GitHub
+App helper before `exec`'ing `/usr/local/bin/quay "$@"`. That way ad-hoc
+operator invocations land in the same DB the tick uses *and* hit the same
+auth identity for any `gh` call quay shells out to (enqueue's PR-existence
+pre-flight, review-pr, …).
 
 For interactive sessions (`sudo -u <agent> -i`, `su - <agent>`), the
 profile.d drop-in at `/etc/profile.d/quay-data-dir.sh` exports
