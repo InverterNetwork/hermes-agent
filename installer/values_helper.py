@@ -15,7 +15,8 @@ Subcommands:
                                 — write <auth>/gateway-runtime.env from
                                   values.yaml. Holds non-secret env vars
                                   derived from the values file
-                                  (SLACK_ALLOWED_USERS, LINEAR_TEAM_*).
+                                  (SLACK_ALLOWED_USERS, SLACK_ALLOWED_CHANNELS,
+                                  GATEWAY_ALLOW_ALL_USERS, LINEAR_TEAM_*).
                                   Always rewrites — the file is a reflection
                                   of values.yaml, not operator input.
   merge-config-model <out>     — set <out>'s ``model.provider`` and
@@ -579,14 +580,18 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     derived config:
 
     * ``SLACK_ALLOWED_USERS`` from ``slack.runtime.allowed_users``.
+    * ``SLACK_ALLOWED_CHANNELS`` from ``slack.runtime.allowed_channels``.
+    * ``GATEWAY_ALLOW_ALL_USERS`` from ``gateway.allow_all_users``.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
-    Always rewritten — values.yaml is the source of truth and the file is a
-    reflection. If ``slack.runtime.allowed_users`` is present but empty, emit
-    an explicit ``SLACK_ALLOWED_USERS=`` so this later-loaded env file clears
-    stale allowlists from legacy ``auth/slack.env`` files. Operator hand-edits
-    live in ``/etc/default/hermes-gateway`` or in actual secret files
-    (``auth/slack.env``, ``auth/hermes.env``), not here.
+    Always rewritten: values.yaml is the source of truth and the file is a
+    reflection. If a list-typed field is present but empty, emit the explicit
+    empty assignment so this later-loaded env file clears stale values that
+    legacy ``auth/slack.env`` / ``/etc/default/hermes-gateway`` may carry.
+    The gateway loads this file via the ``z-runtime-env.conf`` drop-in, which
+    sorts last in systemd's lexical drop-in order, so this file wins on any
+    var it sets. Operator hand-edits live in ``/etc/default/hermes-gateway``
+    or in actual secret files (``auth/slack.env``, ``auth/hermes.env``).
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -609,6 +614,27 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
                 return 1
             joined = ",".join(_env_safe("slack.runtime.allowed_users[]", str(v)) for v in au)
             lines.append(f"SLACK_ALLOWED_USERS={joined}")
+        if "allowed_channels" in runtime:
+            ac = runtime.get("allowed_channels")
+            if not isinstance(ac, list):
+                sys.stderr.write(
+                    "values_helper.py: slack.runtime.allowed_channels must be a list\n"
+                )
+                return 1
+            joined = ",".join(
+                _env_safe("slack.runtime.allowed_channels[]", str(v)) for v in ac
+            )
+            lines.append(f"SLACK_ALLOWED_CHANNELS={joined}")
+
+    gateway = data.get("gateway") or {}
+    if isinstance(gateway, dict) and "allow_all_users" in gateway:
+        flag = gateway.get("allow_all_users")
+        if not isinstance(flag, bool):
+            sys.stderr.write(
+                "values_helper.py: gateway.allow_all_users must be a bool\n"
+            )
+            return 1
+        lines.append(f"GATEWAY_ALLOW_ALL_USERS={'true' if flag else 'false'}")
 
     # linear.teams.<key>: <uuid>  →  LINEAR_TEAM_<KEY>=<uuid>
     # Lets skills (e.g. inverter-linear) reference team UUIDs by env var
