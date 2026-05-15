@@ -22,7 +22,6 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
-    _build_slack_blocks_from_interactive_actions,
     _derive_forum_thread_name,
     _parse_target_ref,
     _send_discord,
@@ -31,7 +30,6 @@ from tools.send_message_tool import (
     _send_slack,
     _send_telegram,
     _send_to_platform,
-    _validate_interactive_actions,
     send_message_tool,
 )
 
@@ -502,70 +500,11 @@ class TestSendToPlatformChunking:
         assert result["success"] is True
         send.assert_awaited_once()
         assert send.await_args.kwargs.get("thread_ts") == "1715420800.123456"
-        assert "blocks" not in send.await_args.kwargs
-
-    def test_slack_interactive_actions_compose_blocks_and_disable_chunking(self, monkeypatch):
-        # interactive_actions are composed into Block Kit internally; the post
-        # goes in one shot regardless of message length, and the composed blocks
-        # arrive at _send_slack as the `blocks` kwarg.
-        _ensure_slack_mock(monkeypatch)
-        import gateway.platforms.slack as slack_mod
-        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
-        send = AsyncMock(return_value={"success": True, "message_id": "1"})
-        actions = [
-            {"label": "File this", "action_id": "skill:file-cr", "value": "1|1",
-             "text": "*1.* Title", "style": "primary"},
-        ]
-        long_msg = "word " * 10000  # well over Slack's chunking limit
-        with patch("tools.send_message_tool._send_slack", send):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    SimpleNamespace(enabled=True, token="***", extra={}),
-                    "C123",
-                    long_msg,
-                    slack_interactive_actions=actions,
-                )
-            )
-        assert result["success"] is True
-        # Single shot, not chunked.
-        assert send.await_count == 1
-        composed = send.await_args.kwargs.get("blocks")
-        assert composed is not None
-        # Lead-in section + divider + per-item section (because text was set) + actions.
-        assert [b["type"] for b in composed] == [
-            "section", "divider", "section", "actions",
-        ]
-        assert composed[-1]["elements"][0]["action_id"] == "skill:file-cr"
-
-    def test_slack_interactive_actions_clamp_oversized_fallback_text(self, monkeypatch):
-        # Slack's chat.postMessage rejects `text` > 40000 chars. When
-        # interactive_actions are set, chunking is bypassed, so the fallback
-        # text must be clamped in-place or the whole post fails server-side.
-        _ensure_slack_mock(monkeypatch)
-        import gateway.platforms.slack as slack_mod
-        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
-        send = AsyncMock(return_value={"success": True, "message_id": "1"})
-        huge = "x" * 80_000
-        actions = [{"label": "Go", "action_id": "skill:file-cr", "value": "v"}]
-        with patch("tools.send_message_tool._send_slack", send):
-            asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    SimpleNamespace(enabled=True, token="***", extra={}),
-                    "C123",
-                    huge,
-                    slack_interactive_actions=actions,
-                )
-            )
-        sent_text = send.await_args.args[2]
-        assert len(sent_text) <= 40_000
-        assert sent_text.endswith("…")
 
     def test_slack_no_extra_kwargs_when_unset(self, monkeypatch):
-        # When neither slack_thread_ts nor slack_blocks is set, _send_slack
-        # is called with exactly the three positional args — guards the
-        # existing test assertions against accidental kwarg leakage.
+        # When slack_thread_ts is not set, _send_slack is called with
+        # exactly the three positional args. Guards the existing test
+        # assertions against accidental kwarg leakage.
         _ensure_slack_mock(monkeypatch)
         import gateway.platforms.slack as slack_mod
         monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
@@ -1079,131 +1018,8 @@ class TestSendMessageSchemaShape:
                 )
 
 
-class TestValidateInteractiveActions:
-    """Validation rules on the interactive_actions list."""
-
-    def _item(self, **kwargs):
-        base = {"label": "File this", "action_id": "skill:file-cr", "value": "1|1"}
-        base.update(kwargs)
-        return base
-
-    def test_valid_minimal_passes(self):
-        assert _validate_interactive_actions([self._item()]) is None
-
-    def test_optional_text_and_style_pass(self):
-        assert (
-            _validate_interactive_actions(
-                [self._item(text="*1.* Title\nCustomer: X", style="primary")]
-            )
-            is None
-        )
-
-    def test_missing_label_rejected(self):
-        err = _validate_interactive_actions([{"action_id": "skill:x", "value": "v"}])
-        assert err is not None
-        assert "label" in err
-
-    def test_missing_action_id_rejected(self):
-        err = _validate_interactive_actions([{"label": "x", "value": "v"}])
-        assert err is not None
-        assert "action_id" in err
-
-    def test_missing_value_rejected(self):
-        err = _validate_interactive_actions(
-            [{"label": "x", "action_id": "skill:x"}]
-        )
-        assert err is not None
-        assert "value" in err
-
-    def test_uppercase_action_id_rejected(self):
-        err = _validate_interactive_actions(
-            [self._item(action_id="skill:File-CR")]
-        )
-        assert err is not None
-        assert "skill" in err.lower()
-
-    def test_non_skill_action_id_rejected(self):
-        err = _validate_interactive_actions(
-            [self._item(action_id="exfil:admin")]
-        )
-        assert err is not None
-        assert "exfil:admin" in err
-
-    def test_invalid_style_rejected(self):
-        err = _validate_interactive_actions([self._item(style="warning")])
-        assert err is not None
-        assert "style" in err
-
-    def test_count_cap(self):
-        items = [self._item(value=f"v{i}") for i in range(13)]
-        err = _validate_interactive_actions(items)
-        assert err is not None
-        assert "12" in err
-
-    def test_count_at_cap_allowed(self):
-        items = [self._item(value=f"v{i}") for i in range(12)]
-        assert _validate_interactive_actions(items) is None
-
-    def test_non_dict_item_rejected(self):
-        err = _validate_interactive_actions(["not-a-dict"])
-        assert err is not None
-
-
-class TestBuildSlackBlocksFromInteractiveActions:
-    """Block Kit composition from interactive_actions items."""
-
-    def test_lead_in_and_single_button(self):
-        blocks = _build_slack_blocks_from_interactive_actions(
-            "*Proposed 1 Customer Request.*",
-            [{"label": "File this", "action_id": "skill:file-cr", "value": "1|1"}],
-        )
-        # section (lead-in), divider, actions (no per-item text).
-        assert blocks[0]["type"] == "section"
-        assert blocks[0]["text"]["text"] == "*Proposed 1 Customer Request.*"
-        assert blocks[1]["type"] == "divider"
-        assert blocks[2]["type"] == "actions"
-        btn = blocks[2]["elements"][0]
-        assert btn["text"]["text"] == "File this"
-        assert btn["action_id"] == "skill:file-cr"
-        assert btn["value"] == "1|1"
-        assert "style" not in btn
-
-    def test_per_item_text_and_style(self):
-        blocks = _build_slack_blocks_from_interactive_actions(
-            "",
-            [{
-                "label": "File this",
-                "action_id": "skill:file-cr",
-                "value": "1|1",
-                "text": "*1.* Title\nCustomer: X",
-                "style": "primary",
-            }],
-        )
-        # No lead-in: divider, section (item text), actions (styled button).
-        assert blocks[0]["type"] == "divider"
-        assert blocks[1]["type"] == "section"
-        assert blocks[1]["text"]["text"] == "*1.* Title\nCustomer: X"
-        assert blocks[2]["type"] == "actions"
-        assert blocks[2]["elements"][0]["style"] == "primary"
-
-    def test_multiple_actions_compose_into_triples(self):
-        blocks = _build_slack_blocks_from_interactive_actions(
-            "*lead-in*",
-            [
-                {"label": "F1", "action_id": "skill:file-cr", "value": "1|1", "text": "a"},
-                {"label": "F2", "action_id": "skill:file-cr", "value": "1|2", "text": "b"},
-            ],
-        )
-        # section + (divider, section, actions) * 2 = 7 blocks.
-        assert len(blocks) == 7
-        assert [b["type"] for b in blocks] == [
-            "section", "divider", "section", "actions",
-            "divider", "section", "actions",
-        ]
-
-
 class TestSendSlackPayload:
-    """_send_slack's chat.postMessage payload includes optional thread_ts and blocks."""
+    """_send_slack's chat.postMessage payload includes optional thread_ts."""
 
     @staticmethod
     def _build_mock(response_data=None):
@@ -1220,7 +1036,7 @@ class TestSendSlackPayload:
         mock_session.post = MagicMock(return_value=mock_resp)
         return mock_session
 
-    def test_plain_send_omits_thread_ts_and_blocks(self):
+    def test_plain_send_omits_thread_ts(self):
         mock_session = self._build_mock()
         with patch("aiohttp.ClientSession", return_value=mock_session):
             asyncio.run(_send_slack("tok", "C123", "hi"))
@@ -1228,7 +1044,6 @@ class TestSendSlackPayload:
         assert payload["channel"] == "C123"
         assert payload["text"] == "hi"
         assert "thread_ts" not in payload
-        assert "blocks" not in payload
 
     def test_thread_ts_included_when_set(self):
         mock_session = self._build_mock()
@@ -1236,17 +1051,6 @@ class TestSendSlackPayload:
             asyncio.run(_send_slack("tok", "C123", "hi", thread_ts="1715420800.123456"))
         payload = mock_session.post.call_args.kwargs["json"]
         assert payload["thread_ts"] == "1715420800.123456"
-        assert "blocks" not in payload
-
-    def test_blocks_included_when_set(self):
-        mock_session = self._build_mock()
-        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}}]
-        with patch("aiohttp.ClientSession", return_value=mock_session):
-            asyncio.run(_send_slack("tok", "C123", "fallback text", blocks=blocks))
-        payload = mock_session.post.call_args.kwargs["json"]
-        assert payload["blocks"] == blocks
-        # Plain-text fallback survives so non-block-rendering clients still see something.
-        assert payload["text"] == "fallback text"
 
 
 class TestSendToPlatformDiscordThread:
