@@ -197,6 +197,43 @@ class TestTriggerDispatch:
         assert handled is False
 
     @pytest.mark.asyncio
+    async def test_in_thread_mention_reaches_agent_dispatch(
+        self, adapter_with_trigger,
+    ):
+        """End-to-end proof of the bypass: an in-thread @mention reply lands
+        as a MessageEvent on the normal agent path (handle_message awaited),
+        and the operator's command text is preserved through.
+
+        Guards against a regression where the router-level test passes
+        ('returns False, falls through') but the normal flow silently drops
+        the message before handle_message is invoked."""
+        adapter_with_trigger._app.client.conversations_replies = AsyncMock(
+            return_value={"ok": True, "messages": []}
+        )
+        event = {
+            "channel": CHAN,
+            "ts": "1700000000.000310",
+            "thread_ts": "1700000000.000100",
+            "user": "U_ALICE",
+            "text": "<@U_BOT> file 1",
+            "team": "T1",
+        }
+
+        await adapter_with_trigger._handle_slack_message(event)
+
+        adapter_with_trigger.handle_message.assert_awaited_once()
+        msg_event = adapter_with_trigger.handle_message.call_args.args[0]
+        # Bot mention is stripped from the user-visible text per the
+        # existing normal-flow contract; the command tail survives.
+        assert "file 1" in msg_event.text
+        assert "<@U_BOT>" not in msg_event.text
+        # Threaded reply: reply_to_message_id carries the thread root.
+        assert msg_event.reply_to_message_id == "1700000000.000100"
+        # No trigger envelope (we bypassed the trigger router).
+        assert "[Slack channel trigger]" not in msg_event.text
+        assert msg_event.auto_skill is None
+
+    @pytest.mark.asyncio
     async def test_in_thread_bot_authored_mention_does_not_bypass(
         self, adapter_with_trigger,
     ):
