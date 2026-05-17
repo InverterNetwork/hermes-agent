@@ -930,7 +930,8 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
   echo "==> rendering $QUAY_CONFIG_OUT from $VALUES_FILE"
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
-    render-quay-config --out "$QUAY_CONFIG_OUT" --force
+    render-quay-config --out "$QUAY_CONFIG_OUT" --force \
+    --reference-repos-root "$TARGET_DIR/code"
   chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
   chmod 0644 "$QUAY_CONFIG_OUT"
 

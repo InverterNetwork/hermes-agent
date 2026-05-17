@@ -226,6 +226,12 @@
 #                                 Codex runs under ChatGPT-subscription auth,
 #                                 NOT an OPENAI_API_KEY — don't stage an
 #                                 API-key env file for codex invocations.
+#   Quay reference repos context — once quay.version points at an AST-136
+#                                 release, setup-hermes.sh renders
+#                                 `[context].reference_repos_root` to
+#                                 `<HERMES_HOME>/code` so Quay workers and
+#                                 reviewers can inspect the same read-only
+#                                 code mirrors the gateway uses.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
 #   quay.tag_namespaces        — OPTIONAL deployment-level tag vocabulary

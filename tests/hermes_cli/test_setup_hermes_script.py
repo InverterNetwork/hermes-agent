@@ -147,6 +147,7 @@ def test_installer_renders_quay_config_with_force_on_every_run():
         "installer must invoke `render-quay-config --out … --force` so the "
         "quay config reconciles from deploy.values.yaml on every install"
     )
+    assert '--reference-repos-root "$TARGET_DIR/code"' in content
     # Belt-and-suspenders: the old preserve branch printed this exact phrase.
     # Its presence would mean the gate snuck back in.
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
