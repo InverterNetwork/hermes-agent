@@ -27,7 +27,7 @@ response (extended to mention the flag).
 | No `quay-config` block | infer block, omit `worker_execution` (defaults to oneshot in Quay), enqueue | infer block, write `worker_execution: goal`, run suitability gate, enqueue if gate passes |
 | Block present, no `worker_execution` | enqueue as-is | run suitability gate; if gate passes, write `worker_execution: goal` into the existing block (append the field, preserve every other field), then enqueue |
 | Block present, `worker_execution: oneshot` | enqueue as-is | **conflict** — do not silently override. Reply with the conflict message below and stop. |
-| Block present, `worker_execution: goal` | treat block as authoritative, enqueue as goal | run suitability gate, then enqueue as goal |
+| Block present, `worker_execution: goal` | treat block as authoritative, enqueue as goal | treat block as authoritative, enqueue as goal (gate skipped — see "Where the gate runs") |
 
 Existing-block writes append the `worker_execution` field without rewriting
 the rest of the block. Re-fetch and verify the field landed before enqueue,
