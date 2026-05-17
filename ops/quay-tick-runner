@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# quay-tick-runner — invoke `quay tick` with $GH_TOKEN minted from the
-# installer's GitHub App helper.
+# quay-tick-runner — invoke `quay tick` with GitHub App installation
+# tokens minted from the installer's shared helper.
 #
 # `gh pr list/create` and `git push` HTTPS both read $GH_TOKEN; minting
-# once at the top of the tick covers every subprocess (claude worker,
-# review-pr, dupe-check pre-flight). Mirrors ops/hermes-upstream-sync's
-# preamble — same helper, same env-var contract.
+# once at the top of the tick covers every worker subprocess (claude/codex
+# worker, submit-brief, dupe-check pre-flight). Reviewer attempts must post
+# as a separate GitHub App, so this runner also mints
+# $QUAY_REVIEWER_GH_TOKEN from /etc/hermes/reviewer.env before `quay tick`.
+# Mirrors ops/hermes-upstream-sync's preamble — same helper, same env-var
+# contract — with a role-specific reviewer config path layered on top.
 #
 # Permissive on helper failure: if the App PEM isn't staged or mint
-# errors transiently, we exec `quay tick` without $GH_TOKEN. Quay's
+# errors transiently, we exec `quay tick` without that token. Quay's
 # existing auth-error message surfaces downstream, rather than blocking
 # the timer on a transient mint failure.
 #
@@ -19,22 +22,29 @@
 #   HERMES_TOKEN_PYTHON  — venv python (default: render under
 #                          $HERMES_HOME/hermes-agent/venv/bin/python)
 #   GH_TOKEN             — when set, used as-is and the helper is skipped
+#   HERMES_REVIEWER_GH_CONFIG
+#                        — reviewer App env file (default:
+#                          /etc/hermes/reviewer.env)
+#   QUAY_REVIEWER_GH_TOKEN
+#                        — when set, used as-is and the reviewer helper is
+#                          skipped
+#   QUAY_BIN             — quay binary path (default: /usr/local/bin/quay)
 
 set -u
 
 LOG_PREFIX="quay-tick-runner"
 warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
 
-mint_gh_token() {
-  [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] && return 0
-
+mint_from_helper() {
+  local label="$1"
+  local config="${2:-}"
   local home="${HERMES_HOME:-$HOME/.hermes}"
   local helper="${HERMES_TOKEN_HELPER:-$home/hermes-agent/installer/hermes_github_token.py}"
   local py="${HERMES_TOKEN_PYTHON:-$home/hermes-agent/venv/bin/python}"
 
   if [[ ! -x "$py" || ! -f "$helper" ]]; then
-    warn "token helper not found at $helper; running tick without \$GH_TOKEN"
-    return 0
+    warn "$label token helper not found at $helper; running tick without $label token"
+    return 1
   fi
 
   # `timeout 30` makes the worst-case mint latency legible at the bash
@@ -43,13 +53,50 @@ mint_gh_token() {
   # unit's TimeoutStartSec=600 but tight enough that a wedged DNS / TLS
   # handshake doesn't waste a full tick.
   local token
-  if ! token="$(timeout 30 env HERMES_HOME="$home" "$py" "$helper" mint 2>/dev/null)" \
-       || [[ -z "$token" ]]; then
-    warn "token mint failed; running tick without \$GH_TOKEN"
-    return 0
+  local -a env_args=(env)
+  if [[ -n "$config" ]]; then
+    # The reviewer App identity must come from its own config file. Strip
+    # generic helper overrides so a worker App env var cannot silently
+    # replace the reviewer App credentials.
+    env_args+=(
+      -u HERMES_GH_CONFIG
+      -u HERMES_GH_APP_ID
+      -u HERMES_GH_INSTALLATION_ID
+      -u HERMES_GH_APP_KEY
+      -u HERMES_GH_API
+      -u HERMES_GH_TOKEN_CACHE
+      -u HERMES_GH_TOKEN_OVERRIDE
+      HERMES_GH_CONFIG="$config"
+    )
   fi
+  env_args+=(HERMES_HOME="$home")
+  if ! token="$(timeout 30 "${env_args[@]}" "$py" "$helper" mint 2>/dev/null)" \
+       || [[ -z "$token" ]]; then
+    warn "$label token mint failed; running tick without $label token"
+    return 1
+  fi
+  printf '%s\n' "$token"
+}
+
+mint_worker_gh_token() {
+  [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] && return 0
+
+  local token
+  token="$(mint_from_helper "worker" "")" || return 0
   export GH_TOKEN="$token"
 }
 
-mint_gh_token
-exec /usr/local/bin/quay tick "$@"
+mint_reviewer_gh_token() {
+  [[ -n "${QUAY_REVIEWER_GH_TOKEN:-}" ]] && return 0
+
+  local config="${HERMES_REVIEWER_GH_CONFIG:-/etc/hermes/reviewer.env}"
+  [[ -f "$config" ]] || return 0
+
+  local token
+  token="$(mint_from_helper "reviewer" "$config")" || return 0
+  export QUAY_REVIEWER_GH_TOKEN="$token"
+}
+
+mint_worker_gh_token
+mint_reviewer_gh_token
+exec "${QUAY_BIN:-/usr/local/bin/quay}" tick "$@"

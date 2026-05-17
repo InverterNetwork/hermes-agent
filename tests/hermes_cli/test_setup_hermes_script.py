@@ -6,6 +6,7 @@ import subprocess
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SETUP_SCRIPT = REPO_ROOT / "setup-hermes.sh"
 INSTALLER_SCRIPT = REPO_ROOT / "installer" / "setup-hermes.sh"
+OPS_DIR = REPO_ROOT / "ops"
 
 
 def test_setup_hermes_script_is_valid_shell():
@@ -201,6 +202,26 @@ def test_installer_persists_quay_expected_sha_for_verify():
         content,
     )
     assert '"$TARGET_DIR/quay/SHA256SUM.expected"' not in content
+
+
+def test_quay_tick_service_carries_reviewer_token_minting_env():
+    service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
+    runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")
+
+    assert "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env" in service
+    assert "RuntimeDirectory=hermes" in service
+    assert "QUAY_REVIEWER_GH_TOKEN" in runner
+    assert "/etc/hermes/reviewer.env" in runner
+
+
+def test_installer_removes_legacy_reviewer_token_timer():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    assert "systemctl disable --now hermes-reviewer-token.timer" in content
+    assert "systemctl stop hermes-reviewer-token.service" in content
+    assert "/etc/systemd/system/hermes-reviewer-token.service" in content
+    assert "/etc/systemd/system/hermes-reviewer-token.timer" in content
+    assert "systemctl enable --now hermes-reviewer-token.timer" not in content
+    assert "systemctl start hermes-reviewer-token.service" not in content
 
 
 def test_installer_unset_loop_iterates_both_suffixes():

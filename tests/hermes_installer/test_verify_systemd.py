@@ -19,13 +19,17 @@ from installer.hermes_installer import verify
 @pytest.fixture(autouse=True)
 def _stub_systemctl_present(monkeypatch):
     monkeypatch.setattr(verify.shutil, "which", lambda x: "/bin/" + x)
+    monkeypatch.setattr(verify, "_values_get", lambda *_args, **_kwargs: "false")
 
 
 class _FakeState:
     """Minimal stand-in for `_State`. Captures v_ok / v_drift calls."""
 
     rails_owner = "root"
-    quay_version = "v0.3.5"
+    quay_version = "v0.3.9"
+    values_file = "/tmp/deploy.values.yaml"
+    values_helper = "/tmp/values_helper.py"
+    systemd_dir = "/tmp/systemd"
 
     def __init__(self):
         self.ok: list[str] = []

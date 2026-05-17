@@ -3,13 +3,9 @@
 # serve them to git via the credential-helper protocol.
 #
 # Usage:
-#   hermes_github_token.py mint              # print a token to stdout
+#   hermes_github_token.py mint [--no-cache] # print a token to stdout
 #   hermes_github_token.py check             # exit 0 iff a token can be obtained, no stdout
 #   hermes_github_token.py credential get    # git credential helper protocol
-#   hermes_github_token.py write-token --out PATH
-#                                            # atomically write the token to PATH (mode 0600)
-#                                            # — used by hermes-reviewer-token.service to
-#                                            # produce /run/hermes/reviewer-gh-token
 #
 # Configuration is read from $HERMES_GH_CONFIG (default: ~/.hermes/auth/github-app.env),
 # with each line in the form KEY=VALUE. Recognized keys:
@@ -189,7 +185,12 @@ def _write_cache(cache_path: Path, payload: dict[str, Any]) -> None:
     _atomic_write_0600(cache_path, json.dumps(payload))
 
 
-def get_token(cfg: dict[str, str] | None = None, *, now: int | None = None) -> str:
+def get_token(
+    cfg: dict[str, str] | None = None,
+    *,
+    now: int | None = None,
+    use_cache: bool = True,
+) -> str:
     """Return a valid installation token, refreshing the on-disk cache if stale."""
     cfg = cfg if cfg is not None else load_config()
     if override := cfg.get("HERMES_GH_TOKEN_OVERRIDE"):
@@ -198,9 +199,10 @@ def get_token(cfg: dict[str, str] | None = None, *, now: int | None = None) -> s
     cache_path = Path(cfg.get("HERMES_GH_TOKEN_CACHE") or _default_cache_path())
     current = int(now or time.time())
 
-    cached = _read_cache(cache_path)
-    if cached and cached.get("expires_at_ts", 0) - TOKEN_REFRESH_MARGIN_S > current:
-        return cached["token"]
+    if use_cache:
+        cached = _read_cache(cache_path)
+        if cached and cached.get("expires_at_ts", 0) - TOKEN_REFRESH_MARGIN_S > current:
+            return cached["token"]
 
     app_id = _require(cfg, "HERMES_GH_APP_ID")
     installation_id = _require(cfg, "HERMES_GH_INSTALLATION_ID")
@@ -217,7 +219,8 @@ def get_token(cfg: dict[str, str] | None = None, *, now: int | None = None) -> s
         "expires_at_ts": _parse_expiry(fetched["expires_at"]),
         "fetched_at_ts": current,
     }
-    _write_cache(cache_path, payload)
+    if use_cache:
+        _write_cache(cache_path, payload)
     return fetched["token"]
 
 
@@ -247,23 +250,17 @@ def credential_protocol(action: str, stdin: str = "") -> str:
     return f"username=x-access-token\npassword={token}\n"
 
 
-def write_token_to_file(out_path: Path) -> None:
-    """Mint a token and atomically persist it to ``out_path`` at mode 0600.
-
-    Used by hermes-reviewer-token.service to refresh /run/hermes/reviewer-gh-token.
-    No trailing newline — consumers (`quay`'s upcoming `gh_token_file` per
-    AST-109; `gh auth login --with-token`) read the whole file as the token.
-    """
-    _atomic_write_0600(out_path, get_token())
-
-
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
     cmd = argv[1]
     if cmd == "mint":
-        print(get_token())
+        extra = argv[2:]
+        if any(arg != "--no-cache" for arg in extra):
+            print("usage: hermes_github_token.py mint [--no-cache]", file=sys.stderr)
+            return 2
+        print(get_token(use_cache="--no-cache" not in extra))
         return 0
     if cmd == "check":
         # Exercise the same path as `mint` but never print the token — used by
@@ -273,12 +270,6 @@ def main(argv: list[str]) -> int:
     if cmd == "credential":
         action = argv[2] if len(argv) > 2 else "get"
         sys.stdout.write(credential_protocol(action, sys.stdin.read()))
-        return 0
-    if cmd == "write-token":
-        if len(argv) < 4 or argv[2] != "--out":
-            print("usage: hermes_github_token.py write-token --out PATH", file=sys.stderr)
-            return 2
-        write_token_to_file(Path(argv[3]))
         return 0
     print(f"unknown command: {cmd}", file=sys.stderr)
     return 2
