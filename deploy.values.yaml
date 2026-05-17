@@ -226,6 +226,12 @@
 #                                 Codex runs under ChatGPT-subscription auth,
 #                                 NOT an OPENAI_API_KEY — don't stage an
 #                                 API-key env file for codex invocations.
+#   Quay reference repos context — once quay.version points at an AST-136
+#                                 release, setup-hermes.sh renders
+#                                 `[context].reference_repos_root` to
+#                                 `<HERMES_HOME>/code` so Quay workers and
+#                                 reviewers can inspect the same read-only
+#                                 code mirrors the gateway uses.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
 #   quay.tag_namespaces        — OPTIONAL deployment-level tag vocabulary
@@ -489,7 +495,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.9"
+  version: "v0.3.10"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode

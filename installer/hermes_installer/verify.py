@@ -24,9 +24,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
+
+
+_REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +574,92 @@ def _parse_repos_tsv(tsv: str) -> list[tuple[str, str, str, str, str]]:
         parts += [""] * (5 - len(parts))
         rows.append(tuple(parts[:5]))  # type: ignore[arg-type]
     return rows
+
+
+def _parse_quay_version(value: str) -> tuple[int, int, int] | None:
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if m is None:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _quay_supports_reference_repos(version: str) -> bool:
+    parsed = _parse_quay_version(version)
+    return parsed is not None and parsed >= _REFERENCE_REPOS_MIN_QUAY_VERSION
+
+
+def _read_quay_config(s: _State) -> dict | None:
+    quay_cfg = s.args.target / "quay" / "config.toml"
+    try:
+        return tomllib.loads(quay_cfg.read_text(encoding="utf-8"))
+    except OSError:
+        # _check_quay_artefacts owns the missing-file drift line.
+        return None
+    except tomllib.TOMLDecodeError as exc:
+        s.v_drift("quay config.toml parse", str(exc))
+        return None
+
+
+def _discover_git_children(root: Path) -> set[str]:
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return set()
+    names: set[str] = set()
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        git_path = entry / ".git"
+        if git_path.is_dir() or git_path.is_file():
+            names.add(entry.name)
+    return names
+
+
+def _check_quay_reference_repos(s: _State, repos_tsv: str) -> None:
+    cfg = _read_quay_config(s)
+    if cfg is None:
+        return
+
+    context = cfg.get("context")
+    got = context.get("reference_repos_root") if isinstance(context, dict) else None
+    expected_root = s.args.target / "code"
+    expected = str(expected_root)
+    if got == expected:
+        s.v_ok(f"quay reference_repos_root: {got}")
+    else:
+        s.v_drift(
+            "quay reference_repos_root",
+            f"expected {expected}, got {got!r}" if got is not None else "missing",
+        )
+
+    if not isinstance(got, str) or not got:
+        return
+
+    root = Path(got)
+    if root.is_dir():
+        s.v_ok(f"quay reference repos root exists: {root}")
+    else:
+        s.v_drift("quay reference repos root", f"missing: {root}")
+        return
+
+    expected_ids = {
+        repo_id
+        for repo_id, _repo_url, _repo_base, _repo_pkg, _install in _parse_repos_tsv(
+            repos_tsv,
+        )
+        if repo_id
+    }
+    if not expected_ids:
+        return
+    discovered = _discover_git_children(root)
+    missing = sorted(expected_ids - discovered)
+    if missing:
+        s.v_drift(
+            "quay reference repo mirrors",
+            f"missing under {root}: {', '.join(missing)}",
+        )
+    else:
+        s.v_ok(f"quay reference repo mirrors: {len(expected_ids)} under {root}")
 
 
 def _executable_info(path: Path) -> tuple[str, str, str] | None:
@@ -1489,6 +1579,8 @@ def run(
         )
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
+        if _quay_supports_reference_repos(quay_version):
+            _check_quay_reference_repos(s, repos_tsv)
     if s.codex_required:
         _check_codex_prereqs(s)
     _check_per_entry_repos(s, repos_tsv)
