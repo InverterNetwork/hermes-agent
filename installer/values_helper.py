@@ -33,6 +33,9 @@ Subcommands:
                                   leave the provider pin drifted.
   render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
                                   quay.* block. Skips if <out> already exists.
+                                  When --reference-repos-root is passed and
+                                  quay.version is new enough for AST-136,
+                                  also renders [context].reference_repos_root.
   active-agent-invocations     — emit one active quay agent invocation command
                                   per line. Uses legacy ``quay.agent_invocation``
                                   when no ``quay.agents`` block exists; otherwise
@@ -669,6 +672,8 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
 # a typo (e.g. `workers`) and should fail loud at validate time rather than
 # silently drop on the floor.
 _AGENT_ROLE_KEYS = ("worker", "reviewer")
+_REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
+_REFERENCE_REPOS_MIN_QUAY_VERSION_STR = "v0.3.10"
 
 # Stricter than `_REPO_ID_RE`: agent ids are interpolated bare into TOML
 # table headers (`[agents.invocations.<id>]`), and a dotted id like `gpt.5`
@@ -803,6 +808,20 @@ def _toml_basic_string(s: str) -> str:
     raw U+007F (DEL) would round-trip through ``json.dumps`` unescaped.
     """
     return json.dumps(s, ensure_ascii=False)
+
+
+def _parse_quay_version(value: Any) -> tuple[int, int, int] | None:
+    if not isinstance(value, str):
+        return None
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if m is None:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _quay_supports_reference_repos(version: Any) -> bool:
+    parsed = _parse_quay_version(version)
+    return parsed is not None and parsed >= _REFERENCE_REPOS_MIN_QUAY_VERSION
 
 
 def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str | None]:
@@ -942,6 +961,21 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         )
         return 1
 
+    reference_repos_root = args.reference_repos_root
+    if reference_repos_root is not None and not reference_repos_root.strip():
+        sys.stderr.write(
+            "values_helper.py: --reference-repos-root must be a non-empty string\n"
+        )
+        return 1
+    if (
+        reference_repos_root is not None
+        and not Path(reference_repos_root.strip()).is_absolute()
+    ):
+        sys.stderr.write(
+            "values_helper.py: --reference-repos-root must be an absolute path\n"
+        )
+        return 1
+
     agents_block, agents_err = _validate_quay_agents_block(quay.get("agents"))
     if agents_err is not None:
         sys.stderr.write(f"values_helper.py: {agents_err}\n")
@@ -997,6 +1031,23 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         lines.append("[adapters.slack]")
         lines.append("enabled = true")
         lines.append(f"bot_token_env = {_toml_basic_string(str(bot_token_env))}")
+
+    if reference_repos_root is not None and _quay_supports_reference_repos(
+        quay.get("version"),
+    ):
+        lines.append("")
+        lines.append("[context]")
+        lines.append(
+            "reference_repos_root = "
+            f"{_toml_basic_string(reference_repos_root.strip())}"
+        )
+    elif reference_repos_root is not None:
+        got_version = quay.get("version") or "<unset>"
+        sys.stderr.write(
+            "values_helper.py: skipping [context].reference_repos_root; "
+            "requires quay.version >= "
+            f"{_REFERENCE_REPOS_MIN_QUAY_VERSION_STR} (got {got_version!r})\n"
+        )
 
     reviewer = quay.get("reviewer")
     if reviewer is None:
@@ -1999,6 +2050,13 @@ def main(argv: list[str] | None = None) -> int:
     p_quay.add_argument("--out", required=True, help="output config.toml path")
     p_quay.add_argument("--force", action="store_true",
                         help="overwrite an existing file")
+    p_quay.add_argument(
+        "--reference-repos-root",
+        help=(
+            "absolute code mirror root to render as [context].reference_repos_root "
+            "when quay.version supports AST-136"
+        ),
+    )
     p_quay.set_defaults(func=cmd_render_quay_config)
 
     p_active_inv = sub.add_parser(

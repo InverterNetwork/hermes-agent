@@ -620,7 +620,7 @@ class TestSetupHermesVerify:
 # ---------------------------------------------------------------------------
 
 
-QUAY_VERSION = "v0.1.0"  # tag-shaped, with leading v, as in deploy.values.yaml
+QUAY_VERSION = "v0.3.10"  # tag-shaped, with leading v, as in deploy.values.yaml
 BUN_VERSION = "1.3.9"
 BUN_LINUX_X64_SHA256 = (
     "4680e80e44e32aa718560ceae85d22ecfbf2efb8f3641782e35e4b7efd65a1aa"
@@ -802,8 +802,12 @@ def quay_install(install: dict) -> dict:
     # Data dir + config.toml + bare clone. Mode/ownership matches the
     # installer's `install -d -o $AGENT_USER -g $AGENT_USER -m 0755`.
     quay_dir = target / "quay"
+    code_root = target / "code"
     quay_dir.mkdir(mode=0o755)
-    (quay_dir / "config.toml").write_text("# stub\n")
+    (quay_dir / "config.toml").write_text(
+        "[context]\n"
+        f'reference_repos_root = "{code_root}"\n'
+    )
     (quay_dir / "config.toml").chmod(0o644)
     repos_dir = quay_dir / "repos"
     repos_dir.mkdir(mode=0o755)
@@ -821,7 +825,7 @@ def quay_install(install: dict) -> dict:
 
     # Code mirror cloned from the same fork as the bare clone so
     # HEAD == origin/main satisfies the branch-freshness check.
-    code_mirror = target / "code" / repo_id
+    code_mirror = code_root / repo_id
     code_mirror.parent.mkdir(exist_ok=True, mode=0o755)
     subprocess.run(
         ["git", "clone", "--quiet", str(install["fork"]), str(code_mirror)],
@@ -881,6 +885,7 @@ def quay_install(install: dict) -> dict:
     install["quay_repo_id"] = repo_id
     install["quay_repo_url"] = repo_url
     install["quay_bare"] = bare
+    install["code_mirror"] = code_mirror
     install["quay_wrapper"] = quay_wrapper
     install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
@@ -931,6 +936,12 @@ class TestSetupHermesVerifyQuay:
         assert "quay binary version" not in result.stdout
         assert "[OK] quay data dir ownership:" in result.stdout
         assert "[OK] quay config.toml:" in result.stdout
+        assert (
+            f"[OK] quay reference_repos_root: {quay_install['target'] / 'code'}"
+            in result.stdout
+        )
+        assert "[OK] quay reference repos root exists:" in result.stdout
+        assert "[OK] quay reference repo mirrors:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} ownership:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} origin:" in result.stdout
         assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
@@ -944,6 +955,20 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay_via_wrapper(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "[OK] quay binary:" in result.stdout
+
+    def test_pre_ast136_quay_pin_skips_reference_repo_check(self, quay_install):
+        values = quay_install["values_file"]
+        values.write_text(values.read_text().replace(QUAY_VERSION, "v0.3.9"))
+        _write_live_quay_stub(quay_install, "v0.3.9", [quay_install["quay_repo_id"]])
+        (quay_install["quay_dir"] / "config.toml").write_text(
+            'agent_invocation = "claude < {prompt_file}"\n'
+        )
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "reference_repos_root" not in result.stdout
+        assert "reference_repos_root" not in result.stderr
 
     def test_missing_quay_wrapper_is_drift(self, quay_install):
         quay_install["quay_wrapper"].unlink()
@@ -1009,6 +1034,24 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] quay config.toml" in result.stderr
+
+    def test_wrong_reference_repos_root_is_drift(self, quay_install):
+        wrong = quay_install["target"] / "wrong-code"
+        (quay_install["quay_dir"] / "config.toml").write_text(
+            "[context]\n"
+            f'reference_repos_root = "{wrong}"\n'
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay reference_repos_root" in result.stderr
+        assert str(quay_install["target"] / "code") in result.stderr
+
+    def test_reference_repo_mirror_missing_is_drift(self, quay_install):
+        shutil.rmtree(quay_install["code_mirror"])
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay reference repo mirrors" in result.stderr
+        assert quay_install["quay_repo_id"] in result.stderr
 
     def test_missing_bare_clone_is_drift(self, quay_install):
         shutil.rmtree(quay_install["quay_bare"])

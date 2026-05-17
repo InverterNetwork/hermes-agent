@@ -725,6 +725,17 @@ class TestRenderQuayConfig:
         )
         return p
 
+    def _quay_values_with_version(self, tmp_path: Path, version: str) -> Path:
+        p = tmp_path / f"values-{version}.yaml"
+        p.write_text(
+            "quay:\n"
+            f"  version: {version}\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  adapters: {}\n",
+            encoding="utf-8",
+        )
+        return p
+
     def test_writes_agent_invocation_and_linear_block(
         self, quay_values: Path, tmp_path: Path
     ):
@@ -736,6 +747,82 @@ class TestRenderQuayConfig:
         assert "[adapters.linear]" in text
         assert "enabled = true" in text
         assert 'api_key_env = "LINEAR_API_KEY"' in text
+
+    def test_writes_reference_repos_context_when_supplied(
+        self, tmp_path: Path
+    ):
+        values = self._quay_values_with_version(tmp_path, "v0.3.10")
+        out = tmp_path / "config.toml"
+        root = tmp_path / "target" / "code"
+        r = _run(
+            values,
+            "render-quay-config",
+            "--out",
+            str(out),
+            "--reference-repos-root",
+            str(root),
+        )
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[context]" in text
+        assert f'reference_repos_root = "{root}"' in text
+
+    def test_skips_reference_repos_context_for_pre_ast136_quay(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        root = tmp_path / "target" / "code"
+        r = _run(
+            quay_values,
+            "render-quay-config",
+            "--out",
+            str(out),
+            "--reference-repos-root",
+            str(root),
+        )
+        assert r.returncode == 0, r.stderr
+        assert "skipping [context].reference_repos_root" in r.stderr
+        assert "[context]" not in out.read_text()
+
+    def test_reference_repos_context_is_optional(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "[context]" not in out.read_text()
+
+    def test_reference_repos_root_rejects_blank(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(
+            quay_values,
+            "render-quay-config",
+            "--out",
+            str(out),
+            "--reference-repos-root",
+            " ",
+        )
+        assert r.returncode == 1
+        assert "--reference-repos-root" in r.stderr
+        assert not out.exists()
+
+    def test_reference_repos_root_rejects_relative_path(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(
+            quay_values,
+            "render-quay-config",
+            "--out",
+            str(out),
+            "--reference-repos-root",
+            "code",
+        )
+        assert r.returncode == 1
+        assert "absolute path" in r.stderr
+        assert not out.exists()
 
     def test_omits_data_dir_repos_root_and_version(
         self, quay_values: Path, tmp_path: Path
