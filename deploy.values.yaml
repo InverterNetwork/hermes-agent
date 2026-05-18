@@ -443,7 +443,7 @@ repos:
       install_cmd: "bun install"
   - id: iTRY-monorepo
     url: https://github.com/InverterNetwork/iTRY-monorepo
-    base_branch: main
+    base_branch: dev
     issue_tracker:
       linear:
         team: itry
