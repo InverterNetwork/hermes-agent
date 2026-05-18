@@ -423,8 +423,25 @@ sudo -u <agent_user> PR_DRY_RUN=1 \
 
 The script mints a short-lived GitHub App installation token at the top
 of every tick (via `installer/hermes_github_token.py mint`) and exports
-it as `$GH_TOKEN`. Both `gh pr create` and `git push` over HTTPS read
-from `$GH_TOKEN`, so a single fresh token covers both ends of the run.
+it as `$GH_TOKEN` for `gh pr create`. `git push` over HTTPS does **not**
+read `$GH_TOKEN` on its own, so the script additionally wires the same
+helper as a per-invocation credential helper on the push command —
+mirroring how `setup-hermes.sh` persists the helper into
+`state/.git/config`:
+
+```sh
+git \
+  -c credential.https://github.com.helper= \
+  -c "credential.https://github.com.helper=!HERMES_HOME=$HERMES_HOME \
+      $HERMES_TOKEN_PYTHON $HERMES_TOKEN_HELPER credential" \
+  push -u origin upstream-sync/<date>-<sha>
+```
+
+The empty first `-c` clears any inherited helper chain (e.g. operator's
+`osxkeychain`) so the App token isn't shadowed; the scoped second `-c`
+applies only to `https://github.com`. Both flow from the same App
+identity, so `gh pr create` and the preceding `git push` post as the
+same actor.
 
 Override the helper by setting any of these in the EnvironmentFile:
 

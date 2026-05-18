@@ -13,8 +13,11 @@
 #   gh, git, an `upstream` remote, an `origin` remote, push permission to
 #   origin, and `gh` auth. The script mints a short-lived GitHub App
 #   installation token via the installer's helper (if available) and
-#   exports it as $GH_TOKEN so `gh` and `git push` both authenticate
-#   against the same identity.
+#   exports it as $GH_TOKEN for `gh`. For `git push` over HTTPS the
+#   script additionally configures `installer/hermes_github_token.py
+#   credential` as a credential.https://github.com.helper for that single
+#   push — git does not consult $GH_TOKEN on its own, so without the
+#   helper the unattended timer dies on the username prompt.
 #
 # Environment overrides:
 #   FORK_DIR             — fork working copy (default: cwd or
@@ -62,15 +65,25 @@ cd "$FORK_DIR"
 command -v gh >/dev/null 2>&1 \
   || die "gh CLI not on PATH"
 
-# Mint a GitHub App installation token unless the caller supplied one.
-# `gh` reads $GH_TOKEN/$GITHUB_TOKEN; `git push` over HTTPS to github.com
-# uses the same env var when no credential helper is configured. One
-# token covers both ends of the operation.
+# Resolve the helper paths once. Used both for minting $GH_TOKEN (for
+# `gh`) and for wiring a per-push git credential helper below. Default
+# locations match the installer layout; env overrides exist for tests
+# and non-default --target installs.
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_TOKEN_HELPER="${HERMES_TOKEN_HELPER:-$HERMES_HOME/hermes-agent/installer/hermes_github_token.py}"
+HERMES_TOKEN_PYTHON="${HERMES_TOKEN_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
+
+HELPER_AVAILABLE=0
+if [[ -x "$HERMES_TOKEN_PYTHON" && -f "$HERMES_TOKEN_HELPER" ]]; then
+  HELPER_AVAILABLE=1
+fi
+
+# Mint a GitHub App installation token for `gh` unless the caller supplied
+# one. `gh` reads $GH_TOKEN/$GITHUB_TOKEN; `git push` does NOT — the push
+# is auth'd separately via the credential helper wired into the push
+# command below.
 if [[ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
-  HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-  HERMES_TOKEN_HELPER="${HERMES_TOKEN_HELPER:-$HERMES_HOME/hermes-agent/installer/hermes_github_token.py}"
-  HERMES_TOKEN_PYTHON="${HERMES_TOKEN_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
-  if [[ -x "$HERMES_TOKEN_PYTHON" && -f "$HERMES_TOKEN_HELPER" ]]; then
+  if [[ "$HELPER_AVAILABLE" -eq 1 ]]; then
     log "minting GitHub App installation token via $HERMES_TOKEN_HELPER"
     GH_TOKEN="$(HERMES_HOME="$HERMES_HOME" "$HERMES_TOKEN_PYTHON" "$HERMES_TOKEN_HELPER" mint)" \
       || die "token helper failed; check $HERMES_HOME/auth/github-app.env"
@@ -79,6 +92,18 @@ if [[ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
     warn "no GH_TOKEN in env and token helper not found at $HERMES_TOKEN_HELPER"
     warn "gh/git auth will fall back to whatever's in ~/.config/gh or git's credential helper"
   fi
+fi
+
+# Per-push git credential helper. Mirrors the helper wiring that
+# setup-hermes.sh persists into state/.git/config: a single shell
+# invocation of `hermes_github_token.py credential`, which implements
+# git's credential protocol and returns x-access-token + a freshly
+# minted installation token. Scoped to https://github.com so it never
+# fires for an unexpected remote (defense in depth — origin should
+# always be on github.com).
+GIT_CRED_HELPER=""
+if [[ "$HELPER_AVAILABLE" -eq 1 ]]; then
+  GIT_CRED_HELPER="!HERMES_HOME='$HERMES_HOME' '$HERMES_TOKEN_PYTHON' '$HERMES_TOKEN_HELPER' credential"
 fi
 
 # Sanity-check remotes.
@@ -182,8 +207,21 @@ $PR_BODY"
   PR_FLAGS+=(--draft)
 fi
 
-git push --quiet -u "$ORIGIN_REMOTE" "$BRANCH" \
-  || die "push $BRANCH failed; resolve and retry"
+# Reset any inherited credential.helper chain on github.com (the empty
+# first `-c` clears it) before layering ours on, so an operator's global
+# helper (e.g. osxkeychain on a dev box) can't shadow the App token.
+# When the helper isn't available, push without the override and let
+# whatever git is already configured with carry the request.
+if [[ -n "$GIT_CRED_HELPER" ]]; then
+  git \
+    -c "credential.https://github.com.helper=" \
+    -c "credential.https://github.com.helper=$GIT_CRED_HELPER" \
+    push --quiet -u "$ORIGIN_REMOTE" "$BRANCH" \
+    || die "push $BRANCH failed; resolve and retry"
+else
+  git push --quiet -u "$ORIGIN_REMOTE" "$BRANCH" \
+    || die "push $BRANCH failed; resolve and retry"
+fi
 
 log "opening PR: $PR_TITLE"
 gh pr create "${PR_FLAGS[@]}" --title "$PR_TITLE" --body "$PR_BODY" \

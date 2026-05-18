@@ -250,6 +250,70 @@ class TestHermesUpstreamSync:
         env_seen = triplet["gh_env_log"].read_text().strip()
         assert env_seen == "GH_TOKEN=caller-supplied-token"
 
+    def test_git_push_uses_app_token_credential_helper(self, triplet, tmp_path):
+        """`git push` must wire the App-token credential helper for the push,
+        not rely on $GH_TOKEN (which git does not consult on its own). Without
+        this, the unattended timer wedges on the username prompt — see
+        BRIX-1429.
+        """
+        _advance_upstream(triplet)
+
+        # Helper stub: serves both `mint` (used at the top of the script) and
+        # `credential get` (used by git push). The credential-protocol branch
+        # has to read git's stdin so git doesn't see a closed pipe.
+        helper = tmp_path / "fake_token_helper.py"
+        helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+            "if cmd == 'mint':\n"
+            "    print('marker-token-xyz')\n"
+            "elif cmd == 'credential':\n"
+            "    sys.stdin.read()\n"
+            "    sys.stdout.write('username=x-access-token\\n')\n"
+            "    sys.stdout.write('password=marker-token-xyz\\n')\n"
+        )
+        helper.chmod(0o755)
+
+        # Spy on git: log argv for any invocation that contains `push`, then
+        # exec real git so the rest of the script still works against the
+        # bare-repo fixture. Use the real git path resolved at fixture-setup
+        # time so PATH overrides in _run_script don't shadow it.
+        push_log = tmp_path / "git-push.log"
+        real_git = subprocess.run(
+            ["which", "git"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        git_stub = triplet["bin"] / "git"
+        git_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "for arg in \"$@\"; do\n"
+            "  if [ \"$arg\" = \"push\" ]; then\n"
+            f"    printf '%s\\n' \"$*\" >> {push_log}\n"
+            "    break\n"
+            "  fi\n"
+            "done\n"
+            f"exec {real_git} \"$@\"\n"
+        )
+        git_stub.chmod(0o755)
+
+        result = _run_script(
+            triplet,
+            HERMES_TOKEN_HELPER=str(helper),
+            HERMES_TOKEN_PYTHON=sys.executable,
+            GH_TOKEN="",
+            GITHUB_TOKEN="",
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        assert push_log.exists(), "spy never observed a `git push` call"
+        push_invocation = push_log.read_text().strip()
+        # Confirm the helper is wired into the push, scoped to github.com,
+        # and references the helper script we passed via env (proving the
+        # path flows through end-to-end).
+        assert "-c credential.https://github.com.helper=" in push_invocation
+        assert str(helper) in push_invocation
+        assert "credential" in push_invocation
+
     def test_stale_local_branch_is_replaced(self, triplet):
         """A previous failed tick can leave a local sync branch with the
         same name as the new one. The remote check above passes (push
