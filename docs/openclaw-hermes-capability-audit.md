@@ -74,9 +74,9 @@ Live Hermes secret files under `/home/hermes/.hermes/auth` expose:
 | Codex | `/home/hermes/.codex/auth.json`, `/home/hermes/.hermes/auth.json` credential pool | Hermes/Quay Codex workers and reviewers |
 | Claude | `/home/hermes/.claude/.credentials.json` | Hermes/Quay Claude workers and reviewers |
 | Gateway runtime | `GATEWAY_ALLOW_ALL_USERS`, `SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS` | Slack access control |
-| AWS dev/staging/test | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` (staged into `auth/ops.env`) | `aws-lambda-debug`, `dynamodb-query` |
-| AWS prod | `AWS_PROD_ACCESS_KEY_ID`, `AWS_PROD_SECRET_ACCESS_KEY` (staged into `auth/ops-prod.env` — separate file for visible prod surface) | `aws-lambda-debug-prod`, `dynamodb-query-prod` |
-| New Relic | `NEW_RELIC_API_KEY` (staged into `auth/ops.env`) | `new-relic-lambda` |
+| AWS dev/staging/test | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` (staged into `auth/ops.env`; must be a read-only IAM user — skills can't enforce read-only, IAM is the boundary) | `aws-lambda-debug`, `dynamodb-query` |
+| AWS prod | `AWS_PROD_ACCESS_KEY_ID`, `AWS_PROD_SECRET_ACCESS_KEY` (staged into `auth/ops-prod.env` — separate file for visible prod surface; same read-only IAM rule) | `aws-lambda-debug-prod`, `dynamodb-query-prod` |
+| New Relic | `NEW_RELIC_API_KEY`, `NEW_RELIC_ACCOUNT_ID`, `NEW_RELIC_GRAPHQL_ENDPOINT` (EU default; staged into `auth/ops.env`) | `new-relic-lambda` |
 
 Hermes does not currently show live env creds for GitBook, Gmail, Telegram, Google service account, or onchain keystores.
 

@@ -8,7 +8,9 @@
 #                                       (LINEAR_API_KEY, QUAY_REVIEW_PR_TOKEN)
 #   <HERMES_HOME>/auth/ops.env      — gateway, non-prod ops skill creds
 #                                       (AWS_* dev/staging/test,
-#                                        NEW_RELIC_API_KEY)
+#                                        NEW_RELIC_API_KEY,
+#                                        NEW_RELIC_ACCOUNT_ID,
+#                                        NEW_RELIC_GRAPHQL_ENDPOINT)
 #   <HERMES_HOME>/auth/ops-prod.env — gateway, PROD ops skill creds
 #                                       (AWS_PROD_ACCESS_KEY_ID,
 #                                        AWS_PROD_SECRET_ACCESS_KEY).
@@ -98,6 +100,8 @@ existing_aws_key=""
 existing_aws_secret=""
 existing_aws_region=""
 existing_new_relic=""
+existing_new_relic_account=""
+existing_new_relic_endpoint=""
 existing_aws_prod_key=""
 existing_aws_prod_secret=""
 
@@ -114,12 +118,19 @@ parse_existing_env "$HERMES_ENV" existing_quay_review_pr_token QUAY_REVIEW_PR_TO
 parse_existing_env "$QUAY_ENV"   existing_anthropic  ANTHROPIC_API_KEY
 
 # Ops env (non-prod AWS + New Relic) and ops-prod env (prod AWS).
-parse_existing_env "$OPS_ENV"      existing_aws_key         AWS_ACCESS_KEY_ID
-parse_existing_env "$OPS_ENV"      existing_aws_secret      AWS_SECRET_ACCESS_KEY
-parse_existing_env "$OPS_ENV"      existing_aws_region      AWS_DEFAULT_REGION
-parse_existing_env "$OPS_ENV"      existing_new_relic       NEW_RELIC_API_KEY
-parse_existing_env "$OPS_PROD_ENV" existing_aws_prod_key    AWS_PROD_ACCESS_KEY_ID
-parse_existing_env "$OPS_PROD_ENV" existing_aws_prod_secret AWS_PROD_SECRET_ACCESS_KEY
+parse_existing_env "$OPS_ENV"      existing_aws_key             AWS_ACCESS_KEY_ID
+parse_existing_env "$OPS_ENV"      existing_aws_secret          AWS_SECRET_ACCESS_KEY
+parse_existing_env "$OPS_ENV"      existing_aws_region          AWS_DEFAULT_REGION
+parse_existing_env "$OPS_ENV"      existing_new_relic           NEW_RELIC_API_KEY
+parse_existing_env "$OPS_ENV"      existing_new_relic_account   NEW_RELIC_ACCOUNT_ID
+parse_existing_env "$OPS_ENV"      existing_new_relic_endpoint  NEW_RELIC_GRAPHQL_ENDPOINT
+parse_existing_env "$OPS_PROD_ENV" existing_aws_prod_key        AWS_PROD_ACCESS_KEY_ID
+parse_existing_env "$OPS_PROD_ENV" existing_aws_prod_secret     AWS_PROD_SECRET_ACCESS_KEY
+
+# Default the NerdGraph endpoint to the EU region (this deployment's account
+# lives there). Operator can type a different URL when prompted; a re-run
+# preserves whatever was previously written.
+: "${existing_new_relic_endpoint:=https://api.eu.newrelic.com/graphql}"
 
 # Prompt for a value with preserve-on-blank semantics, optional prefix
 # check, and silent input for secrets. Empty input keeps the current
@@ -187,16 +198,27 @@ if (( manage_quay )); then
 fi
 
 # Ops skills (aws-lambda-debug, dynamodb-query, new-relic-lambda) — all
-# optional. A blank value clears that key on the next write; the env files
-# are only written when at least one var in their bundle is non-empty.
+# optional. Blank input at the prompt preserves whatever is already on
+# disk (matches the SLACK_BOT_TOKEN / LINEAR_API_KEY behaviour above —
+# see prompt_value's body). The env files are only written when at least
+# one var in their bundle is non-empty, so a Linear-only install leaves
+# ops.env / ops-prod.env absent.
+#
+# Reminder for the operator: the staged AWS keys must come from an IAM
+# user/role with read-only Lambda + CloudWatch Logs + CloudFormation +
+# DynamoDB policies attached. The skills themselves don't (and can't)
+# enforce read-only — IAM is the boundary. Don't paste a long-lived
+# AdministratorAccess key into these prompts.
 echo
-echo "Ops skills (AWS / New Relic) — all optional, blank to skip."
-prompt_value AWS_KEY        "AWS_ACCESS_KEY_ID (non-prod)"     0 "$existing_aws_key"     ""     1
-prompt_value AWS_SECRET     "AWS_SECRET_ACCESS_KEY (non-prod)" 0 "$existing_aws_secret"  ""     1
-prompt_value AWS_REGION     "AWS_DEFAULT_REGION"               0 "$existing_aws_region"  ""     0
-prompt_value NEW_RELIC      "NEW_RELIC_API_KEY (NRAK-…)"       0 "$existing_new_relic"   "NRAK-" 1
-prompt_value AWS_PROD_KEY    "AWS_PROD_ACCESS_KEY_ID"          0 "$existing_aws_prod_key"    "" 1
-prompt_value AWS_PROD_SECRET "AWS_PROD_SECRET_ACCESS_KEY"      0 "$existing_aws_prod_secret" "" 1
+echo "Ops skills (AWS / New Relic) — all optional, blank preserves existing."
+prompt_value AWS_KEY             "AWS_ACCESS_KEY_ID (non-prod, read-only IAM user)"     0 "$existing_aws_key"             "" 1
+prompt_value AWS_SECRET          "AWS_SECRET_ACCESS_KEY (non-prod)"                     0 "$existing_aws_secret"          "" 1
+prompt_value AWS_REGION          "AWS_DEFAULT_REGION"                                   0 "$existing_aws_region"          "" 0
+prompt_value NEW_RELIC           "NEW_RELIC_API_KEY (NRAK-…)"                           0 "$existing_new_relic"           "NRAK-" 1
+prompt_value NEW_RELIC_ACCOUNT   "NEW_RELIC_ACCOUNT_ID (numeric)"                       0 "$existing_new_relic_account"   "" 0
+prompt_value NEW_RELIC_ENDPOINT  "NEW_RELIC_GRAPHQL_ENDPOINT (EU default)"              0 "$existing_new_relic_endpoint"  "" 0
+prompt_value AWS_PROD_KEY        "AWS_PROD_ACCESS_KEY_ID (read-only IAM user)"          0 "$existing_aws_prod_key"        "" 1
+prompt_value AWS_PROD_SECRET     "AWS_PROD_SECRET_ACCESS_KEY"                           0 "$existing_aws_prod_secret"     "" 1
 
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
 
@@ -264,6 +286,16 @@ if [[ -n "$NEW_RELIC" ]]; then
   [[ -n "$ops_content" ]] && ops_content+="
 "
   ops_content+="NEW_RELIC_API_KEY=${NEW_RELIC}"
+fi
+if [[ -n "$NEW_RELIC_ACCOUNT" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="NEW_RELIC_ACCOUNT_ID=${NEW_RELIC_ACCOUNT}"
+fi
+if [[ -n "$NEW_RELIC_ENDPOINT" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="NEW_RELIC_GRAPHQL_ENDPOINT=${NEW_RELIC_ENDPOINT}"
 fi
 if [[ -n "$ops_content" ]]; then
   write_env "$OPS_ENV" "$ops_content" ops_changed
