@@ -324,6 +324,18 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
     cp = runtime.get("channel_prompts")
     if isinstance(cp, dict) and cp:
         slack_block["channel_prompts"] = {str(k): str(v) for k, v in cp.items()}
+    # BRIX-1414 EXPLORATION: bridge channel_skill_bindings and
+    # free_response_channels from slack.runtime to the rendered slack.*
+    # so gateway/config.py picks them up. Drop this block (and the
+    # accompanying deploy.values.yaml entries) when the exploration
+    # concludes; the keys revert to slack.triggers handling above if we
+    # decide to keep the custom router.
+    frc = runtime.get("free_response_channels")
+    if isinstance(frc, list) and frc:
+        slack_block["free_response_channels"] = list(frc)
+    csb = runtime.get("channel_skill_bindings")
+    if isinstance(csb, list) and csb:
+        slack_block["channel_skill_bindings"] = list(csb)
 
     # `slack_triggers:` is a top-level block in values.yaml — flatten it
     # into the rendered `slack.triggers:` so gateway/config.py finds it

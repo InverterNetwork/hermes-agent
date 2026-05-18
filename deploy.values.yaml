@@ -631,13 +631,34 @@ quay:
 # Populate `channel_id` from the actual Slack channel id (visible in
 # the URL: https://app.slack.com/client/<team>/<channel_id>); the
 # `feedback-intake` skill is shipped in hermes-state.
-slack_triggers:
-  - channel_id: C0B4LLZ5Z2L
-    channel_name: brix-feedback-sandbox
-    skill: feedback-intake
-    require_top_level: true
-    accept_from_bots: false
-    rate_limit:
-      max_per_hour: 30
-      on_overflow: skip
-    default_repo: iTRY-monorepo
+# ── BRIX-1414 EXPLORATION (DO NOT SHIP) ──────────────────────────────
+# Custom slack_triggers commented out and replaced with the upstream
+# channel_skill_bindings primitive + free_response_channels. Goal: see
+# whether the upstream stack can run feedback-intake end-to-end without
+# the custom router. Toggle the comments to flip between modes.
+# slack_triggers:
+#   - channel_id: C0B4LLZ5Z2L
+#     channel_name: brix-feedback-sandbox
+#     skill: feedback-intake
+#     require_top_level: true
+#     accept_from_bots: false
+#     rate_limit:
+#       max_per_hour: 30
+#       on_overflow: skip
+#     default_repo: iTRY-monorepo
+slack:
+  runtime:
+    # free_response_channels: bot listens to every message in the
+    # channel without requiring an @mention. Combined with
+    # channel_skill_bindings below, the gateway should start a
+    # feedback-intake session on every top-level message (and on every
+    # reply, which is a known divergence from slack_triggers — capture
+    # in the observation notes).
+    free_response_channels:
+      - C0B4LLZ5Z2L
+    # channel_skill_bindings: auto-load feedback-intake when a session
+    # starts in the bound channel. Upstream doc:
+    # hermes-agent.nousresearch.com/docs/user-guide/messaging/slack#per-channel-skill-bindings
+    channel_skill_bindings:
+      - id: C0B4LLZ5Z2L
+        skill: feedback-intake
