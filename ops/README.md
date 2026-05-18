@@ -51,6 +51,8 @@ Six units live here:
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
 | `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`, `QUAY_REVIEW_PR_TOKEN`). Staged via `stage-secrets.sh`. |
+| `ops/hermes-gateway.service.d/ops-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops.env` (non-prod AWS creds — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` — plus `NEW_RELIC_API_KEY`). Powers the `aws-lambda-debug`, `dynamodb-query`, and `new-relic-lambda` skills. Staged via `stage-secrets.sh`. |
+| `ops/hermes-gateway.service.d/ops-prod-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops-prod.env` (PROD AWS creds — `AWS_PROD_ACCESS_KEY_ID`, `AWS_PROD_SECRET_ACCESS_KEY`). Kept in a separate file from `ops.env` so the prod surface is visible at the filesystem level; skills (`aws-lambda-debug-prod`, `dynamodb-query-prod`) remap `AWS_PROD_*` onto the canonical AWS env-var names per-command. Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints the worker GitHub App token via `installer/hermes_github_token.py` and exports it as `$GH_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
@@ -584,10 +586,11 @@ configured, `$QUAY_REVIEWER_GH_TOKEN`) with:
 
 `stage-secrets.sh` (at the repo root) is the single entry point for
 every runtime secret. One pass writes `auth/slack.env`,
-`auth/hermes.env`, and (on quay-provisioned hosts) `auth/quay.env` —
-each unique value prompted once, even when the same key (e.g.
-`LINEAR_API_KEY`) lands in two files. Run it once after first install,
-and again whenever a token rotates:
+`auth/hermes.env`, `auth/ops.env` and `auth/ops-prod.env` (when any
+ops-skill creds are entered), and (on quay-provisioned hosts)
+`auth/quay.env` — each unique value prompted once, even when the same
+key (e.g. `LINEAR_API_KEY`) lands in two files. Run it once after first
+install, and again whenever a token rotates:
 
 ```sh
 sudo ./stage-secrets.sh
@@ -602,6 +605,19 @@ Prompts (gateway side, always):
   linear-create skill.
 * `QUAY_REVIEW_PR_TOKEN` — optional; enables authenticated
   `POST /quay/review-pr` enrollment from GitHub Actions.
+
+Ops-skill prompts (all optional, all gateway side):
+
+* `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION`
+  — non-prod AWS. Land in `auth/ops.env`. Powers the
+  `aws-lambda-debug` and `dynamodb-query` skills (non-prod variants).
+* `NEW_RELIC_API_KEY` — NerdGraph User API key (`NRAK-…`). Lands in
+  `auth/ops.env`. Powers the `new-relic-lambda` skill.
+* `AWS_PROD_ACCESS_KEY_ID` / `AWS_PROD_SECRET_ACCESS_KEY` — PROD AWS.
+  Land in a **separate** `auth/ops-prod.env` so the prod surface is
+  visible at the filesystem level. Powers the `aws-lambda-debug-prod`
+  and `dynamodb-query-prod` skills, which remap `AWS_PROD_*` onto the
+  canonical AWS env-var names per-command.
 
 Non-secret runtime config (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …)
 is **not** prompted here. It lives in `deploy.values.yaml` and is rendered
