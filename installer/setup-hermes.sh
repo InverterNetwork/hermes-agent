@@ -265,13 +265,34 @@ if [[ "$SKIP_PREP" -eq 0 ]]; then
     # time to seed identity, manifest, and config.yaml).
     # tmux + gh are runtime deps of quay: tmux hosts each task's worker
     # session, gh is what the worker uses to open PRs.
+    # unzip is needed for the AWS CLI v2 install below (the official
+    # distribution is a zip, not a deb).
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
       build-essential "python${PY_VERSION}-dev" "python${PY_VERSION}-venv" libffi-dev rsync python3-yaml \
-      curl tmux gh >/dev/null
+      curl tmux gh unzip >/dev/null
   else
     echo "==> no apt-get detected; skipping automated prep" >&2
     echo "    ensure these are installed manually if anything below fails:" >&2
-    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync, python3-yaml, curl, tmux, gh" >&2
+    echo "    build-essential, python${PY_VERSION}-dev, python${PY_VERSION}-venv, libffi-dev, rsync, python3-yaml, curl, tmux, gh, unzip" >&2
+  fi
+
+  # AWS CLI v2 — needed by the ops skills (aws-lambda-debug{,-prod},
+  # dynamodb-query{,-prod}). Ubuntu 24.04 dropped awscli from the main
+  # repos, so the official zip distribution is the supported path.
+  # Idempotent: skip when /usr/local/bin/aws is already v2+; --update
+  # would re-install on top, but probing first keeps re-runs quiet.
+  if command -v aws >/dev/null 2>&1 \
+     && aws --version 2>&1 | grep -qE 'aws-cli/[2-9]'; then
+    echo "==> aws CLI v2 already present ($(aws --version 2>&1 | awk '{print $1}'))"
+  else
+    echo "==> installing AWS CLI v2 (official zip)"
+    AWSCLI_TMP="$(mktemp -d)"
+    curl -fsSL --retry 3 \
+      "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" \
+      -o "$AWSCLI_TMP/awscliv2.zip"
+    unzip -q -o "$AWSCLI_TMP/awscliv2.zip" -d "$AWSCLI_TMP"
+    "$AWSCLI_TMP/aws/install" --update >/dev/null
+    rm -rf "$AWSCLI_TMP"
   fi
 fi
 
