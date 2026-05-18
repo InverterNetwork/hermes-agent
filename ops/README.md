@@ -421,27 +421,31 @@ sudo -u <agent_user> PR_DRY_RUN=1 \
 
 ## Auth
 
-The script mints a short-lived GitHub App installation token at the top
-of every tick (via `installer/hermes_github_token.py mint`) and exports
-it as `$GH_TOKEN` for `gh pr create`. `git push` over HTTPS does **not**
-read `$GH_TOKEN` on its own, so the script additionally wires the same
-helper as a per-invocation credential helper on the push command —
-mirroring how `setup-hermes.sh` persists the helper into
-`state/.git/config`:
+The script resolves a GitHub App installation token at the top of every
+tick: it mints via `installer/hermes_github_token.py mint` when
+neither `$GH_TOKEN` nor `$GITHUB_TOKEN` is set, or honors the caller-
+supplied value as-is. The resolved token is exported as `$GH_TOKEN`
+for `gh pr create`.
+
+`git push` over HTTPS does **not** read `$GH_TOKEN` on its own, so the
+push is auth'd via an inline `credential.https://github.com.helper`
+that emits `x-access-token` + `$GH_TOKEN`:
 
 ```sh
 git \
   -c credential.https://github.com.helper= \
-  -c "credential.https://github.com.helper=!HERMES_HOME=$HERMES_HOME \
-      $HERMES_TOKEN_PYTHON $HERMES_TOKEN_HELPER credential" \
+  -c "credential.https://github.com.helper=!f() { \
+      printf 'username=x-access-token\npassword=%s\n' \"\$GH_TOKEN\"; }; f" \
   push -u origin upstream-sync/<date>-<sha>
 ```
 
 The empty first `-c` clears any inherited helper chain (e.g. operator's
 `osxkeychain`) so the App token isn't shadowed; the scoped second `-c`
-applies only to `https://github.com`. Both flow from the same App
-identity, so `gh pr create` and the preceding `git push` post as the
-same actor.
+applies only to `https://github.com`. The helper body is single-quoted
+in the script source, so the literal token value never lands in
+argv — it's looked up from the helper's inherited env at the moment
+git invokes it. Both `gh pr create` and `git push` post as the same
+actor because both reach for the same `$GH_TOKEN`.
 
 Override the helper by setting any of these in the EnvironmentFile:
 

@@ -11,13 +11,15 @@
 #
 # Required:
 #   gh, git, an `upstream` remote, an `origin` remote, push permission to
-#   origin, and `gh` auth. The script mints a short-lived GitHub App
-#   installation token via the installer's helper (if available) and
-#   exports it as $GH_TOKEN for `gh`. For `git push` over HTTPS the
-#   script additionally configures `installer/hermes_github_token.py
-#   credential` as a credential.https://github.com.helper for that single
-#   push — git does not consult $GH_TOKEN on its own, so without the
-#   helper the unattended timer dies on the username prompt.
+#   origin, and `gh` auth. The script resolves a GitHub App installation
+#   token at the top of every tick — minting via the installer's helper
+#   when neither $GH_TOKEN nor $GITHUB_TOKEN is set, or honoring the
+#   caller-supplied value as-is — and exports it as $GH_TOKEN for `gh`.
+#   For `git push` over HTTPS the script wires an inline
+#   credential.https://github.com.helper that emits the same $GH_TOKEN
+#   as the password, because git does not consult $GH_TOKEN on its
+#   own; without the helper the unattended timer dies on git's
+#   username prompt.
 #
 # Environment overrides:
 #   FORK_DIR             — fork working copy (default: cwd or
@@ -94,16 +96,20 @@ if [[ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
   fi
 fi
 
-# Per-push git credential helper. Mirrors the helper wiring that
-# setup-hermes.sh persists into state/.git/config: a single shell
-# invocation of `hermes_github_token.py credential`, which implements
-# git's credential protocol and returns x-access-token + a freshly
-# minted installation token. Scoped to https://github.com so it never
-# fires for an unexpected remote (defense in depth — origin should
-# always be on github.com).
+# Per-push git credential helper. Emits whatever $GH_TOKEN ended up in
+# scope above — caller-supplied via EnvironmentFile or freshly minted
+# from $HERMES_TOKEN_HELPER — so a single resolved token covers both
+# `gh pr create` and the preceding `git push`.
+#
+# The helper body is single-quoted so $GH_TOKEN stays literal in the
+# config; git invokes it via `sh -c`, and that sh expands it from our
+# exported env. The token value never appears in `ps` output (only the
+# literal "$GH_TOKEN" reference does). Scoped to https://github.com so
+# the helper can't fire for an unexpected remote — defense in depth;
+# origin should always be on github.com.
 GIT_CRED_HELPER=""
-if [[ "$HELPER_AVAILABLE" -eq 1 ]]; then
-  GIT_CRED_HELPER="!HERMES_HOME='$HERMES_HOME' '$HERMES_TOKEN_PYTHON' '$HERMES_TOKEN_HELPER' credential"
+if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
+  GIT_CRED_HELPER='!f() { printf "username=x-access-token\npassword=%s\n" "${GH_TOKEN:-$GITHUB_TOKEN}"; }; f'
 fi
 
 # Sanity-check remotes.
