@@ -121,7 +121,8 @@ jobs:
           init_fixture "$BRIX_LANDING_FIXTURE" "init fixture"
           # iTRY-frontends real repo lives on `master`.
           init_fixture "$ITRY_FRONTENDS_FIXTURE" "init fixture" master
-          init_fixture "$ITRY_MONOREPO_FIXTURE" "init fixture"
+          # iTRY-monorepo is configured for Quay against `dev`.
+          init_fixture "$ITRY_MONOREPO_FIXTURE" "init fixture" dev
           # brix-indexer real repo lives on `dev`; init the fixture there
           # directly so the values entry's base_branch=dev resolves cleanly.
           init_fixture "$BRIX_FIXTURE" "init fixture" dev
