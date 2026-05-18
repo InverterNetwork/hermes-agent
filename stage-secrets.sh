@@ -3,10 +3,20 @@
 #
 # Single staging script for all runtime secrets — three files on disk:
 #
-#   <HERMES_HOME>/auth/slack.env   — gateway, Slack tokens
-#   <HERMES_HOME>/auth/hermes.env  — gateway, adapter tokens
-#                                      (LINEAR_API_KEY, QUAY_REVIEW_PR_TOKEN)
-#   <HERMES_HOME>/auth/quay.env    — quay-tick worker tokens
+#   <HERMES_HOME>/auth/slack.env    — gateway, Slack tokens
+#   <HERMES_HOME>/auth/hermes.env   — gateway, adapter tokens
+#                                       (LINEAR_API_KEY, QUAY_REVIEW_PR_TOKEN)
+#   <HERMES_HOME>/auth/ops.env      — gateway, non-prod ops skill creds
+#                                       (AWS_* dev/staging/test,
+#                                        NEW_RELIC_API_KEY,
+#                                        NEW_RELIC_ACCOUNT_ID,
+#                                        NEW_RELIC_GRAPHQL_ENDPOINT)
+#   <HERMES_HOME>/auth/ops-prod.env — gateway, PROD ops skill creds
+#                                       (AWS_PROD_ACCESS_KEY_ID,
+#                                        AWS_PROD_SECRET_ACCESS_KEY).
+#                                       Separate file so prod is visible
+#                                       at the filesystem level.
+#   <HERMES_HOME>/auth/quay.env     — quay-tick worker tokens
 #
 # AUTH_DIR defaults to /home/${AGENT_USER}/.hermes/auth — the same path
 # setup-hermes.sh's `--target` defaults to. Non-default installs (e.g.
@@ -45,6 +55,8 @@ AGENT_USER="${AGENT_USER:-hermes}"
 AUTH_DIR="${AUTH_DIR:-/home/${AGENT_USER}/.hermes/auth}"
 SLACK_ENV="${SLACK_ENV:-${AUTH_DIR}/slack.env}"
 HERMES_ENV="${HERMES_ENV:-${AUTH_DIR}/hermes.env}"
+OPS_ENV="${OPS_ENV:-${AUTH_DIR}/ops.env}"
+OPS_PROD_ENV="${OPS_PROD_ENV:-${AUTH_DIR}/ops-prod.env}"
 QUAY_ENV="${QUAY_ENV:-${AUTH_DIR}/quay.env}"
 
 [[ "$(id -u)" -eq 0 ]] || { echo "must run as root (try: sudo $0)" >&2; exit 1; }
@@ -84,6 +96,14 @@ existing_slack_app=""
 existing_linear=""
 existing_anthropic=""
 existing_quay_review_pr_token=""
+existing_aws_key=""
+existing_aws_secret=""
+existing_aws_region=""
+existing_new_relic=""
+existing_new_relic_account=""
+existing_new_relic_endpoint=""
+existing_aws_prod_key=""
+existing_aws_prod_secret=""
 
 parse_existing_env "$SLACK_ENV"  existing_slack_bot   SLACK_BOT_TOKEN
 parse_existing_env "$SLACK_ENV"  existing_slack_app   SLACK_APP_TOKEN
@@ -96,6 +116,21 @@ parse_existing_env "$HERMES_ENV" existing_linear     LINEAR_API_KEY
 parse_existing_env "$HERMES_ENV" existing_quay_review_pr_token QUAY_REVIEW_PR_TOKEN
 
 parse_existing_env "$QUAY_ENV"   existing_anthropic  ANTHROPIC_API_KEY
+
+# Ops env (non-prod AWS + New Relic) and ops-prod env (prod AWS).
+parse_existing_env "$OPS_ENV"      existing_aws_key             AWS_ACCESS_KEY_ID
+parse_existing_env "$OPS_ENV"      existing_aws_secret          AWS_SECRET_ACCESS_KEY
+parse_existing_env "$OPS_ENV"      existing_aws_region          AWS_DEFAULT_REGION
+parse_existing_env "$OPS_ENV"      existing_new_relic           NEW_RELIC_API_KEY
+parse_existing_env "$OPS_ENV"      existing_new_relic_account   NEW_RELIC_ACCOUNT_ID
+parse_existing_env "$OPS_ENV"      existing_new_relic_endpoint  NEW_RELIC_GRAPHQL_ENDPOINT
+parse_existing_env "$OPS_PROD_ENV" existing_aws_prod_key        AWS_PROD_ACCESS_KEY_ID
+parse_existing_env "$OPS_PROD_ENV" existing_aws_prod_secret     AWS_PROD_SECRET_ACCESS_KEY
+
+# Default the NerdGraph endpoint to the EU region (this deployment's account
+# lives there). Operator can type a different URL when prompted; a re-run
+# preserves whatever was previously written.
+: "${existing_new_relic_endpoint:=https://api.eu.newrelic.com/graphql}"
 
 # Prompt for a value with preserve-on-blank semantics, optional prefix
 # check, and silent input for secrets. Empty input keeps the current
@@ -162,6 +197,29 @@ if (( manage_quay )); then
   prompt_value ANTHROPIC  "ANTHROPIC_API_KEY (optional — leave blank if using \"claude login\" subscription auth)" 0 "$existing_anthropic"  "" 1
 fi
 
+# Ops skills (aws-lambda-debug, dynamodb-query, new-relic-lambda) — all
+# optional. Blank input at the prompt preserves whatever is already on
+# disk (matches the SLACK_BOT_TOKEN / LINEAR_API_KEY behaviour above —
+# see prompt_value's body). The env files are only written when at least
+# one var in their bundle is non-empty, so a Linear-only install leaves
+# ops.env / ops-prod.env absent.
+#
+# Reminder for the operator: the staged AWS keys must come from an IAM
+# user/role with read-only Lambda + CloudWatch Logs + CloudFormation +
+# DynamoDB policies attached. The skills themselves don't (and can't)
+# enforce read-only — IAM is the boundary. Don't paste a long-lived
+# AdministratorAccess key into these prompts.
+echo
+echo "Ops skills (AWS / New Relic) — all optional, blank preserves existing."
+prompt_value AWS_KEY             "AWS_ACCESS_KEY_ID (non-prod, read-only IAM user)"     0 "$existing_aws_key"             "" 1
+prompt_value AWS_SECRET          "AWS_SECRET_ACCESS_KEY (non-prod)"                     0 "$existing_aws_secret"          "" 1
+prompt_value AWS_REGION          "AWS_DEFAULT_REGION"                                   0 "$existing_aws_region"          "" 0
+prompt_value NEW_RELIC           "NEW_RELIC_API_KEY (NRAK-…)"                           0 "$existing_new_relic"           "NRAK-" 1
+prompt_value NEW_RELIC_ACCOUNT   "NEW_RELIC_ACCOUNT_ID (numeric)"                       0 "$existing_new_relic_account"   "" 0
+prompt_value NEW_RELIC_ENDPOINT  "NEW_RELIC_GRAPHQL_ENDPOINT (EU default)"              0 "$existing_new_relic_endpoint"  "" 0
+prompt_value AWS_PROD_KEY        "AWS_PROD_ACCESS_KEY_ID (read-only IAM user)"          0 "$existing_aws_prod_key"        "" 1
+prompt_value AWS_PROD_SECRET     "AWS_PROD_SECRET_ACCESS_KEY"                           0 "$existing_aws_prod_secret"     "" 1
+
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
 
 # Write a single env file. The optional third arg names a caller-side
@@ -169,6 +227,8 @@ install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
 # leave it untouched. Always returns 0 — failures `set -e` out.
 slack_changed=0
 hermes_changed=0
+ops_changed=0
+ops_prod_changed=0
 write_env() {
   local target="$1" content="$2" changed_var="${3:-}"
   local tmp; tmp="$(mktemp)"
@@ -207,6 +267,53 @@ if [[ -n "$hermes_content" ]]; then
   write_env "$HERMES_ENV" "$hermes_content" hermes_changed
 fi
 
+# ops.env (gateway-side non-prod AWS + NEW_RELIC_API_KEY). Written only
+# when at least one var in the bundle is set, so a Linear-only install
+# doesn't leave an empty file on disk.
+ops_content=""
+[[ -n "$AWS_KEY" ]]    && ops_content+="AWS_ACCESS_KEY_ID=${AWS_KEY}"
+if [[ -n "$AWS_SECRET" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="AWS_SECRET_ACCESS_KEY=${AWS_SECRET}"
+fi
+if [[ -n "$AWS_REGION" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="AWS_DEFAULT_REGION=${AWS_REGION}"
+fi
+if [[ -n "$NEW_RELIC" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="NEW_RELIC_API_KEY=${NEW_RELIC}"
+fi
+if [[ -n "$NEW_RELIC_ACCOUNT" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="NEW_RELIC_ACCOUNT_ID=${NEW_RELIC_ACCOUNT}"
+fi
+if [[ -n "$NEW_RELIC_ENDPOINT" ]]; then
+  [[ -n "$ops_content" ]] && ops_content+="
+"
+  ops_content+="NEW_RELIC_GRAPHQL_ENDPOINT=${NEW_RELIC_ENDPOINT}"
+fi
+if [[ -n "$ops_content" ]]; then
+  write_env "$OPS_ENV" "$ops_content" ops_changed
+fi
+
+# ops-prod.env (gateway-side PROD AWS only). Same write-on-content rule.
+# Kept in its own file so prod creds are visible at `ls auth/`.
+ops_prod_content=""
+[[ -n "$AWS_PROD_KEY" ]] && ops_prod_content+="AWS_PROD_ACCESS_KEY_ID=${AWS_PROD_KEY}"
+if [[ -n "$AWS_PROD_SECRET" ]]; then
+  [[ -n "$ops_prod_content" ]] && ops_prod_content+="
+"
+  ops_prod_content+="AWS_PROD_SECRET_ACCESS_KEY=${AWS_PROD_SECRET}"
+fi
+if [[ -n "$ops_prod_content" ]]; then
+  write_env "$OPS_PROD_ENV" "$ops_prod_content" ops_prod_changed
+fi
+
 # quay.env — only on quay-provisioned hosts. quay-tick reads its env
 # file fresh per timer tick, so no restart concept; we don't track
 # whether quay.env changed.
@@ -223,9 +330,9 @@ ANTHROPIC_API_KEY=${ANTHROPIC}"
 fi
 
 # hermes-gateway is long-running and only reads EnvironmentFile= at unit
-# start, so a restart is required when slack.env or hermes.env actually
+# start, so a restart is required when any gateway-loaded env file actually
 # changed. quay.env changes don't need anything — quay-tick reads fresh.
-if (( slack_changed || hermes_changed )); then
+if (( slack_changed || hermes_changed || ops_changed || ops_prod_changed )); then
   if systemctl is-enabled hermes-gateway.service >/dev/null 2>&1; then
     echo "↻ restarting hermes-gateway.service to pick up new env"
     systemctl restart hermes-gateway.service

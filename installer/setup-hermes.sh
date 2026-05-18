@@ -1620,11 +1620,15 @@ fi
 
 GATEWAY_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/slack-env.conf"
 GATEWAY_HERMES_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/hermes-env.conf"
+GATEWAY_OPS_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/ops-env.conf"
+GATEWAY_OPS_PROD_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/ops-prod-env.conf"
 # z- prefix is load-order sensitive — see ops/hermes-gateway.service.d/z-runtime-env.conf.
 GATEWAY_RUNTIME_DROPIN_SRC="$OPS_DIR/hermes-gateway.service.d/z-runtime-env.conf"
 GATEWAY_DROPIN_DIR="/etc/systemd/system/hermes-gateway.service.d"
 GATEWAY_DROPIN_DST="$GATEWAY_DROPIN_DIR/slack-env.conf"
 GATEWAY_HERMES_DROPIN_DST="$GATEWAY_DROPIN_DIR/hermes-env.conf"
+GATEWAY_OPS_DROPIN_DST="$GATEWAY_DROPIN_DIR/ops-env.conf"
+GATEWAY_OPS_PROD_DROPIN_DST="$GATEWAY_DROPIN_DIR/ops-prod-env.conf"
 GATEWAY_RUNTIME_DROPIN_DST="$GATEWAY_DROPIN_DIR/z-runtime-env.conf"
 GATEWAY_SLACK_ENV="$AUTH_DIR/slack.env"
 
@@ -1675,6 +1679,18 @@ EOF
     echo "==> installing hermes-env drop-in at $GATEWAY_HERMES_DROPIN_DST"
     sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_HERMES_DROPIN_SRC" \
       | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_HERMES_DROPIN_DST"
+
+    # Ops env drop-ins: non-prod (AWS dev/staging/test + NEW_RELIC_API_KEY)
+    # and prod (AWS_PROD_*) live in separate files so the prod surface is
+    # visible at the filesystem level. Both EnvironmentFile= lines use a
+    # leading `-`, so the unit loads cleanly before either auth file exists.
+    echo "==> installing ops-env drop-in at $GATEWAY_OPS_DROPIN_DST"
+    sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_OPS_DROPIN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_OPS_DROPIN_DST"
+
+    echo "==> installing ops-prod-env drop-in at $GATEWAY_OPS_PROD_DROPIN_DST"
+    sed -e "s|__TARGET_DIR__|$TARGET_DIR|g" "$GATEWAY_OPS_PROD_DROPIN_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin "$GATEWAY_OPS_PROD_DROPIN_DST"
 
     # First-time install of z-runtime-env.conf on an existing host counts as
     # an env-source change for the running gateway — track it so the restart
