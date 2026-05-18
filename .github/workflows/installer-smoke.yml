@@ -84,7 +84,7 @@ jobs:
         # every quay-managed entry in deploy.values.yaml:
         #   * brix-landing        — quay-managed, base_branch: main
         #   * iTRY-frontends      — quay-managed, base_branch: master
-        #   * iTRY-monorepo       — quay-managed, base_branch: main
+        #   * iTRY-monorepo       — quay-managed, base_branch: dev
         #   * brix-indexer        — quay-managed, base_branch: dev
         #   * erpc                — quay-managed, base_branch: main
         #   * iTry-contracts      — quay-managed, base_branch: main
@@ -440,7 +440,7 @@ jobs:
             for spec in \
               brix-landing:main \
               iTRY-frontends:master \
-              iTRY-monorepo:main \
+              iTRY-monorepo:dev \
               brix-indexer:dev \
               erpc:main \
               iTry-contracts:main \
@@ -489,7 +489,7 @@ jobs:
             for spec in \
               brix-landing:main \
               iTRY-frontends:master \
-              iTRY-monorepo:main \
+              iTRY-monorepo:dev \
               brix-indexer:dev \
               erpc:main \
               iTry-contracts:main \
