@@ -250,6 +250,110 @@ class TestHermesUpstreamSync:
         env_seen = triplet["gh_env_log"].read_text().strip()
         assert env_seen == "GH_TOKEN=caller-supplied-token"
 
+    @staticmethod
+    def _install_git_push_spy(triplet: dict, log_path: Path) -> None:
+        """Place a `git` shim on PATH that records argv whenever an
+        invocation contains `push`, then execs real git so the rest of
+        the script still drives the bare-repo fixture normally. The real
+        git path is resolved at install time so the spy's own PATH
+        override can't re-enter itself.
+        """
+        real_git = subprocess.run(
+            ["which", "git"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        git_stub = triplet["bin"] / "git"
+        git_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            "for arg in \"$@\"; do\n"
+            "  if [ \"$arg\" = \"push\" ]; then\n"
+            f"    printf '%s\\n' \"$*\" >> {log_path}\n"
+            "    break\n"
+            "  fi\n"
+            "done\n"
+            f"exec {real_git} \"$@\"\n"
+        )
+        git_stub.chmod(0o755)
+
+    def _assert_push_carries_inline_token_helper(
+        self, push_invocation: str, token_value: str,
+    ) -> None:
+        """git push must override credential.https://github.com.helper with
+        a tiny inline shell helper that emits x-access-token + $GH_TOKEN.
+        Critically: the literal token must NOT be in argv (which would
+        leak via `ps`) — the helper references $GH_TOKEN by name and the
+        spawned sh expands it from inherited env.
+        """
+        assert "-c credential.https://github.com.helper=" in push_invocation, (
+            f"push lacks scoped credential helper: {push_invocation!r}"
+        )
+        assert "x-access-token" in push_invocation
+        assert "GH_TOKEN" in push_invocation, (
+            "inline helper must reference $GH_TOKEN by name so the token "
+            f"value never lands in argv: {push_invocation!r}"
+        )
+        assert token_value not in push_invocation, (
+            f"token value {token_value!r} leaked into push argv: {push_invocation!r}"
+        )
+
+    def test_git_push_wires_inline_credential_helper_for_minted_token(
+        self, triplet, tmp_path,
+    ):
+        """When the script mints $GH_TOKEN from the App helper, the push
+        command must wire an inline credential.https://github.com.helper
+        that emits that token. Otherwise the unattended timer wedges on
+        git's username prompt — git does not read $GH_TOKEN on its own.
+        """
+        _advance_upstream(triplet)
+
+        # Helper stub: print a marker token on `mint`. Only the mint path
+        # runs in this fixture; the inline credential helper takes over
+        # from there.
+        helper = tmp_path / "fake_token_helper.py"
+        helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "if sys.argv[1] == 'mint':\n"
+            "    print('marker-installation-token-xyz')\n"
+        )
+        helper.chmod(0o755)
+
+        push_log = tmp_path / "git-push.log"
+        self._install_git_push_spy(triplet, push_log)
+
+        result = _run_script(
+            triplet,
+            HERMES_TOKEN_HELPER=str(helper),
+            HERMES_TOKEN_PYTHON=sys.executable,
+            GH_TOKEN="",
+            GITHUB_TOKEN="",
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert push_log.exists(), "spy never observed a `git push` call"
+        self._assert_push_carries_inline_token_helper(
+            push_log.read_text().strip(), "marker-installation-token-xyz",
+        )
+
+    def test_git_push_wires_inline_credential_helper_for_caller_supplied_token(
+        self, triplet, tmp_path,
+    ):
+        """A token supplied via $GH_TOKEN (e.g. from EnvironmentFile, or
+        an operator bypassing the helper) must reach `git push` too, not
+        just `gh pr create`. Without this the override is silently broken
+        and the push falls back to whatever git auth is — typically none,
+        so the timer dies on the username prompt.
+        """
+        _advance_upstream(triplet)
+
+        push_log = tmp_path / "git-push.log"
+        self._install_git_push_spy(triplet, push_log)
+
+        result = _run_script(triplet, GH_TOKEN="caller-supplied-token")
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert push_log.exists(), "spy never observed a `git push` call"
+        self._assert_push_carries_inline_token_helper(
+            push_log.read_text().strip(), "caller-supplied-token",
+        )
+
     def test_stale_local_branch_is_replaced(self, triplet):
         """A previous failed tick can leave a local sync branch with the
         same name as the new one. The remote check above passes (push
