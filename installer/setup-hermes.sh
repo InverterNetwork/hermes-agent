@@ -1140,7 +1140,8 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
 fi
 
 # Snapshot quay's already-registered ids ONCE per install, before the
-# per-repo loop, so re-runs of `quay repo add` are no-ops. A fresh data
+# per-repo loop, so existing rows take the `quay repo update` reconcile
+# path while missing rows take the `quay repo add` create path. A fresh data
 # dir applies embedded migrations on first invocation and returns [];
 # parse failure aborts the install — silently treating it as "no
 # registrations" would re-invoke `quay repo add` on every re-run, which
@@ -1283,16 +1284,24 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
         fi
 
         if grep -Fxq "$repo_id" <<<"$QUAY_REGISTERED_IDS"; then
-          echo "==> quay repo $repo_id already registered (preserving)"
+          echo "==> reconciling quay repo $repo_id metadata"
+          repo_config_json="$(
+            python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+              get-repo-config "$repo_id" --mode update
+          )"
+          sudo -u "$AGENT_USER" \
+            env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo update \
+              --id "$repo_id" \
+              --input "$repo_config_json" >/dev/null
         else
           echo "==> registering $repo_id with quay"
+          repo_config_json="$(
+            python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+              get-repo-config "$repo_id" --mode add
+          )"
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
-              --id "$repo_id" \
-              --url "$repo_url" \
-              --base-branch "$repo_base" \
-              --package-manager "$repo_pkg" \
-              --install-cmd "$repo_install" >/dev/null
+              --input "$repo_config_json" >/dev/null
         fi
 
         # Reconcile per-repo tag vocab: pipe the desired state from

@@ -175,6 +175,22 @@
 #                                 of the block leaves the entry as a code
 #                                 mirror only (no quay registration, no
 #                                 worker spawn).
+#   repos[].quay.test_cmd      — OPTIONAL repo metadata stored in Quay.
+#   repos[].quay.ci_workflow_name
+#                               — OPTIONAL legacy CI workflow metadata stored
+#                                 in Quay.
+#   repos[].quay.contribution_guide_path
+#                               — OPTIONAL repo-local contribution guide path.
+#   repos[].quay.agent_worker / agent_reviewer
+#                               — OPTIONAL Quay worker/reviewer agent override
+#                                 for this repo. `worker_agent` /
+#                                 `reviewer_agent` aliases are accepted.
+#   repos[].quay.model_worker / model_reviewer
+#                               — OPTIONAL worker/reviewer model override for
+#                                 this repo. `worker_model` /
+#                                 `reviewer_model` aliases are accepted.
+#                                 These mutable repo fields are reconciled into
+#                                 existing Quay registrations on every install.
 #   repos[].quay.tags          — OPTIONAL per-repo tag vocabulary, namespace
 #                                 → list of allowed values. Reconciled into
 #                                 quay via `quay repo apply-tags --from -`

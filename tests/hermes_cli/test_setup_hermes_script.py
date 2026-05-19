@@ -153,6 +153,27 @@ def test_installer_renders_quay_config_with_force_on_every_run():
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
 
 
+def test_installer_reconciles_existing_quay_repo_metadata():
+    """Existing Quay repo rows must be declaratively reconciled from
+    deploy.values.yaml, not merely preserved after the first `repo add`.
+    BRIX-1432 observed stale base_branch values surviving redeploys.
+    """
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "==> reconciling quay repo $repo_id metadata" in content
+    assert 'get-repo-config "$repo_id" --mode update' in content
+    assert re.search(
+        r'"\$QUAY_BIN_DST"\s+repo\s+update\s+\\\s*\n\s+--id "\$repo_id"\s+\\\s*\n\s+--input "\$repo_config_json"',
+        content,
+    )
+    assert 'get-repo-config "$repo_id" --mode add' in content
+    assert re.search(
+        r'"\$QUAY_BIN_DST"\s+repo\s+add\s+\\\s*\n\s+--input "\$repo_config_json"',
+        content,
+    )
+    assert "already registered (preserving)" not in content
+
+
 def test_installer_translates_legacy_orchestrator_env_keys():
     """Legacy /etc/default/brix-orchestrator overrides must keep winning
     after migration. The new service sets QUAY_ORCHESTRATOR_CONFIG by default,
