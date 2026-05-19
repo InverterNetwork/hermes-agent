@@ -287,6 +287,42 @@ class TestRenderGatewayRuntimeEnv:
         assert r.returncode == 1
         assert "allowed_channels must be a list" in r.stderr
 
+    def test_writes_slack_home_channel(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    home_channel: C0B3WAWLL0L\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "SLACK_HOME_CHANNEL=C0B3WAWLL0L" in text
+        assert "SLACK_HOME_CHANNEL_THREAD_ID=\n" in text
+
+    def test_empty_slack_home_channel_does_not_override_runtime_env(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            'slack:\n  runtime:\n    home_channel: ""\n',
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "SLACK_HOME_CHANNEL" not in out.read_text()
+
+    def test_rejects_invalid_slack_home_channel(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "slack:\n  runtime:\n    home_channel: not-a-channel\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "home_channel" in r.stderr
+        assert not out.exists()
+
     def test_writes_gateway_allow_all_users_true(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(

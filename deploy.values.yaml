@@ -41,6 +41,12 @@
 #                                 ignores this gate (slack_triggers below run
 #                                 regardless), so only the normal agent flow
 #                                 honours the allowlist.
+#   slack.runtime.home_channel — optional Slack channel ID for the gateway's
+#                                 home channel. Rendered into
+#                                 SLACK_HOME_CHANNEL in gateway-runtime.env on
+#                                 every install so cron results and
+#                                 cross-platform messages have a deployment-
+#                                 managed fallback target.
 #
 #   gateway.model_provider     — provider key persisted into <target>/config.yaml
 #                                 under model.provider (e.g. "openai-codex",
@@ -406,7 +412,7 @@ slack:
       - C0B3WAWLL0L
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
-    home_channel: ""
+    home_channel: "C0B3WAWLL0L"
     # When true, the bot only responds in channels when @-mentioned (DMs are
     # unaffected). Mirrors slack.require_mention in upstream config.yaml.
     require_mention: true

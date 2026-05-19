@@ -584,6 +584,7 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
 
     * ``SLACK_ALLOWED_USERS`` from ``slack.runtime.allowed_users``.
     * ``SLACK_ALLOWED_CHANNELS`` from ``slack.runtime.allowed_channels``.
+    * ``SLACK_HOME_CHANNEL`` from ``slack.runtime.home_channel``.
     * ``GATEWAY_ALLOW_ALL_USERS`` from ``gateway.allow_all_users``.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
@@ -628,6 +629,23 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
                 _env_safe("slack.runtime.allowed_channels[]", str(v)) for v in ac
             )
             lines.append(f"SLACK_ALLOWED_CHANNELS={joined}")
+        home = runtime.get("home_channel")
+        if home:
+            if not isinstance(home, str):
+                sys.stderr.write(
+                    "values_helper.py: slack.runtime.home_channel must be a string\n"
+                )
+                return 1
+            if not _SLACK_CHANNEL_RE.match(home):
+                sys.stderr.write(
+                    "values_helper.py: slack.runtime.home_channel must be a Slack "
+                    "channel/conversation id like C0123ABCDEF\n"
+                )
+                return 1
+            lines.append(f"SLACK_HOME_CHANNEL={_env_safe('slack.runtime.home_channel', home)}")
+            # Deployment-managed channel homes should not inherit a stale
+            # thread target from a prior /sethome invocation.
+            lines.append("SLACK_HOME_CHANNEL_THREAD_ID=")
 
     gateway = data.get("gateway") or {}
     if isinstance(gateway, dict) and "allow_all_users" in gateway:

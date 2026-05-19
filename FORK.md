@@ -22,7 +22,7 @@ Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instan
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
    - seeds `<HERMES_HOME>/config.yaml` from `slack.runtime.*` on first install (preserved on re-runs — operator hand-edits survive),
    - merges `gateway.model_provider` / `gateway.model_base_url` into `<HERMES_HOME>/config.yaml`'s `model:` block on every run (deterministic — no longer dependent on `hermes auth add`), and merges optional `gateway.approvals_mode` into `approvals.mode` (`off` bypasses approval prompts for trusted internal Slack deployments; hardline-blocked commands still remain blocked),
-   - rewrites `<HERMES_HOME>/auth/gateway-runtime.env` from `slack.runtime.allowed_users` and `linear.teams.*` on every run (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>` — non-secret, version-controlled, no operator re-typing on rotations),
+   - rewrites `<HERMES_HOME>/auth/gateway-runtime.env` from `slack.runtime.allowed_users`, `slack.runtime.allowed_channels`, `slack.runtime.home_channel`, `gateway.allow_all_users`, and `linear.teams.*` on every run (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `SLACK_HOME_CHANNEL`, `GATEWAY_ALLOW_ALL_USERS`, `LINEAR_TEAM_<KEY>` — non-secret, version-controlled, no operator re-typing on rotations),
    - renders `<HERMES_HOME>/gateway-org-defaults.md` from `repos[]` + `linear.teams` (compact org-defaults seed the gateway loads into its cached system prompt — code-mirror location + per-repo Linear team mapping; reflects values.yaml, rewritten every run),
    - regenerates `<HERMES_HOME>/auth/github-app.env` from `auth.github_app.*` on every `--auth-method app` run; CLI flags (`--app-id`, `--app-installation-id`) stay as per-run overrides,
    - configures `git user.name` on agent commits to `org.agent_identity_name`.
@@ -107,7 +107,7 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `auth/` | `root:hermes` | 750 | Staged secrets (`slack.env`, `hermes.env`, `ops.env`, `ops-prod.env`, `quay.env`) and values-derived runtime config. Always present (created on every install). |
 | `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent). Only with `--auth-method app`. |
 | `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path. Regenerated from `auth.github_app.*` on every run. |
-| `auth/gateway-runtime.env` | `root:hermes` | 640 | Non-secret env vars from `deploy.values.yaml` (`SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten every run; do not hand-edit. |
+| `auth/gateway-runtime.env` | `root:hermes` | 640 | Non-secret env vars from `deploy.values.yaml` (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `SLACK_HOME_CHANNEL`, `GATEWAY_ALLOW_ALL_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten every run; do not hand-edit. |
 | `gateway-org-defaults.md` | `root:hermes` | 640 | Compact deployment-defaults seed loaded by the gateway agent into its cached system prompt: code-mirror location + per-repo Linear team mapping (`issue_tracker.linear.team` on each `repos[]` entry). Rendered from `deploy.values.yaml` on every run; do not hand-edit. |
 
 Agent writes through the symlinks land inside the `state/` working tree, where the auto-commit pipeline can pick them up.
