@@ -215,6 +215,40 @@ def _git_config_get(repo: Path, *args: str) -> str:
     return _git_str(repo, "config", "--get", *args)
 
 
+def _git_config_get_all(repo: Path, *args: str) -> list[str]:
+    """Read all stored git config values for a key. Returns [] on failure."""
+    out = _git_str(repo, "config", "--get-all", *args)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _agent_home(s: _State) -> Path:
+    override = os.environ.get("HERMES_VERIFY_AGENT_HOME")
+    if override:
+        return Path(override)
+    try:
+        return Path(pwd.getpwnam(s.agent_owner).pw_dir)
+    except KeyError:
+        return s.args.target.parent
+
+
+def _git_config_file_get_as_agent(s: _State, config_file: Path, key: str) -> str:
+    rc, out, _ = _run([
+        *_sudo_prefix_for(s.agent_owner),
+        "git", "config", "--file", str(config_file), "--get", key,
+    ])
+    return out.strip() if rc == 0 else ""
+
+
+def _git_config_file_get_all_as_agent(s: _State, config_file: Path, key: str) -> list[str]:
+    rc, out, _ = _run([
+        *_sudo_prefix_for(s.agent_owner),
+        "git", "config", "--file", str(config_file), "--get-all", key,
+    ])
+    if rc != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 def _v_check_clone_basics(
     s: _State, label: str, clone_path: Path, expected_url: str, expected_owner: str,
 ) -> None:
@@ -233,6 +267,117 @@ def _v_check_clone_basics(
             f"{label} origin",
             f"got '{origin or '?'}' (expected '{expected_url}')",
         )
+
+
+def _v_check_github_app_clone_auth(
+    s: _State,
+    label: str,
+    clone_path: Path,
+    *,
+    required: bool,
+) -> None:
+    """Check GitHub App auth config on a GitHub clone.
+
+    The credential helper handles HTTPS remotes. The url rewrites are just as
+    important for Quay worktrees: install commands can run `git submodule
+    update`, and .gitmodules may still contain SSH GitHub URLs.
+    """
+    if not required:
+        return
+
+    helper = _git_config_get(
+        clone_path, "--local", "credential.https://github.com.helper",
+    )
+    if helper:
+        s.v_ok(f"{label} GitHub App credential helper configured")
+    else:
+        s.v_drift(
+            f"{label} GitHub App credential helper",
+            "missing credential.https://github.com.helper",
+        )
+
+    expected = ("git@github.com:", "ssh://git@github.com/")
+    actual = set(_git_config_get_all(
+        clone_path, "--local", "url.https://github.com/.insteadOf",
+    ))
+    missing = [v for v in expected if v not in actual]
+    if not missing:
+        s.v_ok(f"{label} GitHub SSH-to-HTTPS rewrites configured")
+    else:
+        s.v_drift(
+            f"{label} GitHub SSH-to-HTTPS rewrites",
+            f"missing {missing!r}",
+        )
+
+
+def _check_quay_github_app_gitconfig(s: _State, *, required: bool) -> None:
+    """Check the Git include used by fresh Quay worktrees.
+
+    Quay task bootstrap runs in disposable worktrees, and GitHub submodules can
+    still be declared with SSH URLs. The setup-time code therefore writes a
+    root-owned include file with HTTPS App auth + SSH-to-HTTPS rewrites, then
+    wires that file into the agent user's global gitconfig for Quay gitdirs.
+    """
+    if not required:
+        return
+
+    include_file = s.args.target / "auth" / "quay-github-app.gitconfig"
+    agent_gitconfig = _agent_home(s) / ".gitconfig"
+
+    if include_file.is_file():
+        _check_mode_owner(
+            s,
+            "quay GitHub App gitconfig",
+            _stat_info(include_file),
+            "640",
+            s.rails_owner,
+            s.agent_group,
+        )
+    else:
+        s.v_drift(
+            "quay GitHub App gitconfig",
+            f"missing: {include_file}",
+        )
+        return
+
+    helper = _git_config_file_get_as_agent(
+        s, include_file, "credential.https://github.com.helper",
+    )
+    if helper:
+        s.v_ok("quay GitHub App gitconfig credential helper configured")
+    else:
+        s.v_drift(
+            "quay GitHub App gitconfig credential helper",
+            "missing credential.https://github.com.helper",
+        )
+
+    expected_rewrites = ("git@github.com:", "ssh://git@github.com/")
+    actual_rewrites = set(_git_config_file_get_all_as_agent(
+        s, include_file, "url.https://github.com/.insteadOf",
+    ))
+    missing_rewrites = [v for v in expected_rewrites if v not in actual_rewrites]
+    if not missing_rewrites:
+        s.v_ok("quay GitHub App gitconfig SSH-to-HTTPS rewrites configured")
+    else:
+        s.v_drift(
+            "quay GitHub App gitconfig SSH-to-HTTPS rewrites",
+            f"missing {missing_rewrites!r}",
+        )
+
+    expected_includes = (
+        f"gitdir:{s.args.target}/quay/worktrees/",
+        f"gitdir:{s.args.target}/quay/repos/",
+    )
+    for pattern in expected_includes:
+        key = f"includeIf.{pattern}.path"
+        actual = _git_config_file_get_as_agent(s, agent_gitconfig, key)
+        if actual == str(include_file):
+            s.v_ok(f"agent gitconfig include {pattern}")
+        else:
+            s.v_drift(
+                f"agent gitconfig include {pattern}",
+                f"got '{actual or '?'}' (expected '{include_file}')",
+            )
 
 
 def _check_mode_owner(
@@ -1106,7 +1251,12 @@ def _check_deployment_tag_vocab(s: _State) -> None:
         print(f"        {extra}", file=s.err, flush=True)
 
 
-def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
+def _check_per_entry_repos(
+    s: _State,
+    repos_tsv: str,
+    *,
+    app_auth_expected: bool,
+) -> None:
     """Per-entry code mirror checks + optional bare clone + registration.
 
     Iterates list-repos[]; the loop runs even when quay is disabled (code
@@ -1138,6 +1288,13 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
             _v_check_clone_basics(
                 s, f"code mirror {repo_id}", code_dir, repo_url, s.agent_owner,
             )
+            if repo_pkg and repo_url.startswith("https://github.com/"):
+                _v_check_github_app_clone_auth(
+                    s,
+                    f"code mirror {repo_id}",
+                    code_dir,
+                    required=app_auth_expected,
+                )
             # HEAD must be on origin/<base_branch>. hermes-code-sync hard-resets
             # to origin/<base> every tick; mismatch means the timer hasn't run
             # since install, itself worth surfacing. `git rev-parse` accepts
@@ -1163,6 +1320,13 @@ def _check_per_entry_repos(s: _State, repos_tsv: str) -> None:
                 _v_check_clone_basics(
                     s, f"quay repo {repo_id}", bare, repo_url, s.agent_owner,
                 )
+                if repo_url.startswith("https://github.com/"):
+                    _v_check_github_app_clone_auth(
+                        s,
+                        f"quay repo {repo_id}",
+                        bare,
+                        required=app_auth_expected,
+                    )
             if not list_failed:
                 if repo_id in registered_set:
                     s.v_ok(f"quay repo {repo_id} registered")
@@ -1579,11 +1743,12 @@ def run(
         )
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
+        _check_quay_github_app_gitconfig(s, required=app_auth_expected)
         if _quay_supports_reference_repos(quay_version):
             _check_quay_reference_repos(s, repos_tsv)
     if s.codex_required:
         _check_codex_prereqs(s)
-    _check_per_entry_repos(s, repos_tsv)
+    _check_per_entry_repos(s, repos_tsv, app_auth_expected=app_auth_expected)
     _check_deployment_tag_vocab(s)
     _check_systemd(s)
     if app_auth_expected:

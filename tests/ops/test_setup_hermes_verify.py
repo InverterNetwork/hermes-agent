@@ -65,6 +65,9 @@ def install(tmp_path: Path) -> dict:
     fork = tmp_path / "fork"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    py_shim = bin_dir / "python3"
+    py_shim.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} "$@"\n')
+    py_shim.chmod(0o755)
 
     # ---- fork (the source git repo we rsynced from at install time) ----
     subprocess.run(["git", "init", "--quiet", "-b", "main", str(fork)], check=True)
@@ -743,6 +746,15 @@ def _quay_expected_sha_path(target: Path) -> Path:
     )
 
 
+def _app_helper_cmd(install: dict) -> str:
+    target = install["target"]
+    return (
+        f"!HERMES_HOME='{target}' "
+        f"{install['rails'] / 'venv' / 'bin' / 'python'} "
+        f"{install['rails'] / 'installer' / 'hermes_github_token.py'} credential"
+    )
+
+
 @pytest.fixture
 def quay_install(install: dict) -> dict:
     """Extend the base install fixture with quay artefacts on disk + a values
@@ -893,6 +905,69 @@ def quay_install(install: dict) -> dict:
     return install
 
 
+def _configure_quay_app_auth(
+    install: dict,
+    *,
+    include_gitconfig: bool = True,
+    include_rewrites: bool = True,
+) -> dict[str, str]:
+    target = install["target"]
+    auth = target / "auth"
+    auth.mkdir(mode=0o750, exist_ok=True)
+    auth.chmod(0o750)
+    (auth / "github-app.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+    )
+    (auth / "github-app.pem").chmod(0o640)
+    (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
+    (auth / "github-app.env").chmod(0o640)
+
+    helper_cmd = _app_helper_cmd(install)
+    _git(install["state"], "config",
+         "credential.https://github.com.helper", helper_cmd)
+
+    for repo in (install["code_mirror"], install["quay_bare"]):
+        _git(repo, "config", "credential.https://github.com.helper", helper_cmd)
+        _git(repo, "config", "--replace-all",
+             "url.https://github.com/.insteadOf", "git@github.com:")
+        _git(repo, "config", "--add",
+             "url.https://github.com/.insteadOf", "ssh://git@github.com/")
+
+    agent_home = install["tmp"] / "agent-home"
+    agent_home.mkdir()
+    if include_gitconfig:
+        include_file = auth / "quay-github-app.gitconfig"
+        rewrite_lines = ""
+        if include_rewrites:
+            rewrite_lines = (
+                "[url \"https://github.com/\"]\n"
+                "\tinsteadOf = git@github.com:\n"
+                "\tinsteadOf = ssh://git@github.com/\n"
+            )
+        include_file.write_text(
+            "[credential \"https://github.com\"]\n"
+            f"\thelper = {helper_cmd}\n"
+            f"{rewrite_lines}"
+        )
+        include_file.chmod(0o640)
+        agent_gitconfig = agent_home / ".gitconfig"
+        for pattern in (
+            f"gitdir:{target}/quay/worktrees/",
+            f"gitdir:{target}/quay/repos/",
+        ):
+            _run(
+                agent_home,
+                "git", "config", "--file", str(agent_gitconfig),
+                f"includeIf.{pattern}.path", str(include_file),
+            )
+
+    curl = install["bin"] / "curl"
+    curl.write_text("#!/usr/bin/env bash\nprintf '200'\n")
+    curl.chmod(0o755)
+
+    return {"HERMES_VERIFY_AGENT_HOME": str(agent_home)}
+
+
 def _quay_env(install: dict) -> dict[str, str]:
     return {
         "HERMES_VERIFY_QUAY_BIN": str(install["quay_bin"]),
@@ -903,11 +978,21 @@ def _quay_env(install: dict) -> dict[str, str]:
     }
 
 
-def _run_verify_quay(install: dict, *, env_overrides: dict[str, str] | None = None) -> SimpleNamespace:
+def _run_verify_quay(
+    install: dict,
+    *,
+    auth_method: str = "none",
+    env_overrides: dict[str, str] | None = None,
+) -> SimpleNamespace:
     overrides = _quay_env(install)
     if env_overrides:
         overrides.update(env_overrides)
-    return _run_verify(install, values=install["values_file"], env_overrides=overrides)
+    return _run_verify(
+        install,
+        auth_method=auth_method,
+        values=install["values_file"],
+        env_overrides=overrides,
+    )
 
 
 def _run_verify_quay_via_wrapper(install: dict) -> subprocess.CompletedProcess:
@@ -947,6 +1032,41 @@ class TestSetupHermesVerifyQuay:
         assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
         assert "[OK] quay-as-hermes wrapper:" in result.stdout
         assert "[OK] quay profile.d drop-in:" in result.stdout
+
+    def test_app_auth_quay_gitconfig_passes(self, quay_install):
+        env = _configure_quay_app_auth(quay_install)
+        result = _run_verify_quay(
+            quay_install,
+            auth_method="app",
+            env_overrides=env,
+        )
+
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] quay GitHub App gitconfig:" in result.stdout
+        assert "quay GitHub App gitconfig SSH-to-HTTPS rewrites configured" in result.stdout
+        assert "agent gitconfig include gitdir:" in result.stdout
+
+    def test_app_auth_missing_quay_gitconfig_is_drift(self, quay_install):
+        env = _configure_quay_app_auth(quay_install, include_gitconfig=False)
+        result = _run_verify_quay(
+            quay_install,
+            auth_method="app",
+            env_overrides=env,
+        )
+
+        assert result.returncode == 1
+        assert "[DRIFT] quay GitHub App gitconfig" in result.stderr
+
+    def test_app_auth_quay_gitconfig_missing_rewrite_is_drift(self, quay_install):
+        env = _configure_quay_app_auth(quay_install, include_rewrites=False)
+        result = _run_verify_quay(
+            quay_install,
+            auth_method="app",
+            env_overrides=env,
+        )
+
+        assert result.returncode == 1
+        assert "[DRIFT] quay GitHub App gitconfig SSH-to-HTTPS rewrites" in result.stderr
 
     def test_clean_quay_install_passes_via_bash_wrapper(self, quay_install):
         """Smoke through bash setup-hermes.sh --verify with the values flag

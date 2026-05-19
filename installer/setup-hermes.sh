@@ -862,6 +862,52 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
   GIT_CRED_HELPER="!HERMES_HOME='$TARGET_DIR' $VENV_PY $TOKEN_HELPER_PY credential"
 fi
 
+AGENT_GITCONFIG="$AGENT_HOME/.gitconfig"
+QUAY_GITHUB_APP_GITCONFIG="$AUTH_DIR/quay-github-app.gitconfig"
+
+configure_github_app_clone_auth() {
+  local clone_path="$1"
+
+  sudo -u "$AGENT_USER" git -C "$clone_path" \
+    config credential.https://github.com.helper "$GIT_CRED_HELPER"
+
+  # Quay-managed repos authenticate to GitHub over HTTPS with the App helper.
+  # Some repos still carry SSH submodule URLs in .gitmodules; without these
+  # local rewrites, `git submodule update` bypasses the helper and fails under
+  # the hermes system user.
+  sudo -u "$AGENT_USER" git -C "$clone_path" \
+    config --replace-all url.https://github.com/.insteadOf "git@github.com:"
+  sudo -u "$AGENT_USER" git -C "$clone_path" \
+    config --add url.https://github.com/.insteadOf "ssh://git@github.com/"
+}
+
+configure_quay_github_app_worktree_auth() {
+  [[ "$QUAY_ENABLED" -eq 1 && -n "$GIT_CRED_HELPER" ]] || return 0
+
+  # Quay creates disposable worktrees for task bootstrap. Those worktrees may
+  # not see per-clone config from setup-time mirrors, so install a scoped
+  # include that is loaded by any Git repo whose gitdir is inside the Quay data
+  # tree. This lets SSH-shaped GitHub submodule URLs use the same HTTPS App
+  # credential helper as the parent repo.
+  echo "==> configuring GitHub App auth for Quay worktrees"
+  {
+    printf '[credential "https://github.com"]\n'
+    printf '\thelper = %s\n' "$GIT_CRED_HELPER"
+    printf '[url "https://github.com/"]\n'
+    printf '\tinsteadOf = git@github.com:\n'
+    printf '\tinsteadOf = ssh://git@github.com/\n'
+  } | install -o root -g "$AGENT_USER" -m 0640 /dev/stdin "$QUAY_GITHUB_APP_GITCONFIG"
+
+  sudo -u "$AGENT_USER" touch "$AGENT_GITCONFIG"
+  for include_pattern in \
+    "gitdir:$TARGET_DIR/quay/worktrees/" \
+    "gitdir:$TARGET_DIR/quay/repos/"; do
+    ( cd "$AGENT_HOME" && \
+      sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
+        --replace-all "includeIf.${include_pattern}.path" "$QUAY_GITHUB_APP_GITCONFIG" )
+  done
+}
+
 if [[ ! -d "$STATE_TARGET/.git" ]]; then
   if [[ -n "$STATE_DIR" ]]; then
     echo "==> cloning state repo from local source into $STATE_TARGET"
@@ -967,6 +1013,7 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   chmod 0644 "$QUAY_ORCHESTRATOR_CONFIG_OUT"
 
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/quay/repos"
+  configure_quay_github_app_worktree_auth
 fi
 
 # ---------- repo provisioning (code mirrors + optional quay) ----------
@@ -977,9 +1024,9 @@ fi
 #
 # Auth bifurcation:
 #   quay-managed github.com entries — clones go over HTTPS with the App
-#     credential helper (-c credential.https://github.com.helper=…) so
-#     the App's GitHub UI repo scope is the only operator-side toggle;
-#     no url.insteadOf rewrite or deploy key required.
+#     credential helper (-c credential.https://github.com.helper=…). A
+#     Quay-scoped include also rewrites SSH-shaped GitHub submodule URLs back
+#     to HTTPS so install hooks do not require deploy keys.
 #   code-only entries (no quay: block) — per-repo url.insteadOf rewrites
 #     land in ~hermes/.gitconfig, bridging the HTTPS values URL to SSH
 #     against the deploy keys staged by stage-repo-auth.sh.
@@ -1133,8 +1180,6 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
 fi
 
 if [[ -n "$ALL_REPOS_TSV" ]]; then
-  AGENT_GITCONFIG="$AGENT_HOME/.gitconfig"
-
   while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
     [[ -z "$repo_id" ]] && continue
 
@@ -1201,10 +1246,11 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
       fi
     fi
     # Persist the credential helper into the code mirror's .git/config for
-    # subsequent fetches by the hermes-code-sync timer.
+    # subsequent fetches by the hermes-code-sync timer. The same helper +
+    # rewrite pair also lets repo hooks or manual operator runs initialize
+    # SSH-shaped GitHub submodules without needing an SSH deploy key.
     if [[ -n "$repo_pkg" && -n "$GIT_CRED_HELPER" && "$repo_url" =~ ^https://github\.com/ ]]; then
-      sudo -u "$AGENT_USER" git -C "$code_dir" \
-        config credential.https://github.com.helper "$GIT_CRED_HELPER"
+      configure_github_app_clone_auth "$code_dir"
     fi
 
     # ---- bare clone + quay registration (entries with `quay:` block) ----
@@ -1230,9 +1276,10 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
         fi
         # Persist the credential helper into the bare clone's config so
         # worker git push from worktrees authenticates without per-spawn env.
+        # Linked Quay worktrees read this same config, so the SSH→HTTPS
+        # rewrites also cover `git submodule update` during install_cmd.
         if [[ -n "$GIT_CRED_HELPER" && "$repo_url" =~ ^https://github\.com/ ]]; then
-          sudo -u "$AGENT_USER" git -C "$bare" \
-            config credential.https://github.com.helper "$GIT_CRED_HELPER"
+          configure_github_app_clone_auth "$bare"
         fi
 
         if grep -Fxq "$repo_id" <<<"$QUAY_REGISTERED_IDS"; then
