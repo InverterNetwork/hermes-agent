@@ -156,7 +156,6 @@ def test_installer_renders_quay_config_with_force_on_every_run():
 def test_installer_reconciles_existing_quay_repo_metadata():
     """Existing Quay repo rows must be declaratively reconciled from
     deploy.values.yaml, not merely preserved after the first `repo add`.
-    BRIX-1432 observed stale base_branch values surviving redeploys.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
 
