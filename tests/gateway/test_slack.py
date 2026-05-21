@@ -1068,6 +1068,156 @@ class TestIncomingDocumentHandling:
         assert "_Notion_" in msg_event.text
 
     @pytest.mark.asyncio
+    async def test_giphy_attachment_context_and_media_are_exposed(self, adapter):
+        """Giphy/Tenor-style Slack unfurls should not collapse to shared-a-GIF."""
+        with patch.object(_slack_mod, "cache_image_from_url", new_callable=AsyncMock) as cache:
+            cache.return_value = "/tmp/cached_gif.gif"
+            event = self._make_event(
+                text="",
+                attachments=[
+                    {
+                        "fallback": "fabi shared a GIF",
+                        "title": "Excited celebration",
+                        "title_link": "https://giphy.com/gifs/example",
+                        "service_name": "GIPHY",
+                        "image_url": "https://media.giphy.com/media/example/giphy.gif",
+                    }
+                ],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/cached_gif.gif"]
+        assert msg_event.media_types == ["image/gif"]
+        assert "[Slack GIF]" in msg_event.text
+        assert "Title/alt: Excited celebration" in msg_event.text
+        assert "Provider: GIPHY" in msg_event.text
+        assert "Source: https://giphy.com/gifs/example" in msg_event.text
+        assert "Media: https://media.giphy.com/media/example/giphy.gif" in msg_event.text
+        cache.assert_awaited_once_with(
+            "https://media.giphy.com/media/example/giphy.gif",
+            ext=".gif",
+        )
+
+    @pytest.mark.asyncio
+    async def test_private_gif_attachment_uses_slack_authenticated_download(self, adapter):
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl, \
+             patch.object(
+                 _slack_mod, "cache_image_from_url", new_callable=AsyncMock
+             ) as public_cache:
+            dl.return_value = "/tmp/private_slack_gif.gif"
+            event = self._make_event(
+                text="",
+                attachments=[
+                    {
+                        "fallback": "fabi shared a GIF",
+                        "title": "Private workspace gif",
+                        "service_name": "Slack",
+                        "url_private_download": (
+                            "https://files.slack.com/files-pri/T123-F123/"
+                            "download/party.gif"
+                        ),
+                    }
+                ],
+            )
+            event["team"] = "T123"
+
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/private_slack_gif.gif"]
+        assert msg_event.media_types == ["image/gif"]
+        assert "Title/alt: Private workspace gif" in msg_event.text
+        assert "Media: private Slack file cached when downloadable." in msg_event.text
+        assert "https://files.slack.com/files-pri" not in msg_event.text
+        dl.assert_awaited_once_with(
+            "https://files.slack.com/files-pri/T123-F123/download/party.gif",
+            ".gif",
+            team_id="T123",
+        )
+        public_cache.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_private_gif_attachment_rejects_non_slack_authenticated_download(self, adapter):
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl, \
+             patch.object(
+                 _slack_mod, "cache_image_from_url", new_callable=AsyncMock
+             ) as public_cache:
+            public_cache.return_value = "/tmp/public_fallback.gif"
+            event = self._make_event(
+                text="",
+                attachments=[
+                    {
+                        "fallback": "fabi shared a GIF",
+                        "title": "Forged private gif",
+                        "service_name": "Slack",
+                        "url_private_download": "https://example.test/steal-token.gif",
+                    }
+                ],
+            )
+            event["team"] = "T123"
+
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/public_fallback.gif"]
+        assert msg_event.media_types == ["image/gif"]
+        dl.assert_not_awaited()
+        public_cache.assert_awaited_once_with(
+            "https://example.test/steal-token.gif",
+            ext=".gif",
+        )
+
+    @pytest.mark.asyncio
+    async def test_gif_attachment_without_media_gets_explicit_notice(self, adapter):
+        event = self._make_event(
+            text="",
+            attachments=[
+                {
+                    "fallback": "fabi shared a GIF",
+                }
+            ],
+        )
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.TEXT
+        assert "[Slack GIF]" in msg_event.text
+        assert "Fallback: fabi shared a GIF" in msg_event.text
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "did not include a downloadable media or preview URL" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_gif_image_block_context_and_media_are_exposed(self, adapter):
+        with patch.object(_slack_mod, "cache_image_from_url", new_callable=AsyncMock) as cache:
+            cache.return_value = "/tmp/cached_block_gif.gif"
+            event = self._make_event(
+                text="look",
+                blocks=[
+                    {
+                        "type": "image",
+                        "title": {"type": "plain_text", "text": "Tenor wave"},
+                        "alt_text": "Tenor wave",
+                        "image_url": "https://media.tenor.com/example.gif",
+                    }
+                ],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/cached_block_gif.gif"]
+        assert msg_event.media_types == ["image/gif"]
+        assert "look" in msg_event.text
+        assert "[Slack GIF]" in msg_event.text
+        assert "Title/alt: Tenor wave" in msg_event.text
+        assert "Media: https://media.tenor.com/example.gif" in msg_event.text
+
+    @pytest.mark.asyncio
     async def test_message_unfurl_attachments_are_skipped(self, adapter):
         """Message unfurls should be skipped to avoid echoing Slack message copies."""
         event = self._make_event(

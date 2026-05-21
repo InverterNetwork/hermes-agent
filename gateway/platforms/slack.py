@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import urlparse
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -58,6 +59,7 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     safe_url_for_log,
     cache_document_from_bytes,
+    cache_image_from_url,
 )
 
 
@@ -240,6 +242,199 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
         payload = payload[: max_chars - 18].rstrip() + "\n... [truncated]"
 
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
+
+
+_GIF_PROVIDER_RE = re.compile(r"\b(giphy|tenor)\b", re.IGNORECASE)
+
+
+def _is_slack_file_url(url: str) -> bool:
+    """Return whether a URL is safe to fetch with Slack bot-token auth."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.hostname == "files.slack.com"
+
+
+def _slack_plain_text(value: Any) -> str:
+    """Extract text from Slack text objects or scalar payload fields."""
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("fallback") or "").strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _slack_gif_candidate_urls(payload: dict) -> list[str]:
+    """Return GIF/media URLs from a Slack attachment or image block."""
+    return [url for url, _is_private in _slack_gif_candidate_url_items(payload)]
+
+
+def _slack_gif_candidate_url_items(payload: dict) -> list[tuple[str, bool]]:
+    """Return GIF/media URLs with whether they require Slack auth."""
+    candidates: list[tuple[str, bool]] = []
+    for key in (
+        "image_url",
+        "thumb_url",
+        "url",
+        "url_private",
+        "url_private_download",
+        "from_url",
+        "title_link",
+        "original_url",
+        "video_url",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            needs_slack_auth = (
+                key in {"url_private", "url_private_download"}
+                and _is_slack_file_url(value)
+            )
+            candidates.append((value, needs_slack_auth))
+
+    seen: set[str] = set()
+    return [(u, is_private) for u, is_private in candidates if not (u in seen or seen.add(u))]
+
+
+def _slack_gif_prompt_url(value: Any) -> str:
+    """Return a prompt-safe GIF URL, omitting private Slack file URLs."""
+    url = _slack_plain_text(value)
+    if url and _is_slack_file_url(url):
+        return ""
+    return url
+
+
+def _slack_payload_looks_like_gif(payload: dict) -> bool:
+    """Heuristically identify Slack GIF/Giphy/Tenor unfurl payloads."""
+    if not isinstance(payload, dict):
+        return False
+
+    text_fields = [
+        _slack_plain_text(payload.get(key))
+        for key in (
+            "fallback",
+            "title",
+            "text",
+            "alt_text",
+            "service_name",
+            "provider_name",
+            "footer",
+            "from_url",
+            "title_link",
+            "original_url",
+            "image_url",
+            "thumb_url",
+            "url",
+        )
+    ]
+    haystack = " ".join(text_fields)
+    if _GIF_PROVIDER_RE.search(haystack):
+        return True
+    lowered = haystack.lower()
+    return "shared a gif" in lowered or ".gif" in lowered or "/gif" in lowered
+
+
+def _format_slack_gif_context(payload: dict, *, label: str = "Slack GIF") -> str:
+    """Build a compact prompt-visible description for a Slack GIF payload."""
+    title = _slack_plain_text(payload.get("title")) or _slack_plain_text(
+        payload.get("alt_text")
+    )
+    fallback = _slack_plain_text(payload.get("fallback"))
+    text = _slack_plain_text(payload.get("text"))
+    provider = _slack_plain_text(
+        payload.get("service_name")
+        or payload.get("provider_name")
+        or payload.get("footer")
+        or ""
+    )
+    source_url = _slack_gif_prompt_url(
+        payload.get("from_url")
+        or payload.get("title_link")
+        or payload.get("original_url")
+        or ""
+    )
+    private_media_omitted = False
+    media_url = ""
+    for candidate_url, is_slack_private in _slack_gif_candidate_url_items(payload):
+        if is_slack_private or _is_slack_file_url(candidate_url):
+            private_media_omitted = True
+            continue
+        media_url = candidate_url
+        break
+
+    details: list[str] = [f"[{label}]"]
+    if title:
+        details.append(f"Title/alt: {title}")
+    if text and text not in {title, fallback}:
+        details.append(f"Text: {text}")
+    if fallback and fallback not in {title, text}:
+        details.append(f"Fallback: {fallback}")
+    if provider:
+        details.append(f"Provider: {provider}")
+    if source_url:
+        details.append(f"Source: {source_url}")
+    if media_url and media_url != source_url:
+        details.append(f"Media: {media_url}")
+    elif private_media_omitted:
+        details.append("Media: private Slack file cached when downloadable.")
+
+    if len(details) == 1:
+        details.append(
+            "Slack reported a GIF share but did not include title, provider, "
+            "source URL, or downloadable media."
+        )
+
+    return "\n".join(details)
+
+
+def _extract_slack_gif_payloads(event: dict) -> list[dict]:
+    """Collect Slack GIF/Giphy/Tenor unfurl payloads from attachments/blocks."""
+    payloads: list[dict] = []
+
+    for att in event.get("attachments") or []:
+        if _slack_payload_looks_like_gif(att):
+            payloads.append(att)
+
+    for block in event.get("blocks") or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "image" and _slack_payload_looks_like_gif(block):
+            payloads.append(block)
+            continue
+        accessory = block.get("accessory")
+        if isinstance(accessory, dict) and accessory.get("type") == "image":
+            if _slack_payload_looks_like_gif(accessory):
+                payloads.append(accessory)
+
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict] = []
+    for payload in payloads:
+        key = (
+            _slack_plain_text(
+                payload.get("image_url")
+                or payload.get("thumb_url")
+                or payload.get("url")
+                or ""
+            ),
+            _slack_plain_text(
+                payload.get("from_url")
+                or payload.get("title_link")
+                or payload.get("original_url")
+                or ""
+            ),
+            _slack_plain_text(
+                payload.get("fallback")
+                or payload.get("title")
+                or payload.get("alt_text")
+                or ""
+            ),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(payload)
+    return unique
 
 
 def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
@@ -1810,6 +2005,12 @@ class SlackAdapter(BasePlatformAdapter):
             for att in slack_attachments:
                 if att.get("is_msg_unfurl"):
                     continue
+                if _slack_payload_looks_like_gif(att):
+                    section = _format_slack_gif_context(att)
+                    if section not in text:
+                        att_parts.append(section)
+                    continue
+
                 att_title = att.get("title", "")
                 att_url = att.get("title_link", "") or att.get("from_url", "")
                 att_text = att.get("text", "")
@@ -1852,7 +2053,21 @@ class SlackAdapter(BasePlatformAdapter):
                     "Slack: appended %d link unfurl(s) to message text",
                     len(att_parts),
                 )
+
+        block_gif_parts = [
+            _format_slack_gif_context(payload)
+            for payload in _extract_slack_gif_payloads(event)
+            if payload not in slack_attachments
+        ]
+        block_gif_parts = [part for part in block_gif_parts if part not in text]
+        if block_gif_parts:
+            text = (
+                text.strip() + "\n\n" + "\n\n".join(block_gif_parts)
+            ).strip()
         return text
+
+    def _extract_gif_payloads_from_event(self, event: dict) -> list[dict]:
+        return _extract_slack_gif_payloads(event)
 
     async def _extract_slack_media(
         self, event: dict, *, channel_id: str, team_id: str,
@@ -2000,6 +2215,48 @@ class SlackAdapter(BasePlatformAdapter):
                             "[Slack] Failed to cache document from %s: %s",
                             url, e, exc_info=True,
                         )
+
+        for payload in self._extract_gif_payloads_from_event(event):
+            candidates = _slack_gif_candidate_url_items(payload)
+            if not candidates:
+                attachment_notices.append(
+                    "Slack GIF share did not include a downloadable media or preview URL."
+                )
+                continue
+
+            cached = None
+            last_error: Optional[Exception] = None
+            for url, is_slack_private in candidates:
+                try:
+                    ext = ".gif" if ".gif" in url.lower() else ".jpg"
+                    if is_slack_private:
+                        cached = await self._download_slack_file(
+                            url, ext, team_id=team_id,
+                        )
+                    else:
+                        cached = await cache_image_from_url(url, ext=ext)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    logger.debug(
+                        "[Slack] Failed to cache GIF candidate %s: %s",
+                        safe_url_for_log(url),
+                        exc,
+                    )
+
+            if cached:
+                media_urls.append(cached)
+                media_types.append("image/gif")
+            else:
+                if last_error is not None:
+                    attachment_notices.append(
+                        "Slack GIF share included media URLs, but Hermes could not cache them: "
+                        f"{last_error}"
+                    )
+                else:
+                    attachment_notices.append(
+                        "Slack GIF share included media URLs, but Hermes could not cache them."
+                    )
 
         inline_text = "\n\n".join(inline_chunks)
         return media_urls, media_types, attachment_notices, inline_text
