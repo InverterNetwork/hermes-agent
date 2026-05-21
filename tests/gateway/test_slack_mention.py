@@ -201,6 +201,12 @@ def test_response_policy_legacy_alias_allows_thread_followups():
     assert adapter._slack_thread_followup_is_actionable("lol", event={}) is True
 
 
+def test_response_policy_does_not_enable_strict_mention():
+    adapter = _make_adapter(response_policy="strict_mention")
+    assert adapter._slack_response_policy() == "mention_to_wake_quiet_thread"
+    assert adapter._slack_strict_mention() is False
+
+
 def test_quiet_thread_suppresses_acknowledgements_and_jokes():
     adapter = _make_adapter()
     assert adapter._slack_thread_followup_is_actionable("thanks!", event={}) is False
@@ -234,6 +240,16 @@ def test_quiet_thread_allows_narrow_clarification_answers_for_active_sessions():
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
         "yes",
+        event={},
+        has_session=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "no",
+        event={},
+        has_session=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "thanks",
         event={},
         has_session=True,
     ) is False
@@ -369,6 +385,14 @@ def test_thread_reply_with_active_session_processed():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="can you check the logs?",
+        thread_reply=True, active_session=True,
+    ) is True
+
+
+def test_thread_reply_with_active_session_allows_short_clarification_answer():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="yes",
         thread_reply=True, active_session=True,
     ) is True
 

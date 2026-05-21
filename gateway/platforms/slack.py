@@ -3265,8 +3265,8 @@ class SlackAdapter(BasePlatformAdapter):
         replies are only processed when they look like asks, status changes,
         failures, completions, or clarification answers. ``thread_followup``
         keeps the historical behavior where any reply in an engaged thread
-        wakes the agent. ``strict_mention`` requires a mention on every
-        channel message.
+        wakes the agent. Use ``strict_mention`` for the separate "mention on
+        every channel message" mode.
         """
         configured = self.config.extra.get("response_policy")
         if configured is None:
@@ -3282,8 +3282,6 @@ class SlackAdapter(BasePlatformAdapter):
             "legacy": "thread_followup",
             "thread": "thread_followup",
             "thread_followup": "thread_followup",
-            "strict": "strict_mention",
-            "strict_mention": "strict_mention",
         }
         return aliases.get(value, "mention_to_wake_quiet_thread")
 
@@ -3297,13 +3295,17 @@ class SlackAdapter(BasePlatformAdapter):
         """Whether an unmentioned channel-thread reply should invoke Hermes."""
         if self._slack_response_policy() == "thread_followup":
             return True
-        if self._slack_response_policy() == "strict_mention":
-            return False
 
         event = event or {}
         normalized = self._normalize_thread_followup_text(text)
         if not normalized:
             return False
+
+        # Active sessions may be waiting for short clarification answers.
+        # Check these before generic low-value suppression so replies like
+        # "yes" or "no" can still reach the existing session flow.
+        if has_session and self._slack_looks_like_clarification_answer(normalized):
+            return True
 
         if self._slack_is_low_value_thread_chatter(normalized, event=event):
             return False
@@ -3335,11 +3337,6 @@ class SlackAdapter(BasePlatformAdapter):
             re.IGNORECASE,
         )
         if state_re.search(normalized):
-            return True
-
-        # Active sessions may be waiting for short clarification answers. Keep
-        # this narrow so acknowledgements and jokes stay suppressed.
-        if has_session and self._slack_looks_like_clarification_answer(normalized):
             return True
 
         return False
@@ -3377,7 +3374,11 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _slack_looks_like_clarification_answer(self, text: str) -> bool:
         lowered = text.lower().strip(" .,!?:;\"'")
-        if not lowered or self._slack_is_low_value_thread_chatter(lowered, event={}):
+        if not lowered:
+            return False
+        if lowered in {"yes", "y", "no", "n"}:
+            return True
+        if self._slack_is_low_value_thread_chatter(lowered, event={}):
             return False
         if len(lowered) > 160:
             return True

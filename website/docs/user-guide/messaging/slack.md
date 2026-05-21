@@ -352,7 +352,6 @@ slack:
   # acknowledgements, jokes, and bare GIF/file shares.
   # Other values:
   #   thread_followup — legacy: every reply in an engaged thread wakes Hermes
-  #   strict_mention  — require @mention on every channel message
   response_policy: mention_to_wake_quiet_thread
 
   # Prevent thread auto-engagement: only reply to channel messages that
@@ -378,7 +377,7 @@ Set this to `true` in busy workspaces where Slack's default "the bot remembers t
 :::
 
 :::info
-Slack's default `mention_to_wake_quiet_thread` policy requires `@mention` to start a channel conversation, then allows unmentioned thread follow-ups only when they look actionable: a direct ask, a material task update, a failure/completion, or a likely clarification answer. Use `thread_followup` if you want the older behavior where every reply in an engaged thread wakes Hermes. In DMs the bot always responds without needing a mention.
+Slack's default `mention_to_wake_quiet_thread` policy requires `@mention` to start a channel conversation, then allows unmentioned thread follow-ups only when they look actionable: a direct ask, a material task update, a failure/completion, or a likely clarification answer. Use `thread_followup` if you want the older behavior where every reply in an engaged thread wakes Hermes. Use `strict_mention: true` if every channel message must mention the bot. In DMs the bot always responds without needing a mention.
 :::
 
 ### Unauthorized User Handling
