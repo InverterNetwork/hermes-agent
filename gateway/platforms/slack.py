@@ -296,6 +296,14 @@ def _slack_gif_candidate_url_items(payload: dict) -> list[tuple[str, bool]]:
     return [(u, is_private) for u, is_private in candidates if not (u in seen or seen.add(u))]
 
 
+def _slack_gif_prompt_url(value: Any) -> str:
+    """Return a prompt-safe GIF URL, omitting private Slack file URLs."""
+    url = _slack_plain_text(value)
+    if url and _is_slack_file_url(url):
+        return ""
+    return url
+
+
 def _slack_payload_looks_like_gif(payload: dict) -> bool:
     """Heuristically identify Slack GIF/Giphy/Tenor unfurl payloads."""
     if not isinstance(payload, dict):
@@ -339,13 +347,20 @@ def _format_slack_gif_context(payload: dict, *, label: str = "Slack GIF") -> str
         or payload.get("footer")
         or ""
     )
-    source_url = _slack_plain_text(
+    source_url = _slack_gif_prompt_url(
         payload.get("from_url")
         or payload.get("title_link")
         or payload.get("original_url")
         or ""
     )
-    media_url = next(iter(_slack_gif_candidate_urls(payload)), "")
+    private_media_omitted = False
+    media_url = ""
+    for candidate_url, is_slack_private in _slack_gif_candidate_url_items(payload):
+        if is_slack_private or _is_slack_file_url(candidate_url):
+            private_media_omitted = True
+            continue
+        media_url = candidate_url
+        break
 
     details: list[str] = [f"[{label}]"]
     if title:
@@ -360,6 +375,8 @@ def _format_slack_gif_context(payload: dict, *, label: str = "Slack GIF") -> str
         details.append(f"Source: {source_url}")
     if media_url and media_url != source_url:
         details.append(f"Media: {media_url}")
+    elif private_media_omitted:
+        details.append("Media: private Slack file cached when downloadable.")
 
     if len(details) == 1:
         details.append(

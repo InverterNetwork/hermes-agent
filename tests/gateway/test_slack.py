@@ -1130,10 +1130,8 @@ class TestIncomingDocumentHandling:
         assert msg_event.media_urls == ["/tmp/private_slack_gif.gif"]
         assert msg_event.media_types == ["image/gif"]
         assert "Title/alt: Private workspace gif" in msg_event.text
-        assert (
-            "Media: https://files.slack.com/files-pri/T123-F123/download/party.gif"
-            in msg_event.text
-        )
+        assert "Media: private Slack file cached when downloadable." in msg_event.text
+        assert "https://files.slack.com/files-pri" not in msg_event.text
         dl.assert_awaited_once_with(
             "https://files.slack.com/files-pri/T123-F123/download/party.gif",
             ".gif",
