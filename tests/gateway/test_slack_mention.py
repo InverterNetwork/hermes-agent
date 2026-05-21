@@ -234,6 +234,16 @@ def test_quiet_thread_allows_direct_asks_and_task_state_updates():
 def test_quiet_thread_preserves_active_session_continuations():
     adapter = _make_adapter()
     assert adapter._slack_thread_followup_is_actionable(
+        "yes",
+        event={},
+        has_session=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "no",
+        event={},
+        has_session=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
         "frontend",
         event={},
         has_session=True,
@@ -253,6 +263,20 @@ def test_quiet_thread_preserves_active_session_continuations():
         event={},
         has_session=True,
     ) is True
+
+
+def test_quiet_thread_suppresses_active_session_chatter():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "thanks",
+        event={},
+        has_session=True,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "lol",
+        event={},
+        has_session=True,
+    ) is False
 
 
 # ---------------------------------------------------------------------------

@@ -1086,8 +1086,8 @@ DEFAULT_CONFIG = {
     "slack": {
         # Channel response policy:
         #   mention_to_wake_quiet_thread — require @mention to wake in channels,
-        #       preserve active sessions, then suppress low-value unmentioned
-        #       thread chatter outside those sessions (default)
+        #       preserve active-session continuations, and suppress low-value
+        #       unmentioned thread chatter (default)
         #   thread_followup — legacy: any reply in an engaged thread wakes Hermes
         # Use slack.strict_mention=true to require @mention on every channel message.
         "response_policy": "mention_to_wake_quiet_thread",

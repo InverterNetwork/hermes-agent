@@ -3262,11 +3262,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         ``mention_to_wake_quiet_thread`` is the cost/noise-conscious default:
         an explicit mention starts a channel thread, then unmentioned thread
-        replies are only processed when they look like asks, status changes,
-        failures, or completions unless an active session already exists for
-        the thread. ``thread_followup`` keeps the historical behavior where any
-        reply in an engaged thread wakes the agent. Use ``slack.strict_mention``
-        for the separate "mention on every channel message" mode.
+        replies are processed when they look like asks, status changes,
+        failures, completions, or active-session continuations. Low-value
+        chatter is still suppressed. ``thread_followup`` keeps the historical
+        behavior where any reply in an engaged thread wakes the agent. Use
+        ``slack.strict_mention`` for the separate "mention on every channel
+        message" mode.
         """
         configured = self.config.extra.get("response_policy")
         if configured is None:
@@ -3301,14 +3302,16 @@ class SlackAdapter(BasePlatformAdapter):
         if not normalized:
             return False
 
+        if self._slack_is_low_value_thread_chatter(normalized, event=event):
+            if has_session and self._slack_looks_like_confirmation_answer(normalized):
+                return True
+            return False
+
         # Active sessions can be waiting on arbitrary short clarification
-        # answers ("frontend", "B", "option 2"). Preserve the existing Slack
-        # session flow instead of trying to classify those replies here.
+        # answers ("frontend", "B", "option 2"). Preserve that continuation
+        # path, while the low-value check above keeps thread chatter quiet.
         if has_session:
             return True
-
-        if self._slack_is_low_value_thread_chatter(normalized, event=event):
-            return False
 
         # Questions and explicit requests are direct asks.
         if "?" in normalized:
@@ -3347,6 +3350,10 @@ class SlackAdapter(BasePlatformAdapter):
         text = re.sub(r"<https?://[^>|]+(?:\|[^>]+)?>", " link ", text)
         text = re.sub(r":[a-z0-9_+\-]+:", " ", text, flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", text).strip()
+
+    def _slack_looks_like_confirmation_answer(self, text: str) -> bool:
+        lowered = text.lower().strip(" .,!?:;\"'")
+        return lowered in {"yes", "yep", "yeah", "y", "no", "nope", "nah", "n"}
 
     def _slack_is_low_value_thread_chatter(self, text: str, *, event: dict) -> bool:
         if event.get("subtype") in {"file_share", "me_message"} and len(text) < 24:
