@@ -665,3 +665,36 @@ slack_triggers:
       max_per_hour: 30
       on_overflow: skip
     default_repo: iTRY-monorepo
+  # iTRY alert/report channels — port of OpenClaw's alert-channel behavior
+  # (BRIX-1441). Bot-authored alert and daily-report messages trigger the
+  # itry-alert-triage entry skill, which investigates and replies in-thread.
+  # accept_from_bots: true is required because the monitoring/report poster
+  # is a bot; synthetic_author stamps a non-empty author on bot-triggered
+  # invocations (quay validate-ticket needs authors[]). The dev alert
+  # channel (C0AAN0K8UMP) is deliberately NOT bound — it stays silent in
+  # Hermes just as OpenClaw was configured not to respond there. Add an
+  # entry here only if dev should become responsive.
+  - channel_id: C0AGZUH6C15
+    channel_name: itry-alerts-staging
+    skill: itry-alert-triage
+    require_top_level: true
+    accept_from_bots: true
+    synthetic_author:
+      name: iTRY Alerts
+      slack_id: BITRYALERT
+    rate_limit:
+      max_per_hour: 30
+      on_overflow: skip
+    default_repo: iTRY-monorepo
+  - channel_id: C0AH910LEV9
+    channel_name: itry-alerts-prod
+    skill: itry-alert-triage
+    require_top_level: true
+    accept_from_bots: true
+    synthetic_author:
+      name: iTRY Alerts
+      slack_id: BITRYALERT
+    rate_limit:
+      max_per_hour: 30
+      on_overflow: skip
+    default_repo: iTRY-monorepo

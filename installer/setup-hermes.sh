@@ -1361,6 +1361,17 @@ for d in skills memories cron; do
   chown -h "$AGENT_USER:$AGENT_USER" "$link"
 done
 
+# Now that the state repo is present, the skills directory exists and we can
+# enforce that every slack_triggers[].skill names a real skill. merge-slack-
+# triggers (run earlier, before the state clone) only shape-validates, so a
+# typo'd or not-yet-synced skill would otherwise reach the gateway and fail
+# silently at boot. validate-schema with --skills-root fails loud here on an
+# unknown skill (or any malformed trigger / unsupported overflow policy),
+# aborting the install before the gateway is restarted (BRIX-1441).
+echo "==> validating slack_triggers skill bindings against $STATE_TARGET/skills"
+python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+  validate-schema --skills-root "$STATE_TARGET/skills"
+
 # ---------- hermes-sync ----------
 # Install the periodic two-way sync script and its systemd timer. The script
 # lives at /usr/local/sbin so the agent (group $AGENT_USER) can read but not

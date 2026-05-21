@@ -92,6 +92,25 @@ class TestValidateSchema:
         r = _run(p, "validate-schema")
         assert r.returncode == 0, r.stderr
 
+    def test_on_overflow_error_rejected(self, tmp_path: Path, base_values_body: str):
+        # BRIX-1441: the installer used to accept on_overflow: error, but the
+        # gateway router only implements "skip" and rejects "error" at boot.
+        # Reject it at install time so the two ends can't drift.
+        triggers = textwrap.dedent(
+            """
+            slack_triggers:
+              - channel_id: C0FEEDBACK
+                skill: feedback-intake
+                rate_limit:
+                  max_per_hour: 30
+                  on_overflow: error
+            """
+        )
+        p = _write_values(tmp_path, base_values_body, triggers)
+        r = _run(p, "validate-schema")
+        assert r.returncode == 1
+        assert "on_overflow" in r.stderr
+
     def test_bad_channel_id_rejected(self, tmp_path: Path, base_values_body: str):
         triggers = textwrap.dedent(
             """
