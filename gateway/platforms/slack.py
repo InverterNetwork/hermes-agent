@@ -2364,9 +2364,9 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 )
-                has_live_session = (
+                has_pending_user_prompt = (
                     is_thread_reply
-                    and self._has_live_session_for_thread(
+                    and self._thread_has_pending_user_prompt(
                         channel_id=channel_id,
                         thread_ts=event_thread_ts,
                         user_id=user_id,
@@ -2378,7 +2378,7 @@ class SlackAdapter(BasePlatformAdapter):
                     text,
                     event=event,
                     has_session=has_session,
-                    has_live_session=has_live_session,
+                    has_pending_user_prompt=has_pending_user_prompt,
                 ):
                     logger.debug(
                         "[Slack] Suppressed non-actionable thread follow-up "
@@ -3162,18 +3162,24 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
-    def _has_live_session_for_thread(
+    def _thread_has_pending_user_prompt(
         self,
         channel_id: str,
         thread_ts: str,
         user_id: str,
     ) -> bool:
-        """Return whether this thread has an in-process adapter session.
+        """Return whether the last stored assistant turn asks for user input.
 
-        This is intentionally narrower than ``_has_active_session_for_thread``:
-        persisted session-store entries preserve context, but they should not
-        be treated as a live clarification wait state for quiet-thread routing.
+        Quiet-thread routing must preserve short arbitrary clarification
+        answers ("frontend", "B", "option 2"), but neither persisted session
+        existence nor ``_active_sessions`` proves the agent is waiting for one.
+        Use the transcript shape instead: only a trailing assistant question is
+        treated as a pending free-form prompt.
         """
+        session_store = getattr(self, "_session_store", None)
+        if not session_store:
+            return False
+
         try:
             from gateway.session import SessionSource, build_session_key
 
@@ -3184,12 +3190,32 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 thread_id=thread_ts,
             )
+            store_cfg = getattr(session_store, "config", None)
+            gspu = getattr(store_cfg, "group_sessions_per_user", True) if store_cfg else True
+            tspu = getattr(store_cfg, "thread_sessions_per_user", False) if store_cfg else False
             session_key = build_session_key(
                 source,
-                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                group_sessions_per_user=gspu,
+                thread_sessions_per_user=tspu,
             )
-            return session_key in getattr(self, "_active_sessions", {})
+
+            session_store._ensure_loaded()
+            entry = session_store._entries.get(session_key)
+            if entry is None:
+                return False
+
+            transcript = session_store.load_transcript(entry.session_id)
+            for message in reversed(transcript):
+                role = message.get("role")
+                if role == "user":
+                    return False
+                if role != "assistant":
+                    continue
+                content = message.get("content") or ""
+                if not isinstance(content, str):
+                    return False
+                return self._slack_assistant_turn_requests_input(content)
+            return False
         except Exception:
             return False
 
@@ -3304,7 +3330,7 @@ class SlackAdapter(BasePlatformAdapter):
         ``mention_to_wake_quiet_thread`` is the cost/noise-conscious default:
         an explicit mention starts a channel thread, then unmentioned thread
         replies are processed when they look like asks, status changes,
-        failures, completions, or live-session continuations. Low-value
+        failures, completions, or pending clarification answers. Low-value
         chatter is still suppressed. ``thread_followup`` keeps the historical
         behavior where any reply in an engaged thread wakes the agent. Use
         ``slack.strict_mention`` for the separate "mention on every channel
@@ -3333,7 +3359,7 @@ class SlackAdapter(BasePlatformAdapter):
         *,
         event: Optional[dict] = None,
         has_session: bool = False,
-        has_live_session: bool = False,
+        has_pending_user_prompt: bool = False,
     ) -> bool:
         """Whether an unmentioned channel-thread reply should invoke Hermes."""
         if self._slack_response_policy() == "thread_followup":
@@ -3345,14 +3371,14 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
         if self._slack_is_low_value_thread_chatter(normalized, event=event):
-            if has_live_session and self._slack_looks_like_confirmation_answer(normalized):
+            if has_pending_user_prompt and self._slack_looks_like_confirmation_answer(normalized):
                 return True
             return False
 
-        # Live sessions can be waiting on arbitrary short clarification
-        # answers ("frontend", "B", "option 2"). Preserve that continuation
-        # path, while persisted sessions still need an ask/state-update signal.
-        if has_live_session:
+        # Preserve arbitrary short clarification answers ("frontend", "B",
+        # "option 2") only when the stored assistant turn actually asked for
+        # input. A running/persisted session alone is not proof of user intent.
+        if has_pending_user_prompt:
             return True
 
         # Questions and explicit requests are direct asks.
@@ -3385,6 +3411,22 @@ class SlackAdapter(BasePlatformAdapter):
             return True
 
         return False
+
+    def _slack_assistant_turn_requests_input(self, text: str) -> bool:
+        """Best-effort check for a trailing assistant question/prompt."""
+        normalized = self._normalize_thread_followup_text(text)
+        if not normalized:
+            return False
+        if "?" in normalized:
+            return True
+        prompt_re = re.compile(
+            r"\b("
+            r"which|what|who|where|when|how|confirm|choose|pick|select|"
+            r"let me know|tell me|send me|reply with"
+            r")\b",
+            re.IGNORECASE,
+        )
+        return bool(prompt_re.search(normalized))
 
     def _normalize_thread_followup_text(self, text: str) -> str:
         text = re.sub(r"<@[A-Z0-9]+>", " ", text or "")
