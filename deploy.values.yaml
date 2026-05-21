@@ -406,6 +406,7 @@ slack:
     # If non-empty, the bot ONLY responds in these channels (whitelist).
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
+      - C0AMT3TD86R
       - C0B23MZ0USV
       - C0B4LLZ5Z2L
       - C0B4A6LEW31
