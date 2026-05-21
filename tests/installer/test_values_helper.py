@@ -1586,6 +1586,95 @@ class TestListRepos:
             "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
         ]
 
+    def test_get_repo_config_add_emits_quay_payload_with_optional_fields(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    quay:\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "      test_cmd: bun test\n"
+            "      ci_workflow_name: CI\n"
+            "      contribution_guide_path: docs/CONTRIBUTING.md\n"
+            "      worker_agent: codex\n"
+            "      reviewer_agent: claude\n"
+            "      worker_model: gpt-5.4\n"
+            "      reviewer_model: gpt-5.4-mini\n",
+            encoding="utf-8",
+        )
+
+        r = _run(values, "get-repo-config", "alpha", "--mode", "add")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {
+            "repo_id": "alpha",
+            "repo_url": "https://github.com/example/alpha",
+            "base_branch": "main",
+            "package_manager": "bun",
+            "install_cmd": "bun install",
+            "test_cmd": "bun test",
+            "ci_workflow_name": "CI",
+            "contribution_guide_path": "docs/CONTRIBUTING.md",
+            "agent_worker": "codex",
+            "agent_reviewer": "claude",
+            "model_worker": "gpt-5.4",
+            "model_reviewer": "gpt-5.4-mini",
+        }
+
+    def test_get_repo_config_update_clears_absent_optional_fields(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: dev\n"
+            "    quay:\n"
+            "      package_manager: pnpm\n"
+            "      install_cmd: pnpm install --frozen-lockfile\n",
+            encoding="utf-8",
+        )
+
+        r = _run(values, "get-repo-config", "alpha", "--mode", "update")
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == {
+            "repo_url": "https://github.com/example/alpha",
+            "base_branch": "dev",
+            "package_manager": "pnpm",
+            "install_cmd": "pnpm install --frozen-lockfile",
+            "test_cmd": None,
+            "ci_workflow_name": None,
+            "contribution_guide_path": None,
+            "agent_worker": None,
+            "agent_reviewer": None,
+            "model_worker": None,
+            "model_reviewer": None,
+        }
+
+    def test_get_repo_config_rejects_conflicting_aliases(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "repos:\n"
+            "  - id: alpha\n"
+            "    url: https://github.com/example/alpha\n"
+            "    base_branch: main\n"
+            "    quay:\n"
+            "      package_manager: bun\n"
+            "      install_cmd: bun install\n"
+            "      agent_worker: claude\n"
+            "      worker_agent: codex\n",
+            encoding="utf-8",
+        )
+
+        r = _run(values, "get-repo-config", "alpha", "--mode", "update")
+        assert r.returncode == 1
+        assert "conflicting quay.agent_worker / quay.worker_agent" in r.stderr
+
     def test_missing_repos_section_emits_nothing(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text("quay:\n  version: v0.1.0\n", encoding="utf-8")

@@ -67,6 +67,12 @@ Subcommands:
                                   empty package_manager + install_cmd
                                   fields. Pass `--quay` to filter to
                                   quay-managed entries only.
+  get-repo-config <repo_id> --mode add|update
+                                — emit the Quay repo add/update JSON payload
+                                  for one repos[] entry. Update payloads
+                                  include nullable optional fields so
+                                  setup-hermes.sh can reconcile stale repo
+                                  metadata declaratively on every install.
   parse-repo-list-ids          — read `quay repo list` JSON from stdin, emit
                                   one repo_id per line. Single source of truth
                                   for the field name on the consumer side.
@@ -1233,6 +1239,155 @@ def _iter_repos(data: dict) -> list[dict]:
     return repos
 
 
+_REPO_OPTIONAL_FIELDS = (
+    "test_cmd",
+    "ci_workflow_name",
+    "contribution_guide_path",
+)
+
+_REPO_OVERRIDE_FIELD_ALIASES = {
+    "agent_worker": ("agent_worker", "worker_agent"),
+    "agent_reviewer": ("agent_reviewer", "reviewer_agent"),
+    "model_worker": ("model_worker", "worker_model"),
+    "model_reviewer": ("model_reviewer", "reviewer_model"),
+}
+
+
+def _repo_scalar(
+    value: Any,
+    path: str,
+    *,
+    required: bool,
+) -> tuple[str | None, str | None]:
+    if value is None or value == "":
+        if required:
+            return None, f"{path} is required"
+        return None, None
+    s = str(value)
+    if "\t" in s or "\n" in s:
+        return (
+            None,
+            f"{path} contains tab or newline; refusing to emit ambiguous shell payload",
+        )
+    return s, None
+
+
+def _repo_aliased_scalar(
+    block: dict,
+    index: int,
+    canonical: str,
+    aliases: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    found: list[tuple[str, str]] = []
+    for key in aliases:
+        if key not in block:
+            continue
+        value, err = _repo_scalar(
+            block.get(key),
+            f"repos[{index}].quay.{key}",
+            required=False,
+        )
+        if err is not None:
+            return None, err
+        if value is not None:
+            found.append((key, value))
+    unique = {value for _, value in found}
+    if len(unique) > 1:
+        names = " / ".join(f"quay.{key}" for key in aliases)
+        return (
+            None,
+            f"repos[{index}] has conflicting {names} values; use only one spelling",
+        )
+    return (found[0][1] if found else None), None
+
+
+def _extract_repo_config(
+    entry: dict,
+    index: int,
+) -> tuple[dict[str, str | None] | None, bool, str | None]:
+    """Validate one repos[] entry and return Quay-ready field names.
+
+    The returned mapping uses Quay's JSON field names (`repo_id`,
+    `repo_url`, `agent_worker`, ...). The boolean says whether the entry
+    carries a `quay:` block and should be registered with Quay.
+    """
+    if not isinstance(entry, dict):
+        return None, False, f"repos[{index}] must be a mapping"
+
+    row: dict[str, str | None] = {}
+    required_map = (
+        ("id", "repo_id"),
+        ("url", "repo_url"),
+        ("base_branch", "base_branch"),
+    )
+    for values_key, quay_key in required_map:
+        value, err = _repo_scalar(
+            entry.get(values_key),
+            f"repos[{index}].{values_key}",
+            required=True,
+        )
+        if err is not None:
+            return None, False, err
+        row[quay_key] = value
+
+    repo_id = row["repo_id"]
+    repo_url = row["repo_url"]
+    if not _REPO_ID_RE.match(str(repo_id)):
+        return (
+            None,
+            False,
+            f"repos[{index}].id={repo_id!r} must match "
+            f"{_REPO_ID_RE.pattern} (alnum/./-/_, no path separators, no leading dot)",
+        )
+    url_err = _validate_repo_url(str(repo_url), index)
+    if url_err:
+        return None, False, url_err
+
+    quay_block = entry.get("quay")
+    if quay_block is not None and not isinstance(quay_block, dict):
+        return None, False, f"repos[{index}].quay must be a mapping when present"
+    if not isinstance(quay_block, dict):
+        return row, False, None
+
+    for field in ("package_manager", "install_cmd"):
+        value, err = _repo_scalar(
+            quay_block.get(field),
+            f"repos[{index}].quay.{field}",
+            required=True,
+        )
+        if err is not None:
+            return None, True, (
+                f"{err} when the `quay:` block is present"
+                if err.endswith(" is required")
+                else err
+            )
+        row[field] = value
+
+    for field in _REPO_OPTIONAL_FIELDS:
+        value, err = _repo_scalar(
+            quay_block.get(field),
+            f"repos[{index}].quay.{field}",
+            required=False,
+        )
+        if err is not None:
+            return None, True, err
+        row[field] = value
+
+    for canonical, aliases in _REPO_OVERRIDE_FIELD_ALIASES.items():
+        value, err = _repo_aliased_scalar(quay_block, index, canonical, aliases)
+        if err is not None:
+            return None, True, err
+        row[canonical] = value
+
+    _, tags_err = _validate_repo_tags_block(
+        f"repos[{index}].quay.tags", quay_block.get("tags"),
+    )
+    if tags_err is not None:
+        return None, True, tags_err
+
+    return row, True, None
+
+
 def cmd_list_repos(args: argparse.Namespace) -> int:
     """Emit one TSV line per repos[] entry: <id>\\t<url>\\t<base_branch>\\t<package_manager>\\t<install_cmd>.
 
@@ -1252,73 +1407,65 @@ def cmd_list_repos(args: argparse.Namespace) -> int:
     entries = _iter_repos(data)
 
     for i, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
+        config, is_quay, err = _extract_repo_config(entry, i)
+        if err is not None:
+            sys.stderr.write(f"values_helper.py: {err}\n")
             return 1
-        # Required scalars: id, url, base_branch.
-        row: list[str] = []
-        for field in ("id", "url", "base_branch"):
-            v = entry.get(field)
-            if v is None or v == "":
-                sys.stderr.write(
-                    f"values_helper.py: repos[{i}].{field} is required\n"
-                )
-                return 1
-            s = str(v)
-            if "\t" in s or "\n" in s:
-                sys.stderr.write(
-                    f"values_helper.py: repos[{i}].{field} contains tab or newline; "
-                    "refusing to emit ambiguous TSV\n"
-                )
-                return 1
-            row.append(s)
-        if not _REPO_ID_RE.match(row[0]):
-            sys.stderr.write(
-                f"values_helper.py: repos[{i}].id={row[0]!r} must match "
-                f"{_REPO_ID_RE.pattern} (alnum/./-/_, no path separators, no leading dot)\n"
-            )
-            return 1
-        url_err = _validate_repo_url(row[1], i)
-        if url_err:
-            sys.stderr.write(f"values_helper.py: {url_err}\n")
-            return 1
-
-        # Optional `quay:` sub-block.
-        quay_block = entry.get("quay")
-        if quay_block is not None and not isinstance(quay_block, dict):
-            sys.stderr.write(
-                f"values_helper.py: repos[{i}].quay must be a mapping when present\n"
-            )
-            return 1
-        pkg = ""
-        install = ""
-        if isinstance(quay_block, dict):
-            for field in ("package_manager", "install_cmd"):
-                v = quay_block.get(field)
-                if v is None or v == "":
-                    sys.stderr.write(
-                        f"values_helper.py: repos[{i}].quay.{field} is required "
-                        f"when the `quay:` block is present\n"
-                    )
-                    return 1
-                s = str(v)
-                if "\t" in s or "\n" in s:
-                    sys.stderr.write(
-                        f"values_helper.py: repos[{i}].quay.{field} contains "
-                        "tab or newline; refusing to emit ambiguous TSV\n"
-                    )
-                    return 1
-                if field == "package_manager":
-                    pkg = s
-                else:
-                    install = s
-        elif args.quay:
-            # `--quay` filter and this entry has no quay: block — skip.
+        if args.quay and not is_quay:
             continue
 
-        row.extend([pkg, install])
+        row = [
+            str(config["repo_id"]),
+            str(config["repo_url"]),
+            str(config["base_branch"]),
+            str(config.get("package_manager") or ""),
+            str(config.get("install_cmd") or ""),
+        ]
         sys.stdout.write("\t".join(row) + "\n")
     return 0
+
+
+def cmd_get_repo_config(args: argparse.Namespace) -> int:
+    """Emit Quay repo add/update JSON for one repos[] entry."""
+    data = _load(Path(args.values))
+    entries = _iter_repos(data)
+    for i, entry in enumerate(entries):
+        config, is_quay, err = _extract_repo_config(entry, i)
+        if err is not None:
+            sys.stderr.write(f"values_helper.py: {err}\n")
+            return 1
+        if config is None or config.get("repo_id") != args.repo:
+            continue
+        if not is_quay:
+            sys.stderr.write(
+                f"values_helper.py: repos[].id={args.repo!r} has no `quay:` block\n"
+            )
+            return 1
+
+        required = {
+            "repo_url": config["repo_url"],
+            "base_branch": config["base_branch"],
+            "package_manager": config["package_manager"],
+            "install_cmd": config["install_cmd"],
+        }
+        optional_keys = (
+            *_REPO_OPTIONAL_FIELDS,
+            *_REPO_OVERRIDE_FIELD_ALIASES.keys(),
+        )
+        if args.mode == "add":
+            payload = {"repo_id": config["repo_id"], **required}
+            for key in optional_keys:
+                if config.get(key) is not None:
+                    payload[key] = config[key]
+        else:
+            payload = {**required}
+            for key in optional_keys:
+                payload[key] = config.get(key)
+        sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return 0
+
+    sys.stderr.write(f"values_helper.py: repo not found in repos[]: {args.repo}\n")
+    return 1
 
 
 # Quay's tag-vocab charsets. Namespace is `[a-z0-9]+` with no dash because
@@ -1886,45 +2033,10 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
         return 1
 
     for i, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            sys.stderr.write(f"values_helper.py: repos[{i}] must be a mapping\n")
+        _, _, repo_err = _extract_repo_config(entry, i)
+        if repo_err is not None:
+            sys.stderr.write(f"values_helper.py: {repo_err}\n")
             return 1
-        for field in ("id", "url", "base_branch"):
-            if not entry.get(field):
-                sys.stderr.write(
-                    f"values_helper.py: repos[{i}].{field} is required\n"
-                )
-                return 1
-        if not _REPO_ID_RE.match(str(entry["id"])):
-            sys.stderr.write(
-                f"values_helper.py: repos[{i}].id={entry['id']!r} must match "
-                f"{_REPO_ID_RE.pattern}\n"
-            )
-            return 1
-        url_err = _validate_repo_url(str(entry["url"]), i)
-        if url_err:
-            sys.stderr.write(f"values_helper.py: {url_err}\n")
-            return 1
-        quay_block = entry.get("quay")
-        if quay_block is not None and not isinstance(quay_block, dict):
-            sys.stderr.write(
-                f"values_helper.py: repos[{i}].quay must be a mapping when present\n"
-            )
-            return 1
-        if isinstance(quay_block, dict):
-            for field in ("package_manager", "install_cmd"):
-                if not quay_block.get(field):
-                    sys.stderr.write(
-                        f"values_helper.py: repos[{i}].quay.{field} is required "
-                        f"when the `quay:` block is present\n"
-                    )
-                    return 1
-            _, tags_err = _validate_repo_tags_block(
-                f"repos[{i}].quay.tags", quay_block.get("tags"),
-            )
-            if tags_err is not None:
-                sys.stderr.write(f"values_helper.py: {tags_err}\n")
-                return 1
         _, it_err = _validate_repo_issue_tracker_block(
             f"repos[{i}].issue_tracker",
             entry.get("issue_tracker"),
@@ -2120,6 +2232,19 @@ def main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--quay", action="store_true",
                         help="filter to entries with a `quay:` sub-block")
     p_list.set_defaults(func=cmd_list_repos)
+
+    p_repo_config = sub.add_parser(
+        "get-repo-config",
+        help="emit Quay repo add/update JSON for one repos[] entry",
+    )
+    p_repo_config.add_argument("repo", help="repos[].id to look up")
+    p_repo_config.add_argument(
+        "--mode",
+        required=True,
+        choices=("add", "update"),
+        help="emit a repo add row or repo update patch",
+    )
+    p_repo_config.set_defaults(func=cmd_get_repo_config)
 
     p_parse = sub.add_parser(
         "parse-repo-list-ids",

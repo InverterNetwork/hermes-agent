@@ -810,7 +810,11 @@ Field invariants:
   to `origin/<base_branch>` on every sync tick.
 * `quay:` is optional. Block-present-vs-absent IS the signal — there is
   no separate `quay.enabled` flag. When present, must carry
-  `package_manager` and `install_cmd`.
+  `package_manager` and `install_cmd`. Optional Quay repo metadata is
+  also reconciled on every install: `test_cmd`, `ci_workflow_name`,
+  `contribution_guide_path`, `agent_worker` / `agent_reviewer`
+  (or `worker_agent` / `reviewer_agent` aliases), and `model_worker` /
+  `model_reviewer` (or `worker_model` / `reviewer_model` aliases).
 
 ## ⚠ Secrets in code
 
