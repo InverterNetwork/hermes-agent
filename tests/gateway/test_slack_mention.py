@@ -231,28 +231,28 @@ def test_quiet_thread_allows_direct_asks_and_task_state_updates():
     assert adapter._slack_thread_followup_is_actionable("deploy failed with timeout", event={}) is True
 
 
-def test_quiet_thread_allows_narrow_clarification_answers_for_active_sessions():
+def test_quiet_thread_preserves_active_session_continuations():
     adapter = _make_adapter()
     assert adapter._slack_thread_followup_is_actionable(
-        "use prod instead",
+        "frontend",
         event={},
         has_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
-        "yes",
+        "option 2",
         event={},
         has_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
-        "no",
+        "B",
         event={},
         has_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
-        "thanks",
+        "Alice",
         event={},
         has_session=True,
-    ) is False
+    ) is True
 
 
 # ---------------------------------------------------------------------------

@@ -377,7 +377,7 @@ Set this to `true` in busy workspaces where Slack's default "the bot remembers t
 :::
 
 :::info
-Slack's default `mention_to_wake_quiet_thread` policy requires `@mention` to start a channel conversation, then allows unmentioned thread follow-ups only when they look actionable: a direct ask, a material task update, a failure/completion, or a likely clarification answer. Use `thread_followup` if you want the older behavior where every reply in an engaged thread wakes Hermes. Use `strict_mention: true` if every channel message must mention the bot. In DMs the bot always responds without needing a mention.
+Slack's default `mention_to_wake_quiet_thread` policy requires `@mention` to start a channel conversation, preserves active thread sessions so short clarification replies still work, and otherwise only allows unmentioned thread follow-ups when they look actionable: a direct ask, a material task update, or a failure/completion. Use `thread_followup` if you want the older behavior where every reply in an engaged thread wakes Hermes. Use `strict_mention: true` if every channel message must mention the bot. In DMs the bot always responds without needing a mention.
 :::
 
 ### Unauthorized User Handling
