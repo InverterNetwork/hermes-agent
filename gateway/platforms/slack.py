@@ -319,8 +319,9 @@ class SlackAdapter(BasePlatformAdapter):
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
-        # Track threads where the bot has been @mentioned — once mentioned,
-        # respond to ALL subsequent messages in that thread automatically.
+        # Track threads where the bot has been @mentioned. The response
+        # policy decides whether unmentioned follow-ups in those threads are
+        # actionable enough to invoke the agent.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
@@ -2328,12 +2329,16 @@ class SlackAdapter(BasePlatformAdapter):
         #   0. Channel is in free_response_channels, OR require_mention is
         #      disabled — always process regardless of mention.
         #   1. The bot is @mentioned in this message, OR
-        #   2. The message is a reply in a thread the bot started/participated in, OR
-        #   3. The message is in a thread where the bot was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
+        #   2. The message is an actionable reply in a thread the bot
+        #      started/participated in, OR
+        #   3. The message is an actionable reply in a thread where the bot
+        #      was previously @mentioned, OR
+        #   4. The reply is actionable in a thread with an existing session
+        #      (survives restarts, but does not by itself prove user intent)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        is_gateway_command = self._slack_text_is_gateway_command(routing_text)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2343,7 +2348,16 @@ class SlackAdapter(BasePlatformAdapter):
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
-                return  # Strict mode: ignore until @-mentioned again
+                if not (
+                    is_thread_reply
+                    and is_gateway_command
+                    and self._has_active_session_for_thread(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        user_id=user_id,
+                    )
+                ):
+                    return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
@@ -2360,7 +2374,29 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 )
+                has_pending_user_prompt = (
+                    is_thread_reply
+                    and self._thread_has_pending_user_prompt(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        user_id=user_id,
+                    )
+                )
                 if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+                    return
+                if not is_gateway_command and not self._slack_thread_followup_is_actionable(
+                    text,
+                    event=event,
+                    has_session=has_session,
+                    has_pending_user_prompt=has_pending_user_prompt,
+                ):
+                    logger.debug(
+                        "[Slack] Suppressed non-actionable thread follow-up "
+                        "channel=%s thread=%s policy=%s",
+                        channel_id,
+                        event_thread_ts,
+                        self._slack_response_policy(),
+                    )
                     return
 
         if is_mentioned:
@@ -3136,6 +3172,63 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    def _thread_has_pending_user_prompt(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        user_id: str,
+    ) -> bool:
+        """Return whether the last stored assistant turn asks for user input.
+
+        Quiet-thread routing must preserve short arbitrary clarification
+        answers ("frontend", "B", "option 2"), but neither persisted session
+        existence nor ``_active_sessions`` proves the agent is waiting for one.
+        Use the transcript shape instead: only a trailing assistant question is
+        treated as a pending free-form prompt.
+        """
+        session_store = getattr(self, "_session_store", None)
+        if not session_store:
+            return False
+
+        try:
+            from gateway.session import SessionSource, build_session_key
+
+            source = SessionSource(
+                platform=Platform.SLACK,
+                chat_id=channel_id,
+                chat_type="group",
+                user_id=user_id,
+                thread_id=thread_ts,
+            )
+            store_cfg = getattr(session_store, "config", None)
+            gspu = getattr(store_cfg, "group_sessions_per_user", True) if store_cfg else True
+            tspu = getattr(store_cfg, "thread_sessions_per_user", False) if store_cfg else False
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=gspu,
+                thread_sessions_per_user=tspu,
+            )
+
+            session_store._ensure_loaded()
+            entry = session_store._entries.get(session_key)
+            if entry is None:
+                return False
+
+            transcript = session_store.load_transcript(entry.session_id)
+            for message in reversed(transcript):
+                role = message.get("role")
+                if role == "user":
+                    return False
+                if role != "assistant":
+                    continue
+                content = message.get("content") or ""
+                if not isinstance(content, str):
+                    return False
+                return self._slack_assistant_turn_requests_input(content)
+            return False
+        except Exception:
+            return False
+
     async def _download_slack_file(self, url: str, ext: str, audio: bool = False, team_id: str = "") -> str:
         """Download a Slack file using the bot token for auth, with retry."""
         import httpx
@@ -3240,6 +3333,163 @@ class SlackAdapter(BasePlatformAdapter):
                 return configured.lower() in ("true", "1", "yes", "on")
             return bool(configured)
         return os.getenv("SLACK_STRICT_MENTION", "false").lower() in ("true", "1", "yes", "on")
+
+    def _slack_response_policy(self) -> str:
+        """Return the Slack channel response policy.
+
+        ``mention_to_wake_quiet_thread`` is the cost/noise-conscious default:
+        an explicit mention starts a channel thread, then unmentioned thread
+        replies are processed when they look like asks, status changes,
+        failures, completions, or pending clarification answers. Low-value
+        chatter is still suppressed. ``thread_followup`` keeps the historical
+        behavior where any reply in an engaged thread wakes the agent. Use
+        ``slack.strict_mention`` for the separate "mention on every channel
+        message" mode.
+        """
+        configured = self.config.extra.get("response_policy")
+        if configured is None:
+            configured = os.getenv("SLACK_RESPONSE_POLICY", "")
+        value = str(configured or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "mention_to_wake_quiet_thread",
+            "default": "mention_to_wake_quiet_thread",
+            "quiet": "mention_to_wake_quiet_thread",
+            "quiet_thread": "mention_to_wake_quiet_thread",
+            "mention_to_wake": "mention_to_wake_quiet_thread",
+            "mention_to_wake_quiet_thread": "mention_to_wake_quiet_thread",
+            "legacy": "thread_followup",
+            "thread": "thread_followup",
+            "thread_followup": "thread_followup",
+        }
+        return aliases.get(value, "mention_to_wake_quiet_thread")
+
+    def _slack_thread_followup_is_actionable(
+        self,
+        text: str,
+        *,
+        event: Optional[dict] = None,
+        has_session: bool = False,
+        has_pending_user_prompt: bool = False,
+    ) -> bool:
+        """Whether an unmentioned channel-thread reply should invoke Hermes."""
+        if self._slack_response_policy() == "thread_followup":
+            return True
+
+        event = event or {}
+        normalized = self._normalize_thread_followup_text(text)
+        if not normalized:
+            return False
+
+        if self._slack_is_low_value_thread_chatter(normalized, event=event):
+            if has_pending_user_prompt and self._slack_looks_like_confirmation_answer(normalized):
+                return True
+            return False
+
+        # Preserve arbitrary short clarification answers ("frontend", "B",
+        # "option 2") only when the stored assistant turn actually asked for
+        # input. A running/persisted session alone is not proof of user intent.
+        if has_pending_user_prompt:
+            return True
+
+        # Questions and explicit requests are direct asks.
+        if "?" in normalized:
+            return True
+
+        request_re = re.compile(
+            r"\b("
+            r"can|could|would|will|should|please|pls|help|check|look|"
+            r"run|rerun|retry|try|fix|debug|investigate|explain|summarize|"
+            r"update|create|open|file|send|post|deploy|merge|review|"
+            r"thoughts|wdyt|what|why|how|when|where|which"
+            r")\b",
+            re.IGNORECASE,
+        )
+        if request_re.search(normalized):
+            return True
+
+        # Material task-state updates are worth showing to the active thread.
+        state_re = re.compile(
+            r"\b("
+            r"done|fixed|resolved|complete|completed|shipped|merged|"
+            r"deployed|failed|failing|failure|error|exception|blocked|"
+            r"stuck|broken|regression|timeout|timed out|crash|crashed|"
+            r"logs?|stacktrace|traceback|status|ready|repro|reproduced"
+            r")\b",
+            re.IGNORECASE,
+        )
+        if state_re.search(normalized):
+            return True
+
+        return False
+
+    def _slack_text_is_gateway_command(self, text: str) -> bool:
+        """Return whether Slack text starts with a known gateway slash command."""
+        text = (text or "").strip()
+        if not text.startswith("/"):
+            return False
+        parts = text.split(maxsplit=1)
+        raw = parts[0][1:].lower() if parts else ""
+        if "@" in raw:
+            raw = raw.split("@", 1)[0]
+        if not raw or "/" in raw:
+            return False
+        try:
+            from hermes_cli.commands import should_bypass_active_session
+
+            return should_bypass_active_session(raw)
+        except Exception:
+            return False
+
+    def _slack_assistant_turn_requests_input(self, text: str) -> bool:
+        """Best-effort check for a trailing assistant question/prompt."""
+        normalized = self._normalize_thread_followup_text(text)
+        if not normalized:
+            return False
+        if "?" in normalized:
+            return True
+        prompt_re = re.compile(
+            r"\b("
+            r"which|what|who|where|when|how|confirm|choose|pick|select|"
+            r"let me know|tell me|send me|reply with"
+            r")\b",
+            re.IGNORECASE,
+        )
+        return bool(prompt_re.search(normalized))
+
+    def _normalize_thread_followup_text(self, text: str) -> str:
+        text = re.sub(r"<@[A-Z0-9]+>", " ", text or "")
+        text = re.sub(r"<#[A-Z0-9]+(?:\|[^>]+)?>", " ", text)
+        text = re.sub(r"<https?://[^>|]+(?:\|[^>]+)?>", " link ", text)
+        text = re.sub(r":[a-z0-9_+\-]+:", " ", text, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _slack_looks_like_confirmation_answer(self, text: str) -> bool:
+        lowered = text.lower().strip(" .,!?:;\"'")
+        return lowered in {"yes", "yep", "yeah", "y", "no", "nope", "nah", "n"}
+
+    def _slack_is_low_value_thread_chatter(self, text: str, *, event: dict) -> bool:
+        if event.get("subtype") in {"file_share", "me_message"} and len(text) < 24:
+            return True
+        if event.get("files") and len(text) < 24:
+            return True
+
+        lowered = text.lower().strip(" .,!?:;\"'")
+        if not lowered:
+            return True
+
+        low_value = {
+            "ok", "okay", "k", "kk", "sure", "yep", "yes", "no", "nope",
+            "thanks", "thank you", "thx", "ty", "got it", "sgtm", "sounds good",
+            "ack", "acknowledged", "lol", "lmao", "haha", "nice", "+1", "same",
+            "cool", "great", "awesome", "perfect", "done thanks",
+        }
+        if lowered in low_value:
+            return True
+        if re.fullmatch(r"[\W_]+", lowered):
+            return True
+        if re.fullmatch(r"(ha)+h?|lo+l|lmao|rofl", lowered):
+            return True
+        return False
 
     def _slack_free_response_channels(self) -> set:
         """Return channel IDs where no @mention is required."""

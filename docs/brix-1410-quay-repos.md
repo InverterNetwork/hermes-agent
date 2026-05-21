@@ -36,4 +36,3 @@ If no suitable issue exists for a repo yet, record the dry-run equivalent as:
 
 1. `quay-as-hermes repo list` shows the repo id.
 2. `installer/hermes_installer/verify.py --verify` reports the repo as registered (no `[DRIFT] quay repo <id>`).
-

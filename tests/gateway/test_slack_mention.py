@@ -5,6 +5,7 @@ Follows the same pattern as test_whatsapp_group_gating.py.
 """
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from gateway.config import Platform, PlatformConfig
@@ -55,7 +56,12 @@ CHANNEL_ID = "C0AQWDLHY9M"
 OTHER_CHANNEL_ID = "C9999999999"
 
 
-def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None):
+def _make_adapter(
+    require_mention=None,
+    strict_mention=None,
+    free_response_channels=None,
+    response_policy=None,
+):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -63,6 +69,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["strict_mention"] = strict_mention
     if free_response_channels is not None:
         extra["free_response_channels"] = free_response_channels
+    if response_policy is not None:
+        extra["response_policy"] = response_policy
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -179,6 +187,257 @@ def test_strict_mention_env_var_fallback(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests: response policy / quiet thread filtering
+# ---------------------------------------------------------------------------
+
+def test_response_policy_defaults_to_quiet_thread(monkeypatch):
+    monkeypatch.delenv("SLACK_RESPONSE_POLICY", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_response_policy() == "mention_to_wake_quiet_thread"
+
+
+def test_response_policy_legacy_alias_allows_thread_followups():
+    adapter = _make_adapter(response_policy="legacy")
+    assert adapter._slack_response_policy() == "thread_followup"
+    assert adapter._slack_thread_followup_is_actionable("lol", event={}) is True
+
+
+def test_response_policy_does_not_enable_strict_mention():
+    adapter = _make_adapter(response_policy="strict_mention")
+    assert adapter._slack_response_policy() == "mention_to_wake_quiet_thread"
+    assert adapter._slack_strict_mention() is False
+
+
+def test_quiet_thread_suppresses_acknowledgements_and_jokes():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable("thanks!", event={}) is False
+    assert adapter._slack_thread_followup_is_actionable("lol", event={}) is False
+
+
+def test_quiet_thread_suppresses_bare_file_or_gif_share():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "",
+        event={"subtype": "file_share", "files": [{"mimetype": "image/gif"}]},
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "nice",
+        event={"files": [{"mimetype": "image/gif"}]},
+    ) is False
+
+
+def test_quiet_thread_allows_direct_asks_and_task_state_updates():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable("can you check the logs?", event={}) is True
+    assert adapter._slack_thread_followup_is_actionable("deploy failed with timeout", event={}) is True
+
+
+def test_quiet_thread_preserves_pending_prompt_continuations():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "yes",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "no",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "frontend",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "option 2",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "B",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "Alice",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=True,
+    ) is True
+
+
+def test_quiet_thread_session_presence_does_not_bypass_actionable_checks():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "frontend",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "that makes sense",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "I talked with Alice",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "can you check frontend?",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "deploy failed",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is True
+
+
+def test_quiet_thread_suppresses_live_session_chatter_without_pending_prompt():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "thanks",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "lol",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "that makes sense",
+        event={},
+        has_session=True,
+        has_pending_user_prompt=False,
+    ) is False
+
+
+def test_slack_text_is_gateway_command_recognizes_control_commands():
+    adapter = _make_adapter()
+    assert adapter._slack_text_is_gateway_command("/approve") is True
+    assert adapter._slack_text_is_gateway_command("/deny all") is True
+    assert adapter._slack_text_is_gateway_command("/stop please") is True
+    assert adapter._slack_text_is_gateway_command("/reset@Hermes") is True
+
+
+def test_slack_text_is_gateway_command_rejects_unknown_or_non_commands():
+    adapter = _make_adapter()
+    assert adapter._slack_text_is_gateway_command("approve") is False
+    assert adapter._slack_text_is_gateway_command("/not-a-real-command") is False
+    assert adapter._slack_text_is_gateway_command("/tmp/file") is False
+
+
+class _FakeSessionStore:
+    def __init__(self, session_key, messages):
+        self.config = SimpleNamespace(
+            group_sessions_per_user=True,
+            thread_sessions_per_user=False,
+        )
+        self._entries = {
+            session_key: SimpleNamespace(session_id="session-1"),
+        }
+        self._messages = messages
+
+    def _ensure_loaded(self):
+        return None
+
+    def load_transcript(self, session_id):
+        assert session_id == "session-1"
+        return self._messages
+
+
+def test_thread_has_pending_user_prompt_uses_trailing_assistant_question():
+    from gateway.session import SessionSource, build_session_key
+
+    adapter = _make_adapter()
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id=CHANNEL_ID,
+        chat_type="group",
+        user_id="U123",
+        thread_id="171234.000100",
+    )
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    adapter._session_store = _FakeSessionStore(
+        session_key,
+        [{"role": "assistant", "content": "Which package should I use?"}],
+    )
+
+    assert adapter._thread_has_pending_user_prompt(CHANNEL_ID, "171234.000100", "U123") is True
+
+
+def test_thread_has_pending_user_prompt_rejects_ordinary_trailing_assistant_text():
+    from gateway.session import SessionSource, build_session_key
+
+    adapter = _make_adapter()
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id=CHANNEL_ID,
+        chat_type="group",
+        user_id="U123",
+        thread_id="171234.000100",
+    )
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    adapter._session_store = _FakeSessionStore(
+        session_key,
+        [{"role": "assistant", "content": "I updated the docs."}],
+    )
+
+    assert adapter._thread_has_pending_user_prompt(CHANNEL_ID, "171234.000100", "U123") is False
+
+
+def test_thread_has_pending_user_prompt_rejects_after_user_reply():
+    from gateway.session import SessionSource, build_session_key
+
+    adapter = _make_adapter()
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id=CHANNEL_ID,
+        chat_type="group",
+        user_id="U123",
+        thread_id="171234.000100",
+    )
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+    adapter._session_store = _FakeSessionStore(
+        session_key,
+        [
+            {"role": "assistant", "content": "Which package should I use?"},
+            {"role": "user", "content": "frontend"},
+        ],
+    )
+
+    assert adapter._thread_has_pending_user_prompt(CHANNEL_ID, "171234.000100", "U123") is False
+
+
+# ---------------------------------------------------------------------------
 # Tests: _slack_free_response_channels
 # ---------------------------------------------------------------------------
 
@@ -238,7 +497,7 @@ def test_free_response_channels_int_list():
 
 def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
                    text="hello", mentioned=False, thread_reply=False,
-                   active_session=False):
+                   active_session=False, pending_user_prompt=False):
     """Simulate the mention gating logic from _handle_slack_message.
 
     Returns True if the message would be processed, False if it would be
@@ -254,9 +513,22 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
             return True
         elif not adapter._slack_require_mention():
             return True
+        elif adapter._slack_strict_mention() and not is_mentioned:
+            return bool(
+                thread_reply
+                and active_session
+                and adapter._slack_text_is_gateway_command(text)
+            )
         elif not is_mentioned:
             if thread_reply and active_session:
-                return True
+                if adapter._slack_text_is_gateway_command(text):
+                    return True
+                return adapter._slack_thread_followup_is_actionable(
+                    text,
+                    event={},
+                    has_session=active_session,
+                    has_pending_user_prompt=pending_user_prompt,
+                )
             else:
                 return False
     return True
@@ -301,7 +573,63 @@ def test_mentioned_message_always_processed():
 def test_thread_reply_with_active_session_processed():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
-        adapter, text="followup",
+        adapter, text="can you check the logs?",
+        thread_reply=True, active_session=True,
+    ) is True
+
+
+def test_thread_reply_with_active_session_allows_short_clarification_answer():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="yes",
+        thread_reply=True, active_session=True, pending_user_prompt=True,
+    ) is True
+
+
+def test_thread_reply_with_active_session_but_chatter_ignored():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="thanks",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_thread_reply_with_active_session_allows_gateway_control_command():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="/approve",
+        thread_reply=True, active_session=True,
+    ) is True
+    assert _would_process(
+        adapter, text="/stop",
+        thread_reply=True, active_session=True,
+    ) is True
+
+
+def test_thread_reply_without_active_session_still_suppresses_gateway_command():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="/approve",
+        thread_reply=True, active_session=False,
+    ) is False
+
+
+def test_strict_mention_allows_active_session_gateway_control_command():
+    adapter = _make_adapter(require_mention=True, strict_mention=True)
+    assert _would_process(
+        adapter, text="/deny",
+        thread_reply=True, active_session=True,
+    ) is True
+    assert _would_process(
+        adapter, text="can you check the logs?",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_legacy_response_policy_processes_thread_chatter():
+    adapter = _make_adapter(require_mention=True, response_policy="thread_followup")
+    assert _would_process(
+        adapter, text="thanks",
         thread_reply=True, active_session=True,
     ) is True
 
@@ -351,6 +679,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     (hermes_home / "config.yaml").write_text(
         "slack:\n"
         "  require_mention: false\n"
+        "  response_policy: thread_followup\n"
         "  free_response_channels:\n"
         "    - C0AQWDLHY9M\n"
         "    - C9999999999\n",
@@ -359,6 +688,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("SLACK_RESPONSE_POLICY", raising=False)
     monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
 
     config = load_gateway_config()
@@ -366,10 +696,12 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert config is not None
     slack_extra = config.platforms[Platform.SLACK].extra
     assert slack_extra.get("require_mention") is False
+    assert slack_extra.get("response_policy") == "thread_followup"
     assert slack_extra.get("free_response_channels") == ["C0AQWDLHY9M", "C9999999999"]
     # Verify env vars were set by config bridging
     import os as _os
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
+    assert _os.environ["SLACK_RESPONSE_POLICY"] == "thread_followup"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
 
 
