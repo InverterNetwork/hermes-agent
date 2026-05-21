@@ -55,7 +55,12 @@ CHANNEL_ID = "C0AQWDLHY9M"
 OTHER_CHANNEL_ID = "C9999999999"
 
 
-def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None):
+def _make_adapter(
+    require_mention=None,
+    strict_mention=None,
+    free_response_channels=None,
+    response_policy=None,
+):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -63,6 +68,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["strict_mention"] = strict_mention
     if free_response_channels is not None:
         extra["free_response_channels"] = free_response_channels
+    if response_policy is not None:
+        extra["response_policy"] = response_policy
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -179,6 +186,60 @@ def test_strict_mention_env_var_fallback(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests: response policy / quiet thread filtering
+# ---------------------------------------------------------------------------
+
+def test_response_policy_defaults_to_quiet_thread(monkeypatch):
+    monkeypatch.delenv("SLACK_RESPONSE_POLICY", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_response_policy() == "mention_to_wake_quiet_thread"
+
+
+def test_response_policy_legacy_alias_allows_thread_followups():
+    adapter = _make_adapter(response_policy="legacy")
+    assert adapter._slack_response_policy() == "thread_followup"
+    assert adapter._slack_thread_followup_is_actionable("lol", event={}) is True
+
+
+def test_quiet_thread_suppresses_acknowledgements_and_jokes():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable("thanks!", event={}) is False
+    assert adapter._slack_thread_followup_is_actionable("lol", event={}) is False
+
+
+def test_quiet_thread_suppresses_bare_file_or_gif_share():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "",
+        event={"subtype": "file_share", "files": [{"mimetype": "image/gif"}]},
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "nice",
+        event={"files": [{"mimetype": "image/gif"}]},
+    ) is False
+
+
+def test_quiet_thread_allows_direct_asks_and_task_state_updates():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable("can you check the logs?", event={}) is True
+    assert adapter._slack_thread_followup_is_actionable("deploy failed with timeout", event={}) is True
+
+
+def test_quiet_thread_allows_narrow_clarification_answers_for_active_sessions():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "use prod instead",
+        event={},
+        has_session=True,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "yes",
+        event={},
+        has_session=True,
+    ) is False
+
+
+# ---------------------------------------------------------------------------
 # Tests: _slack_free_response_channels
 # ---------------------------------------------------------------------------
 
@@ -254,9 +315,15 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
             return True
         elif not adapter._slack_require_mention():
             return True
+        elif adapter._slack_strict_mention() and not is_mentioned:
+            return False
         elif not is_mentioned:
             if thread_reply and active_session:
-                return True
+                return adapter._slack_thread_followup_is_actionable(
+                    text,
+                    event={},
+                    has_session=active_session,
+                )
             else:
                 return False
     return True
@@ -301,7 +368,23 @@ def test_mentioned_message_always_processed():
 def test_thread_reply_with_active_session_processed():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
-        adapter, text="followup",
+        adapter, text="can you check the logs?",
+        thread_reply=True, active_session=True,
+    ) is True
+
+
+def test_thread_reply_with_active_session_but_chatter_ignored():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="thanks",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_legacy_response_policy_processes_thread_chatter():
+    adapter = _make_adapter(require_mention=True, response_policy="thread_followup")
+    assert _would_process(
+        adapter, text="thanks",
         thread_reply=True, active_session=True,
     ) is True
 
@@ -351,6 +434,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     (hermes_home / "config.yaml").write_text(
         "slack:\n"
         "  require_mention: false\n"
+        "  response_policy: thread_followup\n"
         "  free_response_channels:\n"
         "    - C0AQWDLHY9M\n"
         "    - C9999999999\n",
@@ -359,6 +443,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("SLACK_RESPONSE_POLICY", raising=False)
     monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
 
     config = load_gateway_config()
@@ -366,10 +451,12 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert config is not None
     slack_extra = config.platforms[Platform.SLACK].extra
     assert slack_extra.get("require_mention") is False
+    assert slack_extra.get("response_policy") == "thread_followup"
     assert slack_extra.get("free_response_channels") == ["C0AQWDLHY9M", "C9999999999"]
     # Verify env vars were set by config bridging
     import os as _os
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
+    assert _os.environ["SLACK_RESPONSE_POLICY"] == "thread_followup"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
 
 

@@ -1084,6 +1084,12 @@ DEFAULT_CONFIG = {
 
     # Slack platform settings (gateway mode)
     "slack": {
+        # Channel response policy:
+        #   mention_to_wake_quiet_thread — require @mention to wake in channels,
+        #       then suppress low-value unmentioned thread chatter (default)
+        #   thread_followup — legacy: any reply in an engaged thread wakes Hermes
+        #   strict_mention — require @mention on every channel message
+        "response_policy": "mention_to_wake_quiet_thread",
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
