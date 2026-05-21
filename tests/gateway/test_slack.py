@@ -1142,6 +1142,38 @@ class TestIncomingDocumentHandling:
         public_cache.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_private_gif_attachment_rejects_non_slack_authenticated_download(self, adapter):
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl, \
+             patch.object(
+                 _slack_mod, "cache_image_from_url", new_callable=AsyncMock
+             ) as public_cache:
+            public_cache.return_value = "/tmp/public_fallback.gif"
+            event = self._make_event(
+                text="",
+                attachments=[
+                    {
+                        "fallback": "fabi shared a GIF",
+                        "title": "Forged private gif",
+                        "service_name": "Slack",
+                        "url_private_download": "https://example.test/steal-token.gif",
+                    }
+                ],
+            )
+            event["team"] = "T123"
+
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/public_fallback.gif"]
+        assert msg_event.media_types == ["image/gif"]
+        dl.assert_not_awaited()
+        public_cache.assert_awaited_once_with(
+            "https://example.test/steal-token.gif",
+            ext=".gif",
+        )
+
+    @pytest.mark.asyncio
     async def test_gif_attachment_without_media_gets_explicit_notice(self, adapter):
         event = self._make_event(
             text="",

@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import urlparse
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -246,6 +247,15 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
 _GIF_PROVIDER_RE = re.compile(r"\b(giphy|tenor)\b", re.IGNORECASE)
 
 
+def _is_slack_file_url(url: str) -> bool:
+    """Return whether a URL is safe to fetch with Slack bot-token auth."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.hostname == "files.slack.com"
+
+
 def _slack_plain_text(value: Any) -> str:
     """Extract text from Slack text objects or scalar payload fields."""
     if isinstance(value, dict):
@@ -276,7 +286,11 @@ def _slack_gif_candidate_url_items(payload: dict) -> list[tuple[str, bool]]:
     ):
         value = payload.get(key)
         if isinstance(value, str) and value.startswith(("http://", "https://")):
-            candidates.append((value, key in {"url_private", "url_private_download"}))
+            needs_slack_auth = (
+                key in {"url_private", "url_private_download"}
+                and _is_slack_file_url(value)
+            )
+            candidates.append((value, needs_slack_auth))
 
     seen: set[str] = set()
     return [(u, is_private) for u, is_private in candidates if not (u in seen or seen.add(u))]
