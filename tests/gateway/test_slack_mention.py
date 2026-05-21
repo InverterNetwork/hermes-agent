@@ -328,6 +328,21 @@ def test_quiet_thread_suppresses_live_session_chatter_without_pending_prompt():
     ) is False
 
 
+def test_slack_text_is_gateway_command_recognizes_control_commands():
+    adapter = _make_adapter()
+    assert adapter._slack_text_is_gateway_command("/approve") is True
+    assert adapter._slack_text_is_gateway_command("/deny all") is True
+    assert adapter._slack_text_is_gateway_command("/stop please") is True
+    assert adapter._slack_text_is_gateway_command("/reset@Hermes") is True
+
+
+def test_slack_text_is_gateway_command_rejects_unknown_or_non_commands():
+    adapter = _make_adapter()
+    assert adapter._slack_text_is_gateway_command("approve") is False
+    assert adapter._slack_text_is_gateway_command("/not-a-real-command") is False
+    assert adapter._slack_text_is_gateway_command("/tmp/file") is False
+
+
 class _FakeSessionStore:
     def __init__(self, session_key, messages):
         self.config = SimpleNamespace(
@@ -499,9 +514,15 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         elif not adapter._slack_require_mention():
             return True
         elif adapter._slack_strict_mention() and not is_mentioned:
-            return False
+            return bool(
+                thread_reply
+                and active_session
+                and adapter._slack_text_is_gateway_command(text)
+            )
         elif not is_mentioned:
             if thread_reply and active_session:
+                if adapter._slack_text_is_gateway_command(text):
+                    return True
                 return adapter._slack_thread_followup_is_actionable(
                     text,
                     event={},
@@ -569,6 +590,38 @@ def test_thread_reply_with_active_session_but_chatter_ignored():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="thanks",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_thread_reply_with_active_session_allows_gateway_control_command():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="/approve",
+        thread_reply=True, active_session=True,
+    ) is True
+    assert _would_process(
+        adapter, text="/stop",
+        thread_reply=True, active_session=True,
+    ) is True
+
+
+def test_thread_reply_without_active_session_still_suppresses_gateway_command():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="/approve",
+        thread_reply=True, active_session=False,
+    ) is False
+
+
+def test_strict_mention_allows_active_session_gateway_control_command():
+    adapter = _make_adapter(require_mention=True, strict_mention=True)
+    assert _would_process(
+        adapter, text="/deny",
+        thread_reply=True, active_session=True,
+    ) is True
+    assert _would_process(
+        adapter, text="can you check the logs?",
         thread_reply=True, active_session=True,
     ) is False
 

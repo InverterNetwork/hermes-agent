@@ -2338,6 +2338,7 @@ class SlackAdapter(BasePlatformAdapter):
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        is_gateway_command = self._slack_text_is_gateway_command(routing_text)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -2347,7 +2348,16 @@ class SlackAdapter(BasePlatformAdapter):
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
-                return  # Strict mode: ignore until @-mentioned again
+                if not (
+                    is_thread_reply
+                    and is_gateway_command
+                    and self._has_active_session_for_thread(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        user_id=user_id,
+                    )
+                ):
+                    return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
@@ -2374,7 +2384,7 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
                     return
-                if not self._slack_thread_followup_is_actionable(
+                if not is_gateway_command and not self._slack_thread_followup_is_actionable(
                     text,
                     event=event,
                     has_session=has_session,
@@ -3411,6 +3421,24 @@ class SlackAdapter(BasePlatformAdapter):
             return True
 
         return False
+
+    def _slack_text_is_gateway_command(self, text: str) -> bool:
+        """Return whether Slack text starts with a known gateway slash command."""
+        text = (text or "").strip()
+        if not text.startswith("/"):
+            return False
+        parts = text.split(maxsplit=1)
+        raw = parts[0][1:].lower() if parts else ""
+        if "@" in raw:
+            raw = raw.split("@", 1)[0]
+        if not raw or "/" in raw:
+            return False
+        try:
+            from hermes_cli.commands import should_bypass_active_session
+
+            return should_bypass_active_session(raw)
+        except Exception:
+            return False
 
     def _slack_assistant_turn_requests_input(self, text: str) -> bool:
         """Best-effort check for a trailing assistant question/prompt."""
