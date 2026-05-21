@@ -2333,7 +2333,8 @@ class SlackAdapter(BasePlatformAdapter):
         #      started/participated in, OR
         #   3. The message is an actionable reply in a thread where the bot
         #      was previously @mentioned, OR
-        #   4. There's an existing session for this thread (survives restarts)
+        #   4. The reply is actionable in a thread with an existing session
+        #      (survives restarts, but does not by itself prove user intent)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
         is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
@@ -2363,12 +2364,21 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 )
+                has_live_session = (
+                    is_thread_reply
+                    and self._has_live_session_for_thread(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        user_id=user_id,
+                    )
+                )
                 if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
                     return
                 if not self._slack_thread_followup_is_actionable(
                     text,
                     event=event,
                     has_session=has_session,
+                    has_live_session=has_live_session,
                 ):
                     logger.debug(
                         "[Slack] Suppressed non-actionable thread follow-up "
@@ -3152,6 +3162,37 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    def _has_live_session_for_thread(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        user_id: str,
+    ) -> bool:
+        """Return whether this thread has an in-process adapter session.
+
+        This is intentionally narrower than ``_has_active_session_for_thread``:
+        persisted session-store entries preserve context, but they should not
+        be treated as a live clarification wait state for quiet-thread routing.
+        """
+        try:
+            from gateway.session import SessionSource, build_session_key
+
+            source = SessionSource(
+                platform=Platform.SLACK,
+                chat_id=channel_id,
+                chat_type="group",
+                user_id=user_id,
+                thread_id=thread_ts,
+            )
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
+            return session_key in getattr(self, "_active_sessions", {})
+        except Exception:
+            return False
+
     async def _download_slack_file(self, url: str, ext: str, audio: bool = False, team_id: str = "") -> str:
         """Download a Slack file using the bot token for auth, with retry."""
         import httpx
@@ -3263,7 +3304,7 @@ class SlackAdapter(BasePlatformAdapter):
         ``mention_to_wake_quiet_thread`` is the cost/noise-conscious default:
         an explicit mention starts a channel thread, then unmentioned thread
         replies are processed when they look like asks, status changes,
-        failures, completions, or active-session continuations. Low-value
+        failures, completions, or live-session continuations. Low-value
         chatter is still suppressed. ``thread_followup`` keeps the historical
         behavior where any reply in an engaged thread wakes the agent. Use
         ``slack.strict_mention`` for the separate "mention on every channel
@@ -3292,6 +3333,7 @@ class SlackAdapter(BasePlatformAdapter):
         *,
         event: Optional[dict] = None,
         has_session: bool = False,
+        has_live_session: bool = False,
     ) -> bool:
         """Whether an unmentioned channel-thread reply should invoke Hermes."""
         if self._slack_response_policy() == "thread_followup":
@@ -3303,14 +3345,14 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
         if self._slack_is_low_value_thread_chatter(normalized, event=event):
-            if has_session and self._slack_looks_like_confirmation_answer(normalized):
+            if has_live_session and self._slack_looks_like_confirmation_answer(normalized):
                 return True
             return False
 
-        # Active sessions can be waiting on arbitrary short clarification
+        # Live sessions can be waiting on arbitrary short clarification
         # answers ("frontend", "B", "option 2"). Preserve that continuation
-        # path, while the low-value check above keeps thread chatter quiet.
-        if has_session:
+        # path, while persisted sessions still need an ask/state-update signal.
+        if has_live_session:
             return True
 
         # Questions and explicit requests are direct asks.

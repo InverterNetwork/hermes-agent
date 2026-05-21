@@ -237,31 +237,71 @@ def test_quiet_thread_preserves_active_session_continuations():
         "yes",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
         "no",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
         "frontend",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
         "option 2",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
         "B",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is True
     assert adapter._slack_thread_followup_is_actionable(
         "Alice",
         event={},
         has_session=True,
+        has_live_session=True,
+    ) is True
+
+
+def test_quiet_thread_persisted_session_does_not_bypass_actionable_checks():
+    adapter = _make_adapter()
+    assert adapter._slack_thread_followup_is_actionable(
+        "frontend",
+        event={},
+        has_session=True,
+        has_live_session=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "that makes sense",
+        event={},
+        has_session=True,
+        has_live_session=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "I talked with Alice",
+        event={},
+        has_session=True,
+        has_live_session=False,
+    ) is False
+    assert adapter._slack_thread_followup_is_actionable(
+        "can you check frontend?",
+        event={},
+        has_session=True,
+        has_live_session=False,
+    ) is True
+    assert adapter._slack_thread_followup_is_actionable(
+        "deploy failed",
+        event={},
+        has_session=True,
+        has_live_session=False,
     ) is True
 
 
@@ -271,12 +311,37 @@ def test_quiet_thread_suppresses_active_session_chatter():
         "thanks",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is False
     assert adapter._slack_thread_followup_is_actionable(
         "lol",
         event={},
         has_session=True,
+        has_live_session=True,
     ) is False
+
+
+def test_has_live_session_for_thread_uses_adapter_active_sessions():
+    from gateway.session import SessionSource, build_session_key
+
+    adapter = _make_adapter()
+    adapter._active_sessions = {}
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id=CHANNEL_ID,
+        chat_type="group",
+        user_id="U123",
+        thread_id="171234.000100",
+    )
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+    )
+
+    assert adapter._has_live_session_for_thread(CHANNEL_ID, "171234.000100", "U123") is False
+    adapter._active_sessions[session_key] = object()
+    assert adapter._has_live_session_for_thread(CHANNEL_ID, "171234.000100", "U123") is True
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +404,7 @@ def test_free_response_channels_int_list():
 
 def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
                    text="hello", mentioned=False, thread_reply=False,
-                   active_session=False):
+                   active_session=False, live_session=False):
     """Simulate the mention gating logic from _handle_slack_message.
 
     Returns True if the message would be processed, False if it would be
@@ -363,6 +428,7 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
                     text,
                     event={},
                     has_session=active_session,
+                    has_live_session=live_session,
                 )
             else:
                 return False
@@ -417,7 +483,7 @@ def test_thread_reply_with_active_session_allows_short_clarification_answer():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="yes",
-        thread_reply=True, active_session=True,
+        thread_reply=True, active_session=True, live_session=True,
     ) is True
 
 
