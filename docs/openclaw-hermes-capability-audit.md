@@ -1,7 +1,7 @@
 # OpenClaw vs Hermes Capability Audit
 
-Snapshot date: 2026-05-18  
-Host inspected: `krustentier`  
+Snapshot date: 2026-05-18
+Host inspected: `krustentier`
 Scope: deployed OpenClaw container and deployed Hermes Agent instance.
 
 This audit lists credential surfaces and the skills or runtime paths that use them. It intentionally does not include raw secret values.
@@ -186,4 +186,3 @@ These are implementation details of the system being sunset.
 - [ ] Confirm whether Gmail, GitBook, Telegram, bug-tracker sheet sync are still used.
 - [ ] Remove OpenClaw backup env files or archive them securely before shutdown.
 - [ ] Rotate any credentials that were only needed by OpenClaw after shutdown.
-
