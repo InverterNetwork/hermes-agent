@@ -1101,6 +1101,47 @@ class TestIncomingDocumentHandling:
         )
 
     @pytest.mark.asyncio
+    async def test_private_gif_attachment_uses_slack_authenticated_download(self, adapter):
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl, \
+             patch.object(
+                 _slack_mod, "cache_image_from_url", new_callable=AsyncMock
+             ) as public_cache:
+            dl.return_value = "/tmp/private_slack_gif.gif"
+            event = self._make_event(
+                text="",
+                attachments=[
+                    {
+                        "fallback": "fabi shared a GIF",
+                        "title": "Private workspace gif",
+                        "service_name": "Slack",
+                        "url_private_download": (
+                            "https://files.slack.com/files-pri/T123-F123/"
+                            "download/party.gif"
+                        ),
+                    }
+                ],
+            )
+            event["team"] = "T123"
+
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.PHOTO
+        assert msg_event.media_urls == ["/tmp/private_slack_gif.gif"]
+        assert msg_event.media_types == ["image/gif"]
+        assert "Title/alt: Private workspace gif" in msg_event.text
+        assert (
+            "Media: https://files.slack.com/files-pri/T123-F123/download/party.gif"
+            in msg_event.text
+        )
+        dl.assert_awaited_once_with(
+            "https://files.slack.com/files-pri/T123-F123/download/party.gif",
+            ".gif",
+            team_id="T123",
+        )
+        public_cache.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_gif_attachment_without_media_gets_explicit_notice(self, adapter):
         event = self._make_event(
             text="",

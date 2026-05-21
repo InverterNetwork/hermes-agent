@@ -257,7 +257,12 @@ def _slack_plain_text(value: Any) -> str:
 
 def _slack_gif_candidate_urls(payload: dict) -> list[str]:
     """Return GIF/media URLs from a Slack attachment or image block."""
-    candidates: list[str] = []
+    return [url for url, _is_private in _slack_gif_candidate_url_items(payload)]
+
+
+def _slack_gif_candidate_url_items(payload: dict) -> list[tuple[str, bool]]:
+    """Return GIF/media URLs with whether they require Slack auth."""
+    candidates: list[tuple[str, bool]] = []
     for key in (
         "image_url",
         "thumb_url",
@@ -271,10 +276,10 @@ def _slack_gif_candidate_urls(payload: dict) -> list[str]:
     ):
         value = payload.get(key)
         if isinstance(value, str) and value.startswith(("http://", "https://")):
-            candidates.append(value)
+            candidates.append((value, key in {"url_private", "url_private_download"}))
 
     seen: set[str] = set()
-    return [u for u in candidates if not (u in seen or seen.add(u))]
+    return [(u, is_private) for u, is_private in candidates if not (u in seen or seen.add(u))]
 
 
 def _slack_payload_looks_like_gif(payload: dict) -> bool:
@@ -2180,7 +2185,7 @@ class SlackAdapter(BasePlatformAdapter):
                         )
 
         for payload in self._extract_gif_payloads_from_event(event):
-            candidates = _slack_gif_candidate_urls(payload)
+            candidates = _slack_gif_candidate_url_items(payload)
             if not candidates:
                 attachment_notices.append(
                     "Slack GIF share did not include a downloadable media or preview URL."
@@ -2189,10 +2194,15 @@ class SlackAdapter(BasePlatformAdapter):
 
             cached = None
             last_error: Optional[Exception] = None
-            for url in candidates:
+            for url, is_slack_private in candidates:
                 try:
                     ext = ".gif" if ".gif" in url.lower() else ".jpg"
-                    cached = await cache_image_from_url(url, ext=ext)
+                    if is_slack_private:
+                        cached = await self._download_slack_file(
+                            url, ext, team_id=team_id,
+                        )
+                    else:
+                        cached = await cache_image_from_url(url, ext=ext)
                     break
                 except Exception as exc:
                     last_error = exc
