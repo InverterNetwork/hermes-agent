@@ -88,10 +88,15 @@ class OutboxItem:
     def from_mapping(cls, raw: Mapping[str, Any]) -> "OutboxItem":
         payload = _json_mapping_field(raw.get("payload_json"), raw.get("payload"))
         route_hint = _json_mapping_field(raw.get("route_hint_json"), raw.get("route_hint"))
+        payload_route_hint = payload.get("route_hint")
+        merged_route_hint = (
+            dict(payload_route_hint) if isinstance(payload_route_hint, Mapping) else {}
+        )
+        merged_route_hint.update(route_hint)
         metadata: dict[str, Any] = {}
         metadata.update(payload)
-        metadata.update(route_hint)
-        metadata["route_hint"] = dict(route_hint)
+        metadata.update(merged_route_hint)
+        metadata["route_hint"] = dict(merged_route_hint)
         metadata["quay_outbox"] = dict(raw)
         return cls(
             outbox_item_id=str(raw.get("outbox_item_id") or raw.get("id") or ""),
@@ -100,7 +105,7 @@ class OutboxItem:
             handler_class=str(raw.get("handler_class") or ""),
             claim_id=_optional_str(raw.get("claim_id")),
             payload=payload,
-            route_hint=route_hint,
+            route_hint=merged_route_hint,
             metadata=metadata,
         )
 
@@ -1300,7 +1305,7 @@ class HandoffDrainer:
                 metrics=self.metrics.as_dict(),
             )
 
-        message = delivery_message_from_outbox(item)
+        message = delivery_message_from_outbox(item, task)
         try:
             post_ref = self._post_delivery_message(
                 item=item,
@@ -2384,7 +2389,15 @@ def _json_mapping_field(encoded: Any, fallback: Any = None) -> dict[str, Any]:
     return {"value": value}
 
 
-def delivery_message_from_outbox(item: OutboxItem) -> str:
+def delivery_message_from_outbox(
+    item: OutboxItem,
+    task: TaskContext | None = None,
+) -> str:
+    if _is_pr_ready_approved_delivery(item):
+        message = _pr_ready_approved_message_from_outbox(item, task)
+        if message:
+            return message
+
     for key in ("text", "message", "body", "summary"):
         value = item.payload.get(key)
         if isinstance(value, str) and value.strip():
@@ -2399,6 +2412,142 @@ def delivery_message_from_outbox(item: OutboxItem) -> str:
     if item.payload:
         return f"Quay delivery item {item.kind}:\n{json.dumps(item.payload, sort_keys=True)}"
     return f"Quay delivery item {item.kind} for task {item.task_id}"
+
+
+def _is_pr_ready_approved_delivery(item: OutboxItem) -> bool:
+    kind = item.kind.strip().lower().replace("-", "_")
+    return kind in {"pr_ready_approved", "slack.pr_ready_approved"}
+
+
+def _pr_ready_approved_message_from_outbox(
+    item: OutboxItem,
+    task: TaskContext | None,
+) -> str:
+    payload = item.payload
+    task_id = _first_text(
+        payload.get("task_id"),
+        item.task_id,
+        task.task_id if task else None,
+    )
+    external_ref = _first_text(
+        payload.get("external_ref"),
+        payload.get("ticket_ref"),
+        payload.get("issue"),
+        payload.get("issue_id"),
+        payload.get("linear_id"),
+        task.issue if task else None,
+    )
+    repo = _first_text(
+        payload.get("repo_id"),
+        payload.get("repository"),
+        payload.get("repository_full_name"),
+        payload.get("repo"),
+        payload.get("repo_name"),
+        task.repo_id if task else None,
+    )
+    pr_number = _first_text(
+        payload.get("pr_number"),
+        payload.get("pull_request_number"),
+        payload.get("github_pr_number"),
+        _nested_value(payload, "pr", "number"),
+        _nested_value(payload, "pull_request", "number"),
+    )
+    pr_url = _first_text(
+        payload.get("pr_url"),
+        payload.get("pull_request_url"),
+        payload.get("html_url"),
+        _nested_value(payload, "pr", "url"),
+        _nested_value(payload, "pr", "html_url"),
+        _nested_value(payload, "pull_request", "url"),
+        _nested_value(payload, "pull_request", "html_url"),
+    )
+    review_id = _first_text(
+        payload.get("review_id"),
+        payload.get("pull_request_review_id"),
+        _nested_value(payload, "review", "id"),
+    )
+    review_url = _first_text(
+        payload.get("review_url"),
+        payload.get("pull_request_review_url"),
+        _nested_value(payload, "review", "url"),
+        _nested_value(payload, "review", "html_url"),
+    )
+    title = _first_text(
+        payload.get("title"),
+        payload.get("pr_title"),
+        payload.get("pull_request_title"),
+    )
+    branch = _first_text(
+        payload.get("branch"),
+        payload.get("branch_name"),
+        payload.get("head_branch"),
+        payload.get("source_branch"),
+    )
+    head_sha = _first_text(
+        payload.get("head_sha"),
+        payload.get("commit_sha"),
+        payload.get("sha"),
+    )
+    note = _first_text(payload.get("message"), payload.get("text"), payload.get("summary"))
+
+    lines = ["*Quay PR ready and reviewer-approved*"]
+    if external_ref:
+        lines.append(f"Ticket: {external_ref}")
+    if repo:
+        lines.append(f"Repo: {repo}")
+    pr_ref = _format_pr_ref(pr_number, pr_url)
+    if pr_ref:
+        lines.append(f"PR: {pr_ref}")
+    if review_id:
+        lines.append(f"Review: {_format_link(review_id, review_url)}")
+    if task_id:
+        lines.append(f"Task: {task_id}")
+    if title:
+        lines.append(f"Title: {title}")
+    if branch:
+        lines.append(f"Branch: {branch}")
+    if head_sha:
+        lines.append(f"Head: {head_sha[:12]}")
+    if note and note not in lines:
+        lines.append(f"Note: {note}")
+
+    return "\n".join(lines)
+
+
+def _format_pr_ref(pr_number: str | None, pr_url: str | None) -> str:
+    if pr_number and pr_url:
+        label = pr_number if pr_number.startswith("#") else f"#{pr_number}"
+        return _format_link(label, pr_url)
+    if pr_number:
+        return pr_number if pr_number.startswith("#") else f"#{pr_number}"
+    if pr_url:
+        return pr_url
+    return ""
+
+
+def _format_link(label: str, url: str | None) -> str:
+    if not url:
+        return label
+    return f"<{url}|{label}>"
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _nested_value(mapping: Mapping[str, Any], *path: str) -> Any:
+    value: Any = mapping
+    for key in path:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
 
 
 def _env_first(*names: str) -> str | None:

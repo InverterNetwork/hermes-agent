@@ -471,7 +471,18 @@ def test_drain_one_submits_direct_next_brief_without_slack():
 
 
 def test_drain_one_delivers_outbox_item_to_existing_thread():
-    item = delivery_item(route_hint={"slack_thread_ref": "C1234567890:1000.000000"})
+    item = delivery_item(
+        payload={
+            "external_ref": "BRIX-1447",
+            "repo_id": "InverterNetwork/hermes-agent",
+            "pr_number": 44,
+            "pr_url": "https://github.com/InverterNetwork/hermes-agent/pull/44",
+            "review_id": "RVW_kwDOExample",
+            "head_sha": "abcdef1234567890",
+            "branch": "quay/task-delivery",
+            "route_hint": {"slack_thread_ref": "C1234567890:1000.000000"},
+        }
+    )
     quay_client = FakeOutboxQuayClient(item)
     slack = FakeSlackClient()
     drainer = quay.HandoffDrainer(
@@ -486,11 +497,70 @@ def test_drain_one_delivers_outbox_item_to_existing_thread():
     assert result.status == "delivery_delivered"
     assert slack.validations == [("C1234567890", "1000.000000")]
     assert slack.questions == []
-    assert slack.acks[0][1] == "PR #44 is approved and ready."
+    delivered_text = slack.acks[0][1]
+    assert "Quay PR ready and reviewer-approved" in delivered_text
+    assert "Ticket: BRIX-1447" in delivered_text
+    assert "Repo: InverterNetwork/hermes-agent" in delivered_text
+    assert "PR: <https://github.com/InverterNetwork/hermes-agent/pull/44|#44>" in delivered_text
+    assert "Review: RVW_kwDOExample" in delivered_text
+    assert "Task: task-delivery" in delivered_text
+    assert "Head: abcdef123456" in delivered_text
     assert quay_client.completed == [item]
     assert quay_client.failed == []
     assert result.metrics["outbox_items_claimed"] == 1
     assert result.metrics["delivery_items_delivered"] == 1
+
+
+def test_drain_one_delivers_outbox_item_to_default_channel_without_route():
+    item = delivery_item(route_hint={})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.validations == []
+    assert slack.questions[0][0] == "CFALLBACK1"
+    assert "Task: task-delivery" in slack.questions[0][1]
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+
+
+def test_drain_one_delivery_stale_thread_falls_back_to_default_channel():
+    item = delivery_item(route_hint={"slack_thread_ref": "CSTALE1234:1000.000000"})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient(
+        validate_results=[
+            quay.SlackApiError("conversations.replies", "thread_not_found"),
+        ]
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.validations == [("CSTALE1234", "1000.000000")]
+    assert slack.questions[0][0] == "CFALLBACK1"
+    assert slack.questions[0][2] is None
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
 
 
 def test_drain_one_delivery_outbox_failure_marks_item_retryable():
@@ -512,6 +582,31 @@ def test_drain_one_delivery_outbox_failure_marks_item_retryable():
     assert quay_client.failed == [(item, "missing_default_slack_channel")]
 
 
+def test_drain_one_delivery_slack_failure_marks_item_retryable():
+    item = delivery_item(route_hint={})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "channel_not_found")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "slack_api_error"
+    assert quay_client.completed == []
+    assert quay_client.failed == [
+        (item, "slack_api_error:chat.postMessage:channel_not_found")
+    ]
+
+
 def test_cli_quay_adapter_claims_delivery_outbox_and_leaves_workflow_for_handoff():
     runner = RecordingDeliveryOutboxRunner()
     quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
@@ -526,7 +621,12 @@ def test_cli_quay_adapter_claims_delivery_outbox_and_leaves_workflow_for_handoff
     result = drainer.drain_one()
 
     assert result.status == "delivery_delivered"
-    assert slack.questions == [("CDELIVERY", "PR #44 is approved and ready.", None)]
+    assert slack.questions[0][0] == "CDELIVERY"
+    assert "Ticket: BRIX-1447" in slack.questions[0][1]
+    assert "Repo: repo-1" in slack.questions[0][1]
+    assert "Task: task-delivery-cli" in slack.questions[0][1]
+    assert "Note: PR #44 is approved and ready." in slack.questions[0][1]
+    assert slack.questions[0][2] is None
     calls = [" ".join(call[1:]) for call in runner.calls]
     assert calls == [
         "outbox list --status pending --handler-class delivery",
