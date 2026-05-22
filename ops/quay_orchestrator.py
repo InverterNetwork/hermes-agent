@@ -109,13 +109,13 @@ class OutboxItem:
             metadata=metadata,
         )
 
-    def as_handoff(self) -> Handoff:
+    def as_handoff(self, task: TaskContext | None = None) -> Handoff:
         return Handoff(
             handoff_id=f"outbox:{self.outbox_item_id}",
             task_id=self.task_id,
             claim_id=self.claim_id,
             reason=self.kind,
-            summary=delivery_message_from_outbox(self),
+            summary=delivery_message_from_outbox(self, task),
             metadata=dict(self.metadata),
         )
 
@@ -1285,7 +1285,7 @@ class HandoffDrainer:
 
     def _handle_claimed_delivery_item(self, item: OutboxItem) -> DrainResult:
         task = self.quay.get_task_context(item.task_id)
-        handoff = item.as_handoff()
+        handoff = item.as_handoff(task)
         route = resolve_slack_route(handoff, task, self.config)
         if route is None:
             reason = "missing_default_slack_channel"
@@ -2491,25 +2491,34 @@ def _pr_ready_approved_message_from_outbox(
     note = _first_text(payload.get("message"), payload.get("text"), payload.get("summary"))
 
     lines = ["*Quay PR ready and reviewer-approved*"]
+    rendered_values: set[str] = set()
+
+    def add_line(label: str, value: str, *aliases: Any) -> None:
+        lines.append(f"{label}: {value}")
+        for item in (value, *aliases):
+            text = _first_text(item)
+            if text:
+                rendered_values.add(text)
+
     if external_ref:
-        lines.append(f"Ticket: {external_ref}")
+        add_line("Ticket", external_ref)
     if repo:
-        lines.append(f"Repo: {repo}")
+        add_line("Repo", repo)
     pr_ref = _format_pr_ref(pr_number, pr_url)
     if pr_ref:
-        lines.append(f"PR: {pr_ref}")
+        add_line("PR", pr_ref, pr_number, pr_url)
     if review_id:
-        lines.append(f"Review: {_format_link(review_id, review_url)}")
+        add_line("Review", _format_link(review_id, review_url), review_id, review_url)
     if task_id:
-        lines.append(f"Task: {task_id}")
+        add_line("Task", task_id)
     if title:
-        lines.append(f"Title: {title}")
+        add_line("Title", title)
     if branch:
-        lines.append(f"Branch: {branch}")
+        add_line("Branch", branch)
     if head_sha:
-        lines.append(f"Head: {head_sha[:12]}")
-    if note and note not in lines:
-        lines.append(f"Note: {note}")
+        add_line("Head", head_sha[:12], head_sha)
+    if note and note not in rendered_values:
+        add_line("Note", note)
 
     return "\n".join(lines)
 

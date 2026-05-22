@@ -511,6 +511,39 @@ def test_drain_one_delivers_outbox_item_to_existing_thread():
     assert result.metrics["delivery_items_delivered"] == 1
 
 
+def test_pr_ready_approved_message_dedupes_note_against_rendered_fields():
+    item = delivery_item(
+        payload={
+            "title": "Ready after approval",
+            "message": "Ready after approval",
+            "repo_id": "InverterNetwork/hermes-agent",
+        }
+    )
+
+    message = quay.delivery_message_from_outbox(
+        item,
+        quay.TaskContext(task_id=item.task_id, issue="BRIX-1447"),
+    )
+
+    assert "Title: Ready after approval" in message
+    assert "Note: Ready after approval" not in message
+
+
+def test_outbox_handoff_summary_uses_task_context_fallbacks():
+    item = delivery_item(payload={})
+    handoff = item.as_handoff(
+        quay.TaskContext(
+            task_id=item.task_id,
+            issue="BRIX-1447",
+            repo_id="InverterNetwork/hermes-agent",
+        )
+    )
+
+    assert "Ticket: BRIX-1447" in handoff.summary
+    assert "Repo: InverterNetwork/hermes-agent" in handoff.summary
+    assert "Task: task-delivery" in handoff.summary
+
+
 def test_drain_one_delivers_outbox_item_to_default_channel_without_route():
     item = delivery_item(route_hint={})
     quay_client = FakeOutboxQuayClient(item)
