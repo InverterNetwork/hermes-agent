@@ -665,8 +665,8 @@ slack_triggers:
       max_per_hour: 30
       on_overflow: skip
     default_repo: iTRY-monorepo
-  # iTRY alert/report channels — port of OpenClaw's alert-channel behavior
-  # (BRIX-1441). Bot-authored alert and daily-report messages trigger the
+  # iTRY alert/report channels — port of OpenClaw's alert-channel behavior.
+  # Bot-authored alert and daily-report messages trigger the
   # itry-alert-triage entry skill, which investigates and replies in-thread.
   # accept_from_bots: true is required because the monitoring/report poster
   # is a bot; synthetic_author stamps a non-empty author on bot-triggered

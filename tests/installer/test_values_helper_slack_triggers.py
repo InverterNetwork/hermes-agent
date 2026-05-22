@@ -93,8 +93,8 @@ class TestValidateSchema:
         assert r.returncode == 0, r.stderr
 
     def test_on_overflow_error_rejected(self, tmp_path: Path, base_values_body: str):
-        # BRIX-1441: the installer used to accept on_overflow: error, but the
-        # gateway router only implements "skip" and rejects "error" at boot.
+        # The installer used to accept on_overflow: error, but the gateway
+        # router only implements "skip" and rejects "error" at boot.
         # Reject it at install time so the two ends can't drift.
         triggers = textwrap.dedent(
             """

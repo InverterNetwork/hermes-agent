@@ -1367,7 +1367,7 @@ done
 # typo'd or not-yet-synced skill would otherwise reach the gateway and fail
 # silently at boot. validate-schema with --skills-root fails loud here on an
 # unknown skill (or any malformed trigger / unsupported overflow policy),
-# aborting the install before the gateway is restarted (BRIX-1441).
+# aborting the install before the gateway is restarted.
 echo "==> validating slack_triggers skill bindings against $STATE_TARGET/skills"
 python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
   validate-schema --skills-root "$STATE_TARGET/skills"

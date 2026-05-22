@@ -1588,8 +1588,8 @@ _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 # Must stay in lockstep with gateway/slack_triggers.py's _VALID_ON_OVERFLOW.
 # The runtime router only implements "skip"; accepting "error" here let a
 # value through install-time validation that the gateway then rejected at
-# boot (BRIX-1441). Keep this the single source of truth on the installer
-# side and widen both ends together if a new policy ever lands.
+# boot. Keep this the single source of truth on the installer side and
+# widen both ends together if a new policy ever lands.
 _VALID_ON_OVERFLOW = ("skip",)
 
 
