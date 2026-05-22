@@ -427,6 +427,14 @@ slack:
       - C0B4LLZ5Z2L
       - C0B4A6LEW31
       - C0B3WAWLL0L
+      # iTRY alert channels (staging / prod). The trigger router fires
+      # without this gate, but the allowlist is what lets humans discuss
+      # the triage analysis with the bot in-thread: an in-thread reply
+      # falls through to the normal agent flow, which is allowlist-gated.
+      # With require_mention on, the bot only engages on @mentions and
+      # replies in threads it already posted in — not arbitrary chatter.
+      - C0AGZUH6C15
+      - C0AH910LEV9
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: "C0B3WAWLL0L"
