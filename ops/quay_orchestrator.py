@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Quay orchestrator-side handoff drain loop.
+"""Quay orchestrator-side delivery outbox and handoff drain loop.
 
 This component owns the runner shape, locking, Slack question/reply flow, and
 how a human reply becomes the next brief text. Quay owns durable task, claim,
-artifact, and handoff state behind the CLI adapter below.
+artifact, outbox, and handoff state behind the CLI adapter below.
 """
 
 from __future__ import annotations
@@ -68,6 +68,50 @@ class Handoff:
             next_brief=_optional_str(raw.get("next_brief")),
             human_question=_optional_str(raw.get("human_question")),
             metadata=dict(metadata),
+        )
+
+
+@dataclass(frozen=True)
+class OutboxItem:
+    """A claimed Quay outbox item owned by the orchestrator sidecar."""
+
+    outbox_item_id: str
+    task_id: str
+    kind: str
+    handler_class: str
+    claim_id: str | None = None
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    route_hint: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "OutboxItem":
+        payload = _json_mapping_field(raw.get("payload_json"), raw.get("payload"))
+        route_hint = _json_mapping_field(raw.get("route_hint_json"), raw.get("route_hint"))
+        metadata: dict[str, Any] = {}
+        metadata.update(payload)
+        metadata.update(route_hint)
+        metadata["route_hint"] = dict(route_hint)
+        metadata["quay_outbox"] = dict(raw)
+        return cls(
+            outbox_item_id=str(raw.get("outbox_item_id") or raw.get("id") or ""),
+            task_id=str(raw.get("task_id") or ""),
+            kind=str(raw.get("kind") or ""),
+            handler_class=str(raw.get("handler_class") or ""),
+            claim_id=_optional_str(raw.get("claim_id")),
+            payload=payload,
+            route_hint=route_hint,
+            metadata=metadata,
+        )
+
+    def as_handoff(self) -> Handoff:
+        return Handoff(
+            handoff_id=f"outbox:{self.outbox_item_id}",
+            task_id=self.task_id,
+            claim_id=self.claim_id,
+            reason=self.kind,
+            summary=delivery_message_from_outbox(self),
+            metadata=dict(self.metadata),
         )
 
 
@@ -163,6 +207,8 @@ class SlackApiError(RuntimeError):
 @dataclass
 class RunMetrics:
     handoffs_claimed: int = 0
+    outbox_items_claimed: int = 0
+    delivery_items_delivered: int = 0
     direct_briefs_submitted: int = 0
     slack_questions_posted: int = 0
     human_replies_ingested: int = 0
@@ -260,8 +306,11 @@ class OrchestratorConfig:
 
 
 class QuayClient(Protocol):
+    def claim_work(self, worker_id: str) -> Handoff | OutboxItem | None:
+        """Claim one durable outbox item or legacy handoff."""
+
     def claim_handoff(self, worker_id: str) -> Handoff | None:
-        """Claim one durable handoff, or return None if no work exists."""
+        """Claim one legacy durable handoff, or return None if no work exists."""
 
     def get_task_context(self, task_id: str) -> TaskContext:
         """Return enough task context for a human-readable Slack question."""
@@ -299,6 +348,12 @@ class QuayClient(Protocol):
 
     def release_claim(self, handoff: Handoff, reason: str) -> None:
         """Release a claim that could not be completed this run."""
+
+    def complete_outbox_item(self, item: OutboxItem) -> None:
+        """Mark a delivery-only outbox item delivered."""
+
+    def fail_outbox_item(self, item: OutboxItem, reason: str) -> None:
+        """Reopen a claimed outbox item with an explicit retry reason."""
 
 
 class SlackQuestionClient(Protocol):
@@ -371,7 +426,7 @@ class QuayCommandError(RuntimeError):
 
 
 class QuayCliClient:
-    """Adapter for the Quay orchestrator handoff CLI contract."""
+    """Adapter for Quay's shared outbox and legacy handoff CLI contracts."""
 
     def __init__(
         self,
@@ -383,6 +438,23 @@ class QuayCliClient:
         self.command = command
         self._logger = logger or LOGGER
         self._runner = runner or subprocess.run
+
+    def claim_work(self, worker_id: str) -> Handoff | OutboxItem | None:
+        try:
+            item = self._claim_delivery_outbox_work(worker_id)
+        except QuayCommandError as exc:
+            if _outbox_unsupported(exc):
+                log_event(
+                    self._logger,
+                    "outbox_contract_unavailable",
+                    worker_id=worker_id,
+                    error_code=exc.code,
+                )
+                return self.claim_handoff(worker_id)
+            raise
+        if item is not None:
+            return item
+        return self.claim_handoff(worker_id)
 
     def claim_handoff(self, worker_id: str) -> Handoff | None:
         rows = self._run_json(["handoff", "list", "--status", "pending"])
@@ -423,6 +495,57 @@ class QuayCliClient:
                 reason=reason,
                 summary=_summary_for_handoff(row, metadata),
                 metadata=metadata,
+            )
+        return None
+
+    def _claim_delivery_outbox_work(self, worker_id: str) -> OutboxItem | None:
+        rows = self._run_json(
+            ["outbox", "list", "--status", "pending", "--handler-class", "delivery"]
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("quay outbox list did not return a JSON array")
+
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            outbox_item_id = str(row.get("outbox_item_id") or row.get("id") or "")
+            if not outbox_item_id:
+                continue
+            try:
+                claim = self._run_json(["outbox", "claim", outbox_item_id])
+            except QuayCommandError as exc:
+                if exc.code in {"wrong_state", "unknown_outbox_item"}:
+                    log_event(
+                        self._logger,
+                        "outbox_claim_skipped",
+                        worker_id=worker_id,
+                        outbox_item_id=outbox_item_id,
+                        error_code=exc.code,
+                    )
+                    continue
+                raise
+            if not isinstance(claim, Mapping):
+                raise RuntimeError("quay outbox claim did not return a JSON object")
+
+            claimed = dict(row)
+            claimed.update(dict(claim))
+            item = OutboxItem.from_mapping(claimed)
+            item = dataclasses.replace(
+                item,
+                metadata={**dict(item.metadata), "worker_id": worker_id},
+            )
+            if item.handler_class == "delivery":
+                return item
+
+            reason = f"unsupported_handler_class:{item.handler_class or 'missing'}"
+            self.fail_outbox_item(item, reason)
+            log_event(
+                self._logger,
+                "outbox_claim_skipped",
+                worker_id=worker_id,
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
             )
         return None
 
@@ -541,6 +664,32 @@ class QuayCliClient:
             ]
         )
 
+    def complete_outbox_item(self, item: OutboxItem) -> None:
+        claim_id = self._outbox_claim_id(item)
+        self._run_json(
+            [
+                "outbox",
+                "complete",
+                item.outbox_item_id,
+                "--claim-id",
+                claim_id,
+            ]
+        )
+
+    def fail_outbox_item(self, item: OutboxItem, reason: str) -> None:
+        claim_id = self._outbox_claim_id(item)
+        self._run_json(
+            [
+                "outbox",
+                "fail",
+                item.outbox_item_id,
+                "--claim-id",
+                claim_id,
+                "--error",
+                reason,
+            ]
+        )
+
     def _claim_id(self, handoff: Handoff) -> str:
         if handoff.claim_id:
             return handoff.claim_id
@@ -548,6 +697,14 @@ class QuayCliClient:
         if isinstance(raw, str) and raw:
             return raw
         raise RuntimeError(f"handoff {handoff.handoff_id} has no claim_id")
+
+    def _outbox_claim_id(self, item: OutboxItem) -> str:
+        if item.claim_id:
+            return item.claim_id
+        raw = item.metadata.get("claim_id")
+        if isinstance(raw, str) and raw:
+            return raw
+        raise RuntimeError(f"outbox item {item.outbox_item_id} has no claim_id")
 
     def _run_json(self, argv: list[str]) -> Any:
         text = self._run_text(argv)
@@ -1041,11 +1198,42 @@ class HandoffDrainer:
         self.metrics = RunMetrics()
 
     def drain_one(self) -> DrainResult:
-        handoff = self.quay.claim_handoff(self.worker_id)
-        if handoff is None:
+        claim_work = getattr(self.quay, "claim_work", None)
+        work = (
+            claim_work(self.worker_id)
+            if callable(claim_work)
+            else self.quay.claim_handoff(self.worker_id)
+        )
+        if work is None:
             self.metrics.no_handoff += 1
             log_event(self.logger, "drain_no_handoff", worker_id=self.worker_id)
             return DrainResult(status="no_handoff", metrics=self.metrics.as_dict())
+
+        if isinstance(work, OutboxItem):
+            self.metrics.outbox_items_claimed += 1
+            log_event(
+                self.logger,
+                "outbox_item_claimed",
+                outbox_item_id=work.outbox_item_id,
+                task_id=work.task_id,
+                kind=work.kind,
+                handler_class=work.handler_class,
+            )
+            if work.handler_class == "delivery":
+                return self._handle_claimed_delivery_item(work)
+            reason = f"unsupported_handler_class:{work.handler_class or 'missing'}"
+            self.quay.fail_outbox_item(work, reason)
+            self.metrics.claims_released += 1
+            return DrainResult(
+                status="unsupported_outbox_handler",
+                handoff_id=f"outbox:{work.outbox_item_id}",
+                task_id=work.task_id,
+                metrics=self.metrics.as_dict(),
+            )
+
+        handoff = work
+        if handoff.metadata.get("outbox_item_id"):
+            self.metrics.outbox_items_claimed += 1
         self.metrics.handoffs_claimed += 1
         log_event(
             self.logger,
@@ -1089,6 +1277,131 @@ class HandoffDrainer:
                 self.logger.exception("failed to release claim after runner error")
             raise
         return result
+
+    def _handle_claimed_delivery_item(self, item: OutboxItem) -> DrainResult:
+        task = self.quay.get_task_context(item.task_id)
+        handoff = item.as_handoff()
+        route = resolve_slack_route(handoff, task, self.config)
+        if route is None:
+            reason = "missing_default_slack_channel"
+            self.quay.fail_outbox_item(item, reason)
+            self.metrics.claims_released += 1
+            log_event(
+                self.logger,
+                "outbox_item_failed",
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
+            )
+            return DrainResult(
+                status=reason,
+                handoff_id=handoff.handoff_id,
+                task_id=item.task_id,
+                metrics=self.metrics.as_dict(),
+            )
+
+        message = delivery_message_from_outbox(item)
+        try:
+            post_ref = self._post_delivery_message(
+                item=item,
+                handoff=handoff,
+                task=task,
+                route=route,
+                message=message,
+            )
+        except SlackApiError as exc:
+            self.metrics.errors += 1
+            reason = f"slack_api_error:{exc.method}:{exc.error}"
+            self.quay.fail_outbox_item(item, reason)
+            self.metrics.claims_released += 1
+            log_event(
+                self.logger,
+                "outbox_item_failed",
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
+                slack_method=exc.method,
+                slack_error=exc.error,
+            )
+            return DrainResult(
+                status="slack_api_error",
+                handoff_id=handoff.handoff_id,
+                task_id=item.task_id,
+                metrics=self.metrics.as_dict(),
+            )
+        except Exception as exc:
+            self.metrics.errors += 1
+            reason = f"runner_error: {type(exc).__name__}: {exc}"
+            try:
+                self.quay.fail_outbox_item(item, reason)
+                self.metrics.claims_released += 1
+            except Exception:
+                self.logger.exception("failed to mark delivery outbox item failed")
+            raise
+
+        # Slack delivery is at-least-once: if the post succeeds but marking the
+        # outbox item complete fails, a later retry may post the same message.
+        self.quay.complete_outbox_item(item)
+        self.metrics.delivery_items_delivered += 1
+        log_event(
+            self.logger,
+            "outbox_item_delivered",
+            outbox_item_id=item.outbox_item_id,
+            task_id=item.task_id,
+            kind=item.kind,
+            channel_id=post_ref.channel_id,
+            thread_ts=post_ref.thread_ts,
+            route_source=route.source,
+        )
+        return DrainResult(
+            status="delivery_delivered",
+            handoff_id=handoff.handoff_id,
+            task_id=item.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _post_delivery_message(
+        self,
+        *,
+        item: OutboxItem,
+        handoff: Handoff,
+        task: TaskContext,
+        route: SlackRoute,
+        message: str,
+    ) -> SlackPostRef:
+        if route.thread_ref:
+            thread_ts = route.thread_ts or ""
+            try:
+                ref = self.slack.validate_thread(route.channel_id, thread_ts)
+            except SlackApiError as exc:
+                if exc.error == "thread_not_found" and route_is_metadata(route):
+                    fallback_channel = (self.config.default_slack_channel or "").strip()
+                    if fallback_channel:
+                        fallback = SlackRoute(
+                            channel_id=fallback_channel,
+                            source="fallback_channel",
+                        )
+                        return self._post_delivery_message(
+                            item=item,
+                            handoff=handoff,
+                            task=task,
+                            route=fallback,
+                            message=message,
+                        )
+                raise
+            return self.slack.post_thread_message(
+                ref,
+                message,
+                handoff=handoff,
+                task=task,
+            )
+        return self.slack.post_question(
+            route.channel_id,
+            message,
+            thread_ts=route.thread_ts,
+            handoff=handoff,
+            task=task,
+        )
 
     def _handle_claimed_handoff(self, handoff: Handoff) -> DrainResult:
         task = self.quay.get_task_context(handoff.task_id)
@@ -1884,6 +2197,7 @@ def _route_from_metadata(metadata: Mapping[str, Any], *, source: str) -> SlackRo
             return route
 
     nested_keys = (
+        "route_hint",
         "slack",
         "slack_thread",
         "original_slack_thread",
@@ -1918,6 +2232,10 @@ def _coerce_slack_route(value: Any, *, source: str) -> SlackRoute | None:
         thread = thread.strip()
         if channel and thread:
             return SlackRoute(channel_id=channel, thread_ts=thread, source=source)
+    if isinstance(channel, str):
+        channel = channel.strip()
+        if channel:
+            return SlackRoute(channel_id=channel, source=source)
     return None
 
 
@@ -2009,10 +2327,15 @@ def setup_logging(*, verbose: bool = False) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Drain Quay orchestrator handoffs")
+    parser = argparse.ArgumentParser(
+        description="Drain Quay orchestrator delivery outbox items and handoffs"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_drain = sub.add_parser("drain-one", help="claim and process one handoff")
+    p_drain = sub.add_parser(
+        "drain-one",
+        help="claim and process one delivery outbox item or legacy handoff",
+    )
     p_drain.add_argument("--config", help="path to orchestrator JSON config")
     p_drain.add_argument("--lock-path", help="override the singleton lock path")
     p_drain.add_argument(
@@ -2045,6 +2368,37 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _json_mapping_field(encoded: Any, fallback: Any = None) -> dict[str, Any]:
+    value = fallback
+    if isinstance(encoded, str) and encoded:
+        try:
+            value = json.loads(encoded)
+        except json.JSONDecodeError:
+            return {"raw_json": encoded}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if value is None:
+        return {}
+    return {"value": value}
+
+
+def delivery_message_from_outbox(item: OutboxItem) -> str:
+    for key in ("text", "message", "body", "summary"):
+        value = item.payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    title = item.payload.get("title")
+    url = item.payload.get("url") or item.payload.get("html_url")
+    if isinstance(title, str) and title.strip():
+        text = title.strip()
+        if isinstance(url, str) and url.strip():
+            return f"{text}\n{url.strip()}"
+        return text
+    if item.payload:
+        return f"Quay delivery item {item.kind}:\n{json.dumps(item.payload, sort_keys=True)}"
+    return f"Quay delivery item {item.kind} for task {item.task_id}"
 
 
 def _env_first(*names: str) -> str | None:
@@ -2086,6 +2440,19 @@ def _cli_error_code(stderr: str) -> str | None:
         return None
     code = parsed.get("error")
     return str(code) if isinstance(code, str) and code else None
+
+
+def _outbox_unsupported(exc: QuayCommandError) -> bool:
+    if len(exc.argv) < 3 or exc.argv[1:3] != ["outbox", "list"]:
+        return False
+    if exc.code in {"unknown_command", "unknown_subcommand"}:
+        return True
+    text = f"{exc.stdout}\n{exc.stderr}".lower()
+    return "outbox" in text and (
+        "unknown command" in text
+        or "unknown subcommand" in text
+        or "invalid command" in text
+    )
 
 
 @contextmanager

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# quay-orchestrator-runner - drain one orchestrator handoff.
+# quay-orchestrator-runner - drain one delivery outbox item or handoff.
 #
 # This is intentionally separate from quay-tick. Quay remains the
-# deterministic task runner; this owns the orchestrator-side human-advice
-# Slack post/reply loop.
+# deterministic task runner; this owns delivery-only Slack posts and the
+# orchestrator-side human-advice Slack post/reply loop.
 
 set -u
 

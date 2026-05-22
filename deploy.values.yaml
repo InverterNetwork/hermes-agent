@@ -277,7 +277,8 @@
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
 #   quay.orchestrator          — Quay orchestrator sidecar for durable Quay
-#                                 orchestrator handoffs. This renders to
+#                                 delivery outbox items and legacy handoffs.
+#                                 This renders to
 #                                 <target>/quay/orchestrator.json, not
 #                                 quay/config.toml, because these are sidecar
 #                                 runtime knobs rather than Quay substrate
@@ -620,8 +621,9 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # Quay orchestrator sidecar. Drains durable Quay handoffs into the
-  # deployment feedback channel when the task has no original Slack thread.
+  # Quay orchestrator sidecar. Drains durable Quay delivery outbox items and
+  # legacy handoffs into the deployment feedback channel when work has no
+  # original Slack thread.
   orchestrator:
     enabled: true
     default_slack_channel: "C0B4A6LEW31"

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Quay orchestrator handoff drain
+Description=Run Quay orchestrator delivery outbox drain
 
 [Timer]
 OnBootSec=45s
