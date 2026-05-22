@@ -1585,7 +1585,12 @@ def _validate_repo_issue_tracker_block(
 _SLACK_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{6,}$")
 _SLACK_USER_ID_RE = re.compile(r"^[UBW][A-Z0-9]{6,}$")
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-_VALID_ON_OVERFLOW = ("skip", "error")
+# Must stay in lockstep with gateway/slack_triggers.py's _VALID_ON_OVERFLOW.
+# The runtime router only implements "skip"; accepting "error" here let a
+# value through install-time validation that the gateway then rejected at
+# boot. Keep this the single source of truth on the installer side and
+# widen both ends together if a new policy ever lands.
+_VALID_ON_OVERFLOW = ("skip",)
 
 
 def _validate_slack_triggers_block(
@@ -1608,7 +1613,7 @@ def _validate_slack_triggers_block(
               slack_id: BNEWRELIC
             rate_limit:                    # optional; defaults: 30/hr, skip
               max_per_hour: 30
-              on_overflow: skip            # skip | error
+              on_overflow: skip            # only "skip" is implemented
             default_repo: iTRY-monorepo    # optional
 
     Returns ``(parsed, None)`` on success or ``(None, error)`` on failure.
