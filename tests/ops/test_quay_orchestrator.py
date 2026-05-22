@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -53,6 +54,9 @@ class FakeQuayClient:
             self.state = "claimed"
         return handoff
 
+    def claim_work(self, worker_id: str):
+        return self.claim_handoff(worker_id)
+
     def get_task_context(self, task_id: str):
         return self.task
 
@@ -98,6 +102,68 @@ class FakeQuayClient:
             task_metadata.setdefault("slack_thread_ref", self.last_thread_ref)
             self.task = dataclasses.replace(self.task, metadata=task_metadata)
         self._handoff = handoff
+
+    def complete_outbox_item(self, item) -> None:
+        raise AssertionError("legacy fake should not complete outbox items")
+
+    def fail_outbox_item(self, item, reason: str) -> None:
+        raise AssertionError("legacy fake should not fail outbox items")
+
+
+class FakeOutboxQuayClient:
+    def __init__(self, item, *, task=None) -> None:
+        self._item = item
+        self.task = task or quay.TaskContext(
+            task_id=item.task_id,
+            title="Review approved PR",
+            issue="BRIX-1447",
+            repo_id="hermes-agent",
+        )
+        self.completed: list[object] = []
+        self.failed: list[tuple[object, str]] = []
+        self.state = "pending" if item is not None else "empty"
+
+    def claim_work(self, worker_id: str):
+        if self.state != "pending":
+            return None
+        self.state = "claimed"
+        return self._item
+
+    def claim_handoff(self, worker_id: str):
+        return None
+
+    def get_task_context(self, task_id: str):
+        return self.task
+
+    def get_artifact(self, handoff):
+        raise AssertionError("delivery items do not fetch artifacts")
+
+    def escalate_human(self, handoff, question: str, thread_ref: str | None) -> None:
+        raise AssertionError("delivery items do not escalate humans")
+
+    def record_human_reply(self, handoff, reply, thread_ref: str) -> None:
+        raise AssertionError("delivery items do not record human replies")
+
+    def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+        raise AssertionError("delivery items do not submit briefs")
+
+    def complete_claim(self, handoff) -> None:
+        raise AssertionError("delivery items do not complete task claims")
+
+    def release_claim(self, handoff, reason: str) -> None:
+        raise AssertionError("delivery items do not release task claims")
+
+    def complete_outbox_item(self, item) -> None:
+        if self.state != "claimed":
+            raise RuntimeError(f"wrong_state: cannot complete outbox from {self.state}")
+        self.state = "completed"
+        self.completed.append(item)
+
+    def fail_outbox_item(self, item, reason: str) -> None:
+        if self.state != "claimed":
+            raise RuntimeError(f"wrong_state: cannot fail outbox from {self.state}")
+        self.state = "pending"
+        self.failed.append((item, reason))
 
 
 class FakeSlackClient:
@@ -193,6 +259,22 @@ def ask(message: str) -> quay.ConversationDecision:
     return quay.ConversationDecision(action="ask", message=message)
 
 
+def delivery_item(*, route_hint=None, payload=None):
+    return quay.OutboxItem.from_mapping(
+        {
+            "outbox_item_id": 31,
+            "task_id": "task-delivery",
+            "kind": "slack.pr_ready_approved",
+            "handler_class": "delivery",
+            "claim_id": "outbox-claim-31",
+            "payload_json": json.dumps(
+                payload or {"message": "PR #44 is approved and ready."}
+            ),
+            "route_hint_json": json.dumps(route_hint or {}),
+        }
+    )
+
+
 class FakeAgent:
     instances = []
 
@@ -221,6 +303,15 @@ class RecordingQuayRunner:
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
         command = argv[1:]
+        if command == [
+            "outbox",
+            "list",
+            "--status",
+            "pending",
+            "--handler-class",
+            "delivery",
+        ]:
+            return FakeCompletedProcess("[]\n")
         if command[:4] == ["handoff", "list", "--status", "pending"]:
             return FakeCompletedProcess(
                 '[{"handoff_id":7,"task_id":"task-cli","reason":"worker_blocker",'
@@ -255,6 +346,103 @@ class RecordingQuayRunner:
         raise AssertionError(f"unexpected quay command: {command!r}")
 
 
+class RecordingDeliveryOutboxRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        command = argv[1:]
+        if command == [
+            "outbox",
+            "list",
+            "--status",
+            "pending",
+            "--handler-class",
+            "delivery",
+        ]:
+            return FakeCompletedProcess(
+                '[{"outbox_item_id":21,"task_id":"task-delivery-cli",'
+                '"kind":"slack.pr_ready_approved","handler_class":"delivery",'
+                '"source_event_id":null,'
+                '"idempotency_key":"task-delivery-cli:ready-approved",'
+                '"payload_json":"{\\"message\\":\\"PR #44 is approved and ready.\\"}",'
+                '"route_hint_json":"{\\"channel_id\\":\\"CDELIVERY\\"}",'
+                '"status":"pending","claim_id":null,"claimed_at":null,'
+                '"delivered_at":null,"completed_at":null,"last_error":null,'
+                '"next_eligible_at":null,'
+                '"created_at":"2026-05-22T00:00:00.000Z",'
+                '"updated_at":"2026-05-22T00:00:00.000Z"}]\n'
+            )
+        if command == ["outbox", "claim", "21"]:
+            return FakeCompletedProcess(
+                '{"outbox_item_id":21,"task_id":"task-delivery-cli",'
+                '"kind":"slack.pr_ready_approved","handler_class":"delivery",'
+                '"status":"claimed","claim_id":"delivery-claim-1"}\n'
+            )
+        if command == ["task", "get", "task-delivery-cli"]:
+            return FakeCompletedProcess(
+                '{"task_id":"task-delivery-cli","repo_id":"repo-1",'
+                '"external_ref":"BRIX-1447","branch_name":"quay/delivery"}\n'
+            )
+        if command == [
+            "outbox",
+            "complete",
+            "21",
+            "--claim-id",
+            "delivery-claim-1",
+        ]:
+            return FakeCompletedProcess(
+                '{"outbox_item_id":21,"task_id":"task-delivery-cli",'
+                '"kind":"slack.pr_ready_approved","handler_class":"delivery",'
+                '"status":"completed","delivered_at":"2026-05-22T00:01:00.000Z",'
+                '"completed_at":"2026-05-22T00:01:00.000Z"}\n'
+            )
+        raise AssertionError(f"unexpected quay command: {command!r}")
+
+
+class RecordingWrongClassOutboxRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        command = argv[1:]
+        if command == [
+            "outbox",
+            "list",
+            "--status",
+            "pending",
+            "--handler-class",
+            "delivery",
+        ]:
+            return FakeCompletedProcess(
+                '[{"outbox_item_id":22,"task_id":"task-workflow-cli",'
+                '"kind":"workflow_intervention.worker_blocker",'
+                '"handler_class":"workflow_intervention","status":"pending"}]\n'
+            )
+        if command == ["outbox", "claim", "22"]:
+            return FakeCompletedProcess(
+                '{"outbox_item_id":22,"task_id":"task-workflow-cli",'
+                '"kind":"workflow_intervention.worker_blocker",'
+                '"handler_class":"workflow_intervention","status":"claimed",'
+                '"claim_id":"wrong-class-claim"}\n'
+            )
+        if command == [
+            "outbox",
+            "fail",
+            "22",
+            "--claim-id",
+            "wrong-class-claim",
+            "--error",
+            "unsupported_handler_class:workflow_intervention",
+        ]:
+            return FakeCompletedProcess('{"outbox_item_id":22,"status":"pending"}\n')
+        if command[:4] == ["handoff", "list", "--status", "pending"]:
+            return FakeCompletedProcess("[]\n")
+        raise AssertionError(f"unexpected quay command: {command!r}")
+
+
 def test_drain_one_submits_direct_next_brief_without_slack():
     handoff = quay.Handoff(
         handoff_id="handoff-1",
@@ -280,6 +468,251 @@ def test_drain_one_submits_direct_next_brief_without_slack():
     assert quay_client.released == []
     assert slack.questions == []
     assert result.metrics["direct_briefs_submitted"] == 1
+
+
+def test_drain_one_delivers_outbox_item_to_existing_thread():
+    item = delivery_item(
+        payload={
+            "external_ref": "BRIX-1447",
+            "repo_id": "InverterNetwork/hermes-agent",
+            "pr_number": 44,
+            "pr_url": "https://github.com/InverterNetwork/hermes-agent/pull/44",
+            "review_id": "RVW_kwDOExample",
+            "head_sha": "abcdef1234567890",
+            "branch": "quay/task-delivery",
+            "route_hint": {"slack_thread_ref": "C1234567890:1000.000000"},
+        }
+    )
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.validations == [("C1234567890", "1000.000000")]
+    assert slack.questions == []
+    delivered_text = slack.acks[0][1]
+    assert "Quay PR ready and reviewer-approved" in delivered_text
+    assert "Ticket: BRIX-1447" in delivered_text
+    assert "Repo: InverterNetwork/hermes-agent" in delivered_text
+    assert "PR: <https://github.com/InverterNetwork/hermes-agent/pull/44|#44>" in delivered_text
+    assert "Review: RVW_kwDOExample" in delivered_text
+    assert "Task: task-delivery" in delivered_text
+    assert "Head: abcdef123456" in delivered_text
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+    assert result.metrics["outbox_items_claimed"] == 1
+    assert result.metrics["delivery_items_delivered"] == 1
+
+
+def test_pr_ready_approved_message_dedupes_note_against_rendered_fields():
+    item = delivery_item(
+        payload={
+            "title": "Ready after approval",
+            "message": "Ready after approval",
+            "repo_id": "InverterNetwork/hermes-agent",
+        }
+    )
+
+    message = quay.delivery_message_from_outbox(
+        item,
+        quay.TaskContext(task_id=item.task_id, issue="BRIX-1447"),
+    )
+
+    assert "Title: Ready after approval" in message
+    assert "Note: Ready after approval" not in message
+
+
+def test_outbox_handoff_summary_uses_task_context_fallbacks():
+    item = delivery_item(payload={})
+    handoff = item.as_handoff(
+        quay.TaskContext(
+            task_id=item.task_id,
+            issue="BRIX-1447",
+            repo_id="InverterNetwork/hermes-agent",
+        )
+    )
+
+    assert "Ticket: BRIX-1447" in handoff.summary
+    assert "Repo: InverterNetwork/hermes-agent" in handoff.summary
+    assert "Task: task-delivery" in handoff.summary
+
+
+def test_drain_one_delivers_outbox_item_to_default_channel_without_route():
+    item = delivery_item(route_hint={})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.validations == []
+    assert slack.questions[0][0] == "CFALLBACK1"
+    assert "Task: task-delivery" in slack.questions[0][1]
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+
+
+def test_drain_one_delivery_stale_thread_falls_back_to_default_channel():
+    item = delivery_item(route_hint={"slack_thread_ref": "CSTALE1234:1000.000000"})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient(
+        validate_results=[
+            quay.SlackApiError("conversations.replies", "thread_not_found"),
+        ]
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.validations == [("CSTALE1234", "1000.000000")]
+    assert slack.questions[0][0] == "CFALLBACK1"
+    assert slack.questions[0][2] is None
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+
+
+def test_drain_one_delivery_outbox_failure_marks_item_retryable():
+    item = delivery_item(route_hint={})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "missing_default_slack_channel"
+    assert slack.questions == []
+    assert quay_client.completed == []
+    assert quay_client.failed == [(item, "missing_default_slack_channel")]
+
+
+def test_drain_one_delivery_slack_failure_marks_item_retryable():
+    item = delivery_item(route_hint={})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "channel_not_found")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="CFALLBACK1",
+        ),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "slack_api_error"
+    assert quay_client.completed == []
+    assert quay_client.failed == [
+        (item, "slack_api_error:chat.postMessage:channel_not_found")
+    ]
+
+
+def test_cli_quay_adapter_claims_delivery_outbox_and_leaves_workflow_for_handoff():
+    runner = RecordingDeliveryOutboxRunner()
+    quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.questions[0][0] == "CDELIVERY"
+    assert "Ticket: BRIX-1447" in slack.questions[0][1]
+    assert "Repo: repo-1" in slack.questions[0][1]
+    assert "Task: task-delivery-cli" in slack.questions[0][1]
+    assert "Note: PR #44 is approved and ready." in slack.questions[0][1]
+    assert slack.questions[0][2] is None
+    calls = [" ".join(call[1:]) for call in runner.calls]
+    assert calls == [
+        "outbox list --status pending --handler-class delivery",
+        "outbox claim 21",
+        "task get task-delivery-cli",
+        "outbox complete 21 --claim-id delivery-claim-1",
+    ]
+
+
+def test_cli_quay_adapter_fails_claimed_outbox_item_with_wrong_handler_class():
+    runner = RecordingWrongClassOutboxRunner()
+    quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
+
+    assert quay_client.claim_work("worker-1") is None
+
+    calls = [" ".join(call[1:]) for call in runner.calls]
+    assert calls == [
+        "outbox list --status pending --handler-class delivery",
+        "outbox claim 22",
+        "outbox fail 22 --claim-id wrong-class-claim "
+        "--error unsupported_handler_class:workflow_intervention",
+        "handoff list --status pending",
+    ]
+
+
+def test_outbox_unsupported_only_masks_missing_outbox_list_contract():
+    assert quay._outbox_unsupported(
+        quay.QuayCommandError(
+            ["/bin/quay", "outbox", "list"],
+            returncode=1,
+            stdout="",
+            stderr="unknown command: outbox\n",
+            code="usage_error",
+        )
+    )
+    assert not quay._outbox_unsupported(
+        quay.QuayCommandError(
+            ["/bin/quay", "outbox", "list"],
+            returncode=1,
+            stdout="",
+            stderr='{"error":"usage_error"}\nusage: quay outbox list ...\n',
+            code="usage_error",
+        )
+    )
+    assert not quay._outbox_unsupported(
+        quay.QuayCommandError(
+            ["/bin/quay", "outbox", "claim", "22"],
+            returncode=1,
+            stdout="",
+            stderr="unknown command: outbox\n",
+            code="unknown_command",
+        )
+    )
 
 
 def test_drain_one_reattaches_to_original_thread_without_reposting_question():
@@ -322,12 +755,15 @@ def test_drain_one_reattaches_to_original_thread_without_reposting_question():
     assert slack.waits[0][1] > 59
     assert slack.waits[0][2] == 2
     calls = [" ".join(call[1:]) for call in runner.calls]
-    assert "escalate-human task-cli --claim-id claim-1" in calls[4]
-    assert "--thread-ref GPRIVATE123:999.000000" in calls[4]
-    assert "record-human-reply task-cli --claim-id claim-1" in calls[5]
+    assert calls[0] == "outbox list --status pending --handler-class delivery"
+    assert "handoff list --status pending" in calls[1]
+    assert "task claim task-cli" in calls[2]
+    assert "escalate-human task-cli --claim-id claim-1" in calls[5]
     assert "--thread-ref GPRIVATE123:999.000000" in calls[5]
-    assert "submit-brief task-cli --claim-id claim-1" in calls[6]
-    assert "--reason advice_answered" in calls[6]
+    assert "record-human-reply task-cli --claim-id claim-1" in calls[6]
+    assert "--thread-ref GPRIVATE123:999.000000" in calls[6]
+    assert "submit-brief task-cli --claim-id claim-1" in calls[7]
+    assert "--reason advice_answered" in calls[7]
     assert "Quay handoff reason: worker_blocker" in runner.file_payloads[0]
     assert "blocked on product input" in runner.file_payloads[0]
     assert "resume the worker once the path is clear" in runner.file_payloads[0]
@@ -1040,6 +1476,10 @@ def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(
     quay_bin = tmp_path / "quay"
     quay_bin.write_text(
         "#!/usr/bin/env bash\n"
+        "if [[ \"$1 $2 $3\" == \"outbox list --status\" ]]; then\n"
+        "  printf '[]\\n'\n"
+        "  exit 0\n"
+        "fi\n"
         "if [[ \"$1 $2 $3\" == \"handoff list --status\" ]]; then\n"
         "  printf '[]\\n'\n"
         "  exit 0\n"

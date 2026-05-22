@@ -277,7 +277,8 @@
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
 #   quay.orchestrator          — Quay orchestrator sidecar for durable Quay
-#                                 orchestrator handoffs. This renders to
+#                                 delivery outbox items and legacy handoffs.
+#                                 This renders to
 #                                 <target>/quay/orchestrator.json, not
 #                                 quay/config.toml, because these are sidecar
 #                                 runtime knobs rather than Quay substrate
@@ -427,6 +428,14 @@ slack:
       - C0B4LLZ5Z2L
       - C0B4A6LEW31
       - C0B3WAWLL0L
+      # iTRY alert channels (staging / prod). The trigger router fires
+      # without this gate, but the allowlist is what lets humans discuss
+      # the triage analysis with the bot in-thread: an in-thread reply
+      # falls through to the normal agent flow, which is allowlist-gated.
+      # With require_mention on, the bot only engages on @mentions and
+      # replies in threads it already posted in — not arbitrary chatter.
+      - C0AGZUH6C15
+      - C0AH910LEV9
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: "C0B3WAWLL0L"
@@ -519,7 +528,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.14"
+  version: "v0.3.16"
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
@@ -612,8 +621,9 @@ quay:
       api_key_env: LINEAR_API_KEY
     slack:
       enabled: false
-  # Quay orchestrator sidecar. Drains durable Quay handoffs into the
-  # deployment feedback channel when the task has no original Slack thread.
+  # Quay orchestrator sidecar. Drains durable Quay delivery outbox items and
+  # legacy handoffs into the deployment feedback channel when work has no
+  # original Slack thread.
   orchestrator:
     enabled: true
     default_slack_channel: "C0B4A6LEW31"
@@ -661,6 +671,39 @@ slack_triggers:
     skill: feedback-intake
     require_top_level: true
     accept_from_bots: false
+    rate_limit:
+      max_per_hour: 30
+      on_overflow: skip
+    default_repo: iTRY-monorepo
+  # iTRY alert/report channels — port of OpenClaw's alert-channel behavior.
+  # Bot-authored alert and daily-report messages trigger the
+  # itry-alert-triage entry skill, which investigates and replies in-thread.
+  # accept_from_bots: true is required because the monitoring/report poster
+  # is a bot; synthetic_author stamps a non-empty author on bot-triggered
+  # invocations (quay validate-ticket needs authors[]). The dev alert
+  # channel (C0AAN0K8UMP) is deliberately NOT bound — it stays silent in
+  # Hermes just as OpenClaw was configured not to respond there. Add an
+  # entry here only if dev should become responsive.
+  - channel_id: C0AGZUH6C15
+    channel_name: itry-alerts-staging
+    skill: itry-alert-triage
+    require_top_level: true
+    accept_from_bots: true
+    synthetic_author:
+      name: iTRY Alerts
+      slack_id: BITRYALERT
+    rate_limit:
+      max_per_hour: 30
+      on_overflow: skip
+    default_repo: iTRY-monorepo
+  - channel_id: C0AH910LEV9
+    channel_name: itry-alerts-prod
+    skill: itry-alert-triage
+    require_top_level: true
+    accept_from_bots: true
+    synthetic_author:
+      name: iTRY Alerts
+      slack_id: BITRYALERT
     rate_limit:
       max_per_hour: 30
       on_overflow: skip
