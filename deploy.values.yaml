@@ -432,19 +432,29 @@ slack:
     # If non-empty, the bot ONLY responds in these channels (whitelist).
     # Empty list / unset disables the gate. "*" anywhere disables it too.
     allowed_channels:
-      - C0AMT3TD86R
+      # Existing Hermes-native channels retained from the previous allowlist.
       - C0B23MZ0USV
       - C0B4LLZ5Z2L
       - C0B4A6LEW31
       - C0B3WAWLL0L
-      # iTRY alert channels (staging / prod). The trigger router fires
-      # without this gate, but the allowlist is what lets humans discuss
-      # the triage analysis with the bot in-thread: an in-thread reply
-      # falls through to the normal agent flow, which is allowlist-gated.
-      # With require_mention on, the bot only engages on @mentions and
-      # replies in threads it already posted in — not arbitrary chatter.
-      - C0AGZUH6C15
-      - C0AH910LEV9
+      # OpenClaw Slack membership parity, observed 2026-05-23. This makes
+      # Hermes allowed to respond in the same channels once the Slack app is
+      # invited there; Slack membership itself remains workspace state.
+      - C05M45H6KAT  # brix-business-development
+      - C0B0LSP8H1B  # brix-product-feedback
+      - C0B0MP16YDD  # brix-qna
+      - C097HBE6Z7E  # daily-update
+      - C0AJ4MM4PPT  # didier-kb
+      - C0AEN8KDRT2  # didier-support
+      - C0AAN0K8UMP  # itry-alerts-dev
+      - C0AGZUH6C15  # itry-alerts-staging
+      - C0AH910LEV9  # itry-alerts-prod
+      - C09R47ZHB61  # itry-defi-n-gtm
+      - C08956H1V4K  # itry-dev
+      - C0AMT3TD86R  # itry-launch-testing
+      - C09QSMWRJKH  # itry-marketing-n-comms
+      - C09E9UX1JTH  # itry-ops
+      - C094LCV1X36  # test-devops (private)
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: "C0B3WAWLL0L"
