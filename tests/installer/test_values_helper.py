@@ -476,6 +476,60 @@ class TestMergeConfigModel:
         loaded = yaml.safe_load(config.read_text())
         assert loaded["model"]["base_url"] == "https://proxy.example.com/v1"
 
+    def test_writes_model_default_when_declared(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  model_default: gpt-5.3-codex\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["model"]["provider"] == "openai-codex"
+        assert loaded["model"]["default"] == "gpt-5.3-codex"
+
+    def test_preserves_model_default_when_values_key_absent(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text("gateway:\n  model_provider: openai\n", encoding="utf-8")
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "model:\n"
+            "  default: claude-sonnet-4-5\n"
+            "  provider: stale\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert loaded["model"]["default"] == "claude-sonnet-4-5"
+
+    def test_drops_stale_model_default_when_values_empty(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            '  model_default: ""\n',
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(
+            config,
+            "model:\n"
+            "  default: stale-model\n"
+            "  provider: stale\n",
+        )
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 0, r.stderr
+        import yaml
+        loaded = yaml.safe_load(config.read_text())
+        assert "default" not in loaded["model"]
+
     def test_drops_stale_base_url_when_values_empty(self, tmp_path: Path):
         # Operator removed the override from values.yaml — config.yaml's
         # stale base_url must drop, otherwise the gateway keeps routing
@@ -564,6 +618,20 @@ class TestMergeConfigModel:
         r = _run(values, "merge-config-model", "--out", str(config))
         assert r.returncode == 1
         assert "gateway.model_provider is required" in r.stderr
+
+    def test_rejects_non_string_model_default(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  model_provider: openai-codex\n"
+            "  model_default: [not, a, string]\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "config.yaml"
+        self._seed_config(config, "{}\n")
+        r = _run(values, "merge-config-model", "--out", str(config))
+        assert r.returncode == 1
+        assert "gateway.model_default" in r.stderr
 
     def test_missing_config_is_error(self, tmp_path: Path):
         # render-runtime-config seeds the file first; merging into a

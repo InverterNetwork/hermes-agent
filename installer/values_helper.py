@@ -19,9 +19,10 @@ Subcommands:
                                   GATEWAY_ALLOW_ALL_USERS, LINEAR_TEAM_*).
                                   Always rewrites — the file is a reflection
                                   of values.yaml, not operator input.
-  merge-config-model <out>     — set <out>'s ``model.provider`` and
-                                  ``model.base_url`` from
+  merge-config-model <out>     — set <out>'s ``model.provider``,
+                                  ``model.default``, and ``model.base_url`` from
                                   ``gateway.model_provider`` /
+                                  ``gateway.model_default`` /
                                   ``gateway.model_base_url`` in
                                   values.yaml, and optionally set
                                   ``approvals.mode`` from
@@ -360,9 +361,10 @@ def cmd_render_runtime_config(args: argparse.Namespace) -> int:
 def cmd_merge_config_model(args: argparse.Namespace) -> int:
     """Set gateway-managed config in ``<out>`` from values.yaml.
 
-    Idempotent: read the existing config.yaml, overwrite the two keys (creating
-    the ``model:`` block if missing), optionally overwrite ``approvals.mode``
-    from ``gateway.approvals_mode``, and preserve every other top-level key.
+    Idempotent: read the existing config.yaml, overwrite gateway-managed
+    model keys (creating the ``model:`` block if missing), optionally
+    overwrite ``approvals.mode`` from ``gateway.approvals_mode``, and
+    preserve every other top-level key.
     Run on every install so the gateway's provider pin matches what
     ``deploy.values.yaml`` declares — independent of whether
     ``hermes auth add`` ran successfully (it can fail silently when the
@@ -381,8 +383,8 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     Roundtrips through PyYAML, so YAML-level comments inside config.yaml
     are not preserved (matching ``hermes_cli.config.save_config``'s existing
     behavior). Operator-added *keys* survive: only the touched scalars
-    (``model.provider``, ``model.base_url``, ``approvals.mode``,
-    ``auxiliary.vision.{provider,model}``) are rewritten.
+    (``model.provider``, ``model.default``, ``model.base_url``,
+    ``approvals.mode``, ``auxiliary.vision.{provider,model}``) are rewritten.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
@@ -392,10 +394,20 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
         sys.stderr.write("values_helper.py: gateway must be a mapping\n")
         return 1
     provider = gateway.get("model_provider")
+    default_model = gateway.get("model_default", _MISSING)
     base_url = gateway.get("model_base_url")
     if not isinstance(provider, str) or not provider:
         sys.stderr.write(
             "values_helper.py: gateway.model_provider is required (non-empty string)\n"
+        )
+        return 1
+    if (
+        default_model is not _MISSING
+        and default_model is not None
+        and not isinstance(default_model, str)
+    ):
+        sys.stderr.write(
+            "values_helper.py: gateway.model_default, if set, must be a string\n"
         )
         return 1
     if base_url is not None and not isinstance(base_url, str):
@@ -444,6 +456,14 @@ def cmd_merge_config_model(args: argparse.Namespace) -> int:
     if not isinstance(model_block, dict):
         model_block = {}
     model_block["provider"] = provider
+    if default_model is not _MISSING:
+        if default_model:
+            model_block["default"] = default_model
+        else:
+            # Empty declared value means "no default model". Preserve legacy
+            # behavior when the key is absent, but make an explicit empty
+            # value declaratively clear stale pins.
+            model_block.pop("default", None)
     if base_url:
         model_block["base_url"] = base_url
     else:
