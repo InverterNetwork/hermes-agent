@@ -398,10 +398,16 @@ else
     *) echo "FAIL: unsupported architecture $(uname -m); quay ships amd64/arm64 Linux only" >&2; exit 1 ;;
   esac
 
-  QUAY_RELEASE_URL="https://github.com/lafawnduh1966/quay/releases/download/${QUAY_VERSION}"
+  QUAY_RELEASE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.release_repo 2>/dev/null || true)"
+  QUAY_RELEASE_REPO="${QUAY_RELEASE_REPO:-InverterNetwork/quay}"
+  if [[ ! "$QUAY_RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "FAIL: quay.release_repo must be a GitHub owner/repo slug (got: $QUAY_RELEASE_REPO)" >&2
+    exit 1
+  fi
+  QUAY_RELEASE_URL="https://github.com/${QUAY_RELEASE_REPO}/releases/download/${QUAY_VERSION}"
   QUAY_ASSET="quay-linux-${QUAY_ARCH}"
 
-  echo "==> installing quay binary ${QUAY_VERSION} (${QUAY_ARCH}) to $QUAY_BIN_DST"
+  echo "==> installing quay binary ${QUAY_VERSION} from ${QUAY_RELEASE_REPO} (${QUAY_ARCH}) to $QUAY_BIN_DST"
   QUAY_TMP="$(mktemp -d)"
   trap 'rm -rf "$QUAY_TMP"' EXIT
   curl -fsSL --retry 3 -o "$QUAY_TMP/$QUAY_ASSET" "$QUAY_RELEASE_URL/$QUAY_ASSET"

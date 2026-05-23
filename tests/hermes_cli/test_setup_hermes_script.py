@@ -225,6 +225,16 @@ def test_installer_persists_quay_expected_sha_for_verify():
     assert '"$TARGET_DIR/quay/SHA256SUM.expected"' not in content
 
 
+def test_installer_uses_configured_quay_release_repo():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "lafawnduh1966/quay" not in content
+    assert "get quay.release_repo" in content
+    assert "QUAY_RELEASE_REPO" in content
+    assert "https://github.com/${QUAY_RELEASE_REPO}/releases/download/${QUAY_VERSION}" in content
+    assert "quay.release_repo must be a GitHub owner/repo slug" in content
+
+
 def test_quay_tick_service_carries_reviewer_token_minting_env():
     service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
     runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")

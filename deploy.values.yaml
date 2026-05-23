@@ -209,12 +209,17 @@
 #                                 lets a fork stage before a quay release is
 #                                 cut and is the default in CI. When set, the
 #                                 installer fetches quay-linux-<arch> from
-#                                 the matching GitHub Release and verifies it
-#                                 against SHA256SUMS; the pin is the security
-#                                 boundary. Must be set for any repos[] entry
-#                                 to be quay-managed; entries with a `quay:`
-#                                 block but no quay.version pin install as
-#                                 code-only with a one-line warning.
+#                                 quay.release_repo's matching GitHub Release
+#                                 and verifies it against SHA256SUMS; the pin
+#                                 is the security boundary. Must be set for any
+#                                 repos[] entry to be quay-managed; entries with
+#                                 a `quay:` block but no quay.version pin
+#                                 install as code-only with a one-line warning.
+#   quay.release_repo          — public GitHub owner/repo slug that publishes
+#                                 Quay release assets. Keep public so the
+#                                 installer can use unauthenticated release
+#                                 downloads; private releases would require a
+#                                 separate authenticated asset-fetch path.
 #   quay.runtime_managers      — pinned package-manager / runtime binaries the
 #                                 installer must guarantee on PATH before quay
 #                                 bootstraps a worktree (`/bin/sh -c install_cmd`
@@ -528,7 +533,9 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.16"
+  version: "v0.3.18"
+  # Public org-owned release repo for unauthenticated installer downloads.
+  release_repo: InverterNetwork/quay
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
