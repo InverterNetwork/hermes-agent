@@ -124,7 +124,7 @@ Test fixture:
   worker tmux, can't review-pr. Re-test against a fixed binary once AST-85
   ships in v0.1.1 (or whatever release shape gets cut).
 - **Resolved 2026-05-08:** AST-85 (PR #25) and AST-86 (PR #26) merged to
-  `lafawnduh1966/quay` main; v0.1.1 cut and published. hermes-agent PR #37
+  Quay main; v0.1.1 cut and published. hermes-agent PR #37
   bumped `quay.version` to v0.1.1; krustentier reinstalled. Confirmed
   Linear adapter no longer spawns `-e` child — see entry #5 below for
   what broke next.

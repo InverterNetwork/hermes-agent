@@ -9,8 +9,8 @@ Status legend: ✅ resolved before/during this install, 🟡 open, 🔵 informat
 ## 1. ✅ Quay repo was private — CI 404'd on release fetch
 
 - **Symptom:** First post-tag CI run failed with `curl: (22) The requested URL returned error: 404` on `releases/download/v0.1.0/quay-linux-amd64`. Local unauth'd `curl -sI` against the asset also returned `404`.
-- **Root cause:** `lafawnduh1966/quay` was private. GitHub returns `404` (not `401`) on unauthenticated requests for private-repo release assets, so the failure looks like "missing" rather than "forbidden."
-- **Resolution:** **Quay stays public** (decided 2026-05-07). Simplest, lowest friction; eliminates any need to thread fetch auth through the installer.
+- **Root cause:** The then-current Quay release repo was private. GitHub returns `404` (not `401`) on unauthenticated requests for private-repo release assets, so the failure looks like "missing" rather than "forbidden."
+- **Resolution:** **Quay release repos stay public** (decided 2026-05-07; current org-owned repo: `InverterNetwork/quay`). Simplest, lowest friction; eliminates any need to thread fetch auth through the installer.
 - **Locus of fix:** Resolved on the quay-side (visibility change). No code follow-up.
 
 ## 2. ✅ Bare-clone of private `InverterNetwork/test-factory-code` failed in CI

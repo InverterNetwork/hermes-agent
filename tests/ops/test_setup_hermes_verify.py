@@ -643,7 +643,7 @@ def _write_quay_stub(
 
     `version` is tag-shaped (`v0.1.0`); the stub strips the leading `v` and
     appends a fake build SHA to mirror what older real binaries emitted
-    (`${pkg.version}+${shortSHA}`, see scripts/embed.ts in lafawnduh1966/quay).
+    (`${pkg.version}+${shortSHA}`, see scripts/embed.ts in InverterNetwork/quay).
     Verify ignores this output for binary drift and compares SHA256 instead.
 
     `repo_list_override` lets a caller substitute the `repo list` payload
