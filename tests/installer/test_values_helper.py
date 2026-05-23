@@ -852,6 +852,17 @@ class TestRenderQuayConfig:
         assert "enabled = true" in text
         assert 'api_key_env = "LINEAR_API_KEY"' in text
 
+    def test_requires_admin_auth_with_generated_token_env(
+        self, quay_values: Path, tmp_path: Path
+    ):
+        out = tmp_path / "config.toml"
+        r = _run(quay_values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "[admin]" in text
+        assert "require_auth = true" in text
+        assert 'token_env = "QUAY_ADMIN_TOKEN"' in text
+
     def test_writes_reference_repos_context_when_supplied(
         self, tmp_path: Path
     ):

@@ -245,6 +245,22 @@ def test_quay_tick_service_carries_reviewer_token_minting_env():
     assert "/etc/hermes/reviewer.env" in runner
 
 
+def test_quay_serve_service_is_localhost_and_token_protected():
+    service = (OPS_DIR / "quay-serve.service").read_text(encoding="utf-8")
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    stage = (REPO_ROOT / "stage-secrets.sh").read_text(encoding="utf-8")
+
+    assert "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731" in service
+    assert "Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay" in service
+    assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in service
+    assert "QUAY_ADMIN_TOKEN" in service
+    assert "quay-serve.service" in installer
+    assert "ensure_quay_admin_token" in installer
+    assert "secrets.token_urlsafe(48)" in installer
+    assert "systemctl enable --now quay-serve.service" in installer
+    assert "QUAY_ADMIN_TOKEN=${existing_quay_admin_token}" in stage
+
+
 def test_installer_removes_legacy_reviewer_token_timer():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
     assert "systemctl disable --now hermes-reviewer-token.timer" in content

@@ -390,6 +390,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `QUAY_REVIEW_PR_COMMAND` | Command used by `POST /quay/review-pr` to enroll a PR (default: `/usr/local/bin/quay-as-hermes`). |
 | `QUAY_REVIEW_PR_TIMEOUT_SECONDS` | Timeout for the local `quay review-pr` command (default: `60`). |
 | `QUAY_DATA_DIR` | Quay data directory used by `POST /quay/review-pr` and other Quay invocations. The API endpoint defaults to `<HERMES_HOME>/quay`; the default `quay-as-hermes` wrapper preserves an explicit override and otherwise falls back to its install target. |
+| `QUAY_ADMIN_TOKEN` | Bearer token required by `quay serve` when the Admin UI/API is enabled. The installer generates and preserves it in `<HERMES_HOME>/auth/quay.env`; the service binds to `127.0.0.1` by default. |
 | `GATEWAY_PROXY_URL` | URL of a remote Hermes API server to forward messages to ([proxy mode](/docs/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos)). When set, the gateway handles platform I/O only — all agent work is delegated to the remote server. Also configurable via `gateway.proxy_url` in `config.yaml`. |
 | `GATEWAY_PROXY_KEY` | Bearer token for authenticating with the remote API server in proxy mode. Must match `API_SERVER_KEY` on the remote host. |
 | `MESSAGING_CWD` | Working directory for terminal commands in messaging mode (default: `~`) |

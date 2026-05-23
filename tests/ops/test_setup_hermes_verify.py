@@ -817,6 +817,10 @@ def quay_install(install: dict) -> dict:
     code_root = target / "code"
     quay_dir.mkdir(mode=0o755)
     (quay_dir / "config.toml").write_text(
+        "[admin]\n"
+        "require_auth = true\n"
+        'token_env = "QUAY_ADMIN_TOKEN"\n'
+        "\n"
         "[context]\n"
         f'reference_repos_root = "{code_root}"\n'
     )
@@ -855,6 +859,27 @@ def quay_install(install: dict) -> dict:
     quay_expected_sha = _quay_expected_sha_path(target)
     _write_expected_quay_sha(quay_expected_sha, quay_stub)
 
+    auth = target / "auth"
+    auth.mkdir(mode=0o750, exist_ok=True)
+    auth.chmod(0o750)
+    (auth / "quay.env").write_text("QUAY_ADMIN_TOKEN=test-admin-token\n")
+    (auth / "quay.env").chmod(0o640)
+
+    systemd_dir = install["tmp"] / "systemd"
+    systemd_dir.mkdir()
+    (systemd_dir / "quay-serve.service").write_text(
+        "[Service]\n"
+        f"Environment=QUAY_DATA_DIR={target / 'quay'}\n"
+        f"EnvironmentFile={target / 'auth' / 'quay.env'}\n"
+        "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731\n",
+        encoding="utf-8",
+    )
+    (systemd_dir / "quay-tick.service").write_text(
+        "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env\n"
+        "RuntimeDirectory=hermes\n",
+        encoding="utf-8",
+    )
+
     # values_helper.py imports pyyaml. The system `python3` on dev macOS
     # often lacks it, so shadow `python3` in PATH with a shim that
     # delegates to whichever interpreter is running pytest (it has pyyaml
@@ -890,6 +915,10 @@ def quay_install(install: dict) -> dict:
     )
     bun_stub.chmod(0o755)
 
+    curl = bin_dir / "curl"
+    curl.write_text("#!/usr/bin/env bash\nprintf '200'\n")
+    curl.chmod(0o755)
+
     install["values_file"] = fork / "deploy.values.yaml"
     install["quay_dir"] = quay_dir
     install["quay_bin"] = quay_stub
@@ -902,6 +931,7 @@ def quay_install(install: dict) -> dict:
     install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
     install["bun_bin"] = bun_stub
+    install["systemd_dir"] = systemd_dir
     return install
 
 
@@ -975,6 +1005,7 @@ def _quay_env(install: dict) -> dict[str, str]:
         "HERMES_VERIFY_QUAY_RUNNER": str(install["quay_runner"]),
         "HERMES_VERIFY_QUAY_PROFILE": str(install["quay_profile"]),
         "HERMES_VERIFY_RUNTIME_DIR": str(install["bin"]),
+        "HERMES_VERIFY_SYSTEMD_DIR": str(install["systemd_dir"]),
     }
 
 
@@ -1021,6 +1052,8 @@ class TestSetupHermesVerifyQuay:
         assert "quay binary version" not in result.stdout
         assert "[OK] quay data dir ownership:" in result.stdout
         assert "[OK] quay config.toml:" in result.stdout
+        assert "[OK] quay admin auth required" in result.stdout
+        assert "[OK] quay admin token env: QUAY_ADMIN_TOKEN" in result.stdout
         assert (
             f"[OK] quay reference_repos_root: {quay_install['target'] / 'code'}"
             in result.stdout
@@ -1032,6 +1065,41 @@ class TestSetupHermesVerifyQuay:
         assert f"[OK] quay repo {quay_install['quay_repo_id']} registered" in result.stdout
         assert "[OK] quay-as-hermes wrapper:" in result.stdout
         assert "[OK] quay profile.d drop-in:" in result.stdout
+        assert "[OK] quay-serve.service: active loaded enabled" in result.stdout
+        assert "[OK] quay-serve.service QUAY_DATA_DIR" in result.stdout
+        assert "[OK] quay-serve.service auth env" in result.stdout
+        assert "[OK] quay-serve.service loopback bind: 127.0.0.1" in result.stdout
+        assert "[OK] quay admin token present" in result.stdout
+        assert "[OK] quay admin local health: HTTP 200" in result.stdout
+
+    def test_quay_serve_missing_admin_token_is_drift(self, quay_install):
+        (quay_install["target"] / "auth" / "quay.env").write_text(
+            "LINEAR_API_KEY=lin_test\n",
+            encoding="utf-8",
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay admin token" in result.stderr
+
+    def test_quay_serve_public_bind_is_drift(self, quay_install):
+        unit = quay_install["systemd_dir"] / "quay-serve.service"
+        unit.write_text(
+            unit.read_text(encoding="utf-8").replace(
+                "--host 127.0.0.1", "--host 0.0.0.0"
+            ),
+            encoding="utf-8",
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay-serve.service bind address" in result.stderr
+
+    def test_quay_serve_health_failure_is_drift(self, quay_install):
+        curl = quay_install["bin"] / "curl"
+        curl.write_text("#!/usr/bin/env bash\nprintf '401'\n", encoding="utf-8")
+        curl.chmod(0o755)
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay admin local health" in result.stderr
 
     def test_app_auth_quay_gitconfig_passes(self, quay_install):
         env = _configure_quay_app_auth(quay_install)
@@ -1081,6 +1149,10 @@ class TestSetupHermesVerifyQuay:
         values.write_text(values.read_text().replace(QUAY_VERSION, "v0.3.9"))
         _write_live_quay_stub(quay_install, "v0.3.9", [quay_install["quay_repo_id"]])
         (quay_install["quay_dir"] / "config.toml").write_text(
+            "[admin]\n"
+            "require_auth = true\n"
+            'token_env = "QUAY_ADMIN_TOKEN"\n'
+            "\n"
             'agent_invocation = "claude < {prompt_file}"\n'
         )
 
@@ -1285,7 +1357,7 @@ class TestSetupHermesVerifyQuay:
         curl.chmod(0o755)
 
         systemd_dir = quay_install["tmp"] / "systemd"
-        systemd_dir.mkdir()
+        systemd_dir.mkdir(exist_ok=True)
         (systemd_dir / "quay-tick.service").write_text(
             "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env\n"
             "RuntimeDirectory=hermes\n",
@@ -1310,7 +1382,7 @@ class TestSetupHermesVerifyQuay:
 
     def test_legacy_reviewer_token_timer_is_drift(self, quay_install):
         systemd_dir = quay_install["tmp"] / "systemd"
-        systemd_dir.mkdir()
+        systemd_dir.mkdir(exist_ok=True)
         (systemd_dir / "hermes-reviewer-token.timer").write_text(
             "[Timer]\nOnUnitActiveSec=30min\n",
             encoding="utf-8",

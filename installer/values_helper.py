@@ -1035,9 +1035,14 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         "# Edit deploy.values.yaml — local edits here are reconciled away.",
         "#",
         "# data_dir comes from QUAY_DATA_DIR set in the systemd unit; repos_root",
-        "# defaults to ${data_dir}/repos.",
+        "# defaults to ${data_dir}/repos. Admin auth is always required; the",
+        "# token is generated into <HERMES_HOME>/auth/quay.env.",
         "",
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
+        "",
+        "[admin]",
+        "require_auth = true",
+        'token_env = "QUAY_ADMIN_TOKEN"',
     ]
 
     # Legacy `agent_invocation` above continues to render unchanged — quay's
