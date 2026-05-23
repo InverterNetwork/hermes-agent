@@ -56,6 +56,11 @@
 #                                 longer required to land the right pin
 #                                 (the CLI's config-update step can fail
 #                                 silently when config.yaml is root-owned).
+#   gateway.model_default      — optional default model id persisted under
+#                                 model.default. Needed for providers like
+#                                 openai-codex where scheduled/background
+#                                 turns cannot infer a safe model when only
+#                                 model.provider is configured.
 #   gateway.model_base_url     — optional override for the provider's default
 #                                 base URL. Leave empty to use the provider
 #                                 default; set only for self-hosted endpoints
@@ -339,6 +344,10 @@ gateway:
   # openai-codex` once for tokens), but the *config wiring* is values-
   # driven.
   model_provider: openai-codex
+  # Default model used by scheduled/background jobs that do not carry their
+  # own model pin. Without this, openai-codex cron turns reach the provider
+  # with an empty model string.
+  model_default: gpt-5.3-codex
   # Empty = use the provider's default endpoint. Set only for routing
   # through a self-hosted gateway or an org-internal proxy.
   model_base_url: ""
