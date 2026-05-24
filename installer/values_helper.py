@@ -1039,6 +1039,15 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         "",
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
     ]
+    if args.enable_admin_auth:
+        lines.extend([
+            "",
+            "# Admin auth is enabled only when the installed quay binary",
+            "# supports `quay serve`; older releases reject unknown config keys.",
+            "[admin]",
+            "require_auth = true",
+            'token_env = "QUAY_ADMIN_TOKEN"',
+        ])
 
     # Legacy `agent_invocation` above continues to render unchanged — quay's
     # back-compat path treats it as the worker default when no `[agents]`
@@ -2211,6 +2220,11 @@ def main(argv: list[str] | None = None) -> int:
             "absolute code mirror root to render as [context].reference_repos_root "
             "when quay.version supports AST-136"
         ),
+    )
+    p_quay.add_argument(
+        "--enable-admin-auth",
+        action="store_true",
+        help="render [admin] auth config for quay releases that support `serve`",
     )
     p_quay.set_defaults(func=cmd_render_quay_config)
 

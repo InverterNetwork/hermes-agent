@@ -16,7 +16,7 @@
 #                                        AWS_PROD_SECRET_ACCESS_KEY).
 #                                       Separate file so prod is visible
 #                                       at the filesystem level.
-#   <HERMES_HOME>/auth/quay.env     — quay-tick worker tokens
+#   <HERMES_HOME>/auth/quay.env     — quay worker + Admin UI tokens
 #
 # AUTH_DIR defaults to /home/${AGENT_USER}/.hermes/auth — the same path
 # setup-hermes.sh's `--target` defaults to. Non-default installs (e.g.
@@ -26,8 +26,8 @@
 # Each unique secret is prompted once; LINEAR_API_KEY lands in BOTH
 # hermes.env and quay.env from one prompt instead of two. Re-runs preserve
 # values left blank, and per-file `cmp -s` short-circuits skip writes
-# (and the gateway restart) when the new content is byte-identical to
-# what's on disk.
+# (and service restarts) when the new content is byte-identical to what's
+# on disk.
 #
 # Non-secret values (SLACK_ALLOWED_USERS, …) are NOT prompted here. They
 # live in deploy.values.yaml and are rendered by setup-hermes.sh into
@@ -49,6 +49,9 @@
 # automatically. To run quay's slack adapter as a separate bot, edit
 # quay.env by hand after staging — left as an explicit edit so a typo
 # during prompt entry can't silently bifurcate the two identities.
+#
+# QUAY_ADMIN_TOKEN in quay.env is generated server-side and preserved on
+# re-runs. It protects the localhost quay-serve Admin UI/API service.
 set -euo pipefail
 
 AGENT_USER="${AGENT_USER:-hermes}"
@@ -96,6 +99,7 @@ existing_slack_app=""
 existing_linear=""
 existing_anthropic=""
 existing_quay_review_pr_token=""
+existing_quay_admin_token=""
 existing_aws_key=""
 existing_aws_secret=""
 existing_aws_region=""
@@ -116,6 +120,7 @@ parse_existing_env "$HERMES_ENV" existing_linear     LINEAR_API_KEY
 parse_existing_env "$HERMES_ENV" existing_quay_review_pr_token QUAY_REVIEW_PR_TOKEN
 
 parse_existing_env "$QUAY_ENV"   existing_anthropic  ANTHROPIC_API_KEY
+parse_existing_env "$QUAY_ENV"   existing_quay_admin_token QUAY_ADMIN_TOKEN
 
 # Ops env (non-prod AWS + New Relic) and ops-prod env (prod AWS).
 parse_existing_env "$OPS_ENV"      existing_aws_key             AWS_ACCESS_KEY_ID
@@ -195,6 +200,9 @@ prompt_value QUAY_REVIEW_PR_TOKEN "QUAY_REVIEW_PR_TOKEN (optional — enables PO
 # (SLACK_TOKEN is auto-populated from SLACK_BOT_TOKEN below — see header.)
 if (( manage_quay )); then
   prompt_value ANTHROPIC  "ANTHROPIC_API_KEY (optional — leave blank if using \"claude login\" subscription auth)" 0 "$existing_anthropic"  "" 1
+  if [[ -z "$existing_quay_admin_token" ]]; then
+    existing_quay_admin_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+  fi
 fi
 
 # Ops skills (aws-lambda-debug, dynamodb-query, new-relic-lambda) — all
@@ -229,6 +237,7 @@ slack_changed=0
 hermes_changed=0
 ops_changed=0
 ops_prod_changed=0
+quay_changed=0
 write_env() {
   local target="$1" content="$2" changed_var="${3:-}"
   local tmp; tmp="$(mktemp)"
@@ -315,23 +324,24 @@ if [[ -n "$ops_prod_content" ]]; then
 fi
 
 # quay.env — only on quay-provisioned hosts. quay-tick reads its env
-# file fresh per timer tick, so no restart concept; we don't track
-# whether quay.env changed.
+# file fresh per timer tick; quay-serve is long-running and gets restarted
+# below when this file changes.
 if (( manage_quay )); then
   # SLACK_TOKEN mirrors the gateway's SLACK_BOT_TOKEN — same xoxb-, same
   # bot identity, two consumer processes. Always set so flipping
   # adapters.slack.enabled=true in deploy.values.yaml activates the
   # adapter without a re-stage.
   quay_content="LINEAR_API_KEY=${LINEAR}
-SLACK_TOKEN=${SLACK_BOT}"
+SLACK_TOKEN=${SLACK_BOT}
+QUAY_ADMIN_TOKEN=${existing_quay_admin_token}"
   [[ -n "$ANTHROPIC" ]] && quay_content+="
 ANTHROPIC_API_KEY=${ANTHROPIC}"
-  write_env "$QUAY_ENV" "$quay_content"
+  write_env "$QUAY_ENV" "$quay_content" quay_changed
 fi
 
 # hermes-gateway is long-running and only reads EnvironmentFile= at unit
 # start, so a restart is required when any gateway-loaded env file actually
-# changed. quay.env changes don't need anything — quay-tick reads fresh.
+# changed.
 if (( slack_changed || hermes_changed || ops_changed || ops_prod_changed )); then
   if systemctl is-enabled hermes-gateway.service >/dev/null 2>&1; then
     echo "↻ restarting hermes-gateway.service to pick up new env"
@@ -339,5 +349,15 @@ if (( slack_changed || hermes_changed || ops_changed || ops_prod_changed )); the
     systemctl --no-pager --lines=0 status hermes-gateway.service || true
   else
     echo "ℹ hermes-gateway.service not enabled yet — re-run setup-hermes.sh."
+  fi
+fi
+
+if (( quay_changed )); then
+  if systemctl is-enabled quay-serve.service >/dev/null 2>&1; then
+    echo "↻ restarting quay-serve.service to pick up new env"
+    systemctl restart quay-serve.service
+    systemctl --no-pager --lines=0 status quay-serve.service || true
+  else
+    echo "ℹ quay-serve.service not enabled yet — re-run setup-hermes.sh."
   fi
 fi
