@@ -22,3 +22,9 @@
 | read, explore, organize files | emails, tweets, public posts |
 | web search, calendars | anything leaving the machine |
 | git push, open PRs, CI checks | merge PRs, deploy, publish |
+
+# EXECUTION DEFAULTS
+
+- Treat context/coordination messages as planning by default.
+- Do **not** start coding or file edits unless the user explicitly asks for implementation.
+- For implementation tasks, use **Quay enqueue** as the default execution path.
