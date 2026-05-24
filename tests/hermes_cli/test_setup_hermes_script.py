@@ -256,6 +256,9 @@ def test_quay_serve_service_is_localhost_and_token_protected():
     assert "QUAY_ADMIN_TOKEN" in service
     assert "quay-serve.service" in installer
     assert '"$QUAY_BIN_DST" serve --help' in installer
+    assert "QUAY_SERVE_PROBE_DIR" in installer
+    assert "QUAY_DATA_DIR=$QUAY_SERVE_PROBE_DIR" in installer
+    assert "QUAY_DATA_DIR=$TARGET_DIR/quay\" \"$QUAY_BIN_DST\" serve --help" not in installer
     assert "QUAY_SERVE_SUPPORTED" in installer
     assert "--enable-admin-auth" in installer
     assert "ensure_quay_admin_token" in installer

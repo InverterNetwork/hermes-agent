@@ -24,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -1854,19 +1855,24 @@ def run(
     quay_tags_supported = False
     quay_serve_supported = False
     if quay_version and Path(quay_bin).is_file():
-        target_quay = args.target / "quay"
-        rc, _, _ = _run([
-            *_sudo_prefix_for(agent_owner),
-            "env", f"QUAY_DATA_DIR={target_quay}",
-            quay_bin, "tags", "--help",
-        ])
-        quay_tags_supported = (rc == 0)
-        rc, _, _ = _run([
-            *_sudo_prefix_for(agent_owner),
-            "env", f"QUAY_DATA_DIR={target_quay}",
-            quay_bin, "serve", "--help",
-        ])
-        quay_serve_supported = (rc == 0)
+        with tempfile.TemporaryDirectory(prefix="hermes-quay-probe-") as probe_dir:
+            probe_path = Path(probe_dir)
+            try:
+                probe_path.chmod(0o777)
+            except OSError:
+                pass
+            rc, _, _ = _run([
+                *_sudo_prefix_for(agent_owner),
+                "env", f"QUAY_DATA_DIR={probe_path}",
+                quay_bin, "tags", "--help",
+            ])
+            quay_tags_supported = (rc == 0)
+            rc, _, _ = _run([
+                *_sudo_prefix_for(agent_owner),
+                "env", f"QUAY_DATA_DIR={probe_path}",
+                quay_bin, "serve", "--help",
+            ])
+            quay_serve_supported = (rc == 0)
 
     s = _State(
         args=args,

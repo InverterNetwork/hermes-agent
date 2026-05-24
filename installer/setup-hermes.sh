@@ -432,11 +432,13 @@ else
   rm -rf "$QUAY_TMP"
   trap - EXIT
 
-  if env "QUAY_DATA_DIR=$TARGET_DIR/quay" "$QUAY_BIN_DST" serve --help >/dev/null 2>&1; then
+  QUAY_SERVE_PROBE_DIR="$(mktemp -d)"
+  if env "QUAY_DATA_DIR=$QUAY_SERVE_PROBE_DIR" "$QUAY_BIN_DST" serve --help >/dev/null 2>&1; then
     QUAY_SERVE_SUPPORTED=1
   else
     echo "==> quay binary does not support 'serve'; skipping Admin UI service for $QUAY_VERSION" >&2
   fi
+  rm -rf "$QUAY_SERVE_PROBE_DIR"
 fi
 
 # ---------- operator-invocation glue (wrapper + profile.d) ----------

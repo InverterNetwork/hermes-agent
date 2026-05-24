@@ -639,6 +639,7 @@ def _write_quay_stub(
     deployment_tags: dict | None = None,
     tags_supported: bool = True,
     serve_supported: bool = True,
+    help_probe_side_effect: bool = False,
 ) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
@@ -702,15 +703,23 @@ def _write_quay_stub(
         'if [[ "$1" == "tags" && "$2" == "get-deployment" ]]; then '
         f"echo {_json.dumps(_json.dumps(deployment_envelope))}; exit 0; fi\n"
     )
+    tags_side_effect = (
+        'mkdir -p "$QUAY_DATA_DIR"; touch "$QUAY_DATA_DIR/tags-help-probe"; '
+        if help_probe_side_effect else ""
+    )
+    serve_side_effect = (
+        'mkdir -p "$QUAY_DATA_DIR"; touch "$QUAY_DATA_DIR/serve-help-probe"; '
+        if help_probe_side_effect else ""
+    )
     tags_help_block = (
-        'if [[ "$1" == "tags" && "$2" == "--help" ]]; then exit 0; fi\n'
+        f'if [[ "$1" == "tags" && "$2" == "--help" ]]; then {tags_side_effect}exit 0; fi\n'
         if tags_supported
-        else 'if [[ "$1" == "tags" && "$2" == "--help" ]]; then echo "unknown_command" >&2; exit 1; fi\n'
+        else f'if [[ "$1" == "tags" && "$2" == "--help" ]]; then {tags_side_effect}echo "unknown_command" >&2; exit 1; fi\n'
     )
     serve_help_block = (
-        'if [[ "$1" == "serve" && "$2" == "--help" ]]; then exit 0; fi\n'
+        f'if [[ "$1" == "serve" && "$2" == "--help" ]]; then {serve_side_effect}exit 0; fi\n'
         if serve_supported
-        else 'if [[ "$1" == "serve" && "$2" == "--help" ]]; then echo "unknown command: serve" >&2; exit 1; fi\n'
+        else f'if [[ "$1" == "serve" && "$2" == "--help" ]]; then {serve_side_effect}echo "unknown command: serve" >&2; exit 1; fi\n'
     )
     path.write_text(
         "#!/usr/bin/env bash\n"
@@ -1132,6 +1141,21 @@ class TestSetupHermesVerifyQuay:
         assert result.returncode == 1
         assert "[DRIFT] quay admin auth config" in result.stderr
         assert "does not support `serve`" in result.stderr
+
+    def test_quay_capability_probes_do_not_touch_live_data_dir(self, quay_install):
+        _write_live_quay_stub(
+            quay_install,
+            QUAY_VERSION,
+            [quay_install["quay_repo_id"]],
+            help_probe_side_effect=True,
+        )
+        before = _snapshot(quay_install["quay_dir"])
+        result = _run_verify_quay(quay_install)
+        after = _snapshot(quay_install["quay_dir"])
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert before == after
+        assert not (quay_install["quay_dir"] / "tags-help-probe").exists()
+        assert not (quay_install["quay_dir"] / "serve-help-probe").exists()
 
     def test_app_auth_quay_gitconfig_passes(self, quay_install):
         env = _configure_quay_app_auth(quay_install)
