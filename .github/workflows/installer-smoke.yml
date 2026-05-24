@@ -90,6 +90,8 @@ jobs:
         #   * brix-indexer        — quay-managed, base_branch: dev
         #   * erpc                — quay-managed, base_branch: main
         #   * iTry-contracts      — quay-managed, base_branch: main
+        #   * quay                — quay-managed, base_branch: dev
+        #   * quay-ui             — quay-managed, base_branch: main
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
         #                           repos[] loop.
@@ -110,6 +112,8 @@ jobs:
           BRIX_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-indexer
           ERPC_FIXTURE=/srv/hermes/repos/quay-fixtures/erpc
           ITRY_CONTRACTS_FIXTURE=/srv/hermes/repos/quay-fixtures/iTry-contracts
+          QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/quay
+          QUAY_UI_FIXTURE=/srv/hermes/repos/quay-fixtures/quay-ui
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
           git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
@@ -130,6 +134,8 @@ jobs:
           init_fixture "$BRIX_FIXTURE" "init fixture" dev
           init_fixture "$ERPC_FIXTURE" "init fixture"
           init_fixture "$ITRY_CONTRACTS_FIXTURE" "init fixture"
+          init_fixture "$QUAY_FIXTURE" "init fixture" dev
+          init_fixture "$QUAY_UI_FIXTURE" "init fixture"
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -142,7 +148,7 @@ jobs:
           git_in "$DEV_FIXTURE" add -A
           git_in "$DEV_FIXTURE" commit -q -m "develop commit"
           git_in "$DEV_FIXTURE" checkout -q main
-          # Repoint both quay-managed entries' URLs at their local fixtures
+          # Repoint quay-managed entries' URLs at their local fixtures
           # and append the two code-only entries to repos[]. Use python to
           # round-trip through PyYAML so the structure stays valid no matter
           # where `quay:` lives relative to `repos:`.
@@ -150,7 +156,7 @@ jobs:
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$QUAY_UI_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
           (
               brix_landing_fixture,
@@ -159,9 +165,11 @@ jobs:
               brix_fixture,
               erpc_fixture,
               itry_contracts_fixture,
+              quay_fixture,
+              quay_ui_fixture,
               code_fixture,
               dev_fixture,
-          ) = sys.argv[1:9]
+          ) = sys.argv[1:11]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
@@ -172,6 +180,8 @@ jobs:
               "brix-indexer": brix_fixture,
               "erpc": erpc_fixture,
               "iTry-contracts": itry_contracts_fixture,
+              "quay": quay_fixture,
+              "quay-ui": quay_ui_fixture,
           }
           for entry in data.get("repos", []):
               if entry.get("id") in rewrite:
@@ -407,7 +417,9 @@ jobs:
               iTRY-monorepo:/srv/hermes/repos/quay-fixtures/iTRY-monorepo \
               brix-indexer:/srv/hermes/repos/quay-fixtures/brix-indexer \
               erpc:/srv/hermes/repos/quay-fixtures/erpc \
-              iTry-contracts:/srv/hermes/repos/quay-fixtures/iTry-contracts; do
+              iTry-contracts:/srv/hermes/repos/quay-fixtures/iTry-contracts \
+              quay:/srv/hermes/repos/quay-fixtures/quay \
+              quay-ui:/srv/hermes/repos/quay-fixtures/quay-ui; do
               id="${spec%%:*}"
               fixture="${spec#*:}"
               [[ -d "$T/quay/repos/$id.git" ]] \
@@ -418,7 +430,7 @@ jobs:
             done
             registered=$(env QUAY_DATA_DIR="$T/quay" /usr/local/bin/quay repo list \
               | python3 -c "import json,sys;print(\"\\n\".join(r[\"repo_id\"] for r in json.load(sys.stdin)))")
-            for id in brix-landing iTRY-frontends iTRY-monorepo brix-indexer erpc iTry-contracts; do
+            for id in brix-landing iTRY-frontends iTRY-monorepo brix-indexer erpc iTry-contracts quay quay-ui; do
               grep -Fxq "$id" <<< "$registered" \
                 || { echo "FAIL: $id not registered (got: $registered)"; exit 1; }
             done
@@ -430,7 +442,7 @@ jobs:
           '
 
       - name: code mirror probes (every repos[] entry has one)
-        # All repos[] entries (the six quay-managed repos from values.yaml
+        # All repos[] entries (the eight quay-managed repos from values.yaml
         # plus the two CI-only code-only fixtures) must produce a working-
         # tree clone at $T/code/<id>/, agent-owned, on origin/<base_branch>.
         # The mirror is what hermes-code-sync refreshes on its 5-min timer.
@@ -446,6 +458,8 @@ jobs:
               brix-indexer:dev \
               erpc:main \
               iTry-contracts:main \
+              quay:dev \
+              quay-ui:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"
@@ -495,6 +509,8 @@ jobs:
               brix-indexer:dev \
               erpc:main \
               iTry-contracts:main \
+              quay:dev \
+              quay-ui:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"

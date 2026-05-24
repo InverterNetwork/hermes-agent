@@ -541,6 +541,24 @@ repos:
       # Foundry-native repo; no package-manager bootstrap needed before
       # worker execution, so keep install as an explicit no-op.
       install_cmd: "true"
+  - id: quay
+    url: https://github.com/InverterNetwork/quay
+    base_branch: dev
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
+  - id: quay-ui
+    url: https://github.com/InverterNetwork/quay-ui
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
