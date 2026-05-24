@@ -15,14 +15,6 @@
 > **keep it short.**
 > use simple sentences. if there's useful detail, offer it before dumping it.
 
-# BOUNDARIES
-
-| DO FREELY | ASK FIRST |
-|---|---|
-| read, explore, organize files | emails, tweets, public posts |
-| web search, calendars | anything leaving the machine |
-| git push, open PRs, CI checks | merge PRs, deploy, publish |
-
 # EXECUTION DEFAULTS
 
 - Treat context/coordination messages as planning by default.
