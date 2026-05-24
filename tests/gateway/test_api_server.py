@@ -33,6 +33,10 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.quay_admin_auth import (
+    authorize_quay_admin_slack_user,
+    parse_quay_admin_allowed_users,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +542,91 @@ class TestQuayReviewPrEndpoint:
             assert data["error"]["code"] == "quay_command_failed"
             assert data["error"]["exit_code"] == 2
             assert data["error"]["quay"]["error"] == "repo_not_configured"
+
+
+# ---------------------------------------------------------------------------
+# Quay Admin Slack allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestQuayAdminAuthorization:
+    def test_allows_configured_slack_user_id(self):
+        result = authorize_quay_admin_slack_user(
+            "U06TDC56VJB",
+            "U06TDC56VJB,U111111111",
+        )
+
+        assert result.allowed is True
+        assert result.user_id == "U06TDC56VJB"
+        assert result.reason == "allowed"
+
+    def test_denies_unlisted_slack_user_id(self):
+        result = authorize_quay_admin_slack_user(
+            "U999999999",
+            "U06TDC56VJB,U111111111",
+        )
+
+        assert result.allowed is False
+        assert result.reason == "slack_user_not_allowlisted"
+
+    @pytest.mark.parametrize("allowlist", ["", "   "])
+    def test_empty_allowlist_denies_all_users(self, allowlist):
+        result = authorize_quay_admin_slack_user("U06TDC56VJB", allowlist)
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_missing_allowlist_denies_all_users(self, monkeypatch):
+        monkeypatch.delenv("QUAY_ADMIN_ALLOWED_USERS", raising=False)
+
+        result = authorize_quay_admin_slack_user("U06TDC56VJB")
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_normalizes_comma_separated_entries_and_ignores_malformed(self):
+        assert parse_quay_admin_allowed_users(
+            " u06tdc56vjb , not-a-slack-id,*, U111111111 "
+        ) == frozenset({"U06TDC56VJB", "U111111111"})
+
+    def test_malformed_user_id_is_denied(self):
+        result = authorize_quay_admin_slack_user(
+            "not-a-slack-id",
+            "U06TDC56VJB",
+        )
+
+        assert result.allowed is False
+        assert result.reason == "invalid_slack_user_id"
+
+    def test_wildcard_does_not_grant_access(self):
+        result = authorize_quay_admin_slack_user("U06TDC56VJB", "*")
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_general_gateway_allowlists_do_not_grant_quay_admin_access(self, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U06TDC56VJB")
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U06TDC56VJB")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        monkeypatch.delenv("QUAY_ADMIN_ALLOWED_USERS", raising=False)
+
+        result = authorize_quay_admin_slack_user("U06TDC56VJB")
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_api_server_adapter_reads_env_allowlist(self, monkeypatch):
+        monkeypatch.setenv("QUAY_ADMIN_ALLOWED_USERS", "U06TDC56VJB")
+        adapter = _make_adapter()
+
+        assert adapter.check_quay_admin_authorization("u06tdc56vjb").allowed is True
+
+    def test_api_server_config_overrides_env_allowlist(self, monkeypatch):
+        monkeypatch.setenv("QUAY_ADMIN_ALLOWED_USERS", "U06TDC56VJB")
+        adapter = _make_adapter(extra={"quay_admin_allowed_users": "U111111111"})
+
+        assert adapter.check_quay_admin_authorization("U06TDC56VJB").allowed is False
+        assert adapter.check_quay_admin_authorization("U111111111").allowed is True
 
 
 # ---------------------------------------------------------------------------

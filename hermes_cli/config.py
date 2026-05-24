@@ -2267,6 +2267,14 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "QUAY_ADMIN_ALLOWED_USERS": {
+        "description": "Comma-separated Slack user IDs allowed to request Quay Admin access. Empty or unset denies all users; wildcard access is not supported.",
+        "prompt": "Quay Admin allowed Slack user IDs",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
     "API_SERVER_PORT": {
         "description": "Port for the API server (default: 8642).",
         "prompt": "API server port",

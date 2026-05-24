@@ -45,6 +45,10 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.quay_admin_auth import (
+    QuayAdminAuthorization,
+    authorize_quay_admin_slack_user,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -627,6 +631,11 @@ class APIServerAdapter(BasePlatformAdapter):
         ).strip()
         if not self._quay_data_dir:
             self._quay_data_dir = str(get_hermes_home() / "quay")
+        self._quay_admin_allowed_users = (
+            extra.get("quay_admin_allowed_users")
+            if "quay_admin_allowed_users" in extra
+            else os.getenv("QUAY_ADMIN_ALLOWED_USERS", "")
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -763,6 +772,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 code="invalid_quay_review_token",
             ),
             status=401,
+        )
+
+    def check_quay_admin_authorization(self, slack_user_id: object) -> QuayAdminAuthorization:
+        """Check the dedicated Slack-ID allowlist for Quay Admin access.
+
+        This deliberately does not consult the general gateway allowlists.
+        ``SLACK_ALLOWED_USERS``/``GATEWAY_ALLOWED_USERS`` can grant normal
+        gateway access, and ``GATEWAY_ALLOW_ALL_USERS`` can open broad message
+        access, but Quay Admin access is higher-privilege and must be listed in
+        ``QUAY_ADMIN_ALLOWED_USERS`` (or ``quay_admin_allowed_users`` in this
+        adapter's config).
+        """
+        return authorize_quay_admin_slack_user(
+            slack_user_id,
+            self._quay_admin_allowed_users,
         )
 
     # ------------------------------------------------------------------
