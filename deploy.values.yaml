@@ -286,10 +286,12 @@
 #                                 SLACK_TOKEN is staged by stage-secrets.sh
 #                                 from the gateway's SLACK_BOT_TOKEN — same
 #                                 xoxb-, same bot identity.
-#   quay Admin UI/API         — setup-hermes.sh renders `[admin]` in
-#                                 quay/config.toml with `require_auth=true`
-#                                 and `token_env=QUAY_ADMIN_TOKEN`, generates
-#                                 that token into auth/quay.env, and starts
+#   quay Admin UI/API         — when the pinned binary passes
+#                                 `quay serve --help`, setup-hermes.sh
+#                                 renders `[admin]` in quay/config.toml with
+#                                 `require_auth=true` and
+#                                 `token_env=QUAY_ADMIN_TOKEN`, generates that
+#                                 token into auth/quay.env, and starts
 #                                 `quay serve` on 127.0.0.1:9731. Public
 #                                 exposure belongs behind an explicit proxy,
 #                                 not by widening the Quay listener.

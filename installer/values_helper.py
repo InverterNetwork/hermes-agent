@@ -1035,15 +1035,19 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         "# Edit deploy.values.yaml — local edits here are reconciled away.",
         "#",
         "# data_dir comes from QUAY_DATA_DIR set in the systemd unit; repos_root",
-        "# defaults to ${data_dir}/repos. Admin auth is always required; the",
-        "# token is generated into <HERMES_HOME>/auth/quay.env.",
+        "# defaults to ${data_dir}/repos.",
         "",
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
-        "",
-        "[admin]",
-        "require_auth = true",
-        'token_env = "QUAY_ADMIN_TOKEN"',
     ]
+    if args.enable_admin_auth:
+        lines.extend([
+            "",
+            "# Admin auth is enabled only when the installed quay binary",
+            "# supports `quay serve`; older releases reject unknown config keys.",
+            "[admin]",
+            "require_auth = true",
+            'token_env = "QUAY_ADMIN_TOKEN"',
+        ])
 
     # Legacy `agent_invocation` above continues to render unchanged — quay's
     # back-compat path treats it as the worker default when no `[agents]`
@@ -2216,6 +2220,11 @@ def main(argv: list[str] | None = None) -> int:
             "absolute code mirror root to render as [context].reference_repos_root "
             "when quay.version supports AST-136"
         ),
+    )
+    p_quay.add_argument(
+        "--enable-admin-auth",
+        action="store_true",
+        help="render [admin] auth config for quay releases that support `serve`",
     )
     p_quay.set_defaults(func=cmd_render_quay_config)
 

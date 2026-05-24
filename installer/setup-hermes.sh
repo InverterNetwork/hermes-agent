@@ -383,6 +383,7 @@ QUAY_EXPECTED_SHA_DST="$QUAY_EXPECTED_SHA_DIR/SHA256SUM.expected"
 QUAY_ENABLED=0
 QUAY_EXPECTED_SHA=""
 QUAY_ORCHESTRATOR_ENABLED=0
+QUAY_SERVE_SUPPORTED=0
 
 if [[ -z "$QUAY_VERSION" ]]; then
   echo "==> quay.version unset in $VALUES_FILE; skipping quay provisioning"
@@ -430,6 +431,12 @@ else
   install -o root -g root -m 0755 "$QUAY_TMP/$QUAY_ASSET" "$QUAY_BIN_DST"
   rm -rf "$QUAY_TMP"
   trap - EXIT
+
+  if env "QUAY_DATA_DIR=$TARGET_DIR/quay" "$QUAY_BIN_DST" serve --help >/dev/null 2>&1; then
+    QUAY_SERVE_SUPPORTED=1
+  else
+    echo "==> quay binary does not support 'serve'; skipping Admin UI service for $QUAY_VERSION" >&2
+  fi
 fi
 
 # ---------- operator-invocation glue (wrapper + profile.d) ----------
@@ -668,7 +675,7 @@ install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
 chmod g-s "$AUTH_DIR"
 
 ensure_quay_admin_token() {
-  [[ "$QUAY_ENABLED" -eq 1 ]] || return 0
+  [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 ]] || return 0
 
   local token_line="" token="" tmp=""
   if [[ -r "$QUAY_ENV_FILE" ]]; then
@@ -1029,9 +1036,14 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   # (QUAY_DATA_DIR, EnvironmentFile=/etc/default/quay-tick), not here.
   QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
   echo "==> rendering $QUAY_CONFIG_OUT from $VALUES_FILE"
+  QUAY_RENDER_ADMIN_AUTH_ARGS=()
+  if [[ "$QUAY_SERVE_SUPPORTED" -eq 1 ]]; then
+    QUAY_RENDER_ADMIN_AUTH_ARGS+=(--enable-admin-auth)
+  fi
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
     render-quay-config --out "$QUAY_CONFIG_OUT" --force \
-    --reference-repos-root "$TARGET_DIR/code"
+    --reference-repos-root "$TARGET_DIR/code" \
+    "${QUAY_RENDER_ADMIN_AUTH_ARGS[@]}"
   chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
   chmod 0644 "$QUAY_CONFIG_OUT"
 
@@ -1653,7 +1665,7 @@ fi
 
 QUAY_SERVE_SRC="$OPS_DIR/quay-serve.service"
 
-if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_SERVE_SRC" ]]; then
+if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 && -f "$QUAY_SERVE_SRC" ]]; then
   install -d -o root -g root -m 0755 /etc/default
   if [[ -f /etc/default/quay-serve ]]; then
     echo "==> /etc/default/quay-serve already present (preserving)"
@@ -1679,8 +1691,10 @@ EOF
   else
     echo "==> systemctl not present; skipping quay-serve service enable" >&2
   fi
-elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
+elif [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 ]]; then
   echo "==> WARNING: $QUAY_SERVE_SRC missing; skipping quay-serve install" >&2
+elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  echo "==> quay-serve not enabled because $QUAY_BIN_DST lacks 'serve' support" >&2
 fi
 
 # ---------- quay-orchestrator ----------

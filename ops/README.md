@@ -31,10 +31,11 @@ Six units live here:
   `$QUAY_REVIEWER_GH_TOKEN` from `/etc/hermes/reviewer.env`.
   `QUAY_DATA_DIR` points at `<HERMES_HOME>/quay/`. Operates on the
   subset of `repos[]` entries carrying a `quay:` block.
-* **`quay-serve`** — localhost-only Admin UI/API service. Release
-  binaries serve the embedded UI, bind to `127.0.0.1:9731`, use
-  `QUAY_DATA_DIR=<HERMES_HOME>/quay`, and require
-  `QUAY_ADMIN_TOKEN` from `<HERMES_HOME>/auth/quay.env`.
+* **`quay-serve`** — localhost-only Admin UI/API service. Installed only
+  when the pinned Quay binary passes `quay serve --help`. Supporting
+  release binaries serve the embedded UI, bind to `127.0.0.1:9731`, use
+  `QUAY_DATA_DIR=<HERMES_HOME>/quay`, and require `QUAY_ADMIN_TOKEN`
+  from `<HERMES_HOME>/auth/quay.env`.
 * **`quay-orchestrator`** — optional Quay sidecar for durable Quay
   delivery outbox items and legacy orchestrator handoffs. It is gated by
   `quay.orchestrator.enabled` and
@@ -63,7 +64,7 @@ Six units live here:
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints the worker GitHub App token via `installer/hermes_github_token.py` and exports it as `$GH_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
-| `ops/quay-serve.service`                   | systemd service unit for the embedded Quay Admin UI/API. Templated with `User=__AGENT_USER__`, `QUAY_DATA_DIR=<TARGET>/quay`, and `EnvironmentFile=<TARGET>/auth/quay.env`; binds `127.0.0.1:9731` and requires `QUAY_ADMIN_TOKEN`. |
+| `ops/quay-serve.service`                   | systemd service unit for the embedded Quay Admin UI/API. Installed only when the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `QUAY_DATA_DIR=<TARGET>/quay`, and `EnvironmentFile=<TARGET>/auth/quay.env`; binds `127.0.0.1:9731` and requires `QUAY_ADMIN_TOKEN`. |
 | `ops/quay_orchestrator.py`                 | Quay delivery-outbox and handoff drain loop. Defines the Quay CLI adapter, delivery-only Slack posts, human-advice Slack question/discussion flow with original-thread routing plus fallback-channel support, orchestrator decision handling, JSON event logging, metrics, and lock wrapper. |
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. |

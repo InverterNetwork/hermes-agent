@@ -71,6 +71,7 @@ class _State:
     agent_invocation: str
     codex_required: bool = False
     quay_tags_supported: bool = False
+    quay_serve_supported: bool = False
     total: int = 0
     drift: int = 0
 
@@ -824,6 +825,13 @@ def _check_quay_admin_config(s: _State) -> None:
     if cfg is None:
         return
     admin = cfg.get("admin")
+    if not s.quay_serve_supported:
+        if isinstance(admin, dict):
+            s.v_drift(
+                "quay admin auth config",
+                "present but installed quay binary does not support `serve`",
+            )
+        return
     if not isinstance(admin, dict):
         s.v_drift("quay admin auth config", "missing [admin] block")
         return
@@ -1583,6 +1591,15 @@ def _check_quay_serve_service(s: _State) -> None:
         s.v_drift("quay admin local health", f"{health_url} returned HTTP {code}")
 
 
+def _check_quay_serve_not_installed(s: _State) -> None:
+    unit_file = Path(s.systemd_dir) / "quay-serve.service"
+    if unit_file.exists():
+        s.v_drift(
+            "quay-serve.service",
+            "installed but the pinned quay binary does not support `serve`",
+        )
+
+
 def _check_quay_tick_unit_architecture(s: _State) -> None:
     unit_file = Path(s.systemd_dir) / "quay-tick.service"
     if not unit_file.is_file():
@@ -1835,6 +1852,7 @@ def run(
     # "could not read live state" lines on a perfectly valid pre-tag-vocab
     # install. Only probes when quay is enabled and the binary exists.
     quay_tags_supported = False
+    quay_serve_supported = False
     if quay_version and Path(quay_bin).is_file():
         target_quay = args.target / "quay"
         rc, _, _ = _run([
@@ -1843,6 +1861,12 @@ def run(
             quay_bin, "tags", "--help",
         ])
         quay_tags_supported = (rc == 0)
+        rc, _, _ = _run([
+            *_sudo_prefix_for(agent_owner),
+            "env", f"QUAY_DATA_DIR={target_quay}",
+            quay_bin, "serve", "--help",
+        ])
+        quay_serve_supported = (rc == 0)
 
     s = _State(
         args=args,
@@ -1865,6 +1889,7 @@ def run(
         agent_invocation=agent_invocation,
         codex_required=codex_required,
         quay_tags_supported=quay_tags_supported,
+        quay_serve_supported=quay_serve_supported,
     )
 
     print(
@@ -1908,7 +1933,10 @@ def run(
     _check_deployment_tag_vocab(s)
     _check_systemd(s)
     if quay_version:
-        _check_quay_serve_service(s)
+        if s.quay_serve_supported:
+            _check_quay_serve_service(s)
+        else:
+            _check_quay_serve_not_installed(s)
     if app_auth_expected:
         _check_token_helper(s, repos_tsv)
     # Reviewer auth is gated by /etc/hermes/reviewer.env presence inside

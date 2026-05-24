@@ -255,8 +255,12 @@ def test_quay_serve_service_is_localhost_and_token_protected():
     assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in service
     assert "QUAY_ADMIN_TOKEN" in service
     assert "quay-serve.service" in installer
+    assert '"$QUAY_BIN_DST" serve --help' in installer
+    assert "QUAY_SERVE_SUPPORTED" in installer
+    assert "--enable-admin-auth" in installer
     assert "ensure_quay_admin_token" in installer
     assert "secrets.token_urlsafe(48)" in installer
+    assert '[[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1' in installer
     assert "systemctl enable --now quay-serve.service" in installer
     assert "QUAY_ADMIN_TOKEN=${existing_quay_admin_token}" in stage
 

@@ -638,6 +638,7 @@ def _write_quay_stub(
     repo_tags: dict[str, dict] | None = None,
     deployment_tags: dict | None = None,
     tags_supported: bool = True,
+    serve_supported: bool = True,
 ) -> None:
     """Stub `quay` binary — emits version on `--version`, JSON list on `repo list`.
 
@@ -706,11 +707,17 @@ def _write_quay_stub(
         if tags_supported
         else 'if [[ "$1" == "tags" && "$2" == "--help" ]]; then echo "unknown_command" >&2; exit 1; fi\n'
     )
+    serve_help_block = (
+        'if [[ "$1" == "serve" && "$2" == "--help" ]]; then exit 0; fi\n'
+        if serve_supported
+        else 'if [[ "$1" == "serve" && "$2" == "--help" ]]; then echo "unknown command: serve" >&2; exit 1; fi\n'
+    )
     path.write_text(
         "#!/usr/bin/env bash\n"
         f'if [[ "$1" == "--version" ]]; then echo "{semver}+abc1234"; exit 0; fi\n'
         f'if [[ "$1" == "repo" && "$2" == "list" ]]; then echo \'{repo_list_payload}\'; exit 0; fi\n'
         + tags_help_block
+        + serve_help_block
         + repo_tags_block
         + deployment_block
         + "exit 0\n"
@@ -1100,6 +1107,31 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] quay admin local health" in result.stderr
+
+    def test_quay_serve_unit_is_drift_when_binary_lacks_serve(self, quay_install):
+        _write_live_quay_stub(
+            quay_install,
+            QUAY_VERSION,
+            [quay_install["quay_repo_id"]],
+            serve_supported=False,
+        )
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay-serve.service" in result.stderr
+        assert "does not support `serve`" in result.stderr
+
+    def test_admin_config_is_drift_when_binary_lacks_serve(self, quay_install):
+        _write_live_quay_stub(
+            quay_install,
+            QUAY_VERSION,
+            [quay_install["quay_repo_id"]],
+            serve_supported=False,
+        )
+        (quay_install["systemd_dir"] / "quay-serve.service").unlink()
+        result = _run_verify_quay(quay_install)
+        assert result.returncode == 1
+        assert "[DRIFT] quay admin auth config" in result.stderr
+        assert "does not support `serve`" in result.stderr
 
     def test_app_auth_quay_gitconfig_passes(self, quay_install):
         env = _configure_quay_app_auth(quay_install)
