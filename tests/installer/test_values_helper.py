@@ -323,6 +323,53 @@ class TestRenderGatewayRuntimeEnv:
         assert "home_channel" in r.stderr
         assert not out.exists()
 
+    def test_writes_quay_admin_allowed_users(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  admin:\n    allowed_users:\n"
+            "      - u06tdc56vjb\n      - U111111111\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "QUAY_ADMIN_ALLOWED_USERS=U06TDC56VJB,U111111111" in out.read_text()
+
+    def test_empty_quay_admin_allowed_users_clears_stale_env(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  admin:\n    allowed_users: []\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "QUAY_ADMIN_ALLOWED_USERS=\n" in out.read_text()
+
+    def test_rejects_quay_admin_wildcard(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  admin:\n    allowed_users:\n      - '*'\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "wildcard access is not supported" in r.stderr
+        assert not out.exists()
+
+    def test_rejects_malformed_quay_admin_allowed_user(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  admin:\n    allowed_users:\n      - not-a-user\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.admin.allowed_users entries" in r.stderr
+        assert not out.exists()
+
     def test_writes_gateway_allow_all_users_true(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(
