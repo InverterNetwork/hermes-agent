@@ -17,6 +17,7 @@ Subcommands:
                                   derived from the values file
                                   (SLACK_ALLOWED_USERS, SLACK_ALLOWED_CHANNELS,
                                   QUAY_ADMIN_ALLOWED_USERS,
+                                  QUAY_ADMIN_PUBLIC_BASE_URL,
                                   GATEWAY_ALLOW_ALL_USERS, LINEAR_TEAM_*).
                                   Always rewrites — the file is a reflection
                                   of values.yaml, not operator input.
@@ -615,6 +616,7 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     * ``SLACK_ALLOWED_CHANNELS`` from ``slack.runtime.allowed_channels``.
     * ``SLACK_HOME_CHANNEL`` from ``slack.runtime.home_channel``.
     * ``QUAY_ADMIN_ALLOWED_USERS`` from ``quay.admin.allowed_users``.
+    * ``QUAY_ADMIN_PUBLIC_BASE_URL`` from ``quay.admin.public_base_url``.
     * ``GATEWAY_ALLOW_ALL_USERS`` from ``gateway.allow_all_users``.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
@@ -698,6 +700,34 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
             normalized_allowed_users.append(_env_safe("quay.admin.allowed_users[]", user_id))
         joined = ",".join(normalized_allowed_users)
         lines.append(f"QUAY_ADMIN_ALLOWED_USERS={joined}")
+    if isinstance(quay_admin, dict) and "public_base_url" in quay_admin:
+        public_base_url = quay_admin.get("public_base_url")
+        if public_base_url is None:
+            public_base_url = ""
+        if not isinstance(public_base_url, str):
+            sys.stderr.write(
+                "values_helper.py: quay.admin.public_base_url must be a string\n"
+            )
+            return 1
+        public_base_url = public_base_url.strip().rstrip("/")
+        if public_base_url:
+            parsed = urlparse(public_base_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                sys.stderr.write(
+                    "values_helper.py: quay.admin.public_base_url must be an "
+                    "http(s) URL like https://hermes.example.com\n"
+                )
+                return 1
+            if parsed.query or parsed.fragment:
+                sys.stderr.write(
+                    "values_helper.py: quay.admin.public_base_url must not "
+                    "include query strings or fragments\n"
+                )
+                return 1
+        lines.append(
+            "QUAY_ADMIN_PUBLIC_BASE_URL="
+            f"{_env_safe('quay.admin.public_base_url', public_base_url)}"
+        )
 
     gateway = data.get("gateway") or {}
     if isinstance(gateway, dict) and "allow_all_users" in gateway:

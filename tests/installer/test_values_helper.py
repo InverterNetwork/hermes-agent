@@ -335,6 +335,32 @@ class TestRenderGatewayRuntimeEnv:
         assert r.returncode == 0, r.stderr
         assert "QUAY_ADMIN_ALLOWED_USERS=U06TDC56VJB,U111111111" in out.read_text()
 
+    def test_writes_quay_admin_public_base_url(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  admin:\n    public_base_url: https://hermes.example.test/\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert (
+            "QUAY_ADMIN_PUBLIC_BASE_URL=https://hermes.example.test\n"
+            in out.read_text()
+        )
+
+    def test_rejects_malformed_quay_admin_public_base_url(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  admin:\n    public_base_url: didier.brix.fyi\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.admin.public_base_url" in r.stderr
+        assert not out.exists()
+
     def test_empty_quay_admin_allowed_users_clears_stale_env(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
         values.write_text(

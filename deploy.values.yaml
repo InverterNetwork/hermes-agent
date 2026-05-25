@@ -59,6 +59,12 @@
 #                                 GATEWAY_ALLOWED_USERS, and
 #                                 GATEWAY_ALLOW_ALL_USERS; general gateway
 #                                 access never grants Quay Admin access.
+#   quay.admin.public_base_url
+#                               — externally reachable Hermes dashboard base
+#                                 URL used when Slack DMs Quay Admin login
+#                                 links. Rendered into
+#                                 QUAY_ADMIN_PUBLIC_BASE_URL in
+#                                 gateway-runtime.env on every install.
 #
 #   gateway.model_provider     — provider key persisted into <target>/config.yaml
 #                                 under model.provider (e.g. "openai-codex",
@@ -672,9 +678,12 @@ quay:
   # from the general gateway user/channel allowlists and from
   # GATEWAY_ALLOW_ALL_USERS. Empty/unset denies every admin access request
   # at POST /quay/admin/authorize; "*" is not supported.
+  # public_base_url is the public Hermes dashboard origin used in Slack
+  # one-time login links for /quay-admin.
   admin:
     allowed_users:
       - U06TDC56VJB
+    public_base_url: https://didier.brix.fyi
   # Pinned Codex CLI worker binary. The OpenAI Codex GitHub release uses
   # `rust-v<version>` tags for static assets; the installer downloads the
   # linux-x64 musl tarball, verifies the release API SHA256 digest pinned
