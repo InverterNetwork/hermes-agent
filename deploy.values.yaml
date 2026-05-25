@@ -48,6 +48,18 @@
 #                                 cross-platform messages have a deployment-
 #                                 managed fallback target.
 #
+#   quay.admin.allowed_users   — Slack member IDs (U…) authorized to request
+#                                 Quay Admin access. Source of truth for
+#                                 QUAY_ADMIN_ALLOWED_USERS in gateway-
+#                                 runtime.env. Empty/unset fails closed: no
+#                                 user can pass POST /quay/admin/authorize.
+#                                 Wildcard access is intentionally unsupported.
+#                                 The Quay Admin allowlist is independent of
+#                                 slack.runtime.allowed_users,
+#                                 GATEWAY_ALLOWED_USERS, and
+#                                 GATEWAY_ALLOW_ALL_USERS; general gateway
+#                                 access never grants Quay Admin access.
+#
 #   gateway.model_provider     — provider key persisted into <target>/config.yaml
 #                                 under model.provider (e.g. "openai-codex",
 #                                 "anthropic", "openrouter"). The installer
@@ -555,6 +567,24 @@ repos:
       # Foundry-native repo; no package-manager bootstrap needed before
       # worker execution, so keep install as an explicit no-op.
       install_cmd: "true"
+  - id: quay
+    url: https://github.com/InverterNetwork/quay
+    base_branch: dev
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
+  - id: quay-ui
+    url: https://github.com/InverterNetwork/quay-ui
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
@@ -608,6 +638,13 @@ quay:
       codex:
         worker: "codex exec --json --dangerously-bypass-approvals-and-sandbox < {prompt_file} > .quay-tool-trace.log"
         reviewer: "codex exec --json --dangerously-bypass-approvals-and-sandbox < {prompt_file} > .quay-tool-trace.log"
+  # Dedicated Quay Admin Slack-ID allowlist. This is intentionally separate
+  # from the general gateway user/channel allowlists and from
+  # GATEWAY_ALLOW_ALL_USERS. Empty/unset denies every admin access request
+  # at POST /quay/admin/authorize; "*" is not supported.
+  admin:
+    allowed_users:
+      - U06TDC56VJB
   # Pinned Codex CLI worker binary. The OpenAI Codex GitHub release uses
   # `rust-v<version>` tags for static assets; the installer downloads the
   # linux-x64 musl tarball, verifies the release API SHA256 digest pinned
