@@ -4,6 +4,7 @@ import dataclasses
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -566,6 +567,78 @@ def test_drain_one_delivers_outbox_item_to_default_channel_without_route():
     assert "Task: task-delivery" in slack.questions[0][1]
     assert quay_client.completed == [item]
     assert quay_client.failed == []
+
+
+def test_delivery_outbox_drains_while_human_wait_remains_active(tmp_path: Path):
+    handoff = quay.Handoff(handoff_id="handoff-waiting", task_id="task-waiting")
+    human_quay = FakeQuayClient(handoff)
+    wait_started = threading.Event()
+    finish_wait = threading.Event()
+    human_result = {}
+    human_error = {}
+
+    class BlockingSlackClient(FakeSlackClient):
+        def wait_for_reply(
+            self,
+            ref,
+            *,
+            after_ts: str,
+            timeout_seconds: float,
+            poll_interval_seconds: float,
+        ):
+            self.waits.append((ref, timeout_seconds, poll_interval_seconds))
+            wait_started.set()
+            finish_wait.wait(timeout=2)
+            return None
+
+    def drain_waiting_handoff() -> None:
+        try:
+            with quay.FileLock(tmp_path / "orchestrator.lock"):
+                human_result["result"] = quay.HandoffDrainer(
+                    quay=human_quay,
+                    slack=BlockingSlackClient(),
+                    config=quay.OrchestratorConfig(
+                        enabled=True,
+                        default_slack_channel="C1234567890",
+                        reply_timeout_seconds=60,
+                        poll_interval_seconds=1,
+                    ),
+                    worker_id="human-worker",
+                    decider=FakeDecider([ready("Resume after the reply.")]),
+                ).drain_one()
+        except Exception as exc:  # pragma: no cover - surfaced below for thread failures
+            human_error["error"] = exc
+
+    thread = threading.Thread(target=drain_waiting_handoff)
+    thread.start()
+    assert wait_started.wait(timeout=2)
+    assert human_quay.state == "waiting_human"
+
+    item = delivery_item(route_hint={})
+    delivery_quay = FakeOutboxQuayClient(item)
+    delivery_slack = FakeSlackClient()
+    with quay.FileLock(tmp_path / "orchestrator.lock"):
+        delivery_result = quay.HandoffDrainer(
+            quay=delivery_quay,
+            slack=delivery_slack,
+            config=quay.OrchestratorConfig(
+                enabled=True,
+                default_slack_channel="CFALLBACK1",
+            ),
+            worker_id="delivery-worker",
+        ).drain_one()
+
+    assert delivery_result.status == "delivery_delivered"
+    assert delivery_quay.completed == [item]
+    assert delivery_slack.questions[0][0] == "CFALLBACK1"
+    assert human_quay.state == "waiting_human"
+
+    finish_wait.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert human_error == {}
+    assert human_result["result"].status == "human_reply_timeout"
+    assert human_quay.released == [(handoff, "human_reply_timeout")]
 
 
 def test_drain_one_delivery_stale_thread_falls_back_to_default_channel():

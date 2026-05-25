@@ -21,12 +21,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 
 LOGGER = logging.getLogger("quay.orchestrator")
+_ACTIVE_DRAIN_LOCK: ContextVar["FileLock | None"] = ContextVar(
+    "_ACTIVE_DRAIN_LOCK",
+    default=None,
+)
 
 
 class LockBusy(RuntimeError):
@@ -1150,28 +1155,39 @@ class FileLock:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._handle: Any = None
+        self._context_token: Any = None
 
     def __enter__(self) -> "FileLock":
-        import fcntl
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self.path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            self._handle.close()
-            self._handle = None
-            raise LockBusy(str(self.path)) from exc
-        self._handle.seek(0)
-        self._handle.truncate()
-        self._handle.write(
-            json.dumps({"pid": os.getpid(), "started_at": time.time()}, sort_keys=True)
-            + "\n"
-        )
-        self._handle.flush()
+        self.acquire(blocking=False)
+        self._context_token = _ACTIVE_DRAIN_LOCK.set(self)
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._context_token is not None:
+            _ACTIVE_DRAIN_LOCK.reset(self._context_token)
+            self._context_token = None
+        self.release()
+
+    def acquire(self, *, blocking: bool) -> None:
+        import fcntl
+
+        if self._handle is not None:
+            return
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), flags)
+        except BlockingIOError as exc:
+            handle.close()
+            raise LockBusy(str(self.path)) from exc
+        self._handle = handle
+        self._write_owner_record()
+
+    def release(self) -> None:
         import fcntl
 
         if self._handle is None:
@@ -1181,6 +1197,31 @@ class FileLock:
         finally:
             self._handle.close()
             self._handle = None
+
+    def _write_owner_record(self) -> None:
+        if self._handle is None:
+            return
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(
+            json.dumps({"pid": os.getpid(), "started_at": time.time()}, sort_keys=True)
+            + "\n"
+        )
+        self._handle.flush()
+
+
+@contextmanager
+def released_drain_lock_while_waiting() -> Any:
+    lock = _ACTIVE_DRAIN_LOCK.get()
+    if lock is None:
+        yield
+        return
+
+    lock.release()
+    try:
+        yield
+    finally:
+        lock.acquire(blocking=True)
 
 
 class HandoffDrainer:
@@ -1602,12 +1643,13 @@ class HandoffDrainer:
             remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 break
-            reply = self.slack.wait_for_reply(
-                post_ref,
-                after_ts=after_ts,
-                timeout_seconds=remaining,
-                poll_interval_seconds=self.config.poll_interval_seconds,
-            )
+            with released_drain_lock_while_waiting():
+                reply = self.slack.wait_for_reply(
+                    post_ref,
+                    after_ts=after_ts,
+                    timeout_seconds=remaining,
+                    poll_interval_seconds=self.config.poll_interval_seconds,
+                )
             if reply is None:
                 return None, None
 
