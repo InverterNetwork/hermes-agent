@@ -882,9 +882,21 @@ proxy. Rotate it when an operator with host access leaves, after suspected
 secret exposure, or as part of normal credential hygiene.
 
 ```sh
-new_token="$(openssl rand -base64 48 | tr -d '\n')"
 sudo cp ~hermes/.hermes/auth/quay.env ~hermes/.hermes/auth/quay.env.$(date -u +%Y%m%dT%H%M%SZ).bak
-sudo sed -i "s/^QUAY_ADMIN_TOKEN=.*/QUAY_ADMIN_TOKEN=${new_token}/" ~hermes/.hermes/auth/quay.env
+new_token="$(
+  sudo python3 - <<'PY'
+from pathlib import Path
+import secrets
+
+path = Path("~hermes/.hermes/auth/quay.env").expanduser()
+token = secrets.token_urlsafe(48)
+lines = path.read_text().splitlines()
+out = [line for line in lines if not line.startswith("QUAY_ADMIN_TOKEN=")]
+out.append(f"QUAY_ADMIN_TOKEN={token}")
+path.write_text("\n".join(out) + "\n")
+print(token)
+PY
+)"
 sudo systemctl restart quay-serve.service
 sudo systemctl restart <dashboard-service>.service
 ```
@@ -928,8 +940,21 @@ sudo systemctl stop quay-serve.service
 #    Exact command depends on your nginx/Caddy/ingress deployment.
 
 # 5. Rotate the service token before re-enabling access.
-new_token="$(openssl rand -base64 48 | tr -d '\n')"
-sudo sed -i "s/^QUAY_ADMIN_TOKEN=.*/QUAY_ADMIN_TOKEN=${new_token}/" ~hermes/.hermes/auth/quay.env
+sudo cp ~hermes/.hermes/auth/quay.env ~hermes/.hermes/auth/quay.env.$(date -u +%Y%m%dT%H%M%SZ).bak
+new_token="$(
+  sudo python3 - <<'PY'
+from pathlib import Path
+import secrets
+
+path = Path("~hermes/.hermes/auth/quay.env").expanduser()
+token = secrets.token_urlsafe(48)
+lines = path.read_text().splitlines()
+out = [line for line in lines if not line.startswith("QUAY_ADMIN_TOKEN=")]
+out.append(f"QUAY_ADMIN_TOKEN={token}")
+path.write_text("\n".join(out) + "\n")
+print(token)
+PY
+)"
 ```
 
 Verify the disable state:
