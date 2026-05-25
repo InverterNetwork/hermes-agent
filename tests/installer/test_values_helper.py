@@ -1013,6 +1013,43 @@ class TestRenderQuayConfig:
         text = out.read_text()
         assert "[adapters.slack]" in text
         assert 'bot_token_env = "QUAY_SLACK_TOKEN"' in text
+        assert "max_thread_messages = 200" in text
+
+    def test_slack_enabled_renders_explicit_max_thread_messages(
+        self, tmp_path: Path
+    ):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  adapters:\n"
+            "    slack:\n"
+            "      enabled: true\n"
+            "      bot_token_env: QUAY_SLACK_TOKEN\n"
+            "      max_thread_messages: 75\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        assert "max_thread_messages = 75" in out.read_text()
+
+    def test_slack_max_thread_messages_must_be_positive_int(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  adapters:\n"
+            "    slack:\n"
+            "      enabled: true\n"
+            "      max_thread_messages: 0\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "config.toml"
+        r = _run(values, "render-quay-config", "--out", str(out))
+        assert r.returncode == 1
+        assert "max_thread_messages" in r.stderr
+        assert not out.exists()
 
     def test_missing_agent_invocation_exits_nonzero(self, tmp_path: Path):
         values = tmp_path / "values.yaml"
