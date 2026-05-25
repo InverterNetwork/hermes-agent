@@ -4,6 +4,7 @@ import dataclasses
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -1466,6 +1467,90 @@ def test_file_lock_is_nonblocking(tmp_path: Path):
         with pytest.raises(quay.LockBusy):
             with quay.FileLock(lock_path):
                 pass
+
+
+def test_delivery_outbox_drains_while_unrelated_handoff_waits_for_human(tmp_path: Path):
+    lock_path = tmp_path / "orchestrator.lock"
+    wait_started = threading.Event()
+    reply_allowed = threading.Event()
+
+    class BlockingSlackClient(FakeSlackClient):
+        def wait_for_reply(
+            self,
+            ref,
+            *,
+            after_ts: str,
+            timeout_seconds: float,
+            poll_interval_seconds: float,
+        ):
+            self.waits.append((ref, timeout_seconds, poll_interval_seconds))
+            wait_started.set()
+            if not reply_allowed.wait(timeout=5):
+                return None
+            return quay.SlackReply(
+                text="Resume with the approved importer fallback.",
+                user_id="U123",
+                ts="1001.000000",
+            )
+
+    handoff = quay.Handoff(handoff_id="handoff-waiting", task_id="task-waiting")
+    handoff_quay = FakeQuayClient(handoff)
+    human_slack = BlockingSlackClient()
+    human_result: list[quay.DrainResult] = []
+    human_errors: list[BaseException] = []
+
+    def run_handoff_wait() -> None:
+        try:
+            with quay.FileLock(lock_path) as lock:
+                drainer = quay.HandoffDrainer(
+                    quay=handoff_quay,
+                    slack=human_slack,
+                    config=quay.OrchestratorConfig(
+                        enabled=True,
+                        default_slack_channel="C1234567890",
+                        reply_timeout_seconds=60,
+                        poll_interval_seconds=1,
+                    ),
+                    worker_id="human-worker",
+                    decider=FakeDecider([ready("Use the approved importer fallback.")]),
+                    coordination_lock=lock,
+                )
+                human_result.append(drainer.drain_one())
+        except BaseException as exc:
+            human_errors.append(exc)
+
+    human_thread = threading.Thread(target=run_handoff_wait)
+    human_thread.start()
+    assert wait_started.wait(timeout=2)
+    assert handoff_quay.state == "waiting_human"
+
+    item = delivery_item(route_hint={})
+    delivery_quay = FakeOutboxQuayClient(item)
+    delivery_slack = FakeSlackClient()
+    with quay.FileLock(lock_path):
+        delivery_result = quay.HandoffDrainer(
+            quay=delivery_quay,
+            slack=delivery_slack,
+            config=quay.OrchestratorConfig(
+                enabled=True,
+                default_slack_channel="CDELIVERY",
+            ),
+            worker_id="delivery-worker",
+        ).drain_one()
+
+    assert delivery_result.status == "delivery_delivered"
+    assert delivery_quay.completed == [item]
+    assert human_thread.is_alive()
+    assert handoff_quay.state == "waiting_human"
+
+    reply_allowed.set()
+    human_thread.join(timeout=5)
+
+    assert not human_thread.is_alive()
+    assert human_errors == []
+    assert human_result[0].status == "submitted_from_human_reply"
+    assert handoff_quay.submitted[0][2] == "advice_answered"
+    assert handoff_quay.completed == [handoff]
 
 
 def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(

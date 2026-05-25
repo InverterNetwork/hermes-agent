@@ -2268,7 +2268,7 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "QUAY_ADMIN_ALLOWED_USERS": {
-        "description": "Comma-separated Slack user IDs allowed to request one-time Quay Admin login links.",
+        "description": "Comma-separated Slack user IDs allowed to request one-time Quay Admin login links. Empty or unset denies all users; wildcard access is not supported.",
         "prompt": "Quay Admin allowed Slack user IDs",
         "url": None,
         "password": False,

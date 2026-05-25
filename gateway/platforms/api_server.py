@@ -13,6 +13,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/stop    — interrupt a running agent
 - POST /quay/review-pr             — authenticated Quay PR review enrollment
+- POST /quay/admin/authorize       — Slack-ID allowlist gate for Quay Admin access
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -45,6 +46,10 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.quay_admin_auth import (
+    QuayAdminAuthorization,
+    authorize_quay_admin_slack_user,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
@@ -627,6 +632,11 @@ class APIServerAdapter(BasePlatformAdapter):
         ).strip()
         if not self._quay_data_dir:
             self._quay_data_dir = str(get_hermes_home() / "quay")
+        self._quay_admin_allowed_users = (
+            extra.get("quay_admin_allowed_users")
+            if "quay_admin_allowed_users" in extra
+            else os.getenv("QUAY_ADMIN_ALLOWED_USERS", "")
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -764,6 +774,30 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
             status=401,
         )
+
+    def check_quay_admin_authorization(self, slack_user_id: object) -> QuayAdminAuthorization:
+        """Check the dedicated Slack-ID allowlist for Quay Admin access.
+
+        This deliberately does not consult the general gateway allowlists.
+        ``SLACK_ALLOWED_USERS``/``GATEWAY_ALLOWED_USERS`` can grant normal
+        gateway access, and ``GATEWAY_ALLOW_ALL_USERS`` can open broad message
+        access, but Quay Admin access is higher-privilege and must be listed in
+        ``QUAY_ADMIN_ALLOWED_USERS`` (or ``quay_admin_allowed_users`` in this
+        adapter's config).
+        """
+        return authorize_quay_admin_slack_user(
+            slack_user_id,
+            self._quay_admin_allowed_users,
+        )
+
+    def _extract_quay_admin_slack_user_id(self, body: Any, request: "web.Request") -> object:
+        """Read the Slack user ID from a trusted caller's request."""
+        if isinstance(body, dict):
+            for key in ("slack_user_id", "user_id", "slackUserId"):
+                value = body.get(key)
+                if value is not None:
+                    return value
+        return request.headers.get("X-Slack-User-Id", "")
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -916,6 +950,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "quay_review_pr": bool(self._quay_review_pr_token),
+                "quay_admin_authorization": True,
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
@@ -931,6 +966,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "quay_review_pr": {"method": "POST", "path": "/quay/review-pr"},
+                "quay_admin_authorize": {"method": "POST", "path": "/quay/admin/authorize"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -1279,6 +1315,48 @@ class APIServerAdapter(BasePlatformAdapter):
                 result.get("review_verdict"),
             )
         return web.json_response(result, status=status)
+
+    async def _handle_quay_admin_authorize(self, request: "web.Request") -> "web.Response":
+        """POST /quay/admin/authorize — authorize a Slack user for Quay Admin."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            body = {}
+
+        result = self.check_quay_admin_authorization(
+            self._extract_quay_admin_slack_user_id(body, request)
+        )
+        if not result.allowed:
+            logger.warning(
+                "[api_server] rejected quay admin access request remote=%s slack_user_id=%s reason=%s",
+                request.remote,
+                result.user_id,
+                result.reason,
+            )
+            return web.json_response(
+                _openai_error(
+                    "Slack user is not authorized for Quay Admin access.",
+                    param="slack_user_id",
+                    code=result.reason,
+                ),
+                status=403,
+            )
+
+        logger.info(
+            "[api_server] authorized quay admin access request remote=%s slack_user_id=%s",
+            request.remote,
+            result.user_id,
+        )
+        return web.json_response(
+            {
+                "allowed": True,
+                "slack_user_id": result.user_id,
+            }
+        )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3228,6 +3306,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             self._app.router.add_post("/quay/review-pr", self._handle_quay_review_pr)
+            self._app.router.add_post("/quay/admin/authorize", self._handle_quay_admin_authorize)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

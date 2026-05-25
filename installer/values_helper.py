@@ -16,6 +16,7 @@ Subcommands:
                                   values.yaml. Holds non-secret env vars
                                   derived from the values file
                                   (SLACK_ALLOWED_USERS, SLACK_ALLOWED_CHANNELS,
+                                  QUAY_ADMIN_ALLOWED_USERS,
                                   GATEWAY_ALLOW_ALL_USERS, LINEAR_TEAM_*).
                                   Always rewrites — the file is a reflection
                                   of values.yaml, not operator input.
@@ -582,6 +583,7 @@ def cmd_merge_slack_triggers(args: argparse.Namespace) -> int:
 
 
 _ENV_VALUE_BAD_CHARS = re.compile(r"[\s=\x00-\x1f\x7f]")
+_QUAY_ADMIN_SLACK_USER_ID_RE = re.compile(r"^U[A-Z0-9]{2,}$")
 
 
 def _env_safe(label: str, value: str) -> str:
@@ -611,6 +613,7 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     * ``SLACK_ALLOWED_USERS`` from ``slack.runtime.allowed_users``.
     * ``SLACK_ALLOWED_CHANNELS`` from ``slack.runtime.allowed_channels``.
     * ``SLACK_HOME_CHANNEL`` from ``slack.runtime.home_channel``.
+    * ``QUAY_ADMIN_ALLOWED_USERS`` from ``quay.admin.allowed_users``.
     * ``GATEWAY_ALLOW_ALL_USERS`` from ``gateway.allow_all_users``.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
@@ -672,6 +675,28 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
             # Deployment-managed channel homes should not inherit a stale
             # thread target from a prior /sethome invocation.
             lines.append("SLACK_HOME_CHANNEL_THREAD_ID=")
+
+    quay_admin = (data.get("quay") or {}).get("admin") or {}
+    if isinstance(quay_admin, dict) and "allowed_users" in quay_admin:
+        allowed_users = quay_admin.get("allowed_users")
+        if not isinstance(allowed_users, list):
+            sys.stderr.write(
+                "values_helper.py: quay.admin.allowed_users must be a list\n"
+            )
+            return 1
+        normalized_allowed_users = []
+        for v in allowed_users:
+            user_id = str(v).strip().upper()
+            if not _QUAY_ADMIN_SLACK_USER_ID_RE.match(user_id):
+                sys.stderr.write(
+                    "values_helper.py: quay.admin.allowed_users entries must be "
+                    "explicit Slack user IDs like U0123ABCDEF; wildcard access "
+                    "is not supported\n"
+                )
+                return 1
+            normalized_allowed_users.append(_env_safe("quay.admin.allowed_users[]", user_id))
+        joined = ",".join(normalized_allowed_users)
+        lines.append(f"QUAY_ADMIN_ALLOWED_USERS={joined}")
 
     gateway = data.get("gateway") or {}
     if isinstance(gateway, dict) and "allow_all_users" in gateway:

@@ -33,6 +33,10 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.quay_admin_auth import (
+    authorize_quay_admin_slack_user,
+    parse_quay_admin_allowed_users,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +366,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post("/quay/review-pr", adapter._handle_quay_review_pr)
+    app.router.add_post("/quay/admin/authorize", adapter._handle_quay_admin_authorize)
     return app
 
 
@@ -538,6 +543,178 @@ class TestQuayReviewPrEndpoint:
             assert data["error"]["code"] == "quay_command_failed"
             assert data["error"]["exit_code"] == 2
             assert data["error"]["quay"]["error"] == "repo_not_configured"
+
+
+# ---------------------------------------------------------------------------
+# Quay Admin Slack allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestQuayAdminAuthorization:
+    def test_allows_configured_slack_user_id(self):
+        result = authorize_quay_admin_slack_user(
+            "U06TDC56VJB",
+            "U06TDC56VJB,U111111111",
+        )
+
+        assert result.allowed is True
+        assert result.user_id == "U06TDC56VJB"
+        assert result.reason == "allowed"
+
+    def test_denies_unlisted_slack_user_id(self):
+        result = authorize_quay_admin_slack_user(
+            "U999999999",
+            "U06TDC56VJB,U111111111",
+        )
+
+        assert result.allowed is False
+        assert result.reason == "slack_user_not_allowlisted"
+
+    @pytest.mark.parametrize("allowlist", ["", "   "])
+    def test_empty_allowlist_denies_all_users(self, allowlist):
+        result = authorize_quay_admin_slack_user("U06TDC56VJB", allowlist)
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_missing_allowlist_denies_all_users(self, monkeypatch):
+        monkeypatch.delenv("QUAY_ADMIN_ALLOWED_USERS", raising=False)
+
+        result = authorize_quay_admin_slack_user("U06TDC56VJB")
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_normalizes_comma_separated_entries_and_ignores_malformed(self):
+        assert parse_quay_admin_allowed_users(
+            " u06tdc56vjb , not-a-slack-id,*, U111111111 "
+        ) == frozenset({"U06TDC56VJB", "U111111111"})
+
+    def test_malformed_user_id_is_denied(self):
+        result = authorize_quay_admin_slack_user(
+            "not-a-slack-id",
+            "U06TDC56VJB",
+        )
+
+        assert result.allowed is False
+        assert result.reason == "invalid_slack_user_id"
+
+    def test_wildcard_does_not_grant_access(self):
+        result = authorize_quay_admin_slack_user("U06TDC56VJB", "*")
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_general_gateway_allowlists_do_not_grant_quay_admin_access(self, monkeypatch):
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U06TDC56VJB")
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U06TDC56VJB")
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+        monkeypatch.delenv("QUAY_ADMIN_ALLOWED_USERS", raising=False)
+
+        result = authorize_quay_admin_slack_user("U06TDC56VJB")
+
+        assert result.allowed is False
+        assert result.reason == "quay_admin_allowlist_empty"
+
+    def test_api_server_adapter_reads_env_allowlist(self, monkeypatch):
+        monkeypatch.setenv("QUAY_ADMIN_ALLOWED_USERS", "U06TDC56VJB")
+        adapter = _make_adapter()
+
+        assert adapter.check_quay_admin_authorization("u06tdc56vjb").allowed is True
+
+    def test_api_server_config_overrides_env_allowlist(self, monkeypatch):
+        monkeypatch.setenv("QUAY_ADMIN_ALLOWED_USERS", "U06TDC56VJB")
+        adapter = _make_adapter(extra={"quay_admin_allowed_users": "U111111111"})
+
+        assert adapter.check_quay_admin_authorization("U06TDC56VJB").allowed is False
+        assert adapter.check_quay_admin_authorization("U111111111").allowed is True
+
+
+class TestQuayAdminAuthorizeEndpoint:
+    @pytest.mark.asyncio
+    async def test_allows_configured_slack_user_id(self):
+        adapter = _make_adapter(
+            api_key="sk-secret",
+            extra={"quay_admin_allowed_users": "U06TDC56VJB,U111111111"},
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/admin/authorize",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"slack_user_id": "u06tdc56vjb"},
+            )
+
+            assert resp.status == 200
+            data = await resp.json()
+            assert data == {"allowed": True, "slack_user_id": "U06TDC56VJB"}
+
+    @pytest.mark.asyncio
+    async def test_accepts_slack_user_id_header(self):
+        adapter = _make_adapter(extra={"quay_admin_allowed_users": "U06TDC56VJB"})
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/admin/authorize",
+                headers={"X-Slack-User-Id": "U06TDC56VJB"},
+                json={},
+            )
+
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["slack_user_id"] == "U06TDC56VJB"
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_api_key_before_allowlist(self):
+        adapter = _make_adapter(
+            api_key="sk-secret",
+            extra={"quay_admin_allowed_users": "U06TDC56VJB"},
+        )
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/admin/authorize",
+                headers={"Authorization": "Bearer wrong"},
+                json={"slack_user_id": "U06TDC56VJB"},
+            )
+
+            assert resp.status == 401
+            data = await resp.json()
+            assert data["error"]["code"] == "invalid_api_key"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("allowed_users", "slack_user_id", "code"),
+        [
+            ("U06TDC56VJB", "U999999999", "slack_user_not_allowlisted"),
+            ("", "U06TDC56VJB", "quay_admin_allowlist_empty"),
+            ("not-a-slack-id", "U06TDC56VJB", "quay_admin_allowlist_empty"),
+            ("U06TDC56VJB", "not-a-slack-id", "invalid_slack_user_id"),
+            ("*", "U06TDC56VJB", "quay_admin_allowlist_empty"),
+        ],
+    )
+    async def test_denies_unauthorized_admin_access_requests(
+        self,
+        allowed_users,
+        slack_user_id,
+        code,
+    ):
+        adapter = _make_adapter(extra={"quay_admin_allowed_users": allowed_users})
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/quay/admin/authorize",
+                json={"slack_user_id": slack_user_id},
+            )
+
+            assert resp.status == 403
+            data = await resp.json()
+            assert data["error"]["code"] == code
+            assert data["error"]["param"] == "slack_user_id"
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +928,9 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["quay_admin_authorization"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert data["endpoints"]["quay_admin_authorize"]["path"] == "/quay/admin/authorize"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
 
     @pytest.mark.asyncio
