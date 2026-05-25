@@ -1150,14 +1150,25 @@ class FileLock:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._handle: Any = None
+        self._locked = False
 
     def __enter__(self) -> "FileLock":
+        self.acquire(blocking=False)
+        return self
+
+    def acquire(self, *, blocking: bool = False) -> None:
         import fcntl
 
+        if self._locked:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._handle = self.path.open("a+", encoding="utf-8")
+        if self._handle is None:
+            self._handle = self.path.open("a+", encoding="utf-8")
+        operation = fcntl.LOCK_EX
+        if not blocking:
+            operation |= fcntl.LOCK_NB
         try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(self._handle.fileno(), operation)
         except BlockingIOError as exc:
             self._handle.close()
             self._handle = None
@@ -1169,18 +1180,35 @@ class FileLock:
             + "\n"
         )
         self._handle.flush()
-        return self
+        self._locked = True
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.release(close=True)
+
+    def release(self, *, close: bool = False) -> None:
         import fcntl
 
         if self._handle is None:
             return
         try:
-            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            if self._locked:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+                self._locked = False
         finally:
-            self._handle.close()
-            self._handle = None
+            if close:
+                self._handle.close()
+                self._handle = None
+
+    @contextmanager
+    def suspended(self):
+        was_locked = self._locked
+        if was_locked:
+            self.release(close=False)
+        try:
+            yield
+        finally:
+            if was_locked:
+                self.acquire(blocking=True)
 
 
 class HandoffDrainer:
@@ -1192,6 +1220,7 @@ class HandoffDrainer:
         config: OrchestratorConfig,
         worker_id: str,
         decider: ConversationDecider | None = None,
+        coordination_lock: FileLock | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.quay = quay
@@ -1199,6 +1228,7 @@ class HandoffDrainer:
         self.config = config
         self.worker_id = worker_id
         self.decider = decider or HermesConversationDecider(logger=logger or LOGGER)
+        self.coordination_lock = coordination_lock
         self.logger = logger or LOGGER
         self.metrics = RunMetrics()
 
@@ -1602,12 +1632,13 @@ class HandoffDrainer:
             remaining = max(0.0, deadline - time.monotonic())
             if remaining <= 0:
                 break
-            reply = self.slack.wait_for_reply(
-                post_ref,
-                after_ts=after_ts,
-                timeout_seconds=remaining,
-                poll_interval_seconds=self.config.poll_interval_seconds,
-            )
+            with self._suspend_lock_for_human_wait(handoff=handoff, task=task):
+                reply = self.slack.wait_for_reply(
+                    post_ref,
+                    after_ts=after_ts,
+                    timeout_seconds=remaining,
+                    poll_interval_seconds=self.config.poll_interval_seconds,
+                )
             if reply is None:
                 return None, None
 
@@ -1682,6 +1713,27 @@ class HandoffDrainer:
             )
 
         return None, None
+
+    @contextmanager
+    def _suspend_lock_for_human_wait(self, *, handoff: Handoff, task: TaskContext):
+        if self.coordination_lock is None:
+            yield
+            return
+
+        log_event(
+            self.logger,
+            "drain_lock_suspended_for_human_wait",
+            handoff_id=handoff.handoff_id,
+            task_id=task.task_id,
+        )
+        with self.coordination_lock.suspended():
+            yield
+        log_event(
+            self.logger,
+            "drain_lock_reacquired_after_human_wait",
+            handoff_id=handoff.handoff_id,
+            task_id=task.task_id,
+        )
 
     def _handle_stale_slack_route(
         self,
@@ -2308,12 +2360,13 @@ def run_drain_one(args: argparse.Namespace) -> int:
     metrics = RunMetrics()
     try:
         lock_path = Path(args.lock_path) if args.lock_path else default_lock_path(config)
-        with FileLock(lock_path):
+        with FileLock(lock_path) as lock:
             drainer = HandoffDrainer(
                 quay=build_quay_client(config),
                 slack=build_slack_client(config),
                 config=config,
                 worker_id=args.worker_id,
+                coordination_lock=lock,
                 logger=LOGGER,
             )
             result = drainer.drain_one()
