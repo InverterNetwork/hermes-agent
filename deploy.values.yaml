@@ -226,12 +226,17 @@
 #                                 lets a fork stage before a quay release is
 #                                 cut and is the default in CI. When set, the
 #                                 installer fetches quay-linux-<arch> from
-#                                 the matching GitHub Release and verifies it
-#                                 against SHA256SUMS; the pin is the security
-#                                 boundary. Must be set for any repos[] entry
-#                                 to be quay-managed; entries with a `quay:`
-#                                 block but no quay.version pin install as
-#                                 code-only with a one-line warning.
+#                                 quay.release_repo's matching GitHub Release
+#                                 and verifies it against SHA256SUMS; the pin
+#                                 is the security boundary. Must be set for any
+#                                 repos[] entry to be quay-managed; entries with
+#                                 a `quay:` block but no quay.version pin
+#                                 install as code-only with a one-line warning.
+#   quay.release_repo          — public GitHub owner/repo slug that publishes
+#                                 Quay release assets. Keep public so the
+#                                 installer can use unauthenticated release
+#                                 downloads; private releases would require a
+#                                 separate authenticated asset-fetch path.
 #   quay.runtime_managers      — pinned package-manager / runtime binaries the
 #                                 installer must guarantee on PATH before quay
 #                                 bootstraps a worktree (`/bin/sh -c install_cmd`
@@ -271,8 +276,18 @@
 #                                 `<HERMES_HOME>/code` so Quay workers and
 #                                 reviewers can inspect the same read-only
 #                                 code mirrors the gateway uses.
+#   Hermes/Quay boundary      — Hermes owns install/run wiring, local bind,
+#                                 proxy/auth handoff, and launch prerequisites.
+#                                 Quay owns product/runtime behavior defaults
+#                                 and longer-term config contracts. See
+#                                 docs/brix-1470-quay-boundary.md before
+#                                 adding new keys to this block or rendering
+#                                 existing keys into quay/config.toml.
 #   quay.adapters.linear       — gates `quay enqueue --linear-issue`. Token
 #                                 lives in <target>/auth/quay.env, never here.
+#                                 Transitional: the enabled flag is still
+#                                 rendered for existing flows, but adapter
+#                                 behavior belongs to Quay.
 #   quay.tag_namespaces        — OPTIONAL deployment-level tag vocabulary
 #                                 merged into every per-repo vocab at
 #                                 ticket-validate time. Each namespace takes
@@ -284,6 +299,9 @@
 #                                 --from -` once per install (declarative
 #                                 replace — dropping a namespace clears it).
 #                                 Same charset rules as repos[].quay.tags.
+#                                 Transitional: this remains Hermes-reconciled
+#                                 for compatibility until Quay owns a durable
+#                                 admin/config contract for deployment vocab.
 #   quay.adapters.slack        — gates quay's slack adapter (waiting_human
 #                                 thread posts + reply ingestion + enqueue-time
 #                                 brief enrichment). Adapter code is built
@@ -296,6 +314,15 @@
 #                                 stage-secrets.sh from the gateway's
 #                                 SLACK_BOT_TOKEN — same xoxb-, same bot
 #                                 identity.
+#   quay Admin UI/API         — when the pinned binary passes
+#                                 `quay serve --help`, setup-hermes.sh
+#                                 renders `[admin]` in quay/config.toml with
+#                                 `require_auth=true` and
+#                                 `token_env=QUAY_ADMIN_TOKEN`, generates that
+#                                 token into auth/quay.env, and starts
+#                                 `quay serve` on 127.0.0.1:9731. Public
+#                                 exposure belongs behind an explicit proxy,
+#                                 not by widening the Quay listener.
 #   quay.orchestrator          — Quay orchestrator sidecar for durable Quay
 #                                 delivery outbox items and legacy handoffs.
 #                                 This renders to
@@ -306,6 +333,11 @@
 #                                 `default_slack_channel` is the deployment
 #                                 fallback channel for human questions when
 #                                 the task has no original Slack thread.
+#   quay.reviewer              — Quay-owned behavior. setup-hermes.sh no
+#                                 longer renders this block into
+#                                 quay/config.toml; existing deployed configs
+#                                 keep their current reviewer settings until
+#                                 changed by an operator or Quay migration.
 #
 #   slack_triggers             — list of (channel, entry-skill) bindings that
 #                                 turn top-level Slack messages in a channel
@@ -574,13 +606,24 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+  - id: hermes-agent
+    url: https://github.com/InverterNetwork/hermes-agent
+    base_branch: dev
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.16"
+  version: "v0.3.19"
+  # Public org-owned release repo for unauthenticated installer downloads.
+  release_repo: InverterNetwork/quay
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode
@@ -658,12 +701,12 @@ quay:
     pnpm:
       version: "10.33.4"
       linux_x64_sha256: "ff1795595535a10d0dfe327303f3dd02377be141190b1f5756de68edde2cf813"
-  # Deployment-level tag vocabulary, merged into every per-repo vocab at
-  # ticket-validate time. `required: true` forces every ticket against an
-  # enforced repo to carry at least one value from that namespace; per-repo
-  # vocab cannot un-require a namespace marked required here. Reconciled
-  # via `quay tags apply-deployment` once per install — dropping a
-  # namespace clears it.
+  # Transitional Hermes-managed behavior: deployment-level tag vocabulary,
+  # merged into every per-repo vocab at ticket-validate time. `required:
+  # true` forces every ticket against an enforced repo to carry at least
+  # one value from that namespace; per-repo vocab cannot un-require a
+  # namespace marked required here. Reconciled via `quay tags
+  # apply-deployment` once per install — dropping a namespace clears it.
   tag_namespaces:
     task:
       required: true
@@ -692,6 +735,11 @@ quay:
     quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
     poll_interval_seconds: 15
+  # Quay-owned behavior retained here as a transitional inventory entry.
+  # setup-hermes.sh no longer renders this into quay/config.toml; existing
+  # deployed configs keep their reviewer settings until an operator or Quay
+  # migration changes them.
+  #
   # Quay pr-review subsystem. `enabled: true` alone only activates
   # ad-hoc /review on human-owned PRs; `gate_quay_owned_done: true` is what
   # opens the `pr-open → done → pr-review` path for quay-spawned tasks

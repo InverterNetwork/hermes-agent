@@ -1,0 +1,30 @@
+[Unit]
+Description=Quay Admin UI and API server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User/Group and target-dir-derived paths are substituted by setup-hermes.sh
+# at install time so non-default --user / --target values stay coherent.
+User=__AGENT_USER__
+Group=__AGENT_USER__
+# QUAY_DATA_DIR pins sqlite, repos, worktrees, and embedded UI runtime state.
+# HERMES_HOME keeps helper code and profile-aware paths on the same install.
+Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
+Environment=HERMES_HOME=__TARGET_DIR__
+# setup-hermes.sh generates QUAY_ADMIN_TOKEN into this file. It is required:
+# the rendered quay/config.toml sets [admin].require_auth=true.
+EnvironmentFile=__TARGET_DIR__/auth/quay.env
+# Optional operator-only extra env. Do not put QUAY_ADMIN_TOKEN here; keep
+# service secrets in <HERMES_HOME>/auth/quay.env with the other Hermes envs.
+EnvironmentFile=-/etc/default/quay-serve
+# Bind loopback only. Public exposure should happen through an explicit
+# authenticated proxy layer, not by widening the Quay listener.
+ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

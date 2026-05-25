@@ -52,7 +52,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -3203,6 +3203,191 @@ async def events_ws(ws: WebSocket) -> None:
 
                 if not subs:
                     _event_channels.pop(channel, None)
+
+
+_QUAY_ADMIN_COOKIE_NAME = "hermes_quay_admin_session"
+_QUAY_ADMIN_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_QUAY_ADMIN_SESSIONS_LOCK = threading.Lock()
+_QUAY_ADMIN_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+_QUAY_ADMIN_HOSTED_PREFIX = "/quay/admin"
+_QUAY_ADMIN_ROOT_ATTR_RE = re.compile(
+    r'(?P<prefix>\b(?:src|href|action)\s*=\s*)(?P<quote>["\'])(?P<path>/(?!/)[^"\']*)'
+)
+
+
+def _quay_admin_base_url() -> str:
+    return os.getenv("QUAY_ADMIN_BASE_URL", "http://127.0.0.1:9731").rstrip("/")
+
+
+def _quay_admin_service_token() -> str:
+    token = os.getenv("QUAY_ADMIN_TOKEN", "").strip()
+    if token:
+        return token
+    env_file = get_hermes_home() / "auth" / "quay.env"
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("QUAY_ADMIN_TOKEN="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return ""
+
+
+def _quay_admin_session_from_request(request: Request) -> Optional[Dict[str, Any]]:
+    session_id = request.cookies.get(_QUAY_ADMIN_COOKIE_NAME, "")
+    if not session_id:
+        return None
+
+    now = time.time()
+    with _QUAY_ADMIN_SESSIONS_LOCK:
+        stale = [
+            sid for sid, sess in _QUAY_ADMIN_SESSIONS.items()
+            if float(sess.get("expires_at") or 0) <= now
+        ]
+        for sid in stale:
+            _QUAY_ADMIN_SESSIONS.pop(sid, None)
+        session = _QUAY_ADMIN_SESSIONS.get(session_id)
+        if not session:
+            return None
+        return dict(session)
+
+
+def _quay_admin_upstream_path(path: str) -> str:
+    target_path = "/" + path.lstrip("/")
+    return target_path or "/"
+
+
+def _rewrite_quay_admin_html(html: str) -> str:
+    bootstrap = f'<script>window.__QUAY_API_BASE_URL__="{_QUAY_ADMIN_HOSTED_PREFIX}";</script>'
+    if "</head>" in html:
+        html = html.replace("</head>", f"{bootstrap}</head>", 1)
+    else:
+        html = f"{bootstrap}{html}"
+
+    def replace_root_attr(match: re.Match) -> str:
+        path = match.group("path")
+        if path == _QUAY_ADMIN_HOSTED_PREFIX or path.startswith(f"{_QUAY_ADMIN_HOSTED_PREFIX}/"):
+            return match.group(0)
+        return f"{match.group('prefix')}{match.group('quote')}{_QUAY_ADMIN_HOSTED_PREFIX}{path}"
+
+    return _QUAY_ADMIN_ROOT_ATTR_RE.sub(replace_root_attr, html)
+
+
+@app.get("/quay/admin/login")
+async def quay_admin_login(token: str = ""):
+    """Exchange a Slack-issued one-time token for an HttpOnly admin session."""
+    from hermes_cli import quay_admin_auth
+
+    record = quay_admin_auth.consume_login_token(token)
+    if not record:
+        return JSONResponse({"detail": "Invalid or expired login link"}, status_code=401)
+
+    session_id, session = quay_admin_auth.create_session(str(record["slack_user_id"]))
+    with _QUAY_ADMIN_SESSIONS_LOCK:
+        _QUAY_ADMIN_SESSIONS[session_id] = session
+
+    response = RedirectResponse(url="/quay/admin/", status_code=303)
+    response.set_cookie(
+        _QUAY_ADMIN_COOKIE_NAME,
+        session_id,
+        max_age=quay_admin_auth.session_ttl_seconds(),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/quay/admin",
+    )
+    return response
+
+
+async def _proxy_quay_admin(request: Request, path: str = "") -> Response:
+    session = _quay_admin_session_from_request(request)
+    if not session:
+        return JSONResponse({"detail": "Quay admin login required"}, status_code=401)
+
+    service_token = _quay_admin_service_token()
+    if not service_token:
+        return JSONResponse(
+            {"detail": "Quay admin service token is not configured"},
+            status_code=503,
+        )
+
+    target_path = _quay_admin_upstream_path(path)
+    target_url = f"{_quay_admin_base_url()}{target_path}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+
+    try:
+        import httpx
+
+        body = await request.body()
+        forwarded_identity_header = os.getenv(
+            "QUAY_ADMIN_FORWARDED_IDENTITY_HEADER",
+            "X-Hermes-User-Id",
+        )
+        headers = {
+            "Authorization": f"Bearer {service_token}",
+            forwarded_identity_header: str(session.get("slack_user_id") or ""),
+            "Accept": request.headers.get("accept", "*/*"),
+        }
+        content_type = request.headers.get("content-type")
+        if content_type:
+            headers["Content-Type"] = content_type
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+            upstream = await client.request(
+                request.method,
+                target_url,
+                content=body,
+                headers=headers,
+            )
+    except Exception as exc:
+        _log.warning("Quay admin proxy failed: %s", exc)
+        return JSONResponse({"detail": "Quay admin service unavailable"}, status_code=502)
+
+    excluded = {
+        "connection",
+        "content-encoding",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "set-cookie",
+        "transfer-encoding",
+        "upgrade",
+    }
+    response_headers = {
+        key: value
+        for key, value in upstream.headers.items()
+        if key.lower() not in excluded
+    }
+    response_headers["Cache-Control"] = "no-store"
+
+    content = upstream.content
+    content_type = upstream.headers.get("content-type", "")
+    if "text/html" in content_type.lower():
+        try:
+            html = content.decode(upstream.encoding or "utf-8")
+            html = _rewrite_quay_admin_html(html)
+            content = html.encode("utf-8")
+            response_headers["content-type"] = "text/html; charset=utf-8"
+        except Exception:
+            pass
+
+    return Response(
+        content=content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
+
+
+@app.api_route("/quay/admin", methods=_QUAY_ADMIN_PROXY_METHODS)
+async def proxy_quay_admin_root(request: Request):
+    return await _proxy_quay_admin(request, "")
+
+
+@app.api_route("/quay/admin/{path:path}", methods=_QUAY_ADMIN_PROXY_METHODS)
+async def proxy_quay_admin_path(request: Request, path: str):
+    return await _proxy_quay_admin(request, path)
 
 
 def mount_spa(application: FastAPI):

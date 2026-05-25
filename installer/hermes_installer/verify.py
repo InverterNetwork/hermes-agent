@@ -24,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,7 @@ class _State:
     agent_invocation: str
     codex_required: bool = False
     quay_tags_supported: bool = False
+    quay_serve_supported: bool = False
     total: int = 0
     drift: int = 0
 
@@ -807,6 +809,56 @@ def _check_quay_reference_repos(s: _State, repos_tsv: str) -> None:
         s.v_ok(f"quay reference repo mirrors: {len(expected_ids)} under {root}")
 
 
+def _read_env_value(path: Path, key: str) -> str | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    prefix = f"{key}="
+    for line in lines:
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return None
+
+
+def _check_quay_admin_config(s: _State) -> None:
+    cfg = _read_quay_config(s)
+    if cfg is None:
+        return
+    admin = cfg.get("admin")
+    if not s.quay_serve_supported:
+        if isinstance(admin, dict):
+            s.v_drift(
+                "quay admin auth config",
+                "present but installed quay binary does not support `serve`",
+            )
+        return
+    if not isinstance(admin, dict):
+        s.v_drift("quay admin auth config", "missing [admin] block")
+        return
+    if admin.get("require_auth") is True:
+        s.v_ok("quay admin auth required")
+    else:
+        s.v_drift(
+            "quay admin auth required",
+            f"expected true, got {admin.get('require_auth')!r}",
+        )
+    if admin.get("token_env") == "QUAY_ADMIN_TOKEN":
+        s.v_ok("quay admin token env: QUAY_ADMIN_TOKEN")
+    else:
+        s.v_drift(
+            "quay admin token env",
+            f"expected QUAY_ADMIN_TOKEN, got {admin.get('token_env')!r}",
+        )
+    if admin.get("forwarded_identity_header") == "X-Hermes-User-Id":
+        s.v_ok("quay admin forwarded identity header: X-Hermes-User-Id")
+    else:
+        s.v_drift(
+            "quay admin forwarded identity header",
+            f"expected X-Hermes-User-Id, got {admin.get('forwarded_identity_header')!r}",
+        )
+
+
 def _executable_info(path: Path) -> tuple[str, str, str] | None:
     """Like ``_stat_info`` but returns ``None`` for non-regular or
     non-executable files — caller treats that as a "missing or
@@ -903,6 +955,7 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
             _check_mode_owner(
                 s, "quay config.toml", _stat_info(quay_cfg), "644", s.agent_owner,
             )
+            _check_quay_admin_config(s)
 
     for label, raw_path in (
         ("quay-as-hermes wrapper", s.quay_wrapper),
@@ -1427,6 +1480,134 @@ def _check_systemd(s: _State) -> None:
                 )
 
 
+def _systemd_unit_state(s: _State, unit: str) -> tuple[str, str, str]:
+    rc, show_out, _ = _run(
+        [
+            "systemctl", "show",
+            "-p", "ActiveState",
+            "-p", "LoadState",
+            "-p", "UnitFileState",
+            unit,
+        ],
+        timeout=10,
+    )
+    props: dict[str, str] = {}
+    if rc == 0:
+        for line in show_out.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                props[key.strip()] = value.strip()
+    return (
+        props.get("ActiveState", ""),
+        props.get("LoadState", ""),
+        props.get("UnitFileState", ""),
+    )
+
+
+def _bearer_http_code(url: str, token: str) -> str:
+    _rc, code_out, _ = _run(
+        [
+            "curl", "-sS", "-o", "/dev/null",
+            "-w", "%{http_code}",
+            "--config", "-",
+            url,
+        ],
+        input=f'header = "Authorization: Bearer {token}"\n',
+        timeout=5,
+    )
+    return code_out.strip() or "000"
+
+
+def _check_quay_serve_service(s: _State) -> None:
+    if not shutil.which("systemctl"):
+        return
+
+    unit = "quay-serve.service"
+    active, load, unitfile = _systemd_unit_state(s, unit)
+    if active == "active" and load == "loaded" and unitfile == "enabled":
+        s.v_ok(f"{unit}: active loaded enabled")
+    else:
+        s.v_drift(
+            unit,
+            f"active={active or '?'} load={load or '?'} unitfile={unitfile or '?'}",
+        )
+
+    unit_file = Path(s.systemd_dir) / unit
+    if not unit_file.is_file():
+        s.v_drift(unit, f"missing unit file: {unit_file}")
+        return
+    owner = _owner(unit_file)
+    if owner == s.rails_owner:
+        s.v_ok(f"{unit_file} ownership: {owner}")
+    else:
+        s.v_drift(
+            f"{unit_file} ownership",
+            f"expected {s.rails_owner}, got {owner}",
+        )
+    try:
+        text = unit_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        s.v_drift(unit, f"unreadable: {exc}")
+        return
+
+    expected_data_dir = f"Environment=QUAY_DATA_DIR={s.args.target / 'quay'}"
+    if expected_data_dir in text:
+        s.v_ok("quay-serve.service QUAY_DATA_DIR")
+    else:
+        s.v_drift(
+            "quay-serve.service QUAY_DATA_DIR",
+            f"missing {expected_data_dir}",
+        )
+
+    auth_env = f"EnvironmentFile={s.args.target / 'auth' / 'quay.env'}"
+    if auth_env in text:
+        s.v_ok("quay-serve.service auth env")
+    else:
+        s.v_drift("quay-serve.service auth env", f"missing {auth_env}")
+
+    if re.search(r"ExecStart=.*\bquay\s+serve\b", text):
+        s.v_ok("quay-serve.service ExecStart uses quay serve")
+    else:
+        s.v_drift("quay-serve.service ExecStart", "missing `quay serve`")
+
+    if re.search(r"ExecStart=.*--host\s+127\.0\.0\.1\b", text):
+        s.v_ok("quay-serve.service loopback bind: 127.0.0.1")
+    else:
+        s.v_drift(
+            "quay-serve.service bind address",
+            "expected ExecStart to include --host 127.0.0.1",
+        )
+
+    token = _read_env_value(s.args.target / "auth" / "quay.env", "QUAY_ADMIN_TOKEN")
+    if token:
+        s.v_ok("quay admin token present")
+    else:
+        s.v_drift(
+            "quay admin token",
+            f"missing QUAY_ADMIN_TOKEN in {s.args.target / 'auth' / 'quay.env'}",
+        )
+        return
+
+    health_url = (
+        os.environ.get("HERMES_VERIFY_QUAY_HEALTH_URL")
+        or "http://127.0.0.1:9731/v1/meta"
+    )
+    code = _bearer_http_code(health_url, token)
+    if code == "200":
+        s.v_ok(f"quay admin local health: HTTP {code}")
+    else:
+        s.v_drift("quay admin local health", f"{health_url} returned HTTP {code}")
+
+
+def _check_quay_serve_not_installed(s: _State) -> None:
+    unit_file = Path(s.systemd_dir) / "quay-serve.service"
+    if unit_file.exists():
+        s.v_drift(
+            "quay-serve.service",
+            "installed but the pinned quay binary does not support `serve`",
+        )
+
+
 def _check_quay_tick_unit_architecture(s: _State) -> None:
     unit_file = Path(s.systemd_dir) / "quay-tick.service"
     if not unit_file.is_file():
@@ -1679,14 +1860,26 @@ def run(
     # "could not read live state" lines on a perfectly valid pre-tag-vocab
     # install. Only probes when quay is enabled and the binary exists.
     quay_tags_supported = False
+    quay_serve_supported = False
     if quay_version and Path(quay_bin).is_file():
-        target_quay = args.target / "quay"
-        rc, _, _ = _run([
-            *_sudo_prefix_for(agent_owner),
-            "env", f"QUAY_DATA_DIR={target_quay}",
-            quay_bin, "tags", "--help",
-        ])
-        quay_tags_supported = (rc == 0)
+        with tempfile.TemporaryDirectory(prefix="hermes-quay-probe-") as probe_dir:
+            probe_path = Path(probe_dir)
+            try:
+                probe_path.chmod(0o777)
+            except OSError:
+                pass
+            rc, _, _ = _run([
+                *_sudo_prefix_for(agent_owner),
+                "env", f"QUAY_DATA_DIR={probe_path}",
+                quay_bin, "tags", "--help",
+            ])
+            quay_tags_supported = (rc == 0)
+            rc, _, _ = _run([
+                *_sudo_prefix_for(agent_owner),
+                "env", f"QUAY_DATA_DIR={probe_path}",
+                quay_bin, "serve", "--help",
+            ])
+            quay_serve_supported = (rc == 0)
 
     s = _State(
         args=args,
@@ -1709,6 +1902,7 @@ def run(
         agent_invocation=agent_invocation,
         codex_required=codex_required,
         quay_tags_supported=quay_tags_supported,
+        quay_serve_supported=quay_serve_supported,
     )
 
     print(
@@ -1751,6 +1945,11 @@ def run(
     _check_per_entry_repos(s, repos_tsv, app_auth_expected=app_auth_expected)
     _check_deployment_tag_vocab(s)
     _check_systemd(s)
+    if quay_version:
+        if s.quay_serve_supported:
+            _check_quay_serve_service(s)
+        else:
+            _check_quay_serve_not_installed(s)
     if app_auth_expected:
         _check_token_helper(s, repos_tsv)
     # Reviewer auth is gated by /etc/hermes/reviewer.env presence inside

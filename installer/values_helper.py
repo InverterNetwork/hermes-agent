@@ -33,8 +33,9 @@ Subcommands:
                                   update failures (it can fail silently
                                   when config.yaml is root-owned) can't
                                   leave the provider pin drifted.
-  render-quay-config <out>     — write ~/.hermes/quay/config.toml from the
-                                  quay.* block. Skips if <out> already exists.
+  render-quay-config <out>     — write ~/.hermes/quay/config.toml with the
+                                  Hermes-owned Quay launch/auth/context
+                                  boundary. Skips if <out> already exists.
                                   When --reference-repos-root is passed and
                                   quay.version is new enough for AST-136,
                                   also renders [context].reference_repos_root.
@@ -879,6 +880,31 @@ def _toml_basic_string(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
 
+def _extract_top_level_toml_table(text: str, table: str) -> list[str]:
+    """Return a top-level TOML table block from existing config text.
+
+    This intentionally preserves text rather than parsing and re-emitting it:
+    the migration path is "Hermes no longer owns this section", so carrying
+    forward the operator/previous-Quay bytes is safer than normalising them.
+    """
+    header = f"[{table}]"
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip() != header:
+            continue
+        end = len(lines)
+        for next_idx in range(idx + 1, len(lines)):
+            stripped = lines[next_idx].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                end = next_idx
+                break
+        block = lines[idx:end]
+        while block and not block[-1].strip():
+            block.pop()
+        return block
+    return []
+
+
 def _parse_quay_version(value: Any) -> tuple[int, int, int] | None:
     if not isinstance(value, str):
         return None
@@ -995,13 +1021,13 @@ def cmd_render_quay_orchestrator_config(args: argparse.Namespace) -> int:
 
 
 def cmd_render_quay_config(args: argparse.Namespace) -> int:
-    """Render <target>/quay/config.toml from the quay.* block.
+    """Render <target>/quay/config.toml for the Hermes/Quay boundary.
 
     Refuses to overwrite an existing file unless --force is passed. The
-    installer always passes --force so deploy.values.yaml stays the source of
-    truth — every key written here is configs-as-code, with no operator-edit
-    domain in the file. Always creates a file when inputs validate, so
-    setup-hermes.sh can chown/chmod the path without racing the helper.
+    installer passes --force for the Hermes-owned launch/auth/context keys
+    below, not for Quay product/runtime behavior. Always creates a file when
+    inputs validate, so setup-hermes.sh can chown/chmod the path without
+    racing the helper.
 
     Deliberately omitted from the rendered TOML:
       * data_dir   — set via QUAY_DATA_DIR in the systemd unit env, so the
@@ -1010,13 +1036,22 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
                      where we want for free.
       * version    — consumed by setup-hermes.sh to fetch the binary, not by
                      quay at runtime; lives in deploy.values.yaml only.
+      * reviewer   — Quay-owned behavior. Existing deployments keep whatever
+                     is already in their Quay config; new installs use Quay's
+                     release defaults until Quay exposes a dedicated contract.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
+    existing_reviewer_block: list[str] = []
 
     if out_path.exists() and not args.force:
         sys.stdout.write(f"preserved: {out_path}\n")
         return 0
+    if out_path.exists() and args.force:
+        existing_reviewer_block = _extract_top_level_toml_table(
+            out_path.read_text(encoding="utf-8"),
+            "reviewer",
+        )
 
     quay = data.get("quay") or {}
     if not isinstance(quay, dict):
@@ -1056,14 +1091,24 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         return 1
 
     lines = [
-        "# Rendered by setup-hermes.sh from deploy.values.yaml on every run.",
-        "# Edit deploy.values.yaml — local edits here are reconciled away.",
+        "# Rendered by setup-hermes.sh for the Hermes/Quay boundary.",
+        "# Hermes owns launch/auth/context wiring here; Quay owns behavior defaults.",
         "#",
         "# data_dir comes from QUAY_DATA_DIR set in the systemd unit; repos_root",
         "# defaults to ${data_dir}/repos.",
         "",
         f"agent_invocation = {_toml_basic_string(agent_invocation)}",
     ]
+    if args.enable_admin_auth:
+        lines.extend([
+            "",
+            "# Admin auth is enabled only when the installed quay binary",
+            "# supports `quay serve`; older releases reject unknown config keys.",
+            "[admin]",
+            "require_auth = true",
+            'token_env = "QUAY_ADMIN_TOKEN"',
+            'forwarded_identity_header = "X-Hermes-User-Id"',
+        ])
 
     # Legacy `agent_invocation` above continues to render unchanged — quay's
     # back-compat path treats it as the worker default when no `[agents]`
@@ -1130,47 +1175,10 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
             f"{_REFERENCE_REPOS_MIN_QUAY_VERSION_STR} (got {got_version!r})\n"
         )
 
-    reviewer = quay.get("reviewer")
-    if reviewer is None:
-        reviewer = {}
-    if not isinstance(reviewer, dict):
-        sys.stderr.write("values_helper.py: quay.reviewer must be a mapping\n")
-        return 1
-    # Strict bool — Python's truthiness coerces "false"/"0" to True, which
-    # would silently flip the quay-owned done → pr-review gate the operator
-    # was trying to disable.
-    for key in ("enabled", "gate_quay_owned_done"):
-        if key in reviewer and not isinstance(reviewer[key], bool):
-            sys.stderr.write(
-                f"values_helper.py: quay.reviewer.{key} must be a bool "
-                f"(got {type(reviewer[key]).__name__}: {reviewer[key]!r})\n"
-            )
-            return 1
-    if "login" in reviewer:
-        login_val = reviewer["login"]
-        if not isinstance(login_val, str) or not login_val:
-            sys.stderr.write(
-                "values_helper.py: quay.reviewer.login must be a non-empty "
-                f"string (got {type(login_val).__name__}: {login_val!r})\n"
-            )
-            return 1
-    if "gh_token_file" in reviewer:
-        sys.stderr.write(
-            "values_helper.py: quay.reviewer.gh_token_file is no longer "
-            "supported; reviewer tokens are passed via QUAY_REVIEWER_GH_TOKEN "
-            "from quay-tick-runner\n"
-        )
-        return 1
-    if reviewer.get("enabled") is True:
+    if existing_reviewer_block:
         lines.append("")
-        lines.append("[reviewer]")
-        lines.append("enabled = true")
-        if "gate_quay_owned_done" in reviewer:
-            gate = reviewer["gate_quay_owned_done"]
-            lines.append(f"gate_quay_owned_done = {'true' if gate else 'false'}")
-        login = reviewer.get("login")
-        if isinstance(login, str) and login:
-            lines.append(f"login = {_toml_basic_string(login)}")
+        lines.append("# Preserved from existing config.toml; Quay owns reviewer behavior.")
+        lines.extend(existing_reviewer_block)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2248,6 +2256,11 @@ def main(argv: list[str] | None = None) -> int:
             "absolute code mirror root to render as [context].reference_repos_root "
             "when quay.version supports AST-136"
         ),
+    )
+    p_quay.add_argument(
+        "--enable-admin-auth",
+        action="store_true",
+        help="render [admin] auth config for quay releases that support `serve`",
     )
     p_quay.set_defaults(func=cmd_render_quay_config)
 

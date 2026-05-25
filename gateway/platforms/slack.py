@@ -715,6 +715,74 @@ class SlackAdapter(BasePlatformAdapter):
         # Non-fatal — the user saw the initial ack already.
         return SendResult(success=True, message_id=None)
 
+    async def _respond_to_slash_command(self, command: dict, content: str) -> None:
+        """Replace a slash ack when possible, else post to the source channel."""
+        response_url = command.get("response_url", "")
+        if response_url:
+            await self._send_slash_ephemeral(
+                {"response_url": response_url, "ts": time.monotonic()},
+                content,
+            )
+            return
+
+        channel_id = command.get("channel_id", "")
+        if channel_id:
+            await self.send(channel_id, content)
+
+    async def _handle_quay_admin_slash_command(self, command: dict) -> None:
+        """Issue a one-time Quay Admin login link to an allowlisted Slack user."""
+        from hermes_cli import quay_admin_auth
+
+        user_id = command.get("user_id", "")
+        if not quay_admin_auth.is_slack_user_allowed(user_id):
+            await self._respond_to_slash_command(
+                command,
+                "You are not allowed to request Quay Admin login links.",
+            )
+            return
+
+        token, _record = quay_admin_auth.create_login_token(user_id)
+        login_url = quay_admin_auth.build_login_url(token)
+        ttl = quay_admin_auth.login_ttl_seconds()
+        minutes = max(1, int(ttl / 60))
+        message = (
+            f"Quay Admin login link: {login_url}\n\n"
+            f"This link expires in {minutes} minute{'s' if minutes != 1 else ''} "
+            "and can be used once."
+        )
+
+        team_id = command.get("team_id", "")
+        client = self._team_clients.get(team_id) if team_id else None
+        if client is None and self._app is not None:
+            client = self._app.client
+
+        dm_sent = False
+        if client is not None:
+            try:
+                opened = await client.conversations_open(users=user_id)
+                dm_channel = ((opened or {}).get("channel") or {}).get("id")
+                if dm_channel:
+                    await client.chat_postMessage(
+                        channel=dm_channel,
+                        text=message,
+                        mrkdwn=True,
+                    )
+                    dm_sent = True
+            except Exception as exc:
+                logger.warning("[Slack] Failed to DM Quay Admin login link: %s", exc)
+
+        if dm_sent:
+            await self._respond_to_slash_command(
+                command,
+                "I sent your one-time Quay Admin login link by DM.",
+            )
+        else:
+            await self._respond_to_slash_command(
+                command,
+                "I could not DM your Quay Admin login link. Check that DMs "
+                "from this app are allowed, then retry `/quay-admin`.",
+            )
+
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -3315,6 +3383,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Track which workspace owns this channel
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
+
+        if slash_name == "quay-admin":
+            await self._handle_quay_admin_slash_command(command)
+            return
 
         if slash_name in ("hermes", ""):
             # Legacy /hermes <subcommand> [args] routing + free-form questions.

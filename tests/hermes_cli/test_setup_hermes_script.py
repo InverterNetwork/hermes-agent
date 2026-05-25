@@ -133,11 +133,10 @@ def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
 
 
 def test_installer_renders_quay_config_with_force_on_every_run():
-    """Configs-as-code guard: setup-hermes.sh must call render-quay-config
-    with --force (no first-install gate) so quay.agent_invocation and the
-    rest of the quay.* block stay in sync with deploy.values.yaml on every
-    install. The earlier gate let updated invocations silently drift on
-    re-runs — workers kept running the seeded-on-first-install command.
+    """Boundary guard: setup-hermes.sh must call render-quay-config with
+    --force for the Hermes-owned launch/auth/context keys. Quay behavior
+    fields must not be added to that renderer just because they live under
+    deploy.values.yaml's transitional quay: block.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
     # Allow any whitespace/line-continuations between the subcommand and the
@@ -145,9 +144,10 @@ def test_installer_renders_quay_config_with_force_on_every_run():
     pattern = r'render-quay-config[^\n]*--out[^\n]*"[^\n]*"\s*(?:\\\s*\n\s*)?--force'
     assert re.search(pattern, content), (
         "installer must invoke `render-quay-config --out … --force` so the "
-        "quay config reconciles from deploy.values.yaml on every install"
+        "Hermes-owned Quay boundary is reconciled from deploy.values.yaml"
     )
     assert '--reference-repos-root "$TARGET_DIR/code"' in content
+    assert "Hermes-owned launch/auth/context boundary" in content
     # Belt-and-suspenders: the old preserve branch printed this exact phrase.
     # Its presence would mean the gate snuck back in.
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
@@ -225,6 +225,16 @@ def test_installer_persists_quay_expected_sha_for_verify():
     assert '"$TARGET_DIR/quay/SHA256SUM.expected"' not in content
 
 
+def test_installer_uses_configured_quay_release_repo():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "lafawnduh1966/quay" not in content
+    assert "get quay.release_repo" in content
+    assert "QUAY_RELEASE_REPO" in content
+    assert "https://github.com/${QUAY_RELEASE_REPO}/releases/download/${QUAY_VERSION}" in content
+    assert "quay.release_repo must be a GitHub owner/repo slug" in content
+
+
 def test_quay_tick_service_carries_reviewer_token_minting_env():
     service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
     runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")
@@ -233,6 +243,29 @@ def test_quay_tick_service_carries_reviewer_token_minting_env():
     assert "RuntimeDirectory=hermes" in service
     assert "QUAY_REVIEWER_GH_TOKEN" in runner
     assert "/etc/hermes/reviewer.env" in runner
+
+
+def test_quay_serve_service_is_localhost_and_token_protected():
+    service = (OPS_DIR / "quay-serve.service").read_text(encoding="utf-8")
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    stage = (REPO_ROOT / "stage-secrets.sh").read_text(encoding="utf-8")
+
+    assert "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731" in service
+    assert "Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay" in service
+    assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in service
+    assert "QUAY_ADMIN_TOKEN" in service
+    assert "quay-serve.service" in installer
+    assert '"$QUAY_BIN_DST" serve --help' in installer
+    assert "QUAY_SERVE_PROBE_DIR" in installer
+    assert "QUAY_DATA_DIR=$QUAY_SERVE_PROBE_DIR" in installer
+    assert "QUAY_DATA_DIR=$TARGET_DIR/quay\" \"$QUAY_BIN_DST\" serve --help" not in installer
+    assert "QUAY_SERVE_SUPPORTED" in installer
+    assert "--enable-admin-auth" in installer
+    assert "ensure_quay_admin_token" in installer
+    assert "secrets.token_urlsafe(48)" in installer
+    assert '[[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1' in installer
+    assert "systemctl enable --now quay-serve.service" in installer
+    assert "QUAY_ADMIN_TOKEN=${existing_quay_admin_token}" in stage
 
 
 def test_installer_removes_legacy_reviewer_token_timer():

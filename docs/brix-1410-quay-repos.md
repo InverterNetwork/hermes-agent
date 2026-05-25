@@ -1,6 +1,6 @@
 # BRIX-1410: Quay Repo Registration
 
-Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all eight are quay-managed):
+Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all nine are quay-managed):
 
 | repo id | remote | base branch | package manager | install cmd |
 | --- | --- | --- | --- | --- |
@@ -12,6 +12,7 @@ Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all e
 | `iTry-contracts` | `https://github.com/InverterNetwork/iTry-contracts` | `main` | `bun` | `true` |
 | `quay` | `https://github.com/InverterNetwork/quay` | `dev` | `bun` | `bun install` |
 | `quay-ui` | `https://github.com/InverterNetwork/quay-ui` | `main` | `bun` | `bun install` |
+| `hermes-agent` | `https://github.com/InverterNetwork/hermes-agent` | `dev` | `bun` | `bun install` |
 
 ## Verification commands
 
@@ -28,7 +29,7 @@ Deployed host (post-deploy):
 sudo /usr/local/bin/quay-as-hermes repo list
 ```
 
-Expected: all eight repo ids above are present.
+Expected: all nine repo ids above are present.
 
 ## Enqueue verification / dry-run equivalent
 

@@ -383,6 +383,7 @@ QUAY_EXPECTED_SHA_DST="$QUAY_EXPECTED_SHA_DIR/SHA256SUM.expected"
 QUAY_ENABLED=0
 QUAY_EXPECTED_SHA=""
 QUAY_ORCHESTRATOR_ENABLED=0
+QUAY_SERVE_SUPPORTED=0
 
 if [[ -z "$QUAY_VERSION" ]]; then
   echo "==> quay.version unset in $VALUES_FILE; skipping quay provisioning"
@@ -398,10 +399,16 @@ else
     *) echo "FAIL: unsupported architecture $(uname -m); quay ships amd64/arm64 Linux only" >&2; exit 1 ;;
   esac
 
-  QUAY_RELEASE_URL="https://github.com/lafawnduh1966/quay/releases/download/${QUAY_VERSION}"
+  QUAY_RELEASE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get quay.release_repo 2>/dev/null || true)"
+  QUAY_RELEASE_REPO="${QUAY_RELEASE_REPO:-InverterNetwork/quay}"
+  if [[ ! "$QUAY_RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "FAIL: quay.release_repo must be a GitHub owner/repo slug (got: $QUAY_RELEASE_REPO)" >&2
+    exit 1
+  fi
+  QUAY_RELEASE_URL="https://github.com/${QUAY_RELEASE_REPO}/releases/download/${QUAY_VERSION}"
   QUAY_ASSET="quay-linux-${QUAY_ARCH}"
 
-  echo "==> installing quay binary ${QUAY_VERSION} (${QUAY_ARCH}) to $QUAY_BIN_DST"
+  echo "==> installing quay binary ${QUAY_VERSION} from ${QUAY_RELEASE_REPO} (${QUAY_ARCH}) to $QUAY_BIN_DST"
   QUAY_TMP="$(mktemp -d)"
   trap 'rm -rf "$QUAY_TMP"' EXIT
   curl -fsSL --retry 3 -o "$QUAY_TMP/$QUAY_ASSET" "$QUAY_RELEASE_URL/$QUAY_ASSET"
@@ -424,6 +431,14 @@ else
   install -o root -g root -m 0755 "$QUAY_TMP/$QUAY_ASSET" "$QUAY_BIN_DST"
   rm -rf "$QUAY_TMP"
   trap - EXIT
+
+  QUAY_SERVE_PROBE_DIR="$(mktemp -d)"
+  if env "QUAY_DATA_DIR=$QUAY_SERVE_PROBE_DIR" "$QUAY_BIN_DST" serve --help >/dev/null 2>&1; then
+    QUAY_SERVE_SUPPORTED=1
+  else
+    echo "==> quay binary does not support 'serve'; skipping Admin UI service for $QUAY_VERSION" >&2
+  fi
+  rm -rf "$QUAY_SERVE_PROBE_DIR"
 fi
 
 # ---------- operator-invocation glue (wrapper + profile.d) ----------
@@ -647,6 +662,7 @@ AUTH_DIR="$TARGET_DIR/auth"
 GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
 GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
+QUAY_ENV_FILE="$AUTH_DIR/quay.env"
 TOKEN_HELPER_PY="$TARGET_DIR/hermes-agent/installer/hermes_github_token.py"
 VENV_PY="$TARGET_DIR/hermes-agent/venv/bin/python"
 HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
@@ -659,6 +675,32 @@ HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
 # bit on coreutils we've seen in CI; `g-s` is unambiguous.
 install -d -o root -g "$AGENT_USER" -m 0750 "$AUTH_DIR"
 chmod g-s "$AUTH_DIR"
+
+ensure_quay_admin_token() {
+  [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 ]] || return 0
+
+  local token_line="" token="" tmp=""
+  if [[ -r "$QUAY_ENV_FILE" ]]; then
+    token_line="$(grep -E '^QUAY_ADMIN_TOKEN=.+$' "$QUAY_ENV_FILE" | tail -n 1 || true)"
+  fi
+  if [[ -n "$token_line" ]]; then
+    chown root:"$AGENT_USER" "$QUAY_ENV_FILE"
+    chmod 0640 "$QUAY_ENV_FILE"
+    return 0
+  fi
+
+  token="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(48))')"
+  tmp="$(mktemp)"
+  if [[ -f "$QUAY_ENV_FILE" ]]; then
+    grep -v '^QUAY_ADMIN_TOKEN=' "$QUAY_ENV_FILE" >"$tmp" || true
+    [[ -s "$tmp" ]] && printf '\n' >>"$tmp"
+  fi
+  printf 'QUAY_ADMIN_TOKEN=%s\n' "$token" >>"$tmp"
+  install -o root -g "$AGENT_USER" -m 0640 "$tmp" "$QUAY_ENV_FILE"
+  rm -f "$tmp"
+}
+
+ensure_quay_admin_token
 
 # Values-derived runtime env file. Rewritten every run — values.yaml is the
 # source of truth; the file is a reflection. Operator hand-edits belong in
@@ -988,17 +1030,21 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   printf '%s  %s\n' "$QUAY_EXPECTED_SHA" "$QUAY_BIN_DST" \
     | install -o root -g root -m 0644 /dev/stdin "$QUAY_EXPECTED_SHA_DST"
 
-  # quay/config.toml is rendered from deploy.values.yaml on every run so
-  # changes to quay.agent_invocation (and other quay.* fields) reconcile
-  # without manual host edits. Every key the helper writes is sourced from
-  # deploy.values.yaml — there is no operator-edit domain to preserve.
-  # Operator-overridable runtime knobs live in the systemd unit env
-  # (QUAY_DATA_DIR, EnvironmentFile=/etc/default/quay-tick), not here.
+  # quay/config.toml is rendered from deploy.values.yaml only for the
+  # Hermes-owned launch/auth/context boundary. Quay product/runtime behavior
+  # belongs to Quay defaults or a Quay-owned config contract; keep new fields
+  # out of this renderer unless they are needed to install, launch, bind, or
+  # proxy the service safely.
   QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
   echo "==> rendering $QUAY_CONFIG_OUT from $VALUES_FILE"
+  QUAY_RENDER_ADMIN_AUTH_ARGS=()
+  if [[ "$QUAY_SERVE_SUPPORTED" -eq 1 ]]; then
+    QUAY_RENDER_ADMIN_AUTH_ARGS+=(--enable-admin-auth)
+  fi
   python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
     render-quay-config --out "$QUAY_CONFIG_OUT" --force \
-    --reference-repos-root "$TARGET_DIR/code"
+    --reference-repos-root "$TARGET_DIR/code" \
+    "${QUAY_RENDER_ADMIN_AUTH_ARGS[@]}"
   chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
   chmod 0644 "$QUAY_CONFIG_OUT"
 
@@ -1611,6 +1657,45 @@ elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
     || echo "==> WARNING: $QUAY_TICK_SRC missing; skipping quay-tick install" >&2
   [[ -f "$QUAY_TICK_RUNNER_SRC" ]] \
     || echo "==> WARNING: $QUAY_TICK_RUNNER_SRC missing; skipping quay-tick install" >&2
+fi
+
+# ---------- quay-serve ----------
+# Long-running localhost Admin UI/API service. The release binary embeds the
+# UI bundle, so this service only needs the same QUAY_DATA_DIR and auth env
+# surface used by the rest of Quay.
+
+QUAY_SERVE_SRC="$OPS_DIR/quay-serve.service"
+
+if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 && -f "$QUAY_SERVE_SRC" ]]; then
+  install -d -o root -g root -m 0755 /etc/default
+  if [[ -f /etc/default/quay-serve ]]; then
+    echo "==> /etc/default/quay-serve already present (preserving)"
+  else
+    echo "==> seeding /etc/default/quay-serve"
+    cat >/etc/default/quay-serve <<'EOF'
+# Generated by setup-hermes.sh — extra env for quay-serve.service.
+# Edits here survive re-runs of the installer. Keep QUAY_ADMIN_TOKEN in
+# <HERMES_HOME>/auth/quay.env; setup-hermes.sh generates and preserves it.
+EOF
+    chown root:root /etc/default/quay-serve
+    chmod 0644 /etc/default/quay-serve
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd service for quay-serve (user=$AGENT_USER, bind=127.0.0.1:9731)"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        "$QUAY_SERVE_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/quay-serve.service
+    systemctl daemon-reload
+    systemctl enable --now quay-serve.service
+  else
+    echo "==> systemctl not present; skipping quay-serve service enable" >&2
+  fi
+elif [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 ]]; then
+  echo "==> WARNING: $QUAY_SERVE_SRC missing; skipping quay-serve install" >&2
+elif [[ "$QUAY_ENABLED" -eq 1 ]]; then
+  echo "==> quay-serve not enabled because $QUAY_BIN_DST lacks 'serve' support" >&2
 fi
 
 # ---------- quay-orchestrator ----------
