@@ -133,11 +133,10 @@ def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
 
 
 def test_installer_renders_quay_config_with_force_on_every_run():
-    """Configs-as-code guard: setup-hermes.sh must call render-quay-config
-    with --force (no first-install gate) so quay.agent_invocation and the
-    rest of the quay.* block stay in sync with deploy.values.yaml on every
-    install. The earlier gate let updated invocations silently drift on
-    re-runs — workers kept running the seeded-on-first-install command.
+    """Boundary guard: setup-hermes.sh must call render-quay-config with
+    --force for the Hermes-owned launch/auth/context keys. Quay behavior
+    fields must not be added to that renderer just because they live under
+    deploy.values.yaml's transitional quay: block.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
     # Allow any whitespace/line-continuations between the subcommand and the
@@ -145,9 +144,10 @@ def test_installer_renders_quay_config_with_force_on_every_run():
     pattern = r'render-quay-config[^\n]*--out[^\n]*"[^\n]*"\s*(?:\\\s*\n\s*)?--force'
     assert re.search(pattern, content), (
         "installer must invoke `render-quay-config --out … --force` so the "
-        "quay config reconciles from deploy.values.yaml on every install"
+        "Hermes-owned Quay boundary is reconciled from deploy.values.yaml"
     )
     assert '--reference-repos-root "$TARGET_DIR/code"' in content
+    assert "Hermes-owned launch/auth/context boundary" in content
     # Belt-and-suspenders: the old preserve branch printed this exact phrase.
     # Its presence would mean the gate snuck back in.
     assert "$QUAY_CONFIG_OUT already present (preserving)" not in content

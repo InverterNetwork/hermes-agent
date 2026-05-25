@@ -1030,12 +1030,11 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   printf '%s  %s\n' "$QUAY_EXPECTED_SHA" "$QUAY_BIN_DST" \
     | install -o root -g root -m 0644 /dev/stdin "$QUAY_EXPECTED_SHA_DST"
 
-  # quay/config.toml is rendered from deploy.values.yaml on every run so
-  # changes to quay.agent_invocation (and other quay.* fields) reconcile
-  # without manual host edits. Every key the helper writes is sourced from
-  # deploy.values.yaml — there is no operator-edit domain to preserve.
-  # Operator-overridable runtime knobs live in the systemd unit env
-  # (QUAY_DATA_DIR, EnvironmentFile=/etc/default/quay-tick), not here.
+  # quay/config.toml is rendered from deploy.values.yaml only for the
+  # Hermes-owned launch/auth/context boundary. Quay product/runtime behavior
+  # belongs to Quay defaults or a Quay-owned config contract; keep new fields
+  # out of this renderer unless they are needed to install, launch, bind, or
+  # proxy the service safely.
   QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
   echo "==> rendering $QUAY_CONFIG_OUT from $VALUES_FILE"
   QUAY_RENDER_ADMIN_AUTH_ARGS=()
