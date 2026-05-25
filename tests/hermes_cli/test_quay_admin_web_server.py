@@ -16,7 +16,7 @@ def test_quay_admin_login_sets_http_only_secure_cookie(monkeypatch, _isolate_her
     from starlette.testclient import TestClient
     import hermes_cli.web_server as web_server
 
-    token, _record = quay_admin_auth.create_login_token("U123", now=1000)
+    token, _record = quay_admin_auth.create_login_token("U123")
     web_server._QUAY_ADMIN_SESSIONS.clear()
 
     client = TestClient(web_server.app)
@@ -38,7 +38,7 @@ def test_quay_admin_login_rejects_reused_token(_isolate_hermes_home):
     from starlette.testclient import TestClient
     import hermes_cli.web_server as web_server
 
-    token, _record = quay_admin_auth.create_login_token("U123", now=1000)
+    token, _record = quay_admin_auth.create_login_token("U123")
     client = TestClient(web_server.app)
 
     first = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
