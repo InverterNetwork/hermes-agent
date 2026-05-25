@@ -3208,6 +3208,7 @@ async def events_ws(ws: WebSocket) -> None:
 _QUAY_ADMIN_COOKIE_NAME = "hermes_quay_admin_session"
 _QUAY_ADMIN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 _QUAY_ADMIN_SESSIONS_LOCK = threading.Lock()
+_QUAY_ADMIN_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 
 
 def _quay_admin_base_url() -> str:
@@ -3245,6 +3246,11 @@ def _quay_admin_session_from_request(request: Request) -> Optional[Dict[str, Any
         if not session:
             return None
         return dict(session)
+
+
+def _quay_admin_upstream_path(path: str) -> str:
+    target_path = "/" + path.lstrip("/")
+    return target_path or "/"
 
 
 @app.get("/quay/admin/login")
@@ -3285,7 +3291,7 @@ async def _proxy_quay_admin(request: Request, path: str = "") -> Response:
             status_code=503,
         )
 
-    target_path = "/" + path.lstrip("/")
+    target_path = _quay_admin_upstream_path(path)
     target_url = f"{_quay_admin_base_url()}{target_path}"
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
@@ -3342,7 +3348,10 @@ async def _proxy_quay_admin(request: Request, path: str = "") -> Response:
         try:
             html = content.decode(upstream.encoding or "utf-8")
             bootstrap = '<script>window.__QUAY_API_BASE_URL__="/quay/admin";</script>'
-            html = html.replace("</head>", f"{bootstrap}</head>", 1)
+            if "</head>" in html:
+                html = html.replace("</head>", f"{bootstrap}</head>", 1)
+            else:
+                html = f"{bootstrap}{html}"
             content = html.encode("utf-8")
             response_headers["content-type"] = "text/html; charset=utf-8"
         except Exception:
@@ -3355,12 +3364,12 @@ async def _proxy_quay_admin(request: Request, path: str = "") -> Response:
     )
 
 
-@app.api_route("/quay/admin", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+@app.api_route("/quay/admin", methods=_QUAY_ADMIN_PROXY_METHODS)
 async def proxy_quay_admin_root(request: Request):
     return await _proxy_quay_admin(request, "")
 
 
-@app.api_route("/quay/admin/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
+@app.api_route("/quay/admin/{path:path}", methods=_QUAY_ADMIN_PROXY_METHODS)
 async def proxy_quay_admin_path(request: Request, path: str):
     return await _proxy_quay_admin(request, path)
 
