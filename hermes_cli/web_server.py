@@ -3209,6 +3209,10 @@ _QUAY_ADMIN_COOKIE_NAME = "hermes_quay_admin_session"
 _QUAY_ADMIN_SESSIONS: Dict[str, Dict[str, Any]] = {}
 _QUAY_ADMIN_SESSIONS_LOCK = threading.Lock()
 _QUAY_ADMIN_PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+_QUAY_ADMIN_HOSTED_PREFIX = "/quay/admin"
+_QUAY_ADMIN_ROOT_ATTR_RE = re.compile(
+    r'(?P<prefix>\b(?:src|href|action)\s*=\s*)(?P<quote>["\'])(?P<path>/(?!/)[^"\']*)'
+)
 
 
 def _quay_admin_base_url() -> str:
@@ -3251,6 +3255,22 @@ def _quay_admin_session_from_request(request: Request) -> Optional[Dict[str, Any
 def _quay_admin_upstream_path(path: str) -> str:
     target_path = "/" + path.lstrip("/")
     return target_path or "/"
+
+
+def _rewrite_quay_admin_html(html: str) -> str:
+    bootstrap = f'<script>window.__QUAY_API_BASE_URL__="{_QUAY_ADMIN_HOSTED_PREFIX}";</script>'
+    if "</head>" in html:
+        html = html.replace("</head>", f"{bootstrap}</head>", 1)
+    else:
+        html = f"{bootstrap}{html}"
+
+    def replace_root_attr(match: re.Match) -> str:
+        path = match.group("path")
+        if path == _QUAY_ADMIN_HOSTED_PREFIX or path.startswith(f"{_QUAY_ADMIN_HOSTED_PREFIX}/"):
+            return match.group(0)
+        return f"{match.group('prefix')}{match.group('quote')}{_QUAY_ADMIN_HOSTED_PREFIX}{path}"
+
+    return _QUAY_ADMIN_ROOT_ATTR_RE.sub(replace_root_attr, html)
 
 
 @app.get("/quay/admin/login")
@@ -3347,11 +3367,7 @@ async def _proxy_quay_admin(request: Request, path: str = "") -> Response:
     if "text/html" in content_type.lower():
         try:
             html = content.decode(upstream.encoding or "utf-8")
-            bootstrap = '<script>window.__QUAY_API_BASE_URL__="/quay/admin";</script>'
-            if "</head>" in html:
-                html = html.replace("</head>", f"{bootstrap}</head>", 1)
-            else:
-                html = f"{bootstrap}{html}"
+            html = _rewrite_quay_admin_html(html)
             content = html.encode("utf-8")
             response_headers["content-type"] = "text/html; charset=utf-8"
         except Exception:

@@ -125,12 +125,14 @@ def test_quay_admin_proxy_serves_static_ui_with_hosted_api_base(monkeypatch, _is
 
     cookies = _install_quay_admin_session(web_server)
     monkeypatch.setenv("QUAY_ADMIN_TOKEN", "service-token")
+    seen_urls = []
 
     class FakeResponse:
-        status_code = 200
-        content = b"<html><head><title>Quay</title></head><body>admin</body></html>"
-        encoding = "utf-8"
-        headers = {"content-type": "text/html"}
+        def __init__(self, content, content_type):
+            self.status_code = 200
+            self.content = content
+            self.encoding = "utf-8"
+            self.headers = {"content-type": content_type}
 
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -143,7 +145,14 @@ def test_quay_admin_proxy_serves_static_ui_with_hosted_api_base(monkeypatch, _is
             return None
 
         async def request(self, method, url, content=None, headers=None):
-            return FakeResponse()
+            seen_urls.append(url)
+            if url.endswith("/assets/app.js"):
+                return FakeResponse(b"console.log('quay')", "application/javascript")
+            return FakeResponse(
+                b'<html><head><title>Quay</title><script type="module" src="/assets/app.js"></script></head>'
+                b'<body><a href="/v1/status">status</a></body></html>',
+                "text/html",
+            )
 
     import httpx
 
@@ -153,8 +162,18 @@ def test_quay_admin_proxy_serves_static_ui_with_hosted_api_base(monkeypatch, _is
 
     assert resp.status_code == 200
     assert 'window.__QUAY_API_BASE_URL__="/quay/admin"' in resp.text
+    assert 'src="/quay/admin/assets/app.js"' in resp.text
+    assert 'href="/quay/admin/v1/status"' in resp.text
     assert "service-token" not in resp.text
     assert resp.headers["cache-control"] == "no-store"
+
+    asset = client.get("/quay/admin/assets/app.js", cookies=cookies)
+    assert asset.status_code == 200
+    assert asset.text == "console.log('quay')"
+    assert seen_urls == [
+        "http://127.0.0.1:9731/",
+        "http://127.0.0.1:9731/assets/app.js",
+    ]
 
 
 def test_quay_admin_proxy_preserves_method_body_query_and_strips_browser_auth(monkeypatch, _isolate_hermes_home):
