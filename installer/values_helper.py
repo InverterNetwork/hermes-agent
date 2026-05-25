@@ -1140,10 +1140,22 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
     slack_adapter = adapters.get("slack") or {}
     if isinstance(slack_adapter, dict) and slack_adapter.get("enabled"):
         bot_token_env = slack_adapter.get("bot_token_env") or "SLACK_TOKEN"
+        max_thread_messages = slack_adapter.get("max_thread_messages", 200)
+        if (
+            isinstance(max_thread_messages, bool)
+            or not isinstance(max_thread_messages, int)
+            or max_thread_messages <= 0
+        ):
+            sys.stderr.write(
+                "values_helper.py: quay.adapters.slack.max_thread_messages "
+                "must be a positive integer\n"
+            )
+            return 1
         lines.append("")
         lines.append("[adapters.slack]")
         lines.append("enabled = true")
         lines.append(f"bot_token_env = {_toml_basic_string(str(bot_token_env))}")
+        lines.append(f"max_thread_messages = {max_thread_messages}")
 
     if reference_repos_root is not None and _quay_supports_reference_repos(
         quay.get("version"),

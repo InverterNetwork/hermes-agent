@@ -305,12 +305,15 @@
 #   quay.adapters.slack        — gates quay's slack adapter (waiting_human
 #                                 thread posts + reply ingestion + enqueue-time
 #                                 brief enrichment). Adapter code is built
-#                                 upstream; this flag is the on/off switch.
-#                                 Off in the iTRY deployment as of v0; flip
-#                                 to `enabled: true` to activate. quay.env's
-#                                 SLACK_TOKEN is staged by stage-secrets.sh
-#                                 from the gateway's SLACK_BOT_TOKEN — same
-#                                 xoxb-, same bot identity.
+#                                 upstream; this flag is the on/off switch. It
+#                                 must stay enabled for Linear enqueue flows
+#                                 that include `quay-config.slack_thread`, or
+#                                 Quay can parse the URL but cannot retain and
+#                                 hydrate the task's `slack_thread_ref`.
+#                                 quay.env's SLACK_TOKEN is staged by
+#                                 stage-secrets.sh from the gateway's
+#                                 SLACK_BOT_TOKEN — same xoxb-, same bot
+#                                 identity.
 #   quay Admin UI/API         — when the pinned binary passes
 #                                 `quay serve --help`, setup-hermes.sh
 #                                 renders `[admin]` in quay/config.toml with
@@ -719,7 +722,9 @@ quay:
       enabled: true
       api_key_env: LINEAR_API_KEY
     slack:
-      enabled: false
+      enabled: true
+      bot_token_env: SLACK_TOKEN
+      max_thread_messages: 200
   # Quay orchestrator sidecar. Drains durable Quay delivery outbox items and
   # legacy handoffs into the deployment feedback channel when work has no
   # original Slack thread.

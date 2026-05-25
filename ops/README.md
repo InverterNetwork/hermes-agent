@@ -69,7 +69,7 @@ Six units live here:
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. |
 | `ops/quay-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock so a human wait cannot overlap another drain. |
-| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, loads `<HERMES_HOME>/auth/quay.env` with a literal `KEY=VAL` parser for adapter tokens, and mints `$GH_TOKEN` from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
@@ -672,6 +672,65 @@ Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
 * `QUAY_ADMIN_TOKEN` is not prompted. `setup-hermes.sh` / `stage-secrets.sh`
   generate it into `auth/quay.env` and preserve it on re-runs.
 
+`stage-secrets.sh` also writes `SLACK_TOKEN=<SLACK_BOT_TOKEN>` into
+`auth/quay.env` on quay-provisioned hosts. That token is the Quay Slack
+adapter credential named by `[adapters.slack].bot_token_env` in
+`<HERMES_HOME>/quay/config.toml`; it is separate from the gateway's
+`auth/slack.env` wiring even though both values intentionally use the
+same bot token.
+
+## Quay Slack adapter and Linear thread context
+
+Quay has two Slack paths that can look similar from the outside:
+
+* The Quay orchestrator can deliver fallback notifications to
+  `quay.orchestrator.default_slack_channel` through its own sidecar
+  config and env files.
+* The Quay Slack adapter reads `[adapters.slack]` from
+  `<HERMES_HOME>/quay/config.toml` and is responsible for resolving and
+  hydrating Slack thread links during `quay enqueue --linear-issue`.
+
+Fallback delivery working does **not** prove the adapter is enabled. If a
+Linear ticket contains a valid `quay-config.slack_thread` permalink but
+`quay task get <id>` shows `"slack_thread_ref": null`, first check the
+effective Quay config and env:
+
+```sh
+sudo -u hermes env QUAY_DATA_DIR=/home/hermes/.hermes/quay python3 - <<'PY'
+import os
+import re
+import tomllib
+
+env_path = "/home/hermes/.hermes/auth/quay.env"
+key_re = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+try:
+    with open(env_path, encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key_re.match(key):
+                os.environ[key] = value
+except FileNotFoundError:
+    print(f"missing env file: {env_path}")
+
+cfg = tomllib.load(open("/home/hermes/.hermes/quay/config.toml", "rb"))
+slack = cfg.get("adapters", {}).get("slack", {})
+print(slack)
+token_env = slack.get("bot_token_env", "")
+print("token env:", token_env, bool(os.getenv(token_env)))
+PY
+```
+
+Expected state is `enabled = true`, `bot_token_env = "SLACK_TOKEN"`, and a
+positive `max_thread_messages` value. `stage-secrets.sh` stages
+`SLACK_TOKEN` into `auth/quay.env`; `quay-tick.service` uses systemd
+`EnvironmentFile=` and `quay-as-hermes` uses a matching literal parser so
+timer ticks and ad-hoc operator commands see the same adapter token
+without executing the env file as shell code.
+
 Re-runs preserve any value the operator leaves blank, so rotating one
 key doesn't require re-typing the others. Per-file `cmp -s`
 short-circuits skip writes (and the gateway restart) when content is
@@ -991,7 +1050,7 @@ the privilege drop, and quay's config-resolution order falls back to
 diverges silently from what the systemd tick writes to. The wrapper
 drops privilege via `sudo -u <agent>`, defaults `QUAY_DATA_DIR` to the
 same path as the tick while preserving an explicit caller override, pins
-`HERMES_HOME`, sources `<HERMES_HOME>/auth/quay.env` for adapter tokens
+`HERMES_HOME`, loads `<HERMES_HOME>/auth/quay.env` for adapter tokens
 (LINEAR_API_KEY, SLACK_TOKEN, …), and mints `$GH_TOKEN` from the GitHub
 App helper before `exec`'ing `/usr/local/bin/quay "$@"`. That way ad-hoc
 operator invocations land in the same DB the tick uses *and* hit the same
