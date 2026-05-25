@@ -1518,6 +1518,14 @@ def _bearer_http_code(url: str, token: str) -> str:
     return code_out.strip() or "000"
 
 
+def _http_code(url: str) -> str:
+    _rc, code_out, _ = _run(
+        ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", url],
+        timeout=5,
+    )
+    return code_out.strip() or "000"
+
+
 def _check_quay_serve_service(s: _State) -> None:
     if not shutil.which("systemctl"):
         return
@@ -1605,6 +1613,112 @@ def _check_quay_serve_not_installed(s: _State) -> None:
         s.v_drift(
             "quay-serve.service",
             "installed but the pinned quay binary does not support `serve`",
+        )
+
+
+def _check_hermes_dashboard_service(s: _State) -> None:
+    if not shutil.which("systemctl"):
+        return
+
+    unit = "hermes-dashboard.service"
+    active, load, unitfile = _systemd_unit_state(s, unit)
+    if active == "active" and load == "loaded" and unitfile == "enabled":
+        s.v_ok(f"{unit}: active loaded enabled")
+    else:
+        s.v_drift(
+            unit,
+            f"active={active or '?'} load={load or '?'} unitfile={unitfile or '?'}",
+        )
+
+    unit_file = Path(s.systemd_dir) / unit
+    if not unit_file.is_file():
+        s.v_drift(unit, f"missing unit file: {unit_file}")
+        return
+    owner = _owner(unit_file)
+    if owner == s.rails_owner:
+        s.v_ok(f"{unit_file} ownership: {owner}")
+    else:
+        s.v_drift(
+            f"{unit_file} ownership",
+            f"expected {s.rails_owner}, got {owner}",
+        )
+    try:
+        text = unit_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        s.v_drift(unit, f"unreadable: {exc}")
+        return
+
+    expected_home = f"Environment=HERMES_HOME={s.args.target}"
+    if expected_home in text:
+        s.v_ok("hermes-dashboard.service HERMES_HOME")
+    else:
+        s.v_drift("hermes-dashboard.service HERMES_HOME", f"missing {expected_home}")
+
+    expected_web_dist = f"Environment=HERMES_WEB_DIST={s.args.target / 'hermes-agent' / 'hermes_cli' / 'web_dist'}"
+    if expected_web_dist in text:
+        s.v_ok("hermes-dashboard.service HERMES_WEB_DIST")
+    else:
+        s.v_drift(
+            "hermes-dashboard.service HERMES_WEB_DIST",
+            f"missing {expected_web_dist}",
+        )
+
+    expected_base = "Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731"
+    if expected_base in text:
+        s.v_ok("hermes-dashboard.service Quay upstream")
+    else:
+        s.v_drift("hermes-dashboard.service Quay upstream", f"missing {expected_base}")
+
+    auth_env = f"EnvironmentFile={s.args.target / 'auth' / 'quay.env'}"
+    if auth_env in text:
+        s.v_ok("hermes-dashboard.service auth env")
+    else:
+        s.v_drift("hermes-dashboard.service auth env", f"missing {auth_env}")
+
+    runtime_env = f"EnvironmentFile=-{s.args.target / 'auth' / 'gateway-runtime.env'}"
+    if runtime_env in text:
+        s.v_ok("hermes-dashboard.service runtime env")
+    else:
+        s.v_drift("hermes-dashboard.service runtime env", f"missing {runtime_env}")
+
+    if re.search(r"ExecStart=.*\bdashboard\b.*--host\s+127\.0\.0\.1\b.*--port\s+9119\b", text):
+        s.v_ok("hermes-dashboard.service loopback bind: 127.0.0.1:9119")
+    else:
+        s.v_drift(
+            "hermes-dashboard.service bind address",
+            "expected ExecStart to include dashboard --host 127.0.0.1 --port 9119",
+        )
+
+    after_quay = re.search(
+        r"^After=.*\bquay-serve\.service\b", text, re.MULTILINE,
+    )
+    wants_quay = re.search(
+        r"^Wants=.*\bquay-serve\.service\b", text, re.MULTILINE,
+    )
+    if after_quay and wants_quay:
+        s.v_ok("hermes-dashboard.service requires quay-serve ordering")
+    else:
+        missing = []
+        if not after_quay:
+            missing.append("After=...quay-serve.service")
+        if not wants_quay:
+            missing.append("Wants=...quay-serve.service")
+        s.v_drift(
+            "hermes-dashboard.service quay-serve ordering",
+            "missing " + ", ".join(missing),
+        )
+
+    health_url = (
+        os.environ.get("HERMES_VERIFY_DASHBOARD_HEALTH_URL")
+        or "http://127.0.0.1:9119/quay/admin/"
+    )
+    code = _http_code(health_url)
+    if code == "401":
+        s.v_ok(f"hermes-dashboard local denial health: HTTP {code}")
+    else:
+        s.v_drift(
+            "hermes-dashboard local denial health",
+            f"{health_url} returned HTTP {code}",
         )
 
 
@@ -1948,6 +2062,12 @@ def run(
     if quay_version:
         if s.quay_serve_supported:
             _check_quay_serve_service(s)
+            if _values_get(
+                s.values_file,
+                s.values_helper,
+                "quay.admin.public_base_url",
+            ):
+                _check_hermes_dashboard_service(s)
         else:
             _check_quay_serve_not_installed(s)
     if app_auth_expected:

@@ -746,6 +746,28 @@ def _write_expected_quay_sha(expected_file: Path, quay_bin: Path) -> None:
     expected_file.chmod(0o644)
 
 
+def _write_curl_status_stub(
+    path: Path,
+    *,
+    default: str = "200",
+    dashboard: str | None = None,
+) -> None:
+    dashboard_case = ""
+    if dashboard is not None:
+        dashboard_case = (
+            f"if [[ \"$args\" == *\"9119\"* ]]; then printf '{dashboard}'; exit 0; fi\n"
+        )
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "args=\"$*\"\n"
+        "cat >/dev/null || true\n"
+        f"{dashboard_case}"
+        f"printf '{default}'\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def _write_live_quay_stub(install: dict, version: str, registered_ids: list[str], **kwargs) -> None:
     _write_quay_stub(install["quay_bin"], version, registered_ids, **kwargs)
     _write_expected_quay_sha(install["quay_expected_sha"], install["quay_bin"])
@@ -932,9 +954,7 @@ def quay_install(install: dict) -> dict:
     )
     bun_stub.chmod(0o755)
 
-    curl = bin_dir / "curl"
-    curl.write_text("#!/usr/bin/env bash\nprintf '200'\n")
-    curl.chmod(0o755)
+    _write_curl_status_stub(bin_dir / "curl")
 
     install["values_file"] = fork / "deploy.values.yaml"
     install["quay_dir"] = quay_dir
@@ -950,6 +970,43 @@ def quay_install(install: dict) -> dict:
     install["bun_bin"] = bun_stub
     install["systemd_dir"] = systemd_dir
     return install
+
+
+def _enable_quay_admin_public_dashboard(install: dict) -> None:
+    values = install["values_file"]
+    text = values.read_text(encoding="utf-8")
+    needle = "quay:\n" f"  version: \"{QUAY_VERSION}\"\n"
+    replacement = (
+        "quay:\n"
+        "  admin:\n"
+        "    public_base_url: https://hermes.example.test\n"
+        f"  version: \"{QUAY_VERSION}\"\n"
+    )
+    assert needle in text
+    values.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+
+    target = install["target"]
+    (target / "auth" / "gateway-runtime.env").write_text(
+        "QUAY_ADMIN_PUBLIC_BASE_URL=https://hermes.example.test\n",
+        encoding="utf-8",
+    )
+    (target / "auth" / "gateway-runtime.env").chmod(0o640)
+    (install["systemd_dir"] / "hermes-dashboard.service").write_text(
+        "[Unit]\n"
+        "After=network-online.target quay-serve.service\n"
+        "Wants=network-online.target quay-serve.service\n"
+        "[Service]\n"
+        f"Environment=HERMES_HOME={target}\n"
+        f"Environment=HERMES_WEB_DIST={target / 'hermes-agent' / 'hermes_cli' / 'web_dist'}\n"
+        "Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731\n"
+        f"EnvironmentFile={target / 'auth' / 'quay.env'}\n"
+        f"EnvironmentFile=-{target / 'auth' / 'gateway-runtime.env'}\n"
+        f"ExecStart={target / 'hermes-agent' / 'venv' / 'bin' / 'hermes'} "
+        "dashboard --host 127.0.0.1 --port 9119 --no-open\n",
+        encoding="utf-8",
+    )
+
+    _write_curl_status_stub(install["bin"] / "curl", dashboard="401")
 
 
 def _configure_quay_app_auth(
@@ -1008,9 +1065,7 @@ def _configure_quay_app_auth(
                 f"includeIf.{pattern}.path", str(include_file),
             )
 
-    curl = install["bin"] / "curl"
-    curl.write_text("#!/usr/bin/env bash\nprintf '200'\n")
-    curl.chmod(0o755)
+    _write_curl_status_stub(install["bin"] / "curl")
 
     return {"HERMES_VERIFY_AGENT_HOME": str(agent_home)}
 
@@ -1093,6 +1148,81 @@ class TestSetupHermesVerifyQuay:
         assert "[OK] quay admin token present" in result.stdout
         assert "[OK] quay admin local health: HTTP 200" in result.stdout
 
+    def test_quay_admin_public_dashboard_service_passes(self, quay_install):
+        _enable_quay_admin_public_dashboard(quay_install)
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "[OK] hermes-dashboard.service: active loaded enabled" in result.stdout
+        assert "[OK] hermes-dashboard.service HERMES_HOME" in result.stdout
+        assert "[OK] hermes-dashboard.service HERMES_WEB_DIST" in result.stdout
+        assert "[OK] hermes-dashboard.service Quay upstream" in result.stdout
+        assert "[OK] hermes-dashboard.service auth env" in result.stdout
+        assert "[OK] hermes-dashboard.service runtime env" in result.stdout
+        assert (
+            "[OK] hermes-dashboard.service loopback bind: 127.0.0.1:9119"
+            in result.stdout
+        )
+        assert "[OK] hermes-dashboard local denial health: HTTP 401" in result.stdout
+
+    def test_quay_admin_public_dashboard_missing_unit_is_drift(self, quay_install):
+        _enable_quay_admin_public_dashboard(quay_install)
+        (quay_install["systemd_dir"] / "hermes-dashboard.service").unlink()
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-dashboard.service" in result.stderr
+
+    def test_quay_admin_public_dashboard_public_bind_is_drift(self, quay_install):
+        _enable_quay_admin_public_dashboard(quay_install)
+        unit = quay_install["systemd_dir"] / "hermes-dashboard.service"
+        unit.write_text(
+            unit.read_text(encoding="utf-8").replace(
+                "--host 127.0.0.1", "--host 0.0.0.0"
+            ),
+            encoding="utf-8",
+        )
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-dashboard.service bind address" in result.stderr
+
+    def test_quay_admin_public_dashboard_comment_only_ordering_is_drift(
+        self, quay_install,
+    ):
+        _enable_quay_admin_public_dashboard(quay_install)
+        unit = quay_install["systemd_dir"] / "hermes-dashboard.service"
+        text = unit.read_text(encoding="utf-8")
+        text = text.replace(
+            "After=network-online.target quay-serve.service\n",
+            "After=network-online.target\n",
+        )
+        text = text.replace(
+            "Wants=network-online.target quay-serve.service\n",
+            "Wants=network-online.target\n",
+        )
+        text += "# quay-serve.service mentioned only in a comment\n"
+        unit.write_text(text, encoding="utf-8")
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-dashboard.service quay-serve ordering" in result.stderr
+        assert "After=...quay-serve.service" in result.stderr
+        assert "Wants=...quay-serve.service" in result.stderr
+
+    def test_quay_admin_public_dashboard_health_failure_is_drift(self, quay_install):
+        _enable_quay_admin_public_dashboard(quay_install)
+        _write_curl_status_stub(quay_install["bin"] / "curl", dashboard="502")
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-dashboard local denial health" in result.stderr
+
     def test_quay_serve_missing_admin_token_is_drift(self, quay_install):
         (quay_install["target"] / "auth" / "quay.env").write_text(
             "LINEAR_API_KEY=lin_test\n",
@@ -1115,9 +1245,7 @@ class TestSetupHermesVerifyQuay:
         assert "[DRIFT] quay-serve.service bind address" in result.stderr
 
     def test_quay_serve_health_failure_is_drift(self, quay_install):
-        curl = quay_install["bin"] / "curl"
-        curl.write_text("#!/usr/bin/env bash\nprintf '401'\n", encoding="utf-8")
-        curl.chmod(0o755)
+        _write_curl_status_stub(quay_install["bin"] / "curl", default="401")
         result = _run_verify_quay(quay_install)
         assert result.returncode == 1
         assert "[DRIFT] quay admin local health" in result.stderr
@@ -1414,9 +1542,7 @@ class TestSetupHermesVerifyQuay:
         reviewer_env.chmod(0o640)
         reviewer_key.chmod(0o640)
 
-        curl = quay_install["bin"] / "curl"
-        curl.write_text("#!/usr/bin/env bash\nprintf '200'\n", encoding="utf-8")
-        curl.chmod(0o755)
+        _write_curl_status_stub(quay_install["bin"] / "curl")
 
         systemd_dir = quay_install["tmp"] / "systemd"
         systemd_dir.mkdir(exist_ok=True)

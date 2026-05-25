@@ -225,6 +225,44 @@ def test_installer_persists_quay_expected_sha_for_verify():
     assert '"$TARGET_DIR/quay/SHA256SUM.expected"' not in content
 
 
+def test_installer_installs_dashboard_web_extra_when_quay_admin_public_url_is_set():
+    """Hosted Quay Admin needs the dashboard runtime deps in the managed venv.
+
+    Regression guard for the release deploy where the host-level dashboard
+    service failed because the installer had only installed the [slack] extra.
+    """
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "QUAY_ADMIN_PUBLIC_BASE_URL" in content
+    assert 'HERMES_INSTALL_EXTRAS="slack"' in content
+    assert 'HERMES_INSTALL_EXTRAS="slack,web"' in content
+    assert '"$TARGET_DIR/hermes-agent[$HERMES_INSTALL_EXTRAS]"' in content
+    assert "hermes-dashboard.service" in content
+    assert "quay.admin.public_base_url" in content
+    assert "http://127.0.0.1:9119/quay/admin/" in content
+    assert "hermes-dashboard.service did not return HTTP 401" in content
+    assert "systemctl enable hermes-dashboard.service" in content
+    assert "systemctl restart hermes-dashboard.service" in content
+    assert "systemctl is-active --quiet hermes-dashboard.service" in content
+
+
+def test_hermes_dashboard_service_is_loopback_quay_admin_proxy():
+    service = OPS_DIR / "hermes-dashboard.service"
+    content = service.read_text(encoding="utf-8")
+
+    assert "After=network-online.target quay-serve.service" in content
+    assert "Wants=network-online.target quay-serve.service" in content
+    assert "Environment=HERMES_HOME=__TARGET_DIR__" in content
+    assert "Environment=HERMES_WEB_DIST=__TARGET_DIR__/hermes-agent/hermes_cli/web_dist" in content
+    assert "Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731" in content
+    assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in content
+    assert "EnvironmentFile=-__TARGET_DIR__/auth/gateway-runtime.env" in content
+    assert re.search(
+        r"ExecStart=.*\bhermes\s+dashboard\s+--host\s+127\.0\.0\.1\s+--port\s+9119\s+--no-open",
+        content,
+    )
+
+
 def test_installer_uses_configured_quay_release_repo():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
 
