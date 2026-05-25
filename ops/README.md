@@ -730,6 +730,244 @@ curl -H "Authorization: Bearer $(sudo awk -F= '$1=="QUAY_ADMIN_TOKEN"{print $2}'
   http://127.0.0.1:9731/v1/meta
 ```
 
+## Quay Admin UI access
+
+This section covers the Hermes-hosted Quay Admin UI path used by operators.
+Hermes is only the Slack-authenticated proxy and login-link issuer. Quay
+remains independently runnable: `quay serve` still starts the Admin UI/API on
+loopback, reads Quay's own config and database, and enforces its own bearer
+token when `[admin].require_auth=true`.
+
+### Version and service assumptions
+
+Quay Admin UI deployment requires a pinned Quay release whose binary supports
+`quay serve --help` and the `[admin]` config block. During install,
+`setup-hermes.sh` probes the installed pinned binary; if the probe fails, it
+does not install `quay-serve.service`.
+
+When supported, the installer:
+
+* renders `<HERMES_HOME>/quay/config.toml` with:
+  `require_auth = true`, `token_env = "QUAY_ADMIN_TOKEN"`, and
+  `forwarded_identity_header = "X-Hermes-User-Id"`;
+* generates and preserves `QUAY_ADMIN_TOKEN` in
+  `<HERMES_HOME>/auth/quay.env`;
+* installs `quay-serve.service`, which runs:
+  `quay serve --host 127.0.0.1 --port 9731`;
+* keeps the service loopback-only. Public access belongs behind Hermes'
+  authenticated dashboard proxy, not by binding Quay to a public interface.
+
+The Hermes dashboard proxy defaults to `QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731`
+and exposes the hosted path at `/quay/admin/`.
+
+### Configure Slack admins
+
+Set `QUAY_ADMIN_ALLOWED_USERS` to a comma-separated list of Slack user IDs,
+for example:
+
+```sh
+QUAY_ADMIN_ALLOWED_USERS=U06TDC56VJB,U0123456789
+QUAY_ADMIN_PUBLIC_BASE_URL=https://hermes.example.com
+```
+
+The values can be entered through Hermes setup or placed in the gateway
+runtime environment, for example `/etc/default/hermes-gateway`. Use Slack user
+IDs (`U...`), not display names or emails. An empty `QUAY_ADMIN_ALLOWED_USERS`
+is fail-closed: `/quay-admin` refuses to issue login links to everyone.
+
+`QUAY_ADMIN_PUBLIC_BASE_URL` is the externally reachable Hermes dashboard base
+URL inserted into Slack DMs. If unset, Hermes falls back to
+`HERMES_DASHBOARD_URL`, then `http://localhost:9119`.
+
+After changing gateway environment, restart the gateway so the Slack command
+handler sees the new allowlist:
+
+```sh
+sudo systemctl restart hermes-gateway.service
+```
+
+### Login and session behavior
+
+An allowlisted Slack user runs `/quay-admin`. Hermes checks the Slack `user_id`
+against `QUAY_ADMIN_ALLOWED_USERS`, creates a random one-time login token, stores
+only its SHA-256 hash in `<HERMES_HOME>/quay/admin_login_links.json`, and DMs a
+login URL.
+
+Default login-link TTL is 5 minutes. Override with
+`QUAY_ADMIN_LOGIN_TTL_SECONDS` if needed. Login links are single-use: after a
+successful exchange, reuse returns `401`.
+
+The browser receives an `HttpOnly`, `Secure`, `SameSite=lax` cookie scoped to
+`/quay/admin`. Default browser session TTL is 12 hours. Override with
+`QUAY_ADMIN_SESSION_TTL_SECONDS` if needed. Sessions are in the Hermes dashboard
+process memory, so restarting the dashboard clears active browser sessions.
+
+The browser never receives `QUAY_ADMIN_TOKEN`. It receives only the Hermes
+session cookie.
+
+### Proxy authentication model
+
+For each `/quay/admin/*` request, Hermes:
+
+* requires a valid Hermes Quay Admin browser session;
+* reads `QUAY_ADMIN_TOKEN` server-side from the environment or
+  `<HERMES_HOME>/auth/quay.env`;
+* strips any browser-provided `Authorization` header;
+* forwards the request to Quay with
+  `Authorization: Bearer <QUAY_ADMIN_TOKEN>`;
+* injects the Slack user ID as `X-Hermes-User-Id` by default, so Quay can write
+  audit context without knowing Slack or Hermes internals.
+
+You can override the internal upstream with `QUAY_ADMIN_BASE_URL` and the
+forwarded identity header name with `QUAY_ADMIN_FORWARDED_IDENTITY_HEADER`.
+
+### Verify access and denial
+
+Check the local Quay service and bearer auth:
+
+```sh
+sudo systemctl status quay-serve.service
+sudo journalctl -u quay-serve.service -n 100 --no-pager
+curl -fsS -H "Authorization: Bearer $(sudo awk -F= '$1=="QUAY_ADMIN_TOKEN"{print $2}' ~hermes/.hermes/auth/quay.env)" \
+  http://127.0.0.1:9731/v1/meta
+```
+
+Check denial without the service token:
+
+```sh
+curl -i http://127.0.0.1:9731/v1/meta
+```
+
+Expected result: Quay returns an auth failure when `[admin].require_auth=true`.
+
+Check Hermes login-link denial:
+
+1. Set `QUAY_ADMIN_ALLOWED_USERS` to omit the test Slack user.
+2. Restart `hermes-gateway.service`.
+3. Run `/quay-admin` from Slack.
+4. Confirm the user gets "not allowed" and no login DM.
+
+Check Hermes proxy denial:
+
+```sh
+curl -i https://hermes.example.com/quay/admin/
+```
+
+Expected result: `401` with `Quay admin login required` when no valid Hermes
+admin session cookie is present.
+
+Check successful proxying:
+
+1. Add the test Slack user ID to `QUAY_ADMIN_ALLOWED_USERS`.
+2. Restart `hermes-gateway.service`.
+3. Run `/quay-admin`.
+4. Open the DM link within the TTL.
+5. Confirm `/quay/admin/` loads and API calls under `/quay/admin/v1/*` succeed.
+
+Check audit logs:
+
+```sh
+sudo journalctl -u quay-serve.service -o cat | rg 'quay_admin_audit'
+sudo journalctl -u <dashboard-service>.service -n 200 --no-pager
+sudo journalctl -u hermes-gateway.service -n 200 --no-pager
+```
+
+Quay Admin audit JSON lines should include the forwarded Slack user ID for
+mutating Admin API requests. Audit records intentionally omit token values.
+
+### Rotate `QUAY_ADMIN_TOKEN`
+
+`QUAY_ADMIN_TOKEN` is the Quay service token shared only by Quay and the Hermes
+proxy. Rotate it when an operator with host access leaves, after suspected
+secret exposure, or as part of normal credential hygiene.
+
+```sh
+sudo cp ~hermes/.hermes/auth/quay.env ~hermes/.hermes/auth/quay.env.$(date -u +%Y%m%dT%H%M%SZ).bak
+new_token="$(
+  sudo python3 - <<'PY'
+from pathlib import Path
+import secrets
+
+path = Path("~hermes/.hermes/auth/quay.env").expanduser()
+token = secrets.token_urlsafe(48)
+lines = path.read_text().splitlines()
+out = [line for line in lines if not line.startswith("QUAY_ADMIN_TOKEN=")]
+out.append(f"QUAY_ADMIN_TOKEN={token}")
+path.write_text("\n".join(out) + "\n")
+print(token)
+PY
+)"
+sudo systemctl restart quay-serve.service
+sudo systemctl restart <dashboard-service>.service
+```
+
+Then verify:
+
+```sh
+curl -fsS -H "Authorization: Bearer ${new_token}" http://127.0.0.1:9731/v1/meta
+```
+
+Existing browser sessions do not contain the old service token, but restarting
+the dashboard clears Hermes' in-memory Quay Admin sessions. Users should request
+a fresh `/quay-admin` link after rotation.
+
+### Add or remove admins
+
+To add an admin, add their Slack user ID to `QUAY_ADMIN_ALLOWED_USERS` and
+restart `hermes-gateway.service`.
+
+To remove an admin, remove their Slack user ID from `QUAY_ADMIN_ALLOWED_USERS`
+and restart `hermes-gateway.service`. This stops new login links. Because
+existing browser sessions live in the dashboard process, also restart
+the dashboard service or process if immediate revocation is required.
+
+### Emergency disable
+
+Use these in order during an incident:
+
+```sh
+# 1. Fail closed: clear the Slack allowlist so no new links can be minted.
+sudo sh -c 'printf "\nQUAY_ADMIN_ALLOWED_USERS=\n" >> /etc/default/hermes-gateway'
+sudo systemctl restart hermes-gateway.service
+
+# 2. Clear active Hermes browser sessions by restarting the dashboard.
+sudo systemctl restart <dashboard-service>.service
+
+# 3. Stop the loopback Quay Admin service.
+sudo systemctl stop quay-serve.service
+
+# 4. Remove any public reverse-proxy route to /quay/admin/ at the edge.
+#    Exact command depends on your nginx/Caddy/ingress deployment.
+
+# 5. Rotate the service token before re-enabling access.
+sudo cp ~hermes/.hermes/auth/quay.env ~hermes/.hermes/auth/quay.env.$(date -u +%Y%m%dT%H%M%SZ).bak
+new_token="$(
+  sudo python3 - <<'PY'
+from pathlib import Path
+import secrets
+
+path = Path("~hermes/.hermes/auth/quay.env").expanduser()
+token = secrets.token_urlsafe(48)
+lines = path.read_text().splitlines()
+out = [line for line in lines if not line.startswith("QUAY_ADMIN_TOKEN=")]
+out.append(f"QUAY_ADMIN_TOKEN={token}")
+path.write_text("\n".join(out) + "\n")
+print(token)
+PY
+)"
+```
+
+Verify the disable state:
+
+```sh
+sudo systemctl is-active quay-serve.service
+curl -i https://hermes.example.com/quay/admin/
+sudo journalctl -u hermes-gateway.service -n 100 --no-pager
+```
+
+Expected result: `quay-serve.service` is inactive, the public route is
+unavailable or returns `401/404/502`, and `/quay-admin` no longer issues links.
+
 ## Manual operations
 
 Force a tick:
