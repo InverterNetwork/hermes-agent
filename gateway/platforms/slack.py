@@ -777,7 +777,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "I sent your one-time Quay Admin login link by DM.",
             )
         else:
-            await self._respond_to_slash_command(command, message)
+            await self._respond_to_slash_command(
+                command,
+                "I could not DM your Quay Admin login link. Check that DMs "
+                "from this app are allowed, then retry `/quay-admin`.",
+            )
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""

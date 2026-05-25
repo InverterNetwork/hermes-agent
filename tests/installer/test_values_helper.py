@@ -915,6 +915,7 @@ class TestRenderQuayConfig:
         assert "[admin]" in text
         assert "require_auth = true" in text
         assert 'token_env = "QUAY_ADMIN_TOKEN"' in text
+        assert 'forwarded_identity_header = "X-Hermes-User-Id"' in text
 
     def test_omits_admin_auth_without_capability_flag(
         self, quay_values: Path, tmp_path: Path

@@ -850,6 +850,13 @@ def _check_quay_admin_config(s: _State) -> None:
             "quay admin token env",
             f"expected QUAY_ADMIN_TOKEN, got {admin.get('token_env')!r}",
         )
+    if admin.get("forwarded_identity_header") == "X-Hermes-User-Id":
+        s.v_ok("quay admin forwarded identity header: X-Hermes-User-Id")
+    else:
+        s.v_drift(
+            "quay admin forwarded identity header",
+            f"expected X-Hermes-User-Id, got {admin.get('forwarded_identity_header')!r}",
+        )
 
 
 def _executable_info(path: Path) -> tuple[str, str, str] | None:

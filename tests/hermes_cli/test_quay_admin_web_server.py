@@ -149,7 +149,11 @@ def test_quay_admin_proxy_serves_static_ui_with_hosted_api_base(monkeypatch, _is
             if url.endswith("/assets/app.js"):
                 return FakeResponse(b"console.log('quay')", "application/javascript")
             return FakeResponse(
-                b'<html><head><title>Quay</title><script type="module" src="/assets/app.js"></script></head>'
+                b'<html><head><title>Quay</title>'
+                b'<link rel="preconnect" href="https://fonts.googleapis.com" />'
+                b'<link rel="icon" type="image/svg+xml" href="/favicon.svg" />'
+                b'<link rel="stylesheet" crossorigin href="/assets/app.css">'
+                b'<script type="module" crossorigin src="/assets/app.js"></script></head>'
                 b'<body><a href="/v1/status">status</a></body></html>',
                 "text/html",
             )
@@ -162,6 +166,9 @@ def test_quay_admin_proxy_serves_static_ui_with_hosted_api_base(monkeypatch, _is
 
     assert resp.status_code == 200
     assert 'window.__QUAY_API_BASE_URL__="/quay/admin"' in resp.text
+    assert 'href="https://fonts.googleapis.com"' in resp.text
+    assert 'href="/quay/admin/favicon.svg"' in resp.text
+    assert 'href="/quay/admin/assets/app.css"' in resp.text
     assert 'src="/quay/admin/assets/app.js"' in resp.text
     assert 'href="/quay/admin/v1/status"' in resp.text
     assert "service-token" not in resp.text

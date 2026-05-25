@@ -73,3 +73,31 @@ async def test_quay_admin_slash_dms_allowed_user(monkeypatch, adapter, _isolate_
     assert "QUAY_ADMIN_TOKEN" not in dm_kwargs["text"]
     adapter._respond_to_slash_command.assert_awaited_once()
     assert "DM" in adapter._respond_to_slash_command.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_quay_admin_slash_dm_failure_never_posts_login_url_to_channel(
+    monkeypatch, adapter, _isolate_hermes_home
+):
+    monkeypatch.setenv("QUAY_ADMIN_ALLOWED_USERS", "U123")
+    monkeypatch.setenv("QUAY_ADMIN_PUBLIC_BASE_URL", "https://hermes.example.test")
+    adapter.send = AsyncMock()
+
+    client = MagicMock()
+    client.conversations_open = AsyncMock(side_effect=RuntimeError("dm unavailable"))
+    adapter._team_clients["T1"] = client
+
+    await adapter._handle_quay_admin_slash_command(
+        {
+            "user_id": "U123",
+            "team_id": "T1",
+            "channel_id": "C1",
+        }
+    )
+
+    adapter.send.assert_awaited_once()
+    channel_id, content = adapter.send.call_args.args[:2]
+    assert channel_id == "C1"
+    assert "https://hermes.example.test/quay/admin/login?token=" not in content
+    assert "token=" not in content
+    assert "could not DM" in content

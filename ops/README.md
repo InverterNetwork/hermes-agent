@@ -856,6 +856,13 @@ Default login-link TTL is 5 minutes. Override with
 `QUAY_ADMIN_LOGIN_TTL_SECONDS` if needed. Login links are single-use: after a
 successful exchange, reuse returns `401`.
 
+The one-time token is carried in the login URL query string so the browser can
+exchange it with a normal GET. Treat dashboard and reverse-proxy access logs as
+sensitive: the raw URL can appear there, and in browser history, until the link
+is consumed or expires. During a suspected leak, delete
+`<HERMES_HOME>/quay/admin_login_links.json` to invalidate outstanding links and
+scrub any retained access logs that may contain `/quay/admin/login?token=...`.
+
 The browser receives an `HttpOnly`, `Secure`, `SameSite=lax` cookie scoped to
 `/quay/admin`. Default browser session TTL is 12 hours. Override with
 `QUAY_ADMIN_SESSION_TTL_SECONDS` if needed. Sessions are in the Hermes dashboard
@@ -878,7 +885,10 @@ For each `/quay/admin/*` request, Hermes:
   audit context without knowing Slack or Hermes internals.
 
 You can override the internal upstream with `QUAY_ADMIN_BASE_URL` and the
-forwarded identity header name with `QUAY_ADMIN_FORWARDED_IDENTITY_HEADER`.
+forwarded identity header name with `QUAY_ADMIN_FORWARDED_IDENTITY_HEADER`, but
+the header must also match Quay's `[admin].forwarded_identity_header`. This
+deployment renders the default `X-Hermes-User-Id`; leave it unchanged unless
+you intentionally manage both sides of the proxy/config boundary.
 
 ### Verify access and denial
 
@@ -992,13 +1002,16 @@ sudo systemctl restart hermes-gateway.service
 # 2. Clear active Hermes browser sessions by restarting the dashboard.
 sudo systemctl restart <dashboard-service>.service
 
-# 3. Stop the loopback Quay Admin service.
+# 3. Invalidate outstanding one-time login links.
+sudo rm -f ~hermes/.hermes/quay/admin_login_links.json
+
+# 4. Stop the loopback Quay Admin service.
 sudo systemctl stop quay-serve.service
 
-# 4. Remove any public reverse-proxy route to /quay/admin/ at the edge.
+# 5. Remove any public reverse-proxy route to /quay/admin/ at the edge.
 #    Exact command depends on your nginx/Caddy/ingress deployment.
 
-# 5. Rotate the service token before re-enabling access.
+# 6. Rotate the service token before re-enabling access.
 sudo cp ~hermes/.hermes/auth/quay.env ~hermes/.hermes/auth/quay.env.$(date -u +%Y%m%dT%H%M%SZ).bak
 new_token="$(
   sudo python3 - <<'PY'
