@@ -12,7 +12,7 @@ def _install_quay_admin_session(web_server, slack_user_id="U123"):
     return {web_server._QUAY_ADMIN_COOKIE_NAME: "sid"}
 
 
-def test_quay_admin_login_sets_http_only_secure_cookie(monkeypatch, _isolate_hermes_home):
+def test_quay_admin_login_get_is_non_mutating_confirmation(_isolate_hermes_home):
     from starlette.testclient import TestClient
     import hermes_cli.web_server as web_server
 
@@ -21,6 +21,35 @@ def test_quay_admin_login_sets_http_only_secure_cookie(monkeypatch, _isolate_her
 
     client = TestClient(web_server.app)
     resp = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
+
+    assert resp.status_code == 200
+    assert "Continue to Quay Admin" in resp.text
+    assert "set-cookie" not in resp.headers
+    assert len(web_server._QUAY_ADMIN_SESSIONS) == 0
+
+    submit = client.post(
+        "/quay/admin/login",
+        data={"token": token},
+        follow_redirects=False,
+    )
+
+    assert submit.status_code == 303
+    assert submit.headers["location"] == "/quay/admin/"
+
+
+def test_quay_admin_login_post_sets_http_only_secure_cookie(_isolate_hermes_home):
+    from starlette.testclient import TestClient
+    import hermes_cli.web_server as web_server
+
+    token, _record = quay_admin_auth.create_login_token("U123")
+    web_server._QUAY_ADMIN_SESSIONS.clear()
+
+    client = TestClient(web_server.app)
+    resp = client.post(
+        "/quay/admin/login",
+        data={"token": token},
+        follow_redirects=False,
+    )
 
     assert resp.status_code == 303
     assert resp.headers["location"] == "/quay/admin/"
@@ -41,9 +70,13 @@ def test_quay_admin_login_rejects_reused_token(_isolate_hermes_home):
     token, _record = quay_admin_auth.create_login_token("U123")
     client = TestClient(web_server.app)
 
-    first = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
-    second = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
+    first_get = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
+    second_get = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
+    first = client.post("/quay/admin/login", data={"token": token}, follow_redirects=False)
+    second = client.post("/quay/admin/login", data={"token": token}, follow_redirects=False)
 
+    assert first_get.status_code == 200
+    assert second_get.status_code == 200
     assert first.status_code == 303
     assert second.status_code == 401
 
@@ -57,9 +90,11 @@ def test_quay_admin_login_rejects_expired_token(monkeypatch, _isolate_hermes_hom
     monkeypatch.setattr(quay_admin_auth.time, "time", lambda: 1002)
 
     client = TestClient(web_server.app)
-    resp = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
+    get_resp = client.get(f"/quay/admin/login?token={token}", follow_redirects=False)
+    post_resp = client.post("/quay/admin/login", data={"token": token}, follow_redirects=False)
 
-    assert resp.status_code == 401
+    assert get_resp.status_code == 401
+    assert post_resp.status_code == 401
 
 
 def test_quay_admin_proxy_uses_server_side_token_and_slack_identity(monkeypatch, _isolate_hermes_home):

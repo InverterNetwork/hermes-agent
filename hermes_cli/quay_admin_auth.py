@@ -66,6 +66,27 @@ def create_login_token(slack_user_id: str, *, now: float | None = None) -> tuple
     return token, record
 
 
+def inspect_login_token(token: str, *, now: float | None = None) -> dict[str, Any] | None:
+    """Return a valid login token record without consuming it."""
+    if not token:
+        return None
+    current = time.time() if now is None else now
+    token_hash = _hash_token(token)
+    with _STATE_LOCK:
+        state = _load_state_unlocked()
+        _gc_state_unlocked(state, current)
+        tokens = state.setdefault("login_tokens", {})
+        record = tokens.get(token_hash)
+        if not isinstance(record, dict):
+            return None
+        if record.get("used_at") is not None:
+            return None
+        expires_at = float(record.get("expires_at") or 0)
+        if expires_at <= current:
+            return None
+        return dict(record)
+
+
 def consume_login_token(token: str, *, now: float | None = None) -> dict[str, Any] | None:
     """Consume a login token once, returning its record when valid."""
     if not token:

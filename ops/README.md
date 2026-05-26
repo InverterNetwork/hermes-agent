@@ -895,10 +895,13 @@ Default login-link TTL is 5 minutes. Override with
 `QUAY_ADMIN_LOGIN_TTL_SECONDS` if needed. Login links are single-use: after a
 successful exchange, reuse returns `401`.
 
-The one-time token is carried in the login URL query string so the browser can
-exchange it with a normal GET. Treat dashboard and reverse-proxy access logs as
-sensitive: the raw URL can appear there, and in browser history, until the link
-is consumed or expires. During a suspected leak, delete
+The one-time token is carried in the login URL query string. Opening the link
+shows a confirmation page; the token is consumed only when the user continues.
+This keeps Slack link previews and security scanners from spending the
+single-use token before the browser session is created. Treat dashboard and
+reverse-proxy access logs as sensitive: the raw URL can appear there, and in
+browser history, until the link is consumed or expires. During a suspected
+leak, delete
 `<HERMES_HOME>/quay/admin_login_links.json` to invalidate outstanding links and
 scrub any retained access logs that may contain `/quay/admin/login?token=...`.
 
