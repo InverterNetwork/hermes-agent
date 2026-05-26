@@ -6,6 +6,10 @@
   ``--skip-root-check`` is passed (tests only).
 * ``ensure-codex`` — provision the pinned Codex CLI as a root-managed
   binary when the active quay agent invocation path references ``codex``.
+* ``seed-systemd-default-env`` — create a preserved /etc/default override
+  file for an installer-managed service.
+* ``render-systemd-unit`` — render a systemd unit template with explicit
+  ``__PLACEHOLDER__`` values.
 * ``verify`` — read-only health check. Inspects the live install for drift
   and exits 0 (no drift) or 1 (drift detected). No root required.
 """
@@ -65,6 +69,47 @@ def main(argv: list[str] | None = None) -> int:
         help="bypass the euid==0 assertion (tests only)",
     )
 
+    sde = sub.add_parser(
+        "seed-systemd-default-env",
+        help="create a preserved /etc/default override file for a service",
+    )
+    sde.add_argument(
+        "--service-name",
+        required=True,
+        help="service name without .service",
+    )
+    sde.add_argument("--out", required=True, type=Path, help="output env file path")
+    sde.add_argument(
+        "--skip-root-check",
+        action="store_true",
+        help="bypass the euid==0 assertion (tests only)",
+    )
+
+    rsu = sub.add_parser(
+        "render-systemd-unit",
+        help="render a systemd unit template with __PLACEHOLDER__ values",
+    )
+    rsu.add_argument(
+        "--template",
+        required=True,
+        type=Path,
+        help="unit template path",
+    )
+    rsu.add_argument("--out", required=True, type=Path, help="rendered unit path")
+    rsu.add_argument(
+        "--set",
+        dest="replacements",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="template replacement; may be passed more than once",
+    )
+    rsu.add_argument(
+        "--skip-root-check",
+        action="store_true",
+        help="bypass the euid==0 assertion (tests only)",
+    )
+
     vr = sub.add_parser("verify", help="read-only health check of a rendered install")
     vr.add_argument("--fork", required=True, type=Path, help="fork repo path")
     vr.add_argument(
@@ -118,6 +163,32 @@ def main(argv: list[str] | None = None) -> int:
         values = load_values(args.values)
         pin = required_codex_pin(values)
         ensure_codex(pin, agent_user=args.agent_user, symlink_path=args.symlink_path)
+        return 0
+
+    if args.cmd == "seed-systemd-default-env":
+        from .systemd import seed_default_env
+
+        if not args.skip_root_check:
+            require_root()
+        seed_default_env(
+            args.out,
+            args.service_name,
+            chown_root=not args.skip_root_check,
+        )
+        return 0
+
+    if args.cmd == "render-systemd-unit":
+        from .systemd import parse_replacement, render_systemd_unit
+
+        if not args.skip_root_check:
+            require_root()
+        replacements = dict(parse_replacement(raw) for raw in args.replacements)
+        render_systemd_unit(
+            args.template,
+            args.out,
+            replacements,
+            chown_root=not args.skip_root_check,
+        )
         return 0
 
     if args.cmd == "verify":
