@@ -20,7 +20,7 @@ def fail(msg: str, code: int = 1) -> NoReturn:
 def require_root() -> None:
     if os.geteuid() != 0:
         fail(
-            "hermes_installer must be invoked as root (it writes /usr/local/bin); "
+            "hermes_installer must be invoked as root for this operation; "
             "run from setup-hermes.sh under sudo.",
             code=2,
         )
