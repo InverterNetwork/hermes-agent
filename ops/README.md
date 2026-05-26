@@ -1,6 +1,6 @@
-# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + quay-orchestrator
+# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + quay-serve + hermes-dashboard + quay-orchestrator
 
-Six units live here:
+Eight units live here:
 
 * **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
   repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
@@ -36,6 +36,11 @@ Six units live here:
   release binaries serve the embedded UI, bind to `127.0.0.1:9731`, use
   `QUAY_DATA_DIR=<HERMES_HOME>/quay`, and require `QUAY_ADMIN_TOKEN`
   from `<HERMES_HOME>/auth/quay.env`.
+* **`hermes-dashboard`** — localhost-only Hermes dashboard process that
+  hosts the Slack-authenticated Quay Admin proxy at `/quay/admin/`.
+  Installed only when `quay.admin.public_base_url` is configured and the
+  pinned Quay binary supports `quay serve`; binds to `127.0.0.1:9119`
+  and depends on `quay-serve.service`.
 * **`quay-orchestrator`** — optional Quay sidecar for durable Quay
   delivery outbox items and legacy orchestrator handoffs. It is gated by
   `quay.orchestrator.enabled` and
@@ -65,6 +70,7 @@ Six units live here:
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Mints the worker GitHub App token via `installer/hermes_github_token.py` and exports it as `$GH_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. Mirrors `ops/hermes-upstream-sync`'s preamble. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
 | `ops/quay-serve.service`                   | systemd service unit for the embedded Quay Admin UI/API. Installed only when the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `QUAY_DATA_DIR=<TARGET>/quay`, and `EnvironmentFile=<TARGET>/auth/quay.env`; binds `127.0.0.1:9731` and requires `QUAY_ADMIN_TOKEN`. |
+| `ops/hermes-dashboard.service`             | systemd service unit for the Hermes dashboard and Quay Admin proxy. Installed only when `quay.admin.public_base_url` is set and the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `HERMES_HOME=<TARGET>`, `HERMES_WEB_DIST=<TARGET>/hermes-agent/hermes_cli/web_dist`, `EnvironmentFile=<TARGET>/auth/quay.env`, and `EnvironmentFile=<TARGET>/auth/gateway-runtime.env`; binds `127.0.0.1:9119` and proxies `/quay/admin/` to `quay-serve.service`. `HERMES_WEB_DIST` prevents this service from attempting an npm build at startup; the Quay Admin proxy routes do not need the Hermes SPA bundle. |
 | `ops/quay_orchestrator.py`                 | Quay delivery-outbox and handoff drain loop. Defines the Quay CLI adapter, delivery-only Slack posts, human-advice Slack question/discussion flow with original-thread routing plus fallback-channel support, orchestrator decision handling, JSON event logging, metrics, and lock wrapper. |
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one` with `<HERMES_HOME>/quay/orchestrator.json`. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. |
@@ -789,6 +795,14 @@ curl -H "Authorization: Bearer $(sudo awk -F= '$1=="QUAY_ADMIN_TOKEN"{print $2}'
   http://127.0.0.1:9731/v1/meta
 ```
 
+The hosted Slack-authenticated proxy runs separately under
+`hermes-dashboard.service` when `quay.admin.public_base_url` is set:
+
+```sh
+sudo systemctl status hermes-dashboard.service
+curl -i http://127.0.0.1:9119/quay/admin/
+```
+
 ## Quay Admin UI access
 
 This section covers the Hermes-hosted Quay Admin UI path used by operators.
@@ -813,6 +827,9 @@ When supported, the installer:
   `<HERMES_HOME>/auth/quay.env`;
 * installs `quay-serve.service`, which runs:
   `quay serve --host 127.0.0.1 --port 9731`;
+* installs `hermes-dashboard.service` when `quay.admin.public_base_url` is
+  set, which runs:
+  `hermes dashboard --host 127.0.0.1 --port 9119 --no-open`;
 * keeps the service loopback-only. Public access belongs behind Hermes'
   authenticated dashboard proxy, not by binding Quay to a public interface.
 
@@ -844,6 +861,28 @@ handler sees the new allowlist:
 ```sh
 sudo systemctl restart hermes-gateway.service
 ```
+
+### Configure the edge route
+
+`hermes-dashboard.service` is loopback-only. The public reverse proxy should
+route only the Quay Admin path to port 9119 and preserve a loopback `Host`
+header, because the dashboard rejects non-local hosts.
+
+Expose this route only behind an HTTPS edge. The browser session cookie is
+marked `Secure`, so HTTP-only routes will not persist the Quay Admin session.
+
+For Caddy:
+
+```caddy
+handle /quay/admin* {
+  reverse_proxy 127.0.0.1:9119 {
+    header_up Host 127.0.0.1:9119
+  }
+}
+```
+
+Other routes for the same host should continue to point wherever they did
+before; do not expose `quay-serve.service` directly.
 
 ### Login and session behavior
 
@@ -937,7 +976,7 @@ Check audit logs:
 
 ```sh
 sudo journalctl -u quay-serve.service -o cat | rg 'quay_admin_audit'
-sudo journalctl -u <dashboard-service>.service -n 200 --no-pager
+sudo journalctl -u hermes-dashboard.service -n 200 --no-pager
 sudo journalctl -u hermes-gateway.service -n 200 --no-pager
 ```
 
@@ -967,7 +1006,7 @@ print(token)
 PY
 )"
 sudo systemctl restart quay-serve.service
-sudo systemctl restart <dashboard-service>.service
+sudo systemctl restart hermes-dashboard.service
 ```
 
 Then verify:
@@ -1000,7 +1039,7 @@ sudo sh -c 'printf "\nQUAY_ADMIN_ALLOWED_USERS=\n" >> /etc/default/hermes-gatewa
 sudo systemctl restart hermes-gateway.service
 
 # 2. Clear active Hermes browser sessions by restarting the dashboard.
-sudo systemctl restart <dashboard-service>.service
+sudo systemctl restart hermes-dashboard.service
 
 # 3. Invalidate outstanding one-time login links.
 sudo rm -f ~hermes/.hermes/quay/admin_login_links.json

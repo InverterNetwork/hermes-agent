@@ -1,0 +1,40 @@
+[Unit]
+Description=Hermes dashboard and Quay Admin proxy
+After=network-online.target quay-serve.service
+Wants=network-online.target quay-serve.service
+
+[Service]
+Type=simple
+# User/Group and target-dir-derived paths are substituted by setup-hermes.sh
+# at install time so non-default --user / --target values stay coherent.
+User=__AGENT_USER__
+Group=__AGENT_USER__
+WorkingDirectory=__TARGET_DIR__/hermes-agent
+Environment=HOME=__AGENT_HOME__
+Environment=USER=__AGENT_USER__
+Environment=LOGNAME=__AGENT_USER__
+Environment=HERMES_HOME=__TARGET_DIR__
+Environment=VIRTUAL_ENV=__TARGET_DIR__/hermes-agent/venv
+# The hosted Quay Admin proxy routes do not require the Hermes SPA bundle.
+# Setting HERMES_WEB_DIST keeps this system service from attempting npm
+# install/build work during startup; if a built bundle is shipped later, the
+# same path can serve it.
+Environment=HERMES_WEB_DIST=__TARGET_DIR__/hermes-agent/hermes_cli/web_dist
+Environment=PATH=__TARGET_DIR__/hermes-agent/venv/bin:__TARGET_DIR__/hermes-agent/node_modules/.bin:/usr/bin:__AGENT_HOME__/.local/bin:__AGENT_HOME__/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731
+# quay.env carries QUAY_ADMIN_TOKEN, which the dashboard uses server-side
+# when proxying authenticated browser sessions to quay-serve.
+EnvironmentFile=__TARGET_DIR__/auth/quay.env
+# gateway-runtime.env carries values-derived non-secret env such as
+# QUAY_ADMIN_PUBLIC_BASE_URL; it is optional for dashboard startup.
+EnvironmentFile=-__TARGET_DIR__/auth/gateway-runtime.env
+# Optional operator-only extra env. Do not put QUAY_ADMIN_TOKEN here; keep
+# service secrets in <HERMES_HOME>/auth/quay.env with the other Hermes envs.
+EnvironmentFile=-/etc/default/hermes-dashboard
+ExecStart=__TARGET_DIR__/hermes-agent/venv/bin/hermes dashboard --host 127.0.0.1 --port 9119 --no-open
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target
