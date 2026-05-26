@@ -11,6 +11,7 @@ Usage:
 
 import asyncio
 import hmac
+import html
 import importlib.util
 import json
 import logging
@@ -3275,7 +3276,33 @@ def _rewrite_quay_admin_html(html: str) -> str:
 
 @app.get("/quay/admin/login")
 async def quay_admin_login(token: str = ""):
+    """Show a confirmation page for a Slack-issued one-time token.
+
+    Slack and corporate link scanners may fetch GET links before the human
+    user opens them. Keep GET non-mutating; the explicit POST below consumes
+    the token and creates the browser session.
+    """
+    from hermes_cli import quay_admin_auth
+
+    record = quay_admin_auth.inspect_login_token(token)
+    if not record:
+        return JSONResponse({"detail": "Invalid or expired login link"}, status_code=401)
+
+    return HTMLResponse(_quay_admin_login_confirmation_html(
+        token,
+        str(record["slack_user_id"]),
+    ))
+
+
+@app.post("/quay/admin/login")
+async def quay_admin_login_submit(request: Request):
     """Exchange a Slack-issued one-time token for an HttpOnly admin session."""
+    body = await request.body()
+    try:
+        form = urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        form = {}
+    token = (form.get("token") or [""])[0]
     from hermes_cli import quay_admin_auth
 
     record = quay_admin_auth.consume_login_token(token)
@@ -3297,6 +3324,62 @@ async def quay_admin_login(token: str = ""):
         path="/quay/admin",
     )
     return response
+
+
+def _quay_admin_login_confirmation_html(token: str, slack_user_id: str) -> str:
+    safe_token = html.escape(token, quote=True)
+    safe_user = html.escape(slack_user_id, quote=True)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quay Admin Login</title>
+  <style>
+    body {{
+      align-items: center;
+      background: #f6f7f8;
+      color: #111827;
+      display: flex;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }}
+    main {{
+      background: white;
+      border: 1px solid #d8dde3;
+      border-radius: 8px;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+      max-width: 420px;
+      padding: 28px;
+      width: calc(100% - 32px);
+    }}
+    h1 {{ font-size: 22px; margin: 0 0 10px; }}
+    p {{ color: #4b5563; line-height: 1.5; margin: 0 0 22px; }}
+    button {{
+      background: #111827;
+      border: 0;
+      border-radius: 6px;
+      color: white;
+      cursor: pointer;
+      font: inherit;
+      padding: 11px 16px;
+      width: 100%;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Quay Admin</h1>
+    <p>Continue as Slack user <strong>{safe_user}</strong>.</p>
+    <form method="post" action="/quay/admin/login">
+      <input type="hidden" name="token" value="{safe_token}">
+      <button type="submit">Continue to Quay Admin</button>
+    </form>
+  </main>
+</body>
+</html>"""
 
 
 async def _proxy_quay_admin(request: Request, path: str = "") -> Response:

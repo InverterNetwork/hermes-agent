@@ -14,6 +14,10 @@ def test_allowed_user_can_create_and_consume_one_time_token(monkeypatch, _isolat
     assert record["slack_user_id"] == "U123"
     assert token not in json.dumps(quay_admin_auth.state_path().read_text(encoding="utf-8"))
 
+    inspected = quay_admin_auth.inspect_login_token(token, now=1001)
+    assert inspected is not None
+    assert inspected["slack_user_id"] == "U123"
+
     consumed = quay_admin_auth.consume_login_token(token, now=1001)
     assert consumed is not None
     assert consumed["slack_user_id"] == "U123"
