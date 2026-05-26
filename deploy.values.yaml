@@ -683,6 +683,11 @@ quay:
   admin:
     allowed_users:
       - U06TDC56VJB
+      - U04DUF16KEG
+      - U05N07C8KFC
+      - U04CZLJ99ST
+      - U0AEGC4KLJD
+      - U087HHUQ3AQ
     public_base_url: https://didier.brix.fyi
   # Pinned Codex CLI worker binary. The OpenAI Codex GitHub release uses
   # `rust-v<version>` tags for static assets; the installer downloads the
