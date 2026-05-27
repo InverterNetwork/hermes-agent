@@ -41,6 +41,7 @@ from _hermes_home import get_hermes_home
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
+CONFIG_PATH = HERMES_HOME / "config.yaml"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -54,6 +55,9 @@ SCOPES = [
 ]
 
 SERVICE_ACCOUNT_ENV = "GOOGLE_SA_KEY_PATH"
+SERVICE_ACCOUNT_CONFIG_KEY = (
+    "skills.config.google_workspace.service_account_key_path"
+)
 SERVICE_ACCOUNT_APIS = {"drive", "sheets", "docs"}
 SERVICE_ACCOUNT_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
@@ -94,11 +98,47 @@ def _gws_binary() -> str | None:
     return shutil.which("gws")
 
 
+def _resolve_config_dotpath(config: dict, dotted_key: str):
+    current = config
+    for part in dotted_key.split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _service_account_key_path_from_config() -> Path | None:
+    if not CONFIG_PATH.exists():
+        return None
+
+    try:
+        import yaml
+
+        parsed = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    raw_path = _resolve_config_dotpath(parsed, SERVICE_ACCOUNT_CONFIG_KEY)
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(raw_path.strip()))
+    return Path(expanded)
+
+
 def _service_account_key_path() -> Path | None:
+    config_path = _service_account_key_path_from_config()
+    if config_path is not None:
+        return config_path
+
     raw_path = os.getenv(SERVICE_ACCOUNT_ENV, "").strip()
     if not raw_path:
         return None
-    return Path(raw_path).expanduser()
+    expanded = os.path.expandvars(os.path.expanduser(raw_path))
+    return Path(expanded)
 
 
 def _service_account_enabled_for(api: str | None) -> bool:
@@ -227,11 +267,15 @@ def get_service_account_credentials(api: str):
     """Load service-account credentials for file-scoped Workspace APIs."""
     key_path = _service_account_key_path()
     if key_path is None:
-        print(f"{SERVICE_ACCOUNT_ENV} is not set.", file=sys.stderr)
+        print(
+            "Google service-account key path is not configured. "
+            f"Set {SERVICE_ACCOUNT_CONFIG_KEY} in config.yaml.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if not key_path.exists():
         print(
-            f"{SERVICE_ACCOUNT_ENV} points to a missing file: {key_path}",
+            f"Google service-account key path points to a missing file: {key_path}",
             file=sys.stderr,
         )
         sys.exit(1)

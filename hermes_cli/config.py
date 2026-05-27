@@ -1612,6 +1612,14 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "config": {
+            "google_workspace": {
+                # Optional service-account key for Google Drive, Docs, and
+                # Sheets file-level access. The JSON key remains a credential
+                # file; this config value stores only the path.
+                "service_account_key_path": "",
+            },
+        },
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

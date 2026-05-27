@@ -19,7 +19,7 @@ metadata:
 
 # Google Workspace
 
-Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation. Drive, Docs, and Sheets can also use file-level service-account access when `GOOGLE_SA_KEY_PATH` is set.
+Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation. Drive, Docs, and Sheets can also use file-level service-account access when `skills.config.google_workspace.service_account_key_path` is set.
 
 ## References
 
@@ -181,20 +181,33 @@ mkdir -p ${HERMES_HOME:-$HOME/.hermes}/auth
 install -m 0640 /path/to/downloaded-key.json ${HERMES_HOME:-$HOME/.hermes}/auth/google-sa-key.json
 ```
 
-5. Add an absolute path to `${HERMES_HOME:-$HOME/.hermes}/.env`:
+5. Add an absolute path to `${HERMES_HOME:-$HOME/.hermes}/config.yaml`:
 
-```bash
-GOOGLE_SA_KEY_PATH=/home/hermes/.hermes/auth/google-sa-key.json
+```yaml
+skills:
+  config:
+    google_workspace:
+      service_account_key_path: /home/hermes/.hermes/auth/google-sa-key.json
 ```
 
 6. Share each Google Doc, Sheet, or Drive folder with the service account's
    email address. Use Viewer access for read-only Docs/Drive searches and
    Editor access when Hermes needs to update Sheets.
 
-When `GOOGLE_SA_KEY_PATH` is set, `google_api.py` uses service-account
-credentials for `drive`, `docs`, and `sheets` commands, even if `gws` is
-installed. Files not shared with the service account remain inaccessible.
-Unset `GOOGLE_SA_KEY_PATH` to fall back to OAuth for these commands.
+You can also set it with:
+
+```bash
+hermes config set skills.config.google_workspace.service_account_key_path /home/hermes/.hermes/auth/google-sa-key.json
+```
+
+When `skills.config.google_workspace.service_account_key_path` is set,
+`google_api.py` uses service-account credentials for `drive`, `docs`, and
+`sheets` commands, even if `gws` is installed. Files not shared with the
+service account remain inaccessible. Clear the config value to fall back to
+OAuth for these commands.
+
+`GOOGLE_SA_KEY_PATH` is still accepted as a legacy fallback when the config
+value is empty, but new deployments should use `config.yaml`.
 
 ## Usage
 

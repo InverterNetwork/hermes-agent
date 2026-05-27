@@ -68,6 +68,20 @@ def _write_token(path: Path, *, token="ya29.test", expiry=None, **extra):
     path.write_text(json.dumps(data))
 
 
+def _write_service_account_config(module, key_path: Path | str):
+    module.CONFIG_PATH.write_text(
+        "\n".join(
+            [
+                "skills:",
+                "  config:",
+                "    google_workspace:",
+                f"      service_account_key_path: {key_path}",
+                "",
+            ]
+        )
+    )
+
+
 def test_bridge_returns_valid_token(bridge_module, tmp_path):
     """Non-expired token is returned without refresh."""
     future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
@@ -489,7 +503,7 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
 def test_api_get_credentials_uses_service_account_for_file_apis(api_module, monkeypatch, tmp_path):
     key_path = tmp_path / "google-sa-key.json"
     key_path.write_text("{}")
-    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", str(key_path))
+    _write_service_account_config(api_module, key_path)
     monkeypatch.setattr(
         api_module,
         "_ensure_authenticated",
@@ -532,7 +546,7 @@ def test_api_get_credentials_keeps_non_file_apis_on_oauth_with_service_account(
     key_path.write_text("{}")
     token_path = api_module.TOKEN_PATH
     _write_token(token_path)
-    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", str(key_path))
+    _write_service_account_config(api_module, key_path)
 
     class FakeCredentials:
         expired = False
@@ -576,7 +590,7 @@ def test_api_get_credentials_keeps_non_file_apis_on_oauth_with_service_account(
 
 
 def test_api_service_account_disables_gws_only_for_file_apis(api_module, monkeypatch):
-    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/tmp/google-sa-key.json")
+    _write_service_account_config(api_module, "/tmp/google-sa-key.json")
     monkeypatch.setattr(api_module, "_gws_binary", lambda: "/usr/bin/gws")
 
     assert not api_module._should_use_gws("drive")
@@ -587,10 +601,23 @@ def test_api_service_account_disables_gws_only_for_file_apis(api_module, monkeyp
     assert api_module._should_use_gws("contacts")
 
 
+def test_api_service_account_key_path_falls_back_to_legacy_env(api_module, monkeypatch):
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/legacy/google-sa-key.json")
+
+    assert api_module._service_account_key_path() == Path("/legacy/google-sa-key.json")
+
+
+def test_api_service_account_config_takes_precedence_over_legacy_env(api_module, monkeypatch):
+    _write_service_account_config(api_module, "/config/google-sa-key.json")
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/legacy/google-sa-key.json")
+
+    assert api_module._service_account_key_path() == Path("/config/google-sa-key.json")
+
+
 def test_api_drive_search_bypasses_gws_when_service_account_configured(
     api_module, monkeypatch, capsys
 ):
-    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/tmp/google-sa-key.json")
+    _write_service_account_config(api_module, "/tmp/google-sa-key.json")
     monkeypatch.setattr(
         api_module,
         "_run_gws",
@@ -636,10 +663,19 @@ def test_api_drive_search_bypasses_gws_when_service_account_configured(
 
 def test_api_service_account_missing_file_exits(api_module, monkeypatch, tmp_path, capsys):
     missing_path = tmp_path / "missing-google-sa-key.json"
-    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", str(missing_path))
+    _write_service_account_config(api_module, missing_path)
 
     with pytest.raises(SystemExit) as exc:
         api_module.get_credentials("docs")
 
     assert exc.value.code == 1
-    assert "GOOGLE_SA_KEY_PATH points to a missing file" in capsys.readouterr().err
+    assert "service-account key path points to a missing file" in capsys.readouterr().err
+
+
+def test_default_config_exposes_google_workspace_service_account_path():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert (
+        DEFAULT_CONFIG["skills"]["config"]["google_workspace"]["service_account_key_path"]
+        == ""
+    )
