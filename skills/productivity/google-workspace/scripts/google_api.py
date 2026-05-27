@@ -53,6 +53,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
+SERVICE_ACCOUNT_ENV = "GOOGLE_SA_KEY_PATH"
+SERVICE_ACCOUNT_APIS = {"drive", "sheets", "docs"}
+SERVICE_ACCOUNT_SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/documents.readonly",
+]
+
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
@@ -84,6 +92,21 @@ def _gws_binary() -> str | None:
     if override:
         return override
     return shutil.which("gws")
+
+
+def _service_account_key_path() -> Path | None:
+    raw_path = os.getenv(SERVICE_ACCOUNT_ENV, "").strip()
+    if not raw_path:
+        return None
+    return Path(raw_path).expanduser()
+
+
+def _service_account_enabled_for(api: str | None) -> bool:
+    return api in SERVICE_ACCOUNT_APIS and _service_account_key_path() is not None
+
+
+def _should_use_gws(api: str) -> bool:
+    return bool(_gws_binary()) and not _service_account_enabled_for(api)
 
 
 def _gws_env() -> dict[str, str]:
@@ -178,8 +201,8 @@ def _datetime_with_timezone(value: str) -> str:
     return value + "Z"
 
 
-def get_credentials():
-    """Load and refresh credentials from token file."""
+def get_oauth_credentials():
+    """Load and refresh OAuth credentials from token file."""
     _ensure_authenticated()
 
     from google.oauth2.credentials import Credentials
@@ -200,10 +223,45 @@ def get_credentials():
     return creds
 
 
+def get_service_account_credentials(api: str):
+    """Load service-account credentials for file-scoped Workspace APIs."""
+    key_path = _service_account_key_path()
+    if key_path is None:
+        print(f"{SERVICE_ACCOUNT_ENV} is not set.", file=sys.stderr)
+        sys.exit(1)
+    if not key_path.exists():
+        print(
+            f"{SERVICE_ACCOUNT_ENV} points to a missing file: {key_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        from google.oauth2 import service_account
+
+        return service_account.Credentials.from_service_account_file(
+            str(key_path),
+            scopes=SERVICE_ACCOUNT_SCOPES,
+        )
+    except Exception as exc:
+        print(
+            f"Failed to load Google service-account credentials for {api}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def get_credentials(api: str | None = None):
+    """Load credentials for an API, preferring service accounts for supported file APIs."""
+    if _service_account_enabled_for(api):
+        return get_service_account_credentials(api or "google-workspace")
+    return get_oauth_credentials()
+
+
 def build_service(api, version):
     from googleapiclient.discovery import build
 
-    return build(api, version, credentials=get_credentials())
+    return build(api, version, credentials=get_credentials(api))
 
 
 # =========================================================================
@@ -212,7 +270,7 @@ def build_service(api, version):
 
 
 def gmail_search(args):
-    if _gws_binary():
+    if _should_use_gws("gmail"):
         results = _run_gws(
             ["gmail", "users", "messages", "list"],
             params={"userId": "me", "q": args.query, "maxResults": args.max},
@@ -276,7 +334,7 @@ def gmail_search(args):
 
 
 def gmail_get(args):
-    if _gws_binary():
+    if _should_use_gws("gmail"):
         msg = _run_gws(
             ["gmail", "users", "messages", "get"],
             params={"userId": "me", "id": args.message_id, "format": "full"},
@@ -316,7 +374,7 @@ def gmail_get(args):
 
 
 def gmail_send(args):
-    if _gws_binary():
+    if _should_use_gws("gmail"):
         message = MIMEText(args.body, "html" if args.html else "plain")
         message["To"] = args.to
         message["Subject"] = args.subject
@@ -359,7 +417,7 @@ def gmail_send(args):
 
 
 def gmail_reply(args):
-    if _gws_binary():
+    if _should_use_gws("gmail"):
         original = _run_gws(
             ["gmail", "users", "messages", "get"],
             params={
@@ -422,7 +480,7 @@ def gmail_reply(args):
 
 
 def gmail_labels(args):
-    if _gws_binary():
+    if _should_use_gws("gmail"):
         results = _run_gws(["gmail", "users", "labels", "list"], params={"userId": "me"})
         labels = [{"id": l["id"], "name": l["name"], "type": l.get("type", "")} for l in results.get("labels", [])]
         print(json.dumps(labels, indent=2))
@@ -442,7 +500,7 @@ def gmail_modify(args):
     if args.remove_labels:
         body["removeLabelIds"] = args.remove_labels.split(",")
 
-    if _gws_binary():
+    if _should_use_gws("gmail"):
         result = _run_gws(
             ["gmail", "users", "messages", "modify"],
             params={"userId": "me", "id": args.message_id},
@@ -466,7 +524,7 @@ def calendar_list(args):
     time_min = _datetime_with_timezone(args.start or now.isoformat())
     time_max = _datetime_with_timezone(args.end or (now + timedelta(days=7)).isoformat())
 
-    if _gws_binary():
+    if _should_use_gws("calendar"):
         results = _run_gws(
             ["calendar", "events", "list"],
             params={
@@ -528,7 +586,7 @@ def calendar_create(args):
     if args.attendees:
         event["attendees"] = [{"email": e.strip()} for e in args.attendees.split(",") if e.strip()]
 
-    if _gws_binary():
+    if _should_use_gws("calendar"):
         result = _run_gws(
             ["calendar", "events", "insert"],
             params={"calendarId": args.calendar},
@@ -554,7 +612,7 @@ def calendar_create(args):
 
 
 def calendar_delete(args):
-    if _gws_binary():
+    if _should_use_gws("calendar"):
         _run_gws(["calendar", "events", "delete"], params={"calendarId": args.calendar, "eventId": args.event_id})
         print(json.dumps({"status": "deleted", "eventId": args.event_id}))
         return
@@ -571,7 +629,7 @@ def calendar_delete(args):
 
 def drive_search(args):
     query = args.query if args.raw_query else f"fullText contains '{args.query}'"
-    if _gws_binary():
+    if _should_use_gws("drive"):
         results = _run_gws(
             ["drive", "files", "list"],
             params={
@@ -804,7 +862,7 @@ def drive_delete(args):
 
 
 def contacts_list(args):
-    if _gws_binary():
+    if _should_use_gws("contacts"):
         results = _run_gws(
             ["people", "people", "connections", "list"],
             params={
@@ -851,7 +909,7 @@ def contacts_list(args):
 
 
 def sheets_get(args):
-    if _gws_binary():
+    if _should_use_gws("sheets"):
         result = _run_gws(
             ["sheets", "spreadsheets", "values", "get"],
             params={"spreadsheetId": args.sheet_id, "range": args.range},
@@ -871,7 +929,7 @@ def sheets_update(args):
     values = json.loads(args.values)
     body = {"values": values}
 
-    if _gws_binary():
+    if _should_use_gws("sheets"):
         result = _run_gws(
             ["sheets", "spreadsheets", "values", "update"],
             params={
@@ -897,7 +955,7 @@ def sheets_append(args):
     values = json.loads(args.values)
     body = {"values": values}
 
-    if _gws_binary():
+    if _should_use_gws("sheets"):
         result = _run_gws(
             ["sheets", "spreadsheets", "values", "append"],
             params={
@@ -953,7 +1011,7 @@ def sheets_create(args):
 
 
 def docs_get(args):
-    if _gws_binary():
+    if _should_use_gws("docs"):
         doc = _run_gws(["docs", "documents", "get"], params={"documentId": args.doc_id})
         result = {
             "title": doc.get("title", ""),

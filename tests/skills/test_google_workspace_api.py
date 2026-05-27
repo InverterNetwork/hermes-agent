@@ -484,3 +484,162 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
     assert isinstance(creds, FakeCredentials)
     assert saved["token"] == "ya29.refreshed"
     assert saved["type"] == "authorized_user"
+
+
+def test_api_get_credentials_uses_service_account_for_file_apis(api_module, monkeypatch, tmp_path):
+    key_path = tmp_path / "google-sa-key.json"
+    key_path.write_text("{}")
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", str(key_path))
+    monkeypatch.setattr(
+        api_module,
+        "_ensure_authenticated",
+        lambda: pytest.fail("service-account auth should not require an OAuth token"),
+    )
+    captured = {}
+
+    class FakeServiceAccountCredentials:
+        pass
+
+    class FakeServiceAccountCredentialsModule:
+        @staticmethod
+        def from_service_account_file(filename, scopes):
+            captured["filename"] = filename
+            captured["scopes"] = scopes
+            return FakeServiceAccountCredentials()
+
+    google_module = types.ModuleType("google")
+    oauth2_module = types.ModuleType("google.oauth2")
+    service_account_module = types.ModuleType("google.oauth2.service_account")
+    service_account_module.Credentials = FakeServiceAccountCredentialsModule
+    google_module.oauth2 = oauth2_module
+    oauth2_module.service_account = service_account_module
+
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth2_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2.service_account", service_account_module)
+
+    creds = api_module.get_credentials("drive")
+
+    assert isinstance(creds, FakeServiceAccountCredentials)
+    assert captured["filename"] == str(key_path)
+    assert captured["scopes"] == api_module.SERVICE_ACCOUNT_SCOPES
+
+
+def test_api_get_credentials_keeps_non_file_apis_on_oauth_with_service_account(
+    api_module, monkeypatch, tmp_path
+):
+    key_path = tmp_path / "google-sa-key.json"
+    key_path.write_text("{}")
+    token_path = api_module.TOKEN_PATH
+    _write_token(token_path)
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", str(key_path))
+
+    class FakeCredentials:
+        expired = False
+        refresh_token = None
+        valid = True
+
+    class FakeCredentialsModule:
+        @staticmethod
+        def from_authorized_user_file(filename, scopes):
+            assert filename == str(token_path)
+            return FakeCredentials()
+
+    class FakeServiceAccountCredentialsModule:
+        @staticmethod
+        def from_service_account_file(filename, scopes):
+            pytest.fail("gmail must keep using OAuth credentials")
+
+    google_module = types.ModuleType("google")
+    oauth2_module = types.ModuleType("google.oauth2")
+    credentials_module = types.ModuleType("google.oauth2.credentials")
+    service_account_module = types.ModuleType("google.oauth2.service_account")
+    credentials_module.Credentials = FakeCredentialsModule
+    service_account_module.Credentials = FakeServiceAccountCredentialsModule
+    google_module.oauth2 = oauth2_module
+    oauth2_module.credentials = credentials_module
+    oauth2_module.service_account = service_account_module
+    transport_module = types.ModuleType("google.auth.transport")
+    requests_module = types.ModuleType("google.auth.transport.requests")
+    requests_module.Request = lambda: object()
+
+    monkeypatch.setitem(sys.modules, "google", google_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2", oauth2_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2.credentials", credentials_module)
+    monkeypatch.setitem(sys.modules, "google.oauth2.service_account", service_account_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport", transport_module)
+    monkeypatch.setitem(sys.modules, "google.auth.transport.requests", requests_module)
+
+    creds = api_module.get_credentials("gmail")
+
+    assert isinstance(creds, FakeCredentials)
+
+
+def test_api_service_account_disables_gws_only_for_file_apis(api_module, monkeypatch):
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/tmp/google-sa-key.json")
+    monkeypatch.setattr(api_module, "_gws_binary", lambda: "/usr/bin/gws")
+
+    assert not api_module._should_use_gws("drive")
+    assert not api_module._should_use_gws("sheets")
+    assert not api_module._should_use_gws("docs")
+    assert api_module._should_use_gws("gmail")
+    assert api_module._should_use_gws("calendar")
+    assert api_module._should_use_gws("contacts")
+
+
+def test_api_drive_search_bypasses_gws_when_service_account_configured(
+    api_module, monkeypatch, capsys
+):
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/tmp/google-sa-key.json")
+    monkeypatch.setattr(
+        api_module,
+        "_run_gws",
+        lambda *args, **kwargs: pytest.fail(
+            "Drive should use the Python client with service-account auth"
+        ),
+    )
+
+    class FakeListRequest:
+        def execute(self):
+            return {
+                "files": [
+                    {
+                        "id": "doc-1",
+                        "name": "Shared plan",
+                        "mimeType": "application/vnd.google-apps.document",
+                    }
+                ]
+            }
+
+    class FakeFilesResource:
+        def list(self, **kwargs):
+            assert kwargs["q"] == "fullText contains 'plan'"
+            assert kwargs["pageSize"] == 5
+            return FakeListRequest()
+
+    class FakeDriveService:
+        def files(self):
+            return FakeFilesResource()
+
+    monkeypatch.setattr(
+        api_module,
+        "build_service",
+        lambda api, version: FakeDriveService(),
+    )
+    args = api_module.argparse.Namespace(query="plan", raw_query=False, max=5)
+
+    api_module.drive_search(args)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output[0]["id"] == "doc-1"
+
+
+def test_api_service_account_missing_file_exits(api_module, monkeypatch, tmp_path, capsys):
+    missing_path = tmp_path / "missing-google-sa-key.json"
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", str(missing_path))
+
+    with pytest.raises(SystemExit) as exc:
+        api_module.get_credentials("docs")
+
+    assert exc.value.code == 1
+    assert "GOOGLE_SA_KEY_PATH points to a missing file" in capsys.readouterr().err

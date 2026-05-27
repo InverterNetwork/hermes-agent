@@ -20,7 +20,7 @@ Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python.
 | Author | Nous Research |
 | License | MIT |
 | Platforms | linux, macos, windows |
-| Tags | `Google`, `Gmail`, `Calendar`, `Drive`, `Sheets`, `Docs`, `Contacts`, `Email`, `OAuth` |
+| Tags | `Google`, `Gmail`, `Calendar`, `Drive`, `Sheets`, `Docs`, `Contacts`, `Email`, `OAuth`, `Service Account` |
 | Related skills | [`himalaya`](/docs/user-guide/skills/bundled/email/email-himalaya) |
 
 ## Reference: full SKILL.md
@@ -31,7 +31,7 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # Google Workspace
 
-Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation.
+Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation. Drive, Docs, and Sheets can also use file-level service-account access when `GOOGLE_SA_KEY_PATH` is set.
 
 ## References
 
@@ -175,6 +175,38 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
 - Pending OAuth session state/verifier are stored temporarily at `~/.hermes/google_oauth_pending.json` until exchange completes.
 - If `gws` is installed, `google_api.py` points it at the same `~/.hermes/google_token.json` credentials file. Users do not need to run a separate `gws auth login` flow.
 - To revoke: `$GSETUP --revoke`
+
+## Service-Account Setup for Drive, Docs, and Sheets
+
+Use this when Hermes should access only files explicitly shared with a Google
+service account, without granting domain-wide Workspace access. Gmail,
+Calendar, and Contacts still use the OAuth setup above.
+
+1. In Google Cloud, create or select the project that owns the Hermes service
+   account.
+2. Enable the Google Drive API, Google Sheets API, and Google Docs API.
+3. Create a service account, then create and download a JSON key for it.
+4. Store the JSON key under the active Hermes profile, for example:
+
+```bash
+mkdir -p ${HERMES_HOME:-$HOME/.hermes}/auth
+install -m 0640 /path/to/downloaded-key.json ${HERMES_HOME:-$HOME/.hermes}/auth/google-sa-key.json
+```
+
+5. Add an absolute path to `${HERMES_HOME:-$HOME/.hermes}/.env`:
+
+```bash
+GOOGLE_SA_KEY_PATH=/home/hermes/.hermes/auth/google-sa-key.json
+```
+
+6. Share each Google Doc, Sheet, or Drive folder with the service account's
+   email address. Use Viewer access for read-only Docs/Drive searches and
+   Editor access when Hermes needs to update Sheets.
+
+When `GOOGLE_SA_KEY_PATH` is set, `google_api.py` uses service-account
+credentials for `drive`, `docs`, and `sheets` commands, even if `gws` is
+installed. Files not shared with the service account remain inaccessible.
+Unset `GOOGLE_SA_KEY_PATH` to fall back to OAuth for these commands.
 
 ## Usage
 
