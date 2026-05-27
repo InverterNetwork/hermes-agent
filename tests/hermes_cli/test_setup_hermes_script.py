@@ -26,7 +26,7 @@ def test_setup_hermes_script_has_termux_path():
     assert ".[termux]" in content
     assert "constraints-termux.txt" in content
     assert "$PREFIX/bin" in content
-    assert "Skipping tinker-atropos on Termux" in content
+    assert "tested Android bundle" in content
 
 
 def test_installer_unsets_stale_insteadof_for_quay_entries(tmp_path):

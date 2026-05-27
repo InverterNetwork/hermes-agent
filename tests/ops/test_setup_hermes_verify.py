@@ -76,6 +76,7 @@ def install(tmp_path: Path) -> dict:
     (fork / "README.md").write_text("seed\n")
     _git(fork, "add", "-A")
     _git(fork, "commit", "-q", "-m", "seed")
+    _git(fork, "remote", "add", "origin", "https://github.com/example/hermes-agent.git")
     fork_sha = _git(fork, "describe", "--always", "--dirty", "--abbrev=40").stdout.strip()
 
     # ---- target (the rendered install) ----
@@ -83,6 +84,10 @@ def install(tmp_path: Path) -> dict:
     # HERMES_HOME mirror: prod is root:hermes 02775 (setgid). The test runs
     # as the developer so ownership is $USER:$primary_group; mode still
     # carries the setgid bit so verify's mode check stays exercised.
+    try:
+        os.chown(target, -1, os.getegid())
+    except PermissionError:
+        pass
     target.chmod(0o2775)
 
     # rails: a few files mimicking the rsynced hermes-agent tree.
@@ -119,6 +124,18 @@ def install(tmp_path: Path) -> dict:
     # Verify treats a missing code/ root as drift, so the base fixture
     # has to mirror what the installer always provisions.
     (target / "code").mkdir(mode=0o755)
+
+    upstream_workspace = target / "upstream-workspace"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(fork), str(upstream_workspace)],
+        check=True,
+    )
+    _git(upstream_workspace, "remote", "set-url",
+         "origin", "https://github.com/example/hermes-agent.git")
+    _git(upstream_workspace, "remote", "add",
+         "upstream", "https://github.com/nousresearch/hermes-agent.git")
+    _git(upstream_workspace, "config", "user.email", "didier@test")
+    _git(upstream_workspace, "config", "user.name", "didier")
 
     # Symlinks at render-target root pointing into state/ (matches the
     # installer's wiring).
@@ -169,11 +186,51 @@ def install(tmp_path: Path) -> dict:
     )
     systemctl.chmod(0o755)
 
+    upstream_sync_script = bin_dir / "hermes-upstream-sync"
+    upstream_sync_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    upstream_sync_script.chmod(0o755)
+
+    etc_default = tmp_path / "etc-default"
+    etc_default.mkdir()
+    upstream_sync_env = etc_default / "hermes-upstream-sync"
+    upstream_sync_env.write_text(f"FORK_DIR={upstream_workspace}\n")
+    upstream_sync_env.chmod(0o644)
+
+    systemd_dir = tmp_path / "systemd"
+    systemd_dir.mkdir()
+    (systemd_dir / "hermes-upstream-sync.service").write_text(
+        "[Unit]\n"
+        "Description=Propose an upstream hermes-agent merge as a PR\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"User={user}\n"
+        f"Group={user}\n"
+        f"EnvironmentFile=-{upstream_sync_env}\n"
+        f"ExecStart={upstream_sync_script}\n"
+        "Restart=no\n"
+        "TimeoutStartSec=300\n",
+        encoding="utf-8",
+    )
+    (systemd_dir / "hermes-upstream-sync.service").chmod(0o644)
+    (systemd_dir / "hermes-upstream-sync.timer").write_text(
+        "[Unit]\n"
+        "Description=Run hermes-upstream-sync weekly\n"
+        "[Timer]\n"
+        "OnCalendar=Mon *-*-* 09:00:00 UTC\n"
+        "RandomizedDelaySec=15min\n"
+        "Persistent=true\n"
+        "Unit=hermes-upstream-sync.service\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n",
+        encoding="utf-8",
+    )
+    (systemd_dir / "hermes-upstream-sync.timer").chmod(0o644)
+
     # On Linux production, useradd creates a primary group named after the
-    # user so $AGENT_USER works as both owner and group. On macOS test, the
-    # user's primary group is "staff" — feed the actual gid name through
-    # the override so the auth-dir owner check has matching expectations.
-    primary_group = grp.getgrgid(os.getegid()).gr_name
+    # user so $AGENT_USER works as both owner and group. In tests, use the
+    # group that the setgid target actually carries so child files inherit
+    # matching expectations on macOS temp directories too.
+    primary_group = grp.getgrgid(target.stat().st_gid).gr_name
 
     return {
         "tmp": tmp_path,
@@ -186,6 +243,10 @@ def install(tmp_path: Path) -> dict:
         "group": primary_group,
         "bin": bin_dir,
         "systemctl_log": systemctl_log,
+        "systemd_dir": systemd_dir,
+        "upstream_workspace": upstream_workspace,
+        "upstream_sync_script": upstream_sync_script,
+        "upstream_sync_env": upstream_sync_env,
     }
 
 
@@ -212,6 +273,9 @@ def _base_env(install: dict, env_overrides: dict[str, str] | None = None) -> dic
         "HERMES_VERIFY_EXPECT_RAILS_OWNER": install["user"],
         "HERMES_VERIFY_EXPECT_AGENT_OWNER": install["user"],
         "HERMES_VERIFY_EXPECT_AGENT_GROUP": install["group"],
+        "HERMES_VERIFY_SYSTEMD_DIR": str(install["systemd_dir"]),
+        "HERMES_VERIFY_UPSTREAM_SYNC_SCRIPT": str(install["upstream_sync_script"]),
+        "HERMES_VERIFY_UPSTREAM_SYNC_ENV": str(install["upstream_sync_env"]),
     }
     if env_overrides:
         env.update(env_overrides)
@@ -578,15 +642,54 @@ class TestSetupHermesVerify:
 
     def test_upstream_workspace_non_github_origin_is_drift(self, install):
         """When upstream-workspace exists, both remotes must be on github.com."""
-        target = install["target"]
-        ws = target / "upstream-workspace"
-        subprocess.run(["git", "clone", "--quiet", str(install["fork"]), str(ws)], check=True)
-        _git(ws, "remote", "add", "upstream",
-             "https://github.com/nousresearch/hermes-agent.git")
+        ws = install["upstream_workspace"]
+        _git(ws, "remote", "set-url", "origin", str(install["fork"]))
         # origin still points at the local fork path → drift.
         result = _run_verify(install)
         assert result.returncode == 1
         assert "[DRIFT] upstream-workspace origin" in result.stderr
+
+    def test_upstream_sync_missing_script_is_drift(self, install):
+        install["upstream_sync_script"].unlink()
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync script" in result.stderr
+
+    def test_upstream_sync_failed_status_is_drift(self, install):
+        status_dir = install["target"] / "state" / "hermes-upstream-sync"
+        status_dir.mkdir(parents=True)
+        (status_dir / "status.env").write_text(
+            "timestamp=2026-05-27T09:00:00Z\n"
+            "state=failed\n"
+            "detail='fetch upstream failed'\n",
+            encoding="utf-8",
+        )
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync status" in result.stderr
+        assert "fetch upstream failed" in result.stderr
+
+    def test_upstream_sync_stale_lock_is_drift(self, install):
+        lock_dir = install["target"] / "state" / "hermes-upstream-sync" / "lock"
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "pid").write_text("999999999\n", encoding="utf-8")
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync lock" in result.stderr
+
+    def test_upstream_sync_service_exec_mismatch_is_drift(self, install):
+        unit = install["systemd_dir"] / "hermes-upstream-sync.service"
+        text = unit.read_text(encoding="utf-8")
+        unit.write_text(
+            text.replace(
+                f"ExecStart={install['upstream_sync_script']}",
+                "ExecStart=/usr/local/bin/old-hermes-upstream-sync",
+            ),
+            encoding="utf-8",
+        )
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync.service exec" in result.stderr
 
     def test_quay_artefacts_skipped_when_no_values_file(self, install):
         """The verify-only fixture has no deploy.values.yaml in the fork —
@@ -904,8 +1007,8 @@ def quay_install(install: dict) -> dict:
     (auth / "quay.env").write_text("QUAY_ADMIN_TOKEN=test-admin-token\n")
     (auth / "quay.env").chmod(0o640)
 
-    systemd_dir = install["tmp"] / "systemd"
-    systemd_dir.mkdir()
+    systemd_dir = install["systemd_dir"]
+    systemd_dir.mkdir(exist_ok=True)
     (systemd_dir / "quay-serve.service").write_text(
         "[Service]\n"
         f"Environment=QUAY_DATA_DIR={target / 'quay'}\n"
@@ -1539,6 +1642,12 @@ class TestSetupHermesVerifyQuay:
             "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
             encoding="utf-8",
         )
+        try:
+            gid = grp.getgrnam(quay_install["group"]).gr_gid
+            os.chown(reviewer_env, -1, gid)
+            os.chown(reviewer_key, -1, gid)
+        except PermissionError:
+            pass
         reviewer_env.chmod(0o640)
         reviewer_key.chmod(0o640)
 

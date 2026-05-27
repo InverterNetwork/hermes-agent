@@ -20,6 +20,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -64,6 +65,8 @@ class _State:
     quay_profile: str
     runtime_dir: str
     systemd_dir: str
+    upstream_sync_script: str
+    upstream_sync_env: str
     reviewer_env: str
     reviewer_key: str
     values_file: Path
@@ -190,6 +193,51 @@ def _first_stdout_line(cmd: list[str], timeout: float = 10) -> str:
     substring compare."""
     _rc, out, _ = _run(cmd, timeout=timeout)
     return (out.splitlines() or [""])[0]
+
+
+def _read_shell_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return values
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        try:
+            tokens = shlex.split(line, comments=True, posix=True)
+        except ValueError:
+            tokens = []
+        token = tokens[0] if tokens else line
+        key, sep, value = token.partition("=")
+        if sep and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            values[key] = value
+    return values
+
+
+def _pid_is_running(pid_text: str) -> bool:
+    try:
+        pid = int(pid_text.strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except RuntimeError:
+        # tests/conftest.py guards real signal delivery; verify only needs a
+        # liveness probe, so a blocked probe is treated as not running.
+        return False
+    except OSError:
+        return False
+    return True
 
 
 def _sha256(path: Path) -> str:
@@ -1915,6 +1963,189 @@ def _check_upstream_workspace(s: _State) -> None:
             )
 
 
+def _check_upstream_sync_service(s: _State) -> None:
+    script = Path(s.upstream_sync_script)
+    if not script.is_file():
+        s.v_drift("hermes-upstream-sync script", f"missing: {script}")
+    elif os.access(script, os.X_OK):
+        _check_mode_owner(
+            s,
+            "hermes-upstream-sync script",
+            _stat_info(script),
+            "755",
+            s.rails_owner,
+        )
+    else:
+        s.v_drift("hermes-upstream-sync script", f"not executable: {script}")
+
+    env_file = Path(s.upstream_sync_env)
+    env_values: dict[str, str] = {}
+    if not env_file.is_file():
+        s.v_drift("hermes-upstream-sync env", f"missing: {env_file}")
+    else:
+        _check_mode_owner(
+            s,
+            "hermes-upstream-sync env",
+            _stat_info(env_file),
+            "644",
+            s.rails_owner,
+        )
+        env_values = _read_shell_env(env_file)
+
+    fork_dir = Path(env_values.get("FORK_DIR") or s.args.target / "upstream-workspace")
+    if not (fork_dir / ".git").is_dir():
+        # A fork with no origin remote intentionally skips provisioning, but
+        # installed production forks should have one and therefore need a
+        # runnable workspace before the timer is enabled.
+        fork_origin = _git_str(s.args.fork, "remote", "get-url", "origin")
+        if fork_origin:
+            s.v_drift(
+                "hermes-upstream-sync workspace",
+                f"missing or not a git repo: {fork_dir}",
+            )
+    else:
+        owner = _owner(fork_dir / ".git") or _owner(fork_dir)
+        if owner == s.agent_owner:
+            s.v_ok(f"hermes-upstream-sync workspace ownership: {owner}")
+        else:
+            s.v_drift(
+                "hermes-upstream-sync workspace ownership",
+                f"expected {s.agent_owner}, got {owner}",
+            )
+        for remote_name in ("origin", "upstream"):
+            remote_url = _git_str(fork_dir, "remote", "get-url", remote_name)
+            if remote_url:
+                s.v_ok(f"hermes-upstream-sync workspace {remote_name}: {remote_url}")
+            else:
+                s.v_drift(
+                    f"hermes-upstream-sync workspace {remote_name}",
+                    "not configured",
+                )
+        for key in ("user.name", "user.email"):
+            val = _git_config_get(fork_dir, "--local", key)
+            if val:
+                s.v_ok(f"hermes-upstream-sync workspace git {key}: {val}")
+            else:
+                s.v_drift(
+                    f"hermes-upstream-sync workspace git {key}",
+                    "not configured",
+                )
+
+    state_dir = Path(
+        env_values.get("HERMES_UPSTREAM_SYNC_STATE_DIR")
+        or s.args.target / "state" / "hermes-upstream-sync"
+    )
+    lock_dir = Path(env_values.get("HERMES_UPSTREAM_SYNC_LOCK_DIR") or state_dir / "lock")
+    status_file = state_dir / "status.env"
+
+    if lock_dir.exists():
+        pid_file = lock_dir / "pid"
+        pid_text = ""
+        try:
+            pid_text = pid_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            pass
+        if pid_text and _pid_is_running(pid_text):
+            s.v_ok(f"hermes-upstream-sync lock active: pid {pid_text}")
+        else:
+            s.v_drift(
+                "hermes-upstream-sync lock",
+                f"stale lock: {lock_dir}",
+            )
+
+    if status_file.exists():
+        status_values = _read_shell_env(status_file)
+        state = status_values.get("state", "")
+        detail = status_values.get("detail", "")
+        if state == "failed":
+            s.v_drift(
+                "hermes-upstream-sync status",
+                f"last run failed: {detail or '?'}",
+            )
+        elif state == "running" and not lock_dir.exists():
+            s.v_drift(
+                "hermes-upstream-sync status",
+                "last run recorded running without an active lock",
+            )
+        elif state:
+            s.v_ok(f"hermes-upstream-sync status: {state}")
+        else:
+            s.v_drift("hermes-upstream-sync status", f"malformed: {status_file}")
+
+    if not shutil.which("systemctl"):
+        return
+
+    service_file = Path(s.systemd_dir) / "hermes-upstream-sync.service"
+    timer_file = Path(s.systemd_dir) / "hermes-upstream-sync.timer"
+    if not service_file.is_file():
+        s.v_drift(
+            "hermes-upstream-sync.service",
+            f"missing unit file: {service_file}",
+        )
+        service_text = ""
+    else:
+        _check_mode_owner(
+            s,
+            "hermes-upstream-sync.service",
+            _stat_info(service_file),
+            "644",
+            s.rails_owner,
+        )
+        try:
+            service_text = service_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            s.v_drift("hermes-upstream-sync.service", f"unreadable: {exc}")
+            service_text = ""
+
+    service_expectations = {
+        "user": f"User={s.agent_owner}",
+        "group": f"Group={s.agent_owner}",
+        "environment file": f"EnvironmentFile=-{env_file}",
+        "exec": f"ExecStart={script}",
+    }
+    for label, needle in service_expectations.items():
+        if service_text and needle in service_text:
+            s.v_ok(f"hermes-upstream-sync.service {label}")
+        elif service_text:
+            s.v_drift(
+                f"hermes-upstream-sync.service {label}",
+                f"missing {needle}",
+            )
+
+    if not timer_file.is_file():
+        s.v_drift(
+            "hermes-upstream-sync.timer",
+            f"missing unit file: {timer_file}",
+        )
+        timer_text = ""
+    else:
+        _check_mode_owner(
+            s,
+            "hermes-upstream-sync.timer",
+            _stat_info(timer_file),
+            "644",
+            s.rails_owner,
+        )
+        try:
+            timer_text = timer_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            s.v_drift("hermes-upstream-sync.timer", f"unreadable: {exc}")
+            timer_text = ""
+
+    timer_expectations = {
+        "persistent": "Persistent=true",
+        "service target": "Unit=hermes-upstream-sync.service",
+    }
+    for label, needle in timer_expectations.items():
+        if timer_text and needle in timer_text:
+            s.v_ok(f"hermes-upstream-sync.timer {label}")
+        elif timer_text:
+            s.v_drift(
+                f"hermes-upstream-sync.timer {label}",
+                f"missing {needle}",
+            )
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -2008,6 +2239,8 @@ def run(
         quay_profile=os.environ.get("HERMES_VERIFY_QUAY_PROFILE") or "/etc/profile.d/quay-data-dir.sh",
         runtime_dir=os.environ.get("HERMES_VERIFY_RUNTIME_DIR") or "/usr/local/bin",
         systemd_dir=os.environ.get("HERMES_VERIFY_SYSTEMD_DIR") or "/etc/systemd/system",
+        upstream_sync_script=os.environ.get("HERMES_VERIFY_UPSTREAM_SYNC_SCRIPT") or "/usr/local/sbin/hermes-upstream-sync",
+        upstream_sync_env=os.environ.get("HERMES_VERIFY_UPSTREAM_SYNC_ENV") or "/etc/default/hermes-upstream-sync",
         reviewer_env=os.environ.get("HERMES_VERIFY_REVIEWER_ENV") or "/etc/hermes/reviewer.env",
         reviewer_key=os.environ.get("HERMES_VERIFY_REVIEWER_KEY") or "/etc/hermes/reviewer.pem",
         values_file=values_file,
@@ -2076,6 +2309,7 @@ def run(
     # the check itself; safe to invoke unconditionally.
     _check_reviewer_token(s)
     _check_upstream_workspace(s)
+    _check_upstream_sync_service(s)
 
     print(
         f"==> verify: {s.total} checks, {s.drift} drift",
