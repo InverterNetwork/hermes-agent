@@ -1888,7 +1888,8 @@ EOF
     echo "==> installing canonical hermes-gateway unit via upstream CLI"
     HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=02775 \
       "$HERMES_BIN" gateway install --system \
-      --force --run-as-user "$AGENT_USER"
+      --force --run-as-user "$AGENT_USER" \
+      --no-start-now --no-start-on-login
     # Re-assert mode + group ownership regardless: if a future CLI change
     # ignores HERMES_HOME_MODE or _secure_dir clamps stricter, the gateway
     # would lose write access to its runtime files.

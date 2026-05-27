@@ -552,6 +552,50 @@ def test_gateway_install_can_decline_start_now_and_startup(monkeypatch):
     ]
 
 
+def test_gateway_install_honors_noninteractive_systemd_flags(monkeypatch):
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "is_managed", lambda: False)
+
+    def fail_prompt(*args, **kwargs):
+        raise AssertionError("should not prompt")
+
+    calls = []
+
+    def fake_systemd_install(
+        force=False,
+        system=False,
+        run_as_user=None,
+        enable_on_startup=True,
+    ):
+        calls.append(("install", force, system, run_as_user, enable_on_startup))
+
+    monkeypatch.setattr(gateway, "prompt_yes_no", fail_prompt)
+    monkeypatch.setattr(
+        gateway,
+        "systemd_install",
+        fake_systemd_install,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "systemd_start",
+        lambda system=False: calls.append(("start", system)),
+    )
+
+    args = SimpleNamespace(
+        gateway_command="install",
+        force=True,
+        system=True,
+        run_as_user="alice",
+        start_now=False,
+        start_on_login=False,
+    )
+    gateway.gateway_command(args)
+
+    assert calls == [("install", True, True, "alice", False)]
+
+
 def test_find_gateway_pids_falls_back_to_pid_file_when_process_scan_fails(monkeypatch):
     monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
     monkeypatch.setattr(gateway, "is_windows", lambda: False)

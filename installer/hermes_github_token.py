@@ -152,7 +152,7 @@ def _read_cache(cache_path: Path) -> dict[str, Any] | None:
     if not cache_path.exists():
         return None
     try:
-        return json.loads(cache_path.read_text())
+        return json.loads(cache_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -209,7 +209,7 @@ def get_token(
     key_path = Path(_require(cfg, "HERMES_GH_APP_KEY"))
     api_base = cfg.get("HERMES_GH_API", "https://api.github.com")
 
-    private_key_pem = key_path.read_text()
+    private_key_pem = key_path.read_text(encoding="utf-8")
     fetched = fetch_installation_token(
         app_id, installation_id, private_key_pem, api_base=api_base
     )
