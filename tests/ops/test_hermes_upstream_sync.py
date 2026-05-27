@@ -96,6 +96,7 @@ def _run_script(triplet: dict, **env_overrides) -> subprocess.CompletedProcess:
     env["PATH"] = f"{triplet['bin']}{os.pathsep}{env['PATH']}"
     env["HERMES_HOME"] = str(triplet["tmp"] / "hermes-home")
     env["HERMES_UPSTREAM_SYNC_WORKTREE_ROOT"] = str(triplet["tmp"] / "worktrees")
+    env["GITHUB_REPOSITORY"] = "InverterNetwork/hermes-agent"
     env.update(env_overrides)
     return subprocess.run(
         ["bash", str(SCRIPT)],
@@ -125,6 +126,12 @@ class TestHermesUpstreamSync:
         assert "fully merged" in result.stdout
         assert not triplet["gh_log"].exists()
 
+    def test_no_divergence_does_not_need_github_repository(self, triplet):
+        result = _run_script(triplet, GITHUB_REPOSITORY="")
+        assert result.returncode == 0, result.stderr
+        assert "fully merged" in result.stdout
+        assert not triplet["gh_log"].exists()
+
     def test_dry_run_with_divergence_does_not_create_branch(self, triplet):
         upstream_short = _advance_upstream(triplet)
         result = _run_script(triplet, PR_DRY_RUN="1")
@@ -147,9 +154,11 @@ class TestHermesUpstreamSync:
 
         assert triplet["gh_log"].exists()
         gh_args = triplet["gh_log"].read_text()
-        assert "pr create" in gh_args
-        assert "--base main" in gh_args
-        assert "--draft" not in gh_args
+        assert "api repos/InverterNetwork/hermes-agent/pulls" in gh_args
+        assert "-X POST" in gh_args
+        assert "base=main" in gh_args
+        assert "head=upstream-sync/" in gh_args
+        assert "draft=true" not in gh_args
         assert "Sync upstream hermes-agent @" in gh_args
         assert "(CONFLICTS)" not in gh_args
 
@@ -187,7 +196,8 @@ class TestHermesUpstreamSync:
         assert result.returncode == 0, result.stderr
 
         gh_args = triplet["gh_log"].read_text()
-        assert "--draft" in gh_args
+        assert "api repos/InverterNetwork/hermes-agent/pulls" in gh_args
+        assert "draft=true" in gh_args
         assert "(CONFLICTS)" in gh_args
         assert "SHARED.md" in gh_args  # listed in body's conflict-files block
 
@@ -377,7 +387,7 @@ class TestHermesUpstreamSync:
     ):
         """A token supplied via $GH_TOKEN (e.g. from EnvironmentFile, or
         an operator bypassing the helper) must reach `git push` too, not
-        just `gh pr create`. Without this the override is silently broken
+        just the GitHub REST API call. Without this the override is silently broken
         and the push falls back to whatever git auth is — typically none,
         so the timer dies on the username prompt.
         """
