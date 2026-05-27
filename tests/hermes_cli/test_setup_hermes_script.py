@@ -19,6 +19,13 @@ def test_installer_script_is_valid_shell():
     assert result.returncode == 0, result.stderr
 
 
+def test_installer_gateway_install_is_noninteractive():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert '"$HERMES_BIN" gateway install --system \\' in content
+    assert "--no-start-now --no-start-on-login" in content
+
+
 def test_setup_hermes_script_has_termux_path():
     content = SETUP_SCRIPT.read_text(encoding="utf-8")
 
@@ -26,7 +33,7 @@ def test_setup_hermes_script_has_termux_path():
     assert ".[termux]" in content
     assert "constraints-termux.txt" in content
     assert "$PREFIX/bin" in content
-    assert "Skipping tinker-atropos on Termux" in content
+    assert "tested Android bundle" in content
 
 
 def test_installer_unsets_stale_insteadof_for_quay_entries(tmp_path):
