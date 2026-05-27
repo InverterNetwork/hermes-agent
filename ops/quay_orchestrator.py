@@ -1588,7 +1588,14 @@ class HandoffDrainer:
         try:
             if route.thread_ref:
                 thread_ts = route.thread_ts or ""
-                return self.slack.validate_thread(route.channel_id, thread_ts), False
+                ref = self.slack.validate_thread(route.channel_id, thread_ts)
+                post_ref = self.slack.post_thread_message(
+                    ref,
+                    question,
+                    handoff=handoff,
+                    task=task,
+                )
+                return post_ref, True
             post_ref = self.slack.post_question(
                 route.channel_id,
                 question,
