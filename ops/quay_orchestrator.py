@@ -51,6 +51,7 @@ class Handoff:
     next_brief: str | None = None
     human_question: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    status: str = ""
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "Handoff":
@@ -68,6 +69,7 @@ class Handoff:
             next_brief=_optional_str(raw.get("next_brief")),
             human_question=_optional_str(raw.get("human_question")),
             metadata=dict(metadata),
+            status=str(raw.get("status") or raw.get("state") or ""),
         )
 
 
@@ -218,6 +220,7 @@ class RunMetrics:
     slack_questions_posted: int = 0
     human_replies_ingested: int = 0
     human_briefs_submitted: int = 0
+    human_waits_parked: int = 0
     claims_released: int = 0
     no_handoff: int = 0
     lock_busy: int = 0
@@ -316,6 +319,9 @@ class QuayClient(Protocol):
 
     def claim_handoff(self, worker_id: str) -> Handoff | None:
         """Claim one legacy durable handoff, or return None if no work exists."""
+
+    def claim_waiting_human(self, worker_id: str) -> Handoff | None:
+        """Return one parked handoff waiting for Slack reply ingestion."""
 
     def get_task_context(self, task_id: str) -> TaskContext:
         """Return enough task context for a human-readable Slack question."""
@@ -461,6 +467,46 @@ class QuayCliClient:
             return item
         return self.claim_handoff(worker_id)
 
+    def claim_waiting_human(self, worker_id: str) -> Handoff | None:
+        try:
+            rows = self._run_json(["handoff", "list", "--status", "waiting_human"])
+        except QuayCommandError as exc:
+            if exc.code in {"unknown_status", "usage_error"}:
+                log_event(
+                    self._logger,
+                    "waiting_human_contract_unavailable",
+                    worker_id=worker_id,
+                    error_code=exc.code,
+                )
+                return None
+            raise
+        if not isinstance(rows, list):
+            raise RuntimeError("quay handoff list did not return a JSON array")
+
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            task_id = str(row.get("task_id") or "")
+            if not task_id:
+                continue
+            handoff = self._handoff_from_row(
+                row,
+                worker_id=worker_id,
+                status_override="waiting_human",
+            )
+            if not handoff.claim_id:
+                log_event(
+                    self._logger,
+                    "waiting_human_handoff_skipped",
+                    worker_id=worker_id,
+                    task_id=task_id,
+                    handoff_id=handoff.handoff_id,
+                    reason="missing_claim_id",
+                )
+                continue
+            return handoff
+        return None
+
     def claim_handoff(self, worker_id: str) -> Handoff | None:
         rows = self._run_json(["handoff", "list", "--status", "pending"])
         if not isinstance(rows, list):
@@ -488,20 +534,55 @@ class QuayCliClient:
             if not isinstance(claim, Mapping):
                 raise RuntimeError("quay task claim did not return a JSON object")
 
-            metadata = self._handoff_metadata(row)
-            metadata["quay_handoff"] = dict(row)
-            metadata["worker_id"] = worker_id
-            reason = str(row.get("reason") or "")
-            return Handoff(
-                handoff_id=str(row.get("handoff_id") or row.get("id") or ""),
-                task_id=task_id,
-                artifact_id=_artifact_kind_for_reason(reason),
+            claimed = dict(row)
+            claimed.update(dict(claim))
+            return self._handoff_from_row(
+                claimed,
+                worker_id=worker_id,
                 claim_id=str(claim.get("claim_id") or ""),
-                reason=reason,
-                summary=_summary_for_handoff(row, metadata),
-                metadata=metadata,
             )
         return None
+
+    def _handoff_from_row(
+        self,
+        row: Mapping[str, Any],
+        *,
+        worker_id: str,
+        claim_id: str | None = None,
+        status_override: str | None = None,
+    ) -> Handoff:
+        metadata = self._handoff_metadata(row)
+        metadata["quay_handoff"] = dict(row)
+        metadata["worker_id"] = worker_id
+        for key in (
+            "slack_thread_ref",
+            "thread_ref",
+            "original_slack_thread_ref",
+            "source_slack_thread_ref",
+        ):
+            value = row.get(key)
+            if isinstance(value, str) and value.strip():
+                metadata.setdefault(key, value.strip())
+        reason = str(row.get("reason") or metadata.get("reason") or "")
+        status = status_override or str(row.get("status") or row.get("state") or "")
+        return Handoff(
+            handoff_id=str(row.get("handoff_id") or row.get("id") or ""),
+            task_id=str(row.get("task_id") or ""),
+            repo_id=_optional_str(row.get("repo_id") or metadata.get("repo_id")),
+            artifact_id=_artifact_kind_for_reason(reason)
+            or _optional_str(row.get("artifact_id") or metadata.get("artifact_id")),
+            claim_id=_optional_str(claim_id or row.get("claim_id") or metadata.get("claim_id")),
+            reason=reason,
+            summary=_summary_for_handoff(row, metadata),
+            next_brief=_optional_str(row.get("next_brief") or metadata.get("next_brief")),
+            human_question=_optional_str(
+                row.get("human_question")
+                or row.get("question")
+                or metadata.get("human_question")
+            ),
+            metadata=metadata,
+            status=status,
+        )
 
     def _claim_delivery_outbox_work(self, worker_id: str) -> OutboxItem | None:
         rows = self._run_json(
@@ -1023,9 +1104,9 @@ class SlackWebApiClient:
         timeout_seconds: float,
         poll_interval_seconds: float,
     ) -> SlackReply | None:
-        deadline = time.monotonic() + timeout_seconds
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
         floor_ts = after_ts or ref.ts
-        while time.monotonic() <= deadline:
+        while True:
             replies = self._api(
                 "conversations.replies",
                 {"channel": ref.channel_id, "ts": ref.thread_ts},
@@ -1047,7 +1128,10 @@ class SlackWebApiClient:
                     ts=ts,
                     permalink=_optional_str(msg.get("permalink")),
                 )
-            time.sleep(poll_interval_seconds)
+            now = time.monotonic()
+            if now >= deadline:
+                return None
+            time.sleep(min(poll_interval_seconds, max(0.0, deadline - now)))
         return None
 
     def post_thread_message(
@@ -1221,6 +1305,7 @@ class HandoffDrainer:
         worker_id: str,
         decider: ConversationDecider | None = None,
         coordination_lock: FileLock | None = None,
+        park_human_waits: bool = False,
         logger: logging.Logger | None = None,
     ) -> None:
         self.quay = quay
@@ -1229,6 +1314,7 @@ class HandoffDrainer:
         self.worker_id = worker_id
         self.decider = decider or HermesConversationDecider(logger=logger or LOGGER)
         self.coordination_lock = coordination_lock
+        self.park_human_waits = park_human_waits
         self.logger = logger or LOGGER
         self.metrics = RunMetrics()
 
@@ -1239,6 +1325,10 @@ class HandoffDrainer:
             if callable(claim_work)
             else self.quay.claim_handoff(self.worker_id)
         )
+        if work is None and self.park_human_waits:
+            claim_waiting_human = getattr(self.quay, "claim_waiting_human", None)
+            if callable(claim_waiting_human):
+                work = claim_waiting_human(self.worker_id)
         if work is None:
             self.metrics.no_handoff += 1
             log_event(self.logger, "drain_no_handoff", worker_id=self.worker_id)
@@ -1275,6 +1365,7 @@ class HandoffDrainer:
             "handoff_claimed",
             handoff_id=handoff.handoff_id,
             task_id=handoff.task_id,
+            status=handoff.status,
         )
 
         try:
@@ -1480,6 +1571,38 @@ class HandoffDrainer:
             )
 
         question = build_human_question(handoff, task, artifact)
+        if handoff_is_waiting_for_human(handoff):
+            return self._poll_waiting_human_handoff(
+                handoff=handoff,
+                task=task,
+                artifact=artifact,
+                question=question,
+                route=route,
+            )
+        if self.park_human_waits:
+            question_result = self._post_question_and_escalate(
+                handoff=handoff,
+                task=task,
+                question=question,
+                route=route,
+            )
+            if question_result is None:
+                return self._handle_stale_slack_route(
+                    handoff=handoff,
+                    task=task,
+                    artifact=artifact,
+                    question=question,
+                    stale_route=route,
+                )
+            post_ref, thread_ref = question_result
+            return self._park_human_wait(
+                handoff=handoff,
+                task=task,
+                post_ref=post_ref,
+                thread_ref=thread_ref,
+                route_source=route.source,
+            )
+
         question_result = self._post_question_and_wait(
             handoff=handoff,
             task=task,
@@ -1525,7 +1648,7 @@ class HandoffDrainer:
             decision=decision,
         )
 
-    def _post_question_and_wait(
+    def _poll_waiting_human_handoff(
         self,
         *,
         handoff: Handoff,
@@ -1533,7 +1656,73 @@ class HandoffDrainer:
         artifact: Artifact | None,
         question: str,
         route: SlackRoute,
-    ) -> tuple[SlackPostRef, str, SlackReply | None, ConversationDecision | None] | None:
+    ) -> DrainResult:
+        if not route.thread_ref:
+            reason = "missing_waiting_thread_ref"
+            self.quay.release_claim(handoff, reason=reason)
+            self.metrics.claims_released += 1
+            log_event(
+                self.logger,
+                "claim_released",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                reason=reason,
+                route_source=route.source,
+            )
+            return DrainResult(
+                status=reason,
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                metrics=self.metrics.as_dict(),
+            )
+
+        thread_ts = route.thread_ts or ""
+        try:
+            post_ref = self.slack.validate_thread(route.channel_id, thread_ts)
+        except SlackApiError as exc:
+            if exc.error == "thread_not_found" and route_is_metadata(route):
+                return self._handle_stale_slack_route(
+                    handoff=handoff,
+                    task=task,
+                    artifact=artifact,
+                    question=question,
+                    stale_route=route,
+                )
+            raise
+
+        thread_ref = slack_thread_ref(post_ref)
+        reply, decision = self._drive_human_discussion(
+            handoff=handoff,
+            task=task,
+            artifact=artifact,
+            question=question,
+            post_ref=post_ref,
+        )
+        if reply is not None and decision is not None:
+            return self._submit_human_resume(
+                handoff=handoff,
+                task=task,
+                post_ref=post_ref,
+                thread_ref=thread_ref,
+                reply=reply,
+                decision=decision,
+            )
+        return self._park_human_wait(
+            handoff=handoff,
+            task=task,
+            post_ref=post_ref,
+            thread_ref=thread_ref,
+            route_source=route.source,
+        )
+
+    def _post_question_and_escalate(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        question: str,
+        route: SlackRoute,
+    ) -> tuple[SlackPostRef, str] | None:
         prepared = self._prepare_thread_before_escalation(
             handoff=handoff,
             task=task,
@@ -1567,7 +1756,54 @@ class HandoffDrainer:
                 thread_ts=post_ref.thread_ts,
                 route_source=route.source,
             )
+        return post_ref, thread_ref
 
+    def _park_human_wait(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        post_ref: SlackPostRef,
+        thread_ref: str,
+        route_source: str,
+    ) -> DrainResult:
+        self.metrics.human_waits_parked += 1
+        log_event(
+            self.logger,
+            "human_wait_parked",
+            handoff_id=handoff.handoff_id,
+            task_id=task.task_id,
+            channel_id=post_ref.channel_id,
+            thread_ts=post_ref.thread_ts,
+            thread_ref=thread_ref,
+            route_source=route_source,
+        )
+        return DrainResult(
+            status="waiting_for_human",
+            handoff_id=handoff.handoff_id,
+            task_id=task.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _post_question_and_wait(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        route: SlackRoute,
+    ) -> tuple[SlackPostRef, str, SlackReply | None, ConversationDecision | None] | None:
+        question_result = self._post_question_and_escalate(
+            handoff=handoff,
+            task=task,
+            question=question,
+            route=route,
+        )
+        if question_result is None:
+            return None
+
+        post_ref, thread_ref = question_result
         reply, decision = self._drive_human_discussion(
             handoff=handoff,
             task=task,
@@ -1588,7 +1824,14 @@ class HandoffDrainer:
         try:
             if route.thread_ref:
                 thread_ts = route.thread_ts or ""
-                return self.slack.validate_thread(route.channel_id, thread_ts), False
+                ref = self.slack.validate_thread(route.channel_id, thread_ts)
+                post_ref = self.slack.post_thread_message(
+                    ref,
+                    question,
+                    handoff=handoff,
+                    task=task,
+                )
+                return post_ref, True
             post_ref = self.slack.post_question(
                 route.channel_id,
                 question,
@@ -1630,13 +1873,14 @@ class HandoffDrainer:
 
         while time.monotonic() <= deadline:
             remaining = max(0.0, deadline - time.monotonic())
-            if remaining <= 0:
+            if remaining <= 0 and not self.park_human_waits:
                 break
+            wait_timeout = 0.0 if self.park_human_waits else remaining
             with self._suspend_lock_for_human_wait(handoff=handoff, task=task):
                 reply = self.slack.wait_for_reply(
                     post_ref,
                     after_ts=after_ts,
-                    timeout_seconds=remaining,
+                    timeout_seconds=wait_timeout,
                     poll_interval_seconds=self.config.poll_interval_seconds,
                 )
             if reply is None:
@@ -1683,6 +1927,8 @@ class HandoffDrainer:
                         task_id=handoff.task_id,
                         reply_ts=reply.ts,
                     )
+                if self.park_human_waits:
+                    return None, None
                 continue
             if decision.action == "ready" and decision.brief.strip():
                 return reply, decision
@@ -1702,6 +1948,8 @@ class HandoffDrainer:
                     task_id=handoff.task_id,
                     reply_ts=reply.ts,
                 )
+                if self.park_human_waits:
+                    return None, None
                 continue
             log_event(
                 self.logger,
@@ -1711,12 +1959,14 @@ class HandoffDrainer:
                 reply_ts=reply.ts,
                 action=decision.action,
             )
+            if self.park_human_waits:
+                return None, None
 
         return None, None
 
     @contextmanager
     def _suspend_lock_for_human_wait(self, *, handoff: Handoff, task: TaskContext):
-        if self.coordination_lock is None:
+        if self.coordination_lock is None or self.park_human_waits:
             yield
             return
 
@@ -1762,6 +2012,23 @@ class HandoffDrainer:
                 fallback_channel_id=fallback_channel,
                 reason="stale_slack_thread_ref",
             )
+            if self.park_human_waits:
+                question_result = self._post_question_and_escalate(
+                    handoff=handoff,
+                    task=task,
+                    question=question,
+                    route=fallback_route,
+                )
+                if question_result is None:
+                    raise RuntimeError("fallback Slack route was unexpectedly stale")
+                post_ref, thread_ref = question_result
+                return self._park_human_wait(
+                    handoff=handoff,
+                    task=task,
+                    post_ref=post_ref,
+                    thread_ref=thread_ref,
+                    route_source=fallback_route.source,
+                )
             question_result = self._post_question_and_wait(
                 handoff=handoff,
                 task=task,
@@ -1906,6 +2173,27 @@ def choose_direct_brief(handoff: Handoff) -> str | None:
         if isinstance(val, str) and val.strip():
             return val.strip()
     return None
+
+
+def handoff_is_waiting_for_human(handoff: Handoff) -> bool:
+    if _handoff_status_text(handoff.status) == "waiting_human":
+        return True
+    for key in ("status", "state"):
+        value = handoff.metadata.get(key)
+        if _handoff_status_text(value) == "waiting_human":
+            return True
+    raw = handoff.metadata.get("quay_handoff")
+    if isinstance(raw, Mapping):
+        for key in ("status", "state"):
+            if _handoff_status_text(raw.get(key)) == "waiting_human":
+                return True
+    return False
+
+
+def _handoff_status_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower().replace("-", "_")
 
 
 def resolve_author_mention(handoff: Handoff, task: TaskContext) -> str | None:
@@ -2367,6 +2655,7 @@ def run_drain_one(args: argparse.Namespace) -> int:
                 config=config,
                 worker_id=args.worker_id,
                 coordination_lock=lock,
+                park_human_waits=args.park_human_waits,
                 logger=LOGGER,
             )
             result = drainer.drain_one()
@@ -2409,6 +2698,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--ignore-disabled",
         action="store_true",
         help="run even when config.enabled is false",
+    )
+    p_drain.add_argument(
+        "--park-human-waits",
+        action="store_true",
+        help=(
+            "post or poll one human-wait handoff without blocking for the full "
+            "reply timeout"
+        ),
     )
     p_drain.add_argument("--verbose", action="store_true")
     p_drain.set_defaults(func=run_drain_one)

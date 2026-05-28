@@ -716,13 +716,13 @@ def test_outbox_unsupported_only_masks_missing_outbox_list_contract():
     )
 
 
-def test_drain_one_reattaches_to_original_thread_without_reposting_question():
+def test_drain_one_posts_guidance_prompt_when_reattaching_to_original_thread():
     runner = RecordingQuayRunner()
     quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
     reply = quay.SlackReply(
         text="Use the existing importer and keep the old endpoint as a fallback.",
         user_id="U123",
-        ts="1001.000000",
+        ts="1003.000000",
         permalink="https://example.slack/thread",
     )
     slack = FakeSlackClient(reply)
@@ -747,9 +747,12 @@ def test_drain_one_reattaches_to_original_thread_without_reposting_question():
     assert result.status == "submitted_from_human_reply"
     assert slack.validations == [("GPRIVATE123", "999.000000")]
     assert slack.questions == []
+    assert slack.acks
+    assert "blocked on product input" in slack.acks[0][1]
+    assert "Discuss freely in this thread" in slack.acks[0][1]
     assert slack.waits[0][0] == quay.SlackPostRef(
         channel_id="GPRIVATE123",
-        ts="999.000000",
+        ts="1002.000000",
         thread_ts="999.000000",
     )
     assert slack.waits[0][1] <= 60
@@ -772,9 +775,8 @@ def test_drain_one_reattaches_to_original_thread_without_reposting_question():
     assert "Use the following human guidance" in runner.file_payloads[2]
     assert "U123" in runner.file_payloads[2]
     assert "Use the existing importer" in runner.file_payloads[2]
-    assert slack.acks
-    assert "Quay resumed for BRIX-1405" in slack.acks[0][1]
-    assert result.metrics["slack_questions_posted"] == 0
+    assert "Quay resumed for BRIX-1405" in slack.acks[1][1]
+    assert result.metrics["slack_questions_posted"] == 1
     assert result.metrics["human_briefs_submitted"] == 1
 
 
@@ -873,7 +875,7 @@ def test_human_reply_timeout_releases_claim():
         quay.SlackReply(
             text="Use the existing thread on retry.",
             user_id="U123",
-            ts="1001.000000",
+            ts="1003.000000",
         )
     )
 
@@ -1086,9 +1088,10 @@ def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
     assert result.status == "human_reply_timeout"
     assert retry.status == "human_reply_timeout"
     assert len(slack.questions) == 1
-    assert len(slack.acks) == 1
+    assert len(slack.acks) == 2
     assert "decision engine hit an internal orchestrator error" in slack.acks[0][1]
     assert "No need to rephrase" in slack.acks[0][1]
+    assert "A Quay task needs human guidance" in slack.acks[1][1]
     assert slack.validations == [("C1234567890", "1000.000000")]
     assert len(decider.calls) == 1
 
@@ -1553,6 +1556,182 @@ def test_delivery_outbox_drains_while_unrelated_handoff_waits_for_human(tmp_path
     assert handoff_quay.completed == [handoff]
 
 
+def test_deployed_parked_handoff_exits_before_pending_handoff_drains_next_timer(
+    tmp_path: Path,
+):
+    lock_path = tmp_path / "orchestrator.lock"
+
+    class MultiHandoffQuayClient:
+        def __init__(self, handoffs) -> None:
+            self._pending = list(handoffs)
+            self._waiting: list[object] = []
+            self.states = {handoff.handoff_id: "pending" for handoff in handoffs}
+            self.submitted: list[tuple[object, str, str]] = []
+            self.completed: list[object] = []
+            self.released: list[tuple[object, str]] = []
+            self.escalations: list[tuple[object, str, str]] = []
+
+        def claim_handoff(self, worker_id: str):
+            if not self._pending:
+                return None
+            handoff = self._pending.pop(0)
+            self.states[handoff.handoff_id] = "claimed"
+            return handoff
+
+        def claim_work(self, worker_id: str):
+            return self.claim_handoff(worker_id)
+
+        def claim_waiting_human(self, worker_id: str):
+            if not self._waiting:
+                return None
+            return self._waiting[0]
+
+        def get_task_context(self, task_id: str):
+            return quay.TaskContext(
+                task_id=task_id,
+                title=f"Fix {task_id}",
+                issue="BRIX-1405",
+                repo_id="hermes-agent",
+            )
+
+        def get_artifact(self, handoff):
+            return quay.Artifact(
+                artifact_id=handoff.artifact_id or "artifact-1",
+                text=f"{handoff.task_id} needs product guidance.",
+                kind="blocker",
+            )
+
+        def escalate_human(self, handoff, question: str, thread_ref: str) -> None:
+            metadata = dict(handoff.metadata)
+            metadata["slack_thread_ref"] = thread_ref
+            metadata["status"] = "waiting_human"
+            waiting = dataclasses.replace(
+                handoff,
+                metadata=metadata,
+                status="waiting_human",
+            )
+            self.states[handoff.handoff_id] = "waiting_human"
+            self._waiting.append(waiting)
+            self.escalations.append((handoff, question, thread_ref))
+
+        def record_human_reply(self, handoff, reply, thread_ref: str) -> None:
+            assert self.states[handoff.handoff_id] == "waiting_human"
+            self.states[handoff.handoff_id] = "claimed"
+
+        def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+            self.states[handoff.handoff_id] = "queued"
+            self.submitted.append((handoff, brief, reason))
+
+        def complete_claim(self, handoff) -> None:
+            self.states[handoff.handoff_id] = "completed"
+            self.completed.append(handoff)
+            self._waiting = [
+                waiting
+                for waiting in self._waiting
+                if waiting.handoff_id != handoff.handoff_id
+            ]
+
+        def release_claim(self, handoff, reason: str) -> None:
+            self.states[handoff.handoff_id] = "pending"
+            self.released.append((handoff, reason))
+
+    waiting_handoff = quay.Handoff(
+        handoff_id="handoff-waiting",
+        task_id="task-waiting",
+    )
+    pending_handoff = quay.Handoff(
+        handoff_id="handoff-pending",
+        task_id="task-pending",
+        next_brief="Apply the already-approved next brief.",
+    )
+    quay_client = MultiHandoffQuayClient([waiting_handoff, pending_handoff])
+    human_slack = FakeSlackClient()
+
+    with quay.FileLock(lock_path) as lock:
+        parked_result = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=human_slack,
+            config=quay.OrchestratorConfig(
+                enabled=True,
+                default_slack_channel="C1234567890",
+                reply_timeout_seconds=60,
+                poll_interval_seconds=1,
+            ),
+            worker_id="systemd-worker",
+            decider=FakeDecider([ready("Use the approved worker path.")]),
+            coordination_lock=lock,
+            park_human_waits=True,
+        ).drain_one()
+
+    assert parked_result.status == "waiting_for_human"
+    assert quay_client.states[waiting_handoff.handoff_id] == "waiting_human"
+    assert quay_client.states[pending_handoff.handoff_id] == "pending"
+    assert len(quay_client.escalations) == 1
+    assert human_slack.waits == []
+
+    with quay.FileLock(lock_path):
+        pending_result = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=human_slack,
+            config=quay.OrchestratorConfig(
+                enabled=True,
+                default_slack_channel="C1234567890",
+            ),
+            worker_id="second-worker",
+            park_human_waits=True,
+        ).drain_one()
+
+    assert pending_result.status == "submitted_direct"
+    assert [handoff.handoff_id for handoff in quay_client.completed] == [
+        pending_handoff.handoff_id
+    ]
+    assert quay_client.states[waiting_handoff.handoff_id] == "waiting_human"
+    assert human_slack.waits == []
+
+    human_slack.wait_results.append(
+        quay.SlackReply(
+            text="Resume with the approved worker path.",
+            user_id="U123",
+            ts="1001.000000",
+        )
+    )
+    with quay.FileLock(lock_path):
+        reply_result = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=human_slack,
+            config=quay.OrchestratorConfig(
+                enabled=True,
+                default_slack_channel="C1234567890",
+            ),
+            worker_id="reply-worker",
+            decider=FakeDecider([ready("Use the approved worker path.")]),
+            park_human_waits=True,
+        ).drain_one()
+
+    assert reply_result.status == "submitted_from_human_reply"
+    assert human_slack.waits[0][1] == 0.0
+    assert [handoff.handoff_id for handoff in quay_client.completed] == [
+        pending_handoff.handoff_id,
+        waiting_handoff.handoff_id,
+    ]
+
+
+def test_installed_quay_orchestrator_runner_uses_parked_human_waits():
+    runner = (REPO_ROOT / "ops" / "quay-orchestrator-runner").read_text(
+        encoding="utf-8"
+    )
+    service = (REPO_ROOT / "ops" / "quay-orchestrator.service").read_text(
+        encoding="utf-8"
+    )
+    timer = (REPO_ROOT / "ops" / "quay-orchestrator.timer").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--park-human-waits" in runner
+    assert "TimeoutStartSec=300" in service
+    assert "Unit=quay-orchestrator.service" in timer
+
+
 def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(
     tmp_path: Path,
     monkeypatch,
@@ -1628,3 +1807,35 @@ def test_quay_cli_client_uses_ast_121_human_reply_contract():
     assert "submit-brief task-cli --claim-id claim-1" in calls[6]
     assert "--reason advice_answered" in calls[6]
     assert runner.file_payloads == ["Question?", "Answer.", "Next brief."]
+
+
+def test_quay_cli_client_claims_waiting_human_handoff_for_parked_poll():
+    class WaitingHumanRunner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv, **kwargs):
+            self.calls.append(list(argv))
+            command = argv[1:]
+            if command == ["handoff", "list", "--status", "waiting_human"]:
+                return FakeCompletedProcess(
+                    '[{"handoff_id":8,"task_id":"task-waiting-cli",'
+                    '"reason":"worker_blocker","status":"waiting_human",'
+                    '"claim_id":"claim-waiting",'
+                    '"thread_ref":"CWAIT12345:1000.000000",'
+                    '"payload_json":"{\\"human_question\\":\\"Question?\\"}"}]\n'
+                )
+            raise AssertionError(f"unexpected quay command: {command!r}")
+
+    runner = WaitingHumanRunner()
+    client = quay.QuayCliClient(command="/bin/quay", runner=runner)
+
+    handoff = client.claim_waiting_human("worker-1")
+
+    assert handoff is not None
+    assert handoff.status == "waiting_human"
+    assert handoff.claim_id == "claim-waiting"
+    assert handoff.metadata["thread_ref"] == "CWAIT12345:1000.000000"
+    assert handoff.human_question == "Question?"
+    calls = [" ".join(call[1:]) for call in runner.calls]
+    assert calls == ["handoff list --status waiting_human"]
