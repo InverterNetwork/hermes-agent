@@ -41,7 +41,11 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
         gh,
         "#!/usr/bin/env bash\n"
         f'printf "args=%s GH_TOKEN=%s GITHUB_TOKEN=%s\\n" "$*" "${{GH_TOKEN:-}}" "${{GITHUB_TOKEN:-}}" >> {gh_log}\n'
-        'exit "${GH_VALIDATE_EXIT:-0}"\n',
+        'case "$*" in\n'
+        '  "api user") exit "${GH_VALIDATE_USER_EXIT:-${GH_VALIDATE_EXIT:-0}}" ;;\n'
+        '  "api installation/repositories") exit "${GH_VALIDATE_INSTALLATION_EXIT:-${GH_VALIDATE_EXIT:-0}}" ;;\n'
+        '  *) exit "${GH_VALIDATE_EXIT:-0}" ;;\n'
+        "esac\n",
     )
 
     calls = tmp_path / "helper.calls"
@@ -160,6 +164,34 @@ def test_valid_existing_worker_token_is_kept_without_mint(tmp_path: Path):
     assert not Path(env["HELPER_CALLS"]).exists()
     gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
     assert "args=api user GH_TOKEN=caller-worker-token" in gh_log
+
+
+def test_valid_installation_worker_token_is_kept_without_mint(tmp_path: Path):
+    reviewer_env = tmp_path / "missing-reviewer.env"
+    env = _runner_env(tmp_path, reviewer_env)
+    env.update(
+        {
+            "GH_TOKEN": "caller-installation-token",
+            "GH_VALIDATE_USER_EXIT": "1",
+            "GH_VALIDATE_INSTALLATION_EXIT": "0",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "GH_TOKEN=caller-installation-token" in log
+    assert not Path(env["HELPER_CALLS"]).exists()
+    gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
+    assert "args=api user GH_TOKEN=caller-installation-token" in gh_log
+    assert "args=api installation/repositories GH_TOKEN=caller-installation-token" in gh_log
 
 
 def test_invalid_existing_worker_token_mints_replacement(tmp_path: Path):

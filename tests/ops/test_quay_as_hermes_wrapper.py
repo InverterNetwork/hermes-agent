@@ -66,7 +66,11 @@ def wrapper_env(tmp_path: Path) -> dict:
     gh.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "ARGS: %s GH_TOKEN: %s GITHUB_TOKEN: %s\\n" "$*" "${{GH_TOKEN:-}}" "${{GITHUB_TOKEN:-}}" >> {gh_log}\n'
-        'exit "${GH_VALIDATE_EXIT:-0}"\n'
+        'case "$*" in\n'
+        '  "api user") exit "${GH_VALIDATE_USER_EXIT:-${GH_VALIDATE_EXIT:-0}}" ;;\n'
+        '  "api installation/repositories") exit "${GH_VALIDATE_INSTALLATION_EXIT:-${GH_VALIDATE_EXIT:-0}}" ;;\n'
+        '  *) exit "${GH_VALIDATE_EXIT:-0}" ;;\n'
+        "esac\n"
     )
     gh.chmod(0o755)
 
@@ -307,3 +311,29 @@ class TestQuayAsHermesWrapper:
         assert not wrapper_env["helper_calls"].exists()
         gh_log = wrapper_env["gh_log"].read_text(encoding="utf-8")
         assert "ARGS: api user GH_TOKEN: stub-from-envfile" in gh_log
+
+    def test_valid_installation_token_skips_mint(self, wrapper_env):
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        _render_wrapper(
+            wrapper,
+            agent_user=getpass.getuser(),
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(
+            wrapper,
+            wrapper_env,
+            extra_env={
+                "GH_VALIDATE_USER_EXIT": "1",
+                "GH_VALIDATE_INSTALLATION_EXIT": "0",
+            },
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        log = _parse_quay_log(wrapper_env["quay_log"])
+        assert log["GH_TOKEN"] == "stub-from-envfile"
+        assert not wrapper_env["helper_calls"].exists()
+        gh_log = wrapper_env["gh_log"].read_text(encoding="utf-8")
+        assert "ARGS: api user GH_TOKEN: stub-from-envfile" in gh_log
+        assert "ARGS: api installation/repositories GH_TOKEN: stub-from-envfile" in gh_log
