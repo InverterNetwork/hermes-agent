@@ -21,7 +21,8 @@
 #                          $HERMES_HOME/hermes-agent/installer/hermes_github_token.py)
 #   HERMES_TOKEN_PYTHON  — venv python (default: render under
 #                          $HERMES_HOME/hermes-agent/venv/bin/python)
-#   GH_TOKEN             — when set, used as-is and the helper is skipped
+#   GH_TOKEN             — when set, kept if valid; invalid/expired values
+#                          are replaced by a freshly minted helper token
 #   HERMES_REVIEWER_GH_CONFIG
 #                        — reviewer App env file (default:
 #                          /etc/hermes/reviewer.env)
@@ -34,6 +35,14 @@ set -u
 
 LOG_PREFIX="quay-tick-runner"
 warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
+
+token_is_valid() {
+  [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
+    GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
+    gh api user >/dev/null 2>&1
+}
 
 mint_from_helper() {
   local label="$1"
@@ -79,11 +88,18 @@ mint_from_helper() {
 }
 
 mint_worker_gh_token() {
-  [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] && return 0
+  if [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
+    if token_is_valid; then
+      return 0
+    fi
+    warn "existing worker GitHub token is invalid; minting replacement"
+    unset GH_TOKEN GITHUB_TOKEN
+  fi
 
   local token
   token="$(mint_from_helper "worker" "")" || return 0
   export GH_TOKEN="$token"
+  export GITHUB_TOKEN="$token"
 }
 
 mint_reviewer_gh_token() {

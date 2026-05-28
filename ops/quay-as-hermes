@@ -31,12 +31,14 @@
 # guard keeps the wrapper usable on fresh installs that haven't run
 # stage-secrets.sh yet.
 #
-# Finally, mint $GH_TOKEN from the GitHub App helper so any operator
+# Finally, resolve $GH_TOKEN from the GitHub App helper so any operator
 # command that shells out to `gh` (enqueue's PR-existence pre-flight,
 # review-pr, …) authenticates against the same identity as the systemd
-# tick. Mirrors ops/quay-tick-runner and ops/hermes-upstream-sync's
-# preamble. Permissive on helper failure: missing PEM or transient mint
-# error → exec without $GH_TOKEN and let quay's auth-error surface.
+# tick. Existing caller-supplied tokens are kept only when `gh api user`
+# accepts them; stale/expired values mint a replacement. Mirrors
+# ops/quay-tick-runner and ops/hermes-upstream-sync's preamble. Permissive
+# on helper failure: missing PEM or transient mint error → exec and let
+# quay's auth-error surface.
 #
 # Two invocation paths share this preamble:
 #   1. operator path — root or fabian-on-host → drop to __AGENT_USER__ via sudo
@@ -64,19 +66,40 @@ if [ -r "$ENV_FILE" ]; then
     export "$key=$value"
   done < "$ENV_FILE"
 fi
-if [ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+token_is_valid() {
+  [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] || return 1
+  command -v gh >/dev/null 2>&1 || return 1
+  GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
+    GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
+    gh api user >/dev/null 2>&1
+}
+
+mint_gh_token() {
   PY=__TARGET_DIR__/hermes-agent/venv/bin/python
   HELPER=__TARGET_DIR__/hermes-agent/installer/hermes_github_token.py
   if [ ! -x "$PY" ] || [ ! -f "$HELPER" ]; then
-    printf "[quay-as-hermes] WARN: token helper not found at %s; running quay without \$GH_TOKEN\n" "$HELPER" >&2
+    printf "[quay-as-hermes] WARN: token helper not found at %s; running quay without minted \$GH_TOKEN\n" "$HELPER" >&2
+    return 1
   # `timeout 30` caps the worst-case mint at the shell layer, matching
   # quay-tick-runner. An operator command stays interactive even if the
   # App API hangs at the TCP/TLS layer.
   elif token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ]; then
     export GH_TOKEN="$token"
+    export GITHUB_TOKEN="$token"
   else
-    printf "[quay-as-hermes] WARN: token mint failed; running quay without \$GH_TOKEN\n" >&2
+    printf "[quay-as-hermes] WARN: token mint failed; running quay without minted \$GH_TOKEN\n" >&2
+    return 1
   fi
+}
+
+if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+  if ! token_is_valid; then
+    printf "[quay-as-hermes] WARN: existing GitHub token is invalid; minting replacement\n" >&2
+    unset GH_TOKEN GITHUB_TOKEN
+    mint_gh_token || true
+  fi
+else
+  mint_gh_token || true
 fi
 exec /usr/local/bin/quay "$@"
 '
