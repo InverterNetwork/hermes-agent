@@ -21,8 +21,10 @@
 #                          $HERMES_HOME/hermes-agent/installer/hermes_github_token.py)
 #   HERMES_TOKEN_PYTHON  — venv python (default: render under
 #                          $HERMES_HOME/hermes-agent/venv/bin/python)
-#   GH_TOKEN             — when set, kept if valid; invalid/expired values
-#                          are replaced by a freshly minted helper token
+#   GH_TOKEN             — when set, kept if `gh api rate_limit` accepts it.
+#                          That probe supports both user tokens and GitHub App
+#                          installation tokens. Invalid/expired values are
+#                          replaced by a freshly minted helper token.
 #   HERMES_REVIEWER_GH_CONFIG
 #                        — reviewer App env file (default:
 #                          /etc/hermes/reviewer.env)
@@ -41,7 +43,7 @@ token_is_valid() {
   command -v gh >/dev/null 2>&1 || return 1
   GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
     GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
-    gh api user >/dev/null 2>&1
+    gh api rate_limit >/dev/null 2>&1
 }
 
 mint_from_helper() {

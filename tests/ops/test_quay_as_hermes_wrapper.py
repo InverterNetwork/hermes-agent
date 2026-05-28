@@ -292,7 +292,10 @@ class TestQuayAsHermesWrapper:
         assert "existing GitHub token is invalid; minting replacement" in result.stderr
         assert wrapper_env["helper_calls"].read_text(encoding="utf-8").splitlines() == ["mint"]
 
-    def test_valid_existing_token_skips_mint(self, wrapper_env):
+    def test_valid_existing_token_uses_installation_token_compatible_probe(
+        self,
+        wrapper_env,
+    ):
         wrapper = wrapper_env["tmp"] / "quay-as-hermes"
         _render_wrapper(
             wrapper,
@@ -306,4 +309,4 @@ class TestQuayAsHermesWrapper:
 
         assert not wrapper_env["helper_calls"].exists()
         gh_log = wrapper_env["gh_log"].read_text(encoding="utf-8")
-        assert "ARGS: api user GH_TOKEN: stub-from-envfile" in gh_log
+        assert "ARGS: api rate_limit GH_TOKEN: stub-from-envfile" in gh_log

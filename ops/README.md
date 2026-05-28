@@ -552,7 +552,8 @@ that's `$GH_TOKEN`'s job, below.
 
 `quay-tick-runner` resolves a worker GitHub token at the top of every
 tick. If `$GH_TOKEN` / `$GITHUB_TOKEN` is already set, the runner first
-checks it with `gh api user`; valid caller-supplied tokens are kept.
+checks it with `gh api rate_limit`, which accepts both user tokens and
+GitHub App installation tokens; valid caller-supplied tokens are kept.
 Missing, expired, or otherwise invalid tokens fall back to minting a
 short-lived worker GitHub App installation token via
 `installer/hermes_github_token.py mint`, exported as both `$GH_TOKEN` and

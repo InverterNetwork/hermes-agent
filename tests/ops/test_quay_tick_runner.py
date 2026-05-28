@@ -141,7 +141,9 @@ def test_reviewer_mint_ignores_generic_worker_helper_env(tmp_path: Path):
     assert calls == [f"config={reviewer_env} app_id= override="]
 
 
-def test_valid_existing_worker_token_is_kept_without_mint(tmp_path: Path):
+def test_valid_existing_worker_token_uses_installation_token_compatible_probe(
+    tmp_path: Path,
+):
     reviewer_env = tmp_path / "missing-reviewer.env"
     env = _runner_env(tmp_path, reviewer_env)
     env["GH_TOKEN"] = "caller-worker-token"
@@ -159,7 +161,7 @@ def test_valid_existing_worker_token_is_kept_without_mint(tmp_path: Path):
     assert "GH_TOKEN=caller-worker-token" in log
     assert not Path(env["HELPER_CALLS"]).exists()
     gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
-    assert "args=api user GH_TOKEN=caller-worker-token" in gh_log
+    assert "args=api rate_limit GH_TOKEN=caller-worker-token" in gh_log
 
 
 def test_invalid_existing_worker_token_mints_replacement(tmp_path: Path):
