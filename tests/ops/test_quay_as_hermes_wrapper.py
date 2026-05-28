@@ -13,8 +13,8 @@ Both branches must apply the same preamble (cd /, load quay.env, mint
 $GH_TOKEN). These tests render the wrapper the same way
 setup-hermes.sh does (sed-substitute __AGENT_USER__ + __TARGET_DIR__),
 stub sudo + quay so we can assert which branch was taken without
-actually privilege-escalating, and pre-seed GH_TOKEN in the env file so
-we don't depend on `timeout` being installed on dev machines.
+actually privilege-escalating, and stub gh/token-helper binaries so token
+validation and fallback minting stay local to the test.
 """
 
 from __future__ import annotations
@@ -49,9 +49,6 @@ def wrapper_env(tmp_path: Path) -> dict:
     (target / "auth").mkdir(parents=True)
     (target / "quay").mkdir()
 
-    # Pre-seed GH_TOKEN so the mint branch (which would invoke `timeout
-    # <secs> python …`) is skipped: avoids a hard dep on coreutils on
-    # macOS and isolates the test from the token helper.
     (target / "auth" / "quay.env").write_text(
         "GH_TOKEN=stub-from-envfile\n"
         "LINEAR_API_KEY=lin-stub\n"
@@ -59,6 +56,40 @@ def wrapper_env(tmp_path: Path) -> dict:
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+
+    timeout = bin_dir / "timeout"
+    timeout.write_text("#!/usr/bin/env bash\nshift\nexec \"$@\"\n")
+    timeout.chmod(0o755)
+
+    gh_log = tmp_path / "gh.log"
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "ARGS: %s GH_TOKEN: %s GITHUB_TOKEN: %s\\n" "$*" "${{GH_TOKEN:-}}" "${{GITHUB_TOKEN:-}}" >> {gh_log}\n'
+        'exit "${GH_VALIDATE_EXIT:-0}"\n'
+    )
+    gh.chmod(0o755)
+
+    py = target / "hermes-agent" / "venv" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text(
+        "#!/usr/bin/env bash\n"
+        'helper="$1"\n'
+        "shift\n"
+        'exec "$helper" "$@"\n'
+    )
+    py.chmod(0o755)
+
+    helper_calls = tmp_path / "helper.calls"
+    helper = target / "hermes-agent" / "installer" / "hermes_github_token.py"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> {helper_calls}\n'
+        'if [[ "${1:-}" != "mint" ]]; then exit 2; fi\n'
+        'printf "minted-worker-token\\n"\n'
+    )
+    helper.chmod(0o755)
 
     # Records argv + a few env vars and cwd to a log file the test reads.
     quay_log = tmp_path / "quay.log"
@@ -98,6 +129,8 @@ def wrapper_env(tmp_path: Path) -> dict:
         "quay_bin": quay_bin,
         "quay_log": quay_log,
         "sudo_log": sudo_log,
+        "gh_log": gh_log,
+        "helper_calls": helper_calls,
     }
 
 
@@ -237,3 +270,43 @@ class TestQuayAsHermesWrapper:
         log = _parse_quay_log(wrapper_env["quay_log"])
         assert log["QUAY_DATA_DIR"] == str(override)
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
+
+    def test_invalid_existing_token_mints_replacement(self, wrapper_env):
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        _render_wrapper(
+            wrapper,
+            agent_user=getpass.getuser(),
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(
+            wrapper,
+            wrapper_env,
+            extra_env={"GH_VALIDATE_EXIT": "1"},
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        log = _parse_quay_log(wrapper_env["quay_log"])
+        assert log["GH_TOKEN"] == "minted-worker-token"
+        assert "existing GitHub token is invalid; minting replacement" in result.stderr
+        assert wrapper_env["helper_calls"].read_text(encoding="utf-8").splitlines() == ["mint"]
+
+    def test_valid_existing_token_uses_installation_token_compatible_probe(
+        self,
+        wrapper_env,
+    ):
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        _render_wrapper(
+            wrapper,
+            agent_user=getpass.getuser(),
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(wrapper, wrapper_env)
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        assert not wrapper_env["helper_calls"].exists()
+        gh_log = wrapper_env["gh_log"].read_text(encoding="utf-8")
+        assert "ARGS: api rate_limit GH_TOKEN: stub-from-envfile" in gh_log

@@ -35,6 +35,15 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
         'exec "$helper" "$@"\n',
     )
 
+    gh_log = tmp_path / "gh.calls"
+    gh = bin_dir / "gh"
+    _write_executable(
+        gh,
+        "#!/usr/bin/env bash\n"
+        f'printf "args=%s GH_TOKEN=%s GITHUB_TOKEN=%s\\n" "$*" "${{GH_TOKEN:-}}" "${{GITHUB_TOKEN:-}}" >> {gh_log}\n'
+        'exit "${GH_VALIDATE_EXIT:-0}"\n',
+    )
+
     calls = tmp_path / "helper.calls"
     helper = tmp_path / "hermes_github_token.py"
     _write_executable(
@@ -73,6 +82,7 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
             "QUAY_BIN": str(quay),
             "HELPER_CALLS": str(calls),
             "QUAY_LOG": str(quay_log),
+            "GH_LOG": str(gh_log),
         }
     )
     env.pop("GH_TOKEN", None)
@@ -129,6 +139,50 @@ def test_reviewer_mint_ignores_generic_worker_helper_env(tmp_path: Path):
 
     calls = Path(env["HELPER_CALLS"]).read_text(encoding="utf-8").splitlines()
     assert calls == [f"config={reviewer_env} app_id= override="]
+
+
+def test_valid_existing_worker_token_uses_installation_token_compatible_probe(
+    tmp_path: Path,
+):
+    reviewer_env = tmp_path / "missing-reviewer.env"
+    env = _runner_env(tmp_path, reviewer_env)
+    env["GH_TOKEN"] = "caller-worker-token"
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "GH_TOKEN=caller-worker-token" in log
+    assert not Path(env["HELPER_CALLS"]).exists()
+    gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
+    assert "args=api rate_limit GH_TOKEN=caller-worker-token" in gh_log
+
+
+def test_invalid_existing_worker_token_mints_replacement(tmp_path: Path):
+    reviewer_env = tmp_path / "missing-reviewer.env"
+    env = _runner_env(tmp_path, reviewer_env)
+    env.update({"GH_TOKEN": "stale-worker-token", "GH_VALIDATE_EXIT": "1"})
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "GH_TOKEN=worker-token" in log
+    assert "existing worker GitHub token is invalid; minting replacement" in result.stderr
+    calls = Path(env["HELPER_CALLS"]).read_text(encoding="utf-8").splitlines()
+    assert calls == ["config= app_id= override="]
 
 
 def test_quay_tick_runner_skips_reviewer_token_without_config(tmp_path: Path):
