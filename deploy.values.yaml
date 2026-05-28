@@ -627,7 +627,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.22"
+  version: "v0.3.23"
   # Public org-owned release repo for unauthenticated installer downloads.
   release_repo: InverterNetwork/quay
   # Single global worker invocation. {prompt_file} is substituted with the
@@ -766,7 +766,7 @@ quay:
   # against `gh pr view --json reviews .reviews[].author.login`, which for
   # GitHub App authors returns `app/<slug>`. Worker and reviewer run under
   # distinct App identities (`app/didier-worker` opens PRs;
-  # `app/didier-reviewer` approves them) — GitHub forbids an App from
+  # `app/quay-reviewer` approves them) — GitHub forbids an App from
   # approving PRs it authored, so a separate reviewer identity is the
   # only way to unblock self-review.
   #
@@ -780,7 +780,7 @@ quay:
   reviewer:
     enabled: true
     gate_quay_owned_done: true
-    login: "app/didier-reviewer"
+    login: "app/quay-reviewer"
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the
