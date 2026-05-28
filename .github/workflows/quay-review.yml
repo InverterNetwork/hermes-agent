@@ -1,0 +1,71 @@
+name: Quay review
+
+on:
+  workflow_run:
+    workflows:
+      - Tests
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quay-review-pr-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  request-quay-review:
+    name: Request Quay review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
+    env:
+      QUAY_REVIEW_URL: ${{ secrets.QUAY_REVIEW_URL }}
+      QUAY_REVIEW_PR_TOKEN: ${{ secrets.QUAY_REVIEW_PR_TOKEN }}
+
+    steps:
+      - name: Skip when Quay review endpoint is not configured
+        if: ${{ env.QUAY_REVIEW_URL == '' || env.QUAY_REVIEW_PR_TOKEN == '' }}
+        run: echo "QUAY_REVIEW_URL or QUAY_REVIEW_PR_TOKEN is not configured; skipping Quay review request."
+
+      - name: Request Quay review
+        if: ${{ env.QUAY_REVIEW_URL != '' && env.QUAY_REVIEW_PR_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+
+          pr_number="$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")"
+          if [ -z "$pr_number" ]; then
+            echo "No pull request found on workflow_run event; skipping Quay review request."
+            exit 0
+          fi
+
+          repository="$(jq -r '.repository.full_name' "$GITHUB_EVENT_PATH")"
+          head_sha="$(jq -r '.workflow_run.head_sha' "$GITHUB_EVENT_PATH")"
+          endpoint="${QUAY_REVIEW_URL%/}"
+          case "$endpoint" in
+            */quay/review-pr) ;;
+            *) endpoint="${endpoint}/quay/review-pr" ;;
+          esac
+
+          payload="$(
+            jq -n \
+              --arg repository "$repository" \
+              --argjson pull_request "$pr_number" \
+              --arg head_sha "$head_sha" \
+              --arg delivery_id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+              --arg tag "task-feature" \
+              '{
+                repository: $repository,
+                pull_request: $pull_request,
+                head_sha: $head_sha,
+                delivery_id: $delivery_id,
+                tags: [$tag]
+              }'
+          )"
+
+          curl --fail-with-body --show-error --silent --retry 3 \
+            --header "Authorization: Bearer ${QUAY_REVIEW_PR_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            "$endpoint"
