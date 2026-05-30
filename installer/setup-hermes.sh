@@ -1612,8 +1612,9 @@ fi
 # worker → submit-brief). Same install model as hermes-sync — sed-
 # templated unit, /etc/default/ env preserved across re-runs, plus a
 # companion script at /usr/local/sbin/quay-tick-runner that mints
-# $GH_TOKEN before exec'ing `quay tick` so the worker pipeline's `gh`
-# calls authenticate against the App identity.
+# $QUAY_WORKER_GH_TOKEN / $GH_TOKEN before exec'ing `quay tick` so Quay
+# can spawn workers and the worker pipeline's `gh` calls authenticate
+# against the App identity.
 #
 # Skipped entirely when quay isn't enabled — see the binary block at the
 # top of the script.
