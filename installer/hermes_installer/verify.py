@@ -906,6 +906,7 @@ def _check_quay_admin_config(s: _State) -> None:
             f"expected X-Hermes-User-Id, got {admin.get('forwarded_identity_header')!r}",
         )
 
+
 def _executable_info(path: Path) -> tuple[str, str, str] | None:
     """Like ``_stat_info`` but returns ``None`` for non-regular or
     non-executable files — caller treats that as a "missing or

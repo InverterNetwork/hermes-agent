@@ -58,24 +58,6 @@ Optional runtime overrides:
 * `QUAY_REVIEW_PR_TIMEOUT_SECONDS` - command timeout, default `60`.
 * `QUAY_DATA_DIR` - Quay data directory, default `<HERMES_HOME>/quay`.
 
-## hermes-agent CI Integration
-
-This repository enrolls pull requests for Quay review from
-`.github/workflows/quay-review.yml` after the `Tests` workflow completes
-successfully for a `pull_request` event. Pushes, failed CI runs, and workflow
-runs without an attached pull request are ignored.
-
-Configure these GitHub Actions repository secrets before expecting enrollment:
-
-* `QUAY_REVIEW_URL` - base URL for the Hermes gateway API server.
-* `QUAY_REVIEW_PR_TOKEN` - bearer token shared with the Hermes
-  `/quay/review-pr` endpoint.
-
-The workflow posts `repository`, `pull_request`, `head_sha`, `delivery_id`, and
-`tags: ["task-feature"]` to `${QUAY_REVIEW_URL%/}/quay/review-pr` with
-`Authorization: Bearer ${QUAY_REVIEW_PR_TOKEN}`. If either secret is missing,
-the workflow logs a skip message and exits successfully.
-
 ## GitHub Actions Example
 
 ```yaml
