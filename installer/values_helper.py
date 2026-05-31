@@ -617,6 +617,9 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     * ``SLACK_HOME_CHANNEL`` from ``slack.runtime.home_channel``.
     * ``QUAY_ADMIN_ALLOWED_USERS`` from ``quay.admin.allowed_users``.
     * ``QUAY_ADMIN_PUBLIC_BASE_URL`` from ``quay.admin.public_base_url``.
+    * ``API_SERVER_*`` non-secret toggles from ``gateway.api_server``.
+    * ``QUAY_AGENT_PROVIDER`` / ``QUAY_HERMES_*`` non-secret toggles from
+      ``quay.agent_interface``.
     * ``GATEWAY_ALLOW_ALL_USERS`` from ``gateway.allow_all_users``.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
@@ -738,6 +741,92 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
             )
             return 1
         lines.append(f"GATEWAY_ALLOW_ALL_USERS={'true' if flag else 'false'}")
+
+    gateway_api_server = gateway.get("api_server") if isinstance(gateway, dict) else None
+    if gateway_api_server is not None:
+        if not isinstance(gateway_api_server, dict):
+            sys.stderr.write("values_helper.py: gateway.api_server must be a mapping\n")
+            return 1
+        enabled = gateway_api_server.get("enabled")
+        if enabled is not None:
+            if not isinstance(enabled, bool):
+                sys.stderr.write("values_helper.py: gateway.api_server.enabled must be a bool\n")
+                return 1
+            lines.append(f"API_SERVER_ENABLED={'true' if enabled else 'false'}")
+        host = gateway_api_server.get("host")
+        if host is not None:
+            if not isinstance(host, str):
+                sys.stderr.write("values_helper.py: gateway.api_server.host must be a string\n")
+                return 1
+            lines.append(f"API_SERVER_HOST={_env_safe('gateway.api_server.host', host.strip())}")
+        port = gateway_api_server.get("port")
+        if port is not None:
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                sys.stderr.write("values_helper.py: gateway.api_server.port must be an integer 1-65535\n")
+                return 1
+            lines.append(f"API_SERVER_PORT={port}")
+        model_name = gateway_api_server.get("model_name")
+        if model_name is not None:
+            if not isinstance(model_name, str):
+                sys.stderr.write("values_helper.py: gateway.api_server.model_name must be a string\n")
+                return 1
+            lines.append(f"API_SERVER_MODEL_NAME={_env_safe('gateway.api_server.model_name', model_name.strip())}")
+
+    quay_agent = (data.get("quay") or {}).get("agent_interface") or {}
+    if quay_agent:
+        if not isinstance(quay_agent, dict):
+            sys.stderr.write("values_helper.py: quay.agent_interface must be a mapping\n")
+            return 1
+        enabled = quay_agent.get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            sys.stderr.write("values_helper.py: quay.agent_interface.enabled must be a bool\n")
+            return 1
+        raw_provider = quay_agent.get("provider") or "hermes"
+        if not isinstance(raw_provider, str):
+            sys.stderr.write("values_helper.py: quay.agent_interface.provider must be a string\n")
+            return 1
+        provider = raw_provider.strip()
+        if provider not in {"echo", "hermes"}:
+            sys.stderr.write("values_helper.py: quay.agent_interface.provider must be echo or hermes\n")
+            return 1
+        if enabled is False:
+            provider = "echo"
+        lines.append(f"QUAY_AGENT_PROVIDER={_env_safe('quay.agent_interface.provider', provider)}")
+        if provider == "hermes":
+            api_base_url = quay_agent.get("hermes_api_base_url")
+            if api_base_url is not None:
+                if not isinstance(api_base_url, str):
+                    sys.stderr.write("values_helper.py: quay.agent_interface.hermes_api_base_url must be a string\n")
+                    return 1
+                api_base_url = api_base_url.strip().rstrip("/")
+                parsed = urlparse(api_base_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    sys.stderr.write(
+                        "values_helper.py: quay.agent_interface.hermes_api_base_url must be an "
+                        "http(s) URL like http://127.0.0.1:8642\n"
+                    )
+                    return 1
+                lines.append(
+                    "QUAY_HERMES_API_BASE_URL="
+                    f"{_env_safe('quay.agent_interface.hermes_api_base_url', api_base_url)}"
+                )
+            hermes_model = quay_agent.get("hermes_model")
+            if hermes_model is not None:
+                if not isinstance(hermes_model, str):
+                    sys.stderr.write("values_helper.py: quay.agent_interface.hermes_model must be a string\n")
+                    return 1
+                lines.append(f"QUAY_HERMES_MODEL={_env_safe('quay.agent_interface.hermes_model', hermes_model.strip())}")
+            session_key_prefix = quay_agent.get("hermes_session_key_prefix")
+            if session_key_prefix is not None:
+                if not isinstance(session_key_prefix, str):
+                    sys.stderr.write(
+                        "values_helper.py: quay.agent_interface.hermes_session_key_prefix must be a string\n"
+                    )
+                    return 1
+                lines.append(
+                    "QUAY_HERMES_SESSION_KEY_PREFIX="
+                    f"{_env_safe('quay.agent_interface.hermes_session_key_prefix', session_key_prefix.strip())}"
+                )
 
     # linear.teams.<key>: <uuid>  →  LINEAR_TEAM_<KEY>=<uuid>
     # Lets skills (e.g. inverter-linear) reference team UUIDs by env var

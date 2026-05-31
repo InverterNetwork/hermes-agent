@@ -52,6 +52,12 @@
 #
 # QUAY_ADMIN_TOKEN in quay.env is generated server-side and preserved on
 # re-runs. It protects the localhost quay-serve Admin UI/API service.
+#
+# API_SERVER_KEY is generated/preserved for quay-provisioned hosts and written
+# to auth/hermes.env. The same secret is mirrored into auth/quay.env as
+# QUAY_HERMES_API_KEY so quay-serve can call the local Hermes API Server.
+# API_SERVER_ENABLED, host, port, model, and Quay's non-secret agent provider
+# settings remain config-as-code in deploy.values.yaml.
 set -euo pipefail
 
 AGENT_USER="${AGENT_USER:-hermes}"
@@ -100,6 +106,7 @@ existing_linear=""
 existing_anthropic=""
 existing_quay_review_pr_token=""
 existing_quay_admin_token=""
+existing_api_server_key=""
 existing_aws_key=""
 existing_aws_secret=""
 existing_aws_region=""
@@ -118,9 +125,11 @@ parse_existing_env "$SLACK_ENV"  existing_slack_app   SLACK_APP_TOKEN
 parse_existing_env "$HERMES_ENV" existing_linear     LINEAR_API_KEY
 [[ -z "$existing_linear" ]] && parse_existing_env "$QUAY_ENV" existing_linear LINEAR_API_KEY
 parse_existing_env "$HERMES_ENV" existing_quay_review_pr_token QUAY_REVIEW_PR_TOKEN
+parse_existing_env "$HERMES_ENV" existing_api_server_key API_SERVER_KEY
 
 parse_existing_env "$QUAY_ENV"   existing_anthropic  ANTHROPIC_API_KEY
 parse_existing_env "$QUAY_ENV"   existing_quay_admin_token QUAY_ADMIN_TOKEN
+[[ -z "$existing_api_server_key" ]] && parse_existing_env "$QUAY_ENV" existing_api_server_key QUAY_HERMES_API_KEY
 
 # Ops env (non-prod AWS + New Relic) and ops-prod env (prod AWS).
 parse_existing_env "$OPS_ENV"      existing_aws_key             AWS_ACCESS_KEY_ID
@@ -203,6 +212,9 @@ if (( manage_quay )); then
   if [[ -z "$existing_quay_admin_token" ]]; then
     existing_quay_admin_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
   fi
+  if [[ -z "$existing_api_server_key" ]]; then
+    existing_api_server_key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+  fi
 fi
 
 # Ops skills (aws-lambda-debug, dynamodb-query, new-relic-lambda) — all
@@ -272,6 +284,11 @@ if [[ -n "$QUAY_REVIEW_PR_TOKEN" ]]; then
 "
   hermes_content+="QUAY_REVIEW_PR_TOKEN=${QUAY_REVIEW_PR_TOKEN}"
 fi
+if [[ -n "$existing_api_server_key" ]]; then
+  [[ -n "$hermes_content" ]] && hermes_content+="
+"
+  hermes_content+="API_SERVER_KEY=${existing_api_server_key}"
+fi
 if [[ -n "$hermes_content" ]]; then
   write_env "$HERMES_ENV" "$hermes_content" hermes_changed
 fi
@@ -334,6 +351,8 @@ if (( manage_quay )); then
   quay_content="LINEAR_API_KEY=${LINEAR}
 SLACK_TOKEN=${SLACK_BOT}
 QUAY_ADMIN_TOKEN=${existing_quay_admin_token}"
+  [[ -n "$existing_api_server_key" ]] && quay_content+="
+QUAY_HERMES_API_KEY=${existing_api_server_key}"
   [[ -n "$ANTHROPIC" ]] && quay_content+="
 ANTHROPIC_API_KEY=${ANTHROPIC}"
   write_env "$QUAY_ENV" "$quay_content" quay_changed

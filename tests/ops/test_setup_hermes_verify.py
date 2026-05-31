@@ -1012,6 +1012,7 @@ def quay_install(install: dict) -> dict:
     (systemd_dir / "quay-serve.service").write_text(
         "[Service]\n"
         f"Environment=QUAY_DATA_DIR={target / 'quay'}\n"
+        f"EnvironmentFile=-{target / 'auth' / 'gateway-runtime.env'}\n"
         f"EnvironmentFile={target / 'auth' / 'quay.env'}\n"
         "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731\n",
         encoding="utf-8",
@@ -1247,6 +1248,7 @@ class TestSetupHermesVerifyQuay:
         assert "[OK] quay-serve.service: active loaded enabled" in result.stdout
         assert "[OK] quay-serve.service QUAY_DATA_DIR" in result.stdout
         assert "[OK] quay-serve.service auth env" in result.stdout
+        assert "[OK] quay-serve.service runtime env" in result.stdout
         assert "[OK] quay-serve.service loopback bind: 127.0.0.1" in result.stdout
         assert "[OK] quay admin token present" in result.stdout
         assert "[OK] quay admin local health: HTTP 200" in result.stdout

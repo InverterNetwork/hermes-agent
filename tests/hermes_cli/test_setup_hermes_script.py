@@ -297,6 +297,7 @@ def test_quay_serve_service_is_localhost_and_token_protected():
 
     assert "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731" in service
     assert "Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay" in service
+    assert "EnvironmentFile=-__TARGET_DIR__/auth/gateway-runtime.env" in service
     assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in service
     assert "QUAY_ADMIN_TOKEN" in service
     assert "quay-serve.service" in installer
@@ -311,6 +312,8 @@ def test_quay_serve_service_is_localhost_and_token_protected():
     assert '[[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1' in installer
     assert "systemctl enable --now quay-serve.service" in installer
     assert "QUAY_ADMIN_TOKEN=${existing_quay_admin_token}" in stage
+    assert "API_SERVER_KEY=${existing_api_server_key}" in stage
+    assert "QUAY_HERMES_API_KEY=${existing_api_server_key}" in stage
 
 
 def test_installer_removes_legacy_reviewer_token_timer():

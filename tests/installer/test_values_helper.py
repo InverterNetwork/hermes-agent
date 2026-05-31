@@ -441,6 +441,102 @@ class TestRenderGatewayRuntimeEnv:
         assert r.returncode == 1
         assert "allow_all_users must be a bool" in r.stderr
 
+    def test_writes_gateway_api_server_env(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n"
+            "  api_server:\n"
+            "    enabled: true\n"
+            "    host: 127.0.0.1\n"
+            "    port: 8642\n"
+            "    model_name: hermes-agent\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "API_SERVER_ENABLED=true\n" in text
+        assert "API_SERVER_HOST=127.0.0.1\n" in text
+        assert "API_SERVER_PORT=8642\n" in text
+        assert "API_SERVER_MODEL_NAME=hermes-agent\n" in text
+        assert "API_SERVER_KEY" not in text
+
+    def test_rejects_invalid_gateway_api_server_port(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "gateway:\n  api_server:\n    port: 99999\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "gateway.api_server.port" in r.stderr
+        assert not out.exists()
+
+    def test_writes_quay_agent_interface_env_without_secret(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  agent_interface:\n"
+            "    enabled: true\n"
+            "    provider: hermes\n"
+            "    hermes_api_base_url: http://127.0.0.1:8642/\n"
+            "    hermes_model: hermes-agent\n"
+            "    hermes_session_key_prefix: quay-krustentier\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "QUAY_AGENT_PROVIDER=hermes\n" in text
+        assert "QUAY_HERMES_API_BASE_URL=http://127.0.0.1:8642\n" in text
+        assert "QUAY_HERMES_MODEL=hermes-agent\n" in text
+        assert "QUAY_HERMES_SESSION_KEY_PREFIX=quay-krustentier\n" in text
+        assert "QUAY_HERMES_API_KEY" not in text
+
+    def test_quay_agent_interface_disabled_forces_echo_provider(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  agent_interface:\n    enabled: false\n    provider: hermes\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        text = out.read_text()
+        assert "QUAY_AGENT_PROVIDER=echo\n" in text
+        assert "QUAY_HERMES_API_BASE_URL" not in text
+
+    def test_rejects_malformed_quay_agent_interface_url(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  agent_interface:\n"
+            "    enabled: true\n"
+            "    provider: hermes\n"
+            "    hermes_api_base_url: localhost:8642\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.agent_interface.hermes_api_base_url" in r.stderr
+        assert not out.exists()
+
+    def test_rejects_non_string_quay_agent_interface_provider(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n  agent_interface:\n    provider: true\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "gateway-runtime.env"
+        r = _run(values, "render-gateway-runtime-env", "--out", str(out))
+        assert r.returncode == 1
+        assert "quay.agent_interface.provider must be a string" in r.stderr
+        assert not out.exists()
+
     def test_writes_linear_team_env_vars(self, tmp_path: Path):
         # linear.teams.<key> → LINEAR_TEAM_<KEY>
         values = tmp_path / "values.yaml"
