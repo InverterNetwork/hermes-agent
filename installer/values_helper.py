@@ -1138,7 +1138,6 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
             "require_auth = true",
             'token_env = "QUAY_ADMIN_TOKEN"',
             'forwarded_identity_header = "X-Hermes-User-Id"',
-            'forwarded_display_name_header = "X-Hermes-User-Display-Name"',
         ])
 
     # Legacy `agent_invocation` above continues to render unchanged — quay's

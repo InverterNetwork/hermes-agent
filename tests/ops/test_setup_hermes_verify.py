@@ -859,7 +859,6 @@ def quay_install(install: dict) -> dict:
         "require_auth = true\n"
         'token_env = "QUAY_ADMIN_TOKEN"\n'
         'forwarded_identity_header = "X-Hermes-User-Id"\n'
-        'forwarded_display_name_header = "X-Hermes-User-Display-Name"\n'
         "\n"
         "[context]\n"
         f'reference_repos_root = "{code_root}"\n'
@@ -1132,11 +1131,6 @@ class TestSetupHermesVerifyQuay:
             in result.stdout
         )
         assert (
-            "[OK] quay admin forwarded display name header: "
-            "X-Hermes-User-Display-Name"
-            in result.stdout
-        )
-        assert (
             f"[OK] quay reference_repos_root: {quay_install['target'] / 'code'}"
             in result.stdout
         )
@@ -1348,7 +1342,6 @@ class TestSetupHermesVerifyQuay:
             "require_auth = true\n"
             'token_env = "QUAY_ADMIN_TOKEN"\n'
             'forwarded_identity_header = "X-Hermes-User-Id"\n'
-            'forwarded_display_name_header = "X-Hermes-User-Display-Name"\n'
             "\n"
             'agent_invocation = "claude < {prompt_file}"\n'
         )

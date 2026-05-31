@@ -857,15 +857,6 @@ def _check_quay_admin_config(s: _State) -> None:
             "quay admin forwarded identity header",
             f"expected X-Hermes-User-Id, got {admin.get('forwarded_identity_header')!r}",
         )
-    if admin.get("forwarded_display_name_header") == "X-Hermes-User-Display-Name":
-        s.v_ok("quay admin forwarded display name header: X-Hermes-User-Display-Name")
-    else:
-        s.v_drift(
-            "quay admin forwarded display name header",
-            "expected X-Hermes-User-Display-Name, "
-            f"got {admin.get('forwarded_display_name_header')!r}",
-        )
-
 
 def _executable_info(path: Path) -> tuple[str, str, str] | None:
     """Like ``_stat_info`` but returns ``None`` for non-regular or
