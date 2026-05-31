@@ -741,7 +741,16 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return
 
-        token, _record = quay_admin_auth.create_login_token(user_id)
+        team_id = command.get("team_id", "")
+        client = self._team_clients.get(team_id) if team_id else None
+        if client is None and self._app is not None:
+            client = self._app.client
+
+        display_name = await self._resolve_quay_admin_display_name(client, user_id)
+        token, _record = quay_admin_auth.create_login_token(
+            user_id,
+            display_name=display_name,
+        )
         login_url = quay_admin_auth.build_login_url(token)
         ttl = quay_admin_auth.login_ttl_seconds()
         minutes = max(1, int(ttl / 60))
@@ -750,11 +759,6 @@ class SlackAdapter(BasePlatformAdapter):
             f"This link expires in {minutes} minute{'s' if minutes != 1 else ''} "
             "and can be used once."
         )
-
-        team_id = command.get("team_id", "")
-        client = self._team_clients.get(team_id) if team_id else None
-        if client is None and self._app is not None:
-            client = self._app.client
 
         dm_sent = False
         if client is not None:
@@ -1627,6 +1631,31 @@ class SlackAdapter(BasePlatformAdapter):
             await self._add_reaction(channel_id, ts, "x")
 
     # ----- User identity resolution -----
+
+    async def _resolve_quay_admin_display_name(self, client: Any, user_id: str) -> str:
+        if not client or not user_id:
+            return ""
+        cached = self._user_name_cache.get(user_id)
+        if cached and cached != user_id:
+            return cached
+        try:
+            result = await client.users_info(user=user_id)
+            user = result.get("user", {})
+            profile = user.get("profile", {})
+            name = (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or user.get("real_name")
+                or user.get("name")
+                or ""
+            )
+            name = " ".join(str(name).split())[:80]
+            if name and name != user_id:
+                self._user_name_cache[user_id] = name
+                return name
+        except Exception as e:
+            logger.debug("[Slack] users.info failed for Quay Admin login %s: %s", user_id, e)
+        return ""
 
     async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:
         """Resolve a Slack user ID to a display name, with caching."""
