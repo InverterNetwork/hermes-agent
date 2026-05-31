@@ -13,8 +13,12 @@ Group=__AGENT_USER__
 # HERMES_HOME keeps helper code and profile-aware paths on the same install.
 Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
 Environment=HERMES_HOME=__TARGET_DIR__
+# gateway-runtime.env carries values-derived non-secret env such as
+# QUAY_AGENT_PROVIDER and QUAY_HERMES_API_BASE_URL.
+EnvironmentFile=-__TARGET_DIR__/auth/gateway-runtime.env
 # setup-hermes.sh generates QUAY_ADMIN_TOKEN into this file. It is required:
-# the rendered quay/config.toml sets [admin].require_auth=true.
+# the rendered quay/config.toml sets [admin].require_auth=true. The same file
+# carries QUAY_HERMES_API_KEY when Quay's Agent Gateway talks to Hermes.
 EnvironmentFile=__TARGET_DIR__/auth/quay.env
 # Optional operator-only extra env. Do not put QUAY_ADMIN_TOKEN here; keep
 # service secrets in <HERMES_HOME>/auth/quay.env with the other Hermes envs.

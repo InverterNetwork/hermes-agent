@@ -1621,6 +1621,12 @@ def _check_quay_serve_service(s: _State) -> None:
     else:
         s.v_drift("quay-serve.service auth env", f"missing {auth_env}")
 
+    runtime_env = f"EnvironmentFile=-{s.args.target / 'auth' / 'gateway-runtime.env'}"
+    if runtime_env in text:
+        s.v_ok("quay-serve.service runtime env")
+    else:
+        s.v_drift("quay-serve.service runtime env", f"missing {runtime_env}")
+
     if re.search(r"ExecStart=.*\bquay\s+serve\b", text):
         s.v_ok("quay-serve.service ExecStart uses quay serve")
     else:
