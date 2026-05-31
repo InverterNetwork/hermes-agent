@@ -62,20 +62,20 @@ Eight units live here:
 | `ops/hermes-upstream-sync.service`         | systemd service unit. Same `User=` templating. |
 | `ops/hermes-upstream-sync.timer`           | systemd timer unit. Weekly (Mon 09:00 UTC) cadence. |
 | `ops/hermes-gateway.service.d/slack-env.conf` | Drop-in layered on top of the CLI-generated `hermes-gateway.service`. Adds `EnvironmentFile=` for `/etc/default/hermes-gateway` and `<TARGET>/auth/slack.env`. |
-| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`, `QUAY_REVIEW_PR_TOKEN`). Staged via `stage-secrets.sh`. |
+| `ops/hermes-gateway.service.d/hermes-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/hermes.env` (gateway-adapter tokens, e.g. `LINEAR_API_KEY`, `QUAY_REVIEW_PR_TOKEN`, `API_SERVER_KEY`). Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/ops-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops.env` (non-prod AWS creds — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` — plus `NEW_RELIC_API_KEY`, `NEW_RELIC_ACCOUNT_ID`, `NEW_RELIC_GRAPHQL_ENDPOINT`). Powers the `aws-lambda-debug`, `dynamodb-query`, and `new-relic-lambda` skills. Staged via `stage-secrets.sh`. The AWS keys must be from an IAM user/role with **read-only** Lambda + CloudWatch Logs + CloudFormation + DynamoDB policies attached — the skills can't enforce read-only, IAM is the boundary. |
 | `ops/hermes-gateway.service.d/ops-prod-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops-prod.env` (PROD AWS creds — `AWS_PROD_ACCESS_KEY_ID`, `AWS_PROD_SECRET_ACCESS_KEY`). Kept in a separate file from `ops.env` so the prod surface is visible at the filesystem level; skills (`aws-lambda-debug-prod`, `dynamodb-query-prod`) remap `AWS_PROD_*` onto the canonical AWS env-var names per-command. Same IAM rule applies — these must be read-only prod keys, ideally from a dedicated IAM user with no other privileges. Staged via `stage-secrets.sh`. |
-| `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
+| `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, `API_SERVER_*`, `QUAY_AGENT_PROVIDER`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
 | `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. |
-| `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Keeps a valid pre-set worker GitHub token, otherwise mints one via `installer/hermes_github_token.py` and exports it as `$GH_TOKEN` / `$GITHUB_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. |
+| `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Keeps a valid pre-set worker GitHub token, otherwise mints one via `installer/hermes_github_token.py` and exports it as `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
-| `ops/quay-serve.service`                   | systemd service unit for the embedded Quay Admin UI/API. Installed only when the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `QUAY_DATA_DIR=<TARGET>/quay`, and `EnvironmentFile=<TARGET>/auth/quay.env`; binds `127.0.0.1:9731` and requires `QUAY_ADMIN_TOKEN`. |
+| `ops/quay-serve.service`                   | systemd service unit for the embedded Quay Admin UI/API. Installed only when the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `QUAY_DATA_DIR=<TARGET>/quay`, `EnvironmentFile=<TARGET>/auth/gateway-runtime.env` for non-secret agent-interface config, and `EnvironmentFile=<TARGET>/auth/quay.env` for service tokens; binds `127.0.0.1:9731` and requires `QUAY_ADMIN_TOKEN`. |
 | `ops/hermes-dashboard.service`             | systemd service unit for the Hermes dashboard and Quay Admin proxy. Installed only when `quay.admin.public_base_url` is set and the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `HERMES_HOME=<TARGET>`, `HERMES_WEB_DIST=<TARGET>/hermes-agent/hermes_cli/web_dist`, `EnvironmentFile=<TARGET>/auth/quay.env`, and `EnvironmentFile=<TARGET>/auth/gateway-runtime.env`; binds `127.0.0.1:9119` and proxies `/quay/admin/` to `quay-serve.service`. `HERMES_WEB_DIST` prevents this service from attempting an npm build at startup; the Quay Admin proxy routes do not need the Hermes SPA bundle. |
 | `ops/quay_orchestrator.py`                 | Quay delivery-outbox and handoff drain loop. Defines the Quay CLI adapter, delivery-only Slack posts, human-advice Slack question/discussion flow with original-thread routing plus fallback-channel support, orchestrator decision handling, JSON event logging, metrics, and lock wrapper. Existing-thread human handoffs validate the thread and post a fresh guidance prompt before either waiting inline or parking for a later poll. |
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one --park-human-waits` with `<HERMES_HOME>/quay/orchestrator.json`, so the deployed oneshot exits after posting a human prompt and later ticks poll parked replies. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. The installed runner does not remain active for the full human reply timeout. |
 | `ops/quay-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock. Pending delivery items and handoffs drain on later timer activations while human handoffs remain parked in `waiting_human`. |
-| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, loads `<HERMES_HOME>/auth/quay.env` with a literal `KEY=VAL` parser for adapter tokens, and keeps valid caller GitHub tokens or mints replacements from the App helper — so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, loads `<HERMES_HOME>/auth/quay.env` with a literal `KEY=VAL` parser for adapter tokens, and keeps valid caller GitHub tokens or mints replacements from the App helper, exporting the worker token as `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN` so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
@@ -551,15 +551,16 @@ clone's `.git/config` covers `git push`; for code-only entries the
 that's `$GH_TOKEN`'s job, below.
 
 `quay-tick-runner` resolves a worker GitHub token at the top of every
-tick. If `$GH_TOKEN` / `$GITHUB_TOKEN` is already set, the runner first
-checks it with `gh api rate_limit`, which accepts both user tokens and
-GitHub App installation tokens; valid caller-supplied tokens are kept.
-Missing, expired, or otherwise invalid tokens fall back to minting a
-short-lived worker GitHub App installation token via
-`installer/hermes_github_token.py mint`, exported as both `$GH_TOKEN` and
-`$GITHUB_TOKEN`. Both `gh` and `git push` over HTTPS read from that env
-surface, so a single fresh token covers every API call the tick or its
-worker makes.
+tick. If `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN` is
+already set, the runner first checks it with `gh api rate_limit`, which
+accepts both user tokens and GitHub App installation tokens; valid
+caller-supplied tokens are kept. Missing, expired, or otherwise invalid
+tokens fall back to minting a short-lived worker GitHub App installation
+token via `installer/hermes_github_token.py mint`, exported as
+`$QUAY_WORKER_GH_TOKEN`, `$GH_TOKEN`, and `$GITHUB_TOKEN`. Quay consumes
+`$QUAY_WORKER_GH_TOKEN` before spawning worker attempts, while `gh` and
+`git push` over HTTPS read from the `GH_TOKEN` surface, so a single fresh
+token covers every API call the tick or its worker makes.
 
 When `/etc/hermes/reviewer.env` exists, the runner also mints a token
 from the reviewer App credentials and exports it as
@@ -606,8 +607,8 @@ sudo systemctl edit quay-tick.timer
 ## Environment
 
 The unit runs `/usr/local/sbin/quay-tick-runner` (which `exec`s
-`/usr/local/bin/quay tick` after minting `$GH_TOKEN` and, when
-configured, `$QUAY_REVIEWER_GH_TOKEN`) with:
+`/usr/local/bin/quay tick` after minting `$QUAY_WORKER_GH_TOKEN` /
+`$GH_TOKEN` and, when configured, `$QUAY_REVIEWER_GH_TOKEN`) with:
 
 * `QUAY_DATA_DIR=<HERMES_HOME>/quay` — pinned by `Environment=` on the
   unit so the runtime path lives in exactly one place.
@@ -683,6 +684,11 @@ Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
   login).
 * `QUAY_ADMIN_TOKEN` is not prompted. `setup-hermes.sh` / `stage-secrets.sh`
   generate it into `auth/quay.env` and preserve it on re-runs.
+* `API_SERVER_KEY` is not prompted. On quay-provisioned hosts,
+  `stage-secrets.sh` generates/preserves it in `auth/hermes.env` and mirrors
+  the same value into `auth/quay.env` as `QUAY_HERMES_API_KEY` so Quay's Agent
+  Gateway can call the local Hermes API Server. The enabled flag, host, port,
+  model, provider, and Hermes base URL remain in `deploy.values.yaml`.
 
 `stage-secrets.sh` also writes `SLACK_TOKEN=<SLACK_BOT_TOKEN>` into
 `auth/quay.env` on quay-provisioned hosts. That token is the Quay Slack
@@ -833,6 +839,9 @@ When supported, the installer:
   `<HERMES_HOME>/auth/quay.env`;
 * installs `quay-serve.service`, which runs:
   `quay serve --host 127.0.0.1 --port 9731`;
+* loads non-secret agent-interface env from
+  `<HERMES_HOME>/auth/gateway-runtime.env` and secrets from
+  `<HERMES_HOME>/auth/quay.env`;
 * installs `hermes-dashboard.service` when `quay.admin.public_base_url` is
   set, which runs:
   `hermes dashboard --host 127.0.0.1 --port 9119 --no-open`;
@@ -841,6 +850,32 @@ When supported, the installer:
 
 The Hermes dashboard proxy defaults to `QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731`
 and exposes the hosted path at `/quay/admin/`.
+
+### Configure the Agent panel backend
+
+For the Quay Agent panel, keep all non-secret wiring in `deploy.values.yaml`:
+
+```yaml
+gateway:
+  api_server:
+    enabled: true
+    host: 127.0.0.1
+    port: 8642
+    model_name: hermes-agent
+
+quay:
+  agent_interface:
+    enabled: true
+    provider: hermes
+    hermes_api_base_url: http://127.0.0.1:8642
+    hermes_model: hermes-agent
+    hermes_session_key_prefix: quay-krustentier
+```
+
+`setup-hermes.sh` renders those values into `auth/gateway-runtime.env`.
+`stage-secrets.sh` handles only the shared bearer secret:
+`API_SERVER_KEY` for `hermes-gateway.service`, mirrored as
+`QUAY_HERMES_API_KEY` for `quay-serve.service`.
 
 ### Configure Slack admins
 

@@ -120,6 +120,14 @@
 #                                 manual, smart, off. Use off only for trusted
 #                                 internal Slack deployments; hardline-blocked
 #                                 commands remain blocked.
+#   gateway.api_server          — optional non-secret API Server wiring
+#                                 rendered into auth/gateway-runtime.env.
+#                                 The bearer token is the actual secret and
+#                                 stays in auth/hermes.env as API_SERVER_KEY.
+#                                 This deployment uses the local API Server as
+#                                 the server-to-server target for Quay's Agent
+#                                 Gateway, so host/port are loopback-only
+#                                 config-as-code values here.
 #
 #   auth.github_app.id         — numeric GitHub App ID. Identifier (not a
 #                                 secret); committing here means re-installs
@@ -329,6 +337,15 @@
 #                                 `quay serve` on 127.0.0.1:9731. Public
 #                                 exposure belongs behind an explicit proxy,
 #                                 not by widening the Quay listener.
+#   quay.agent_interface       — optional non-secret Agent Gateway wiring
+#                                 rendered into auth/gateway-runtime.env and
+#                                 loaded by quay-serve.service. Set provider
+#                                 to `hermes` to connect Quay's `/v1/agent/*`
+#                                 routes to the local Hermes API Server.
+#                                 QUAY_HERMES_API_KEY is the actual secret and
+#                                 is staged in auth/quay.env by
+#                                 stage-secrets.sh, using the same generated
+#                                 value as API_SERVER_KEY.
 #   quay.orchestrator          — Quay orchestrator sidecar for durable Quay
 #                                 delivery outbox items and legacy handoffs.
 #                                 This renders to
@@ -421,6 +438,13 @@ gateway:
   # trusted internal Slack deployments. The hardline blocklist still applies
   # even with approvals disabled.
   approvals_mode: off
+  # Local Hermes API Server used by Quay's Agent Gateway. The bearer token is
+  # generated/staged as API_SERVER_KEY in auth/hermes.env, not committed here.
+  api_server:
+    enabled: true
+    host: 127.0.0.1
+    port: 8642
+    model_name: hermes-agent
 
 auth:
   # GitHub App used for the agent's git push back to hermes-state. IDs are
@@ -630,6 +654,15 @@ quay:
   version: "v0.3.31"
   # Public org-owned release repo for unauthenticated installer downloads.
   release_repo: InverterNetwork/quay
+  # Quay Agent panel backend. All values here are non-secret and are loaded by
+  # quay-serve.service from auth/gateway-runtime.env; the shared bearer token
+  # lives in auth/quay.env as QUAY_HERMES_API_KEY.
+  agent_interface:
+    enabled: true
+    provider: hermes
+    hermes_api_base_url: http://127.0.0.1:8642
+    hermes_model: hermes-agent
+    hermes_session_key_prefix: quay-krustentier
   # Single global worker invocation. {prompt_file} is substituted with the
   # path to the synthesized brief inside the task worktree.
   # `--output-format json` puts claude into non-interactive print mode

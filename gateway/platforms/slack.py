@@ -86,8 +86,29 @@ class _ThreadContextCache:
 
 
 def check_slack_requirements() -> bool:
-    """Check if Slack dependencies are available."""
-    return SLACK_AVAILABLE
+    """Check if Slack dependencies are available.
+
+    Lazy-installs slack-bolt/slack-sdk via ``tools.lazy_deps.ensure("platform.slack")``
+    on first call if not present. Rebinds all module-level globals on success.
+    """
+    if SLACK_AVAILABLE:
+        return True
+
+    def _import():
+        from slack_bolt.async_app import AsyncApp
+        from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+        from slack_sdk.web.async_client import AsyncWebClient
+        import aiohttp
+        return {
+            "AsyncApp": AsyncApp,
+            "AsyncSocketModeHandler": AsyncSocketModeHandler,
+            "AsyncWebClient": AsyncWebClient,
+            "aiohttp": aiohttp,
+            "SLACK_AVAILABLE": True,
+        }
+
+    from tools.lazy_deps import ensure_and_bind
+    return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
 
 
 def _extract_text_from_slack_blocks(blocks: list) -> str:
@@ -694,7 +715,7 @@ class SlackAdapter(BasePlatformAdapter):
             "text": text,
         }
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(trust_env=True) as session:
                 async with session.post(
                     ctx["response_url"],
                     json=payload,
@@ -1014,6 +1035,41 @@ class SlackAdapter(BasePlatformAdapter):
             if lock_acquired and not self._running:
                 self._release_platform_lock()
 
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a Slack thread anchor for a session handoff.
+
+        Slack threads are anchored to a parent message (``thread_ts``), not
+        a channel-level construct. So we post a seed message into the home
+        channel and return its ``ts`` — the watcher uses that as the
+        ``thread_id`` for subsequent sends.
+
+        Returns the seed message ts as a string, or ``None`` on failure.
+        """
+        if not self._app:
+            return None
+        try:
+            client = self._get_client(parent_chat_id)
+            if client is None:
+                return None
+            seed_text = f":thread: Hermes handoff — *{(name or 'session').strip()[:80]}*"
+            result = await client.chat_postMessage(
+                channel=parent_chat_id,
+                text=seed_text,
+            )
+            ts = result.get("ts") if isinstance(result, dict) else getattr(result, "get", lambda _k, _d=None: None)("ts")
+            if ts:
+                return str(ts)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Handoff thread: seed-post failed for channel %s: %s",
+                self.name, parent_chat_id, exc,
+            )
+        return None
+
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         if self._handler:
@@ -1235,7 +1291,7 @@ class SlackAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("dm_top_level_threads_as_sessions")
         if raw is None:
             return True  # default: each DM thread is its own session
-        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     def _resolve_thread_ts(
         self,
@@ -1600,7 +1656,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("SLACK_REACTIONS", "true").lower() not in ("false", "0", "no")
+        return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -2629,11 +2685,23 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Ignore message edits and deletions
         subtype = event.get("subtype")
-        if subtype in ("message_changed", "message_deleted"):
+        if subtype in {"message_changed", "message_deleted"}:
             return
 
         original_text = event.get("text", "")
-        text = self._extract_slack_text_payload(event)
+        if original_text.startswith("!"):
+            try:
+                from hermes_cli.commands import is_gateway_known_command
+                first_token = original_text[1:].split(maxsplit=1)[0]
+                # Strip "@suffix" the same way get_command() does, so
+                # forms like ``!stop@hermes`` still resolve.
+                cmd_name = first_token.split("@", 1)[0].lower()
+                if cmd_name and "/" not in cmd_name and is_gateway_known_command(cmd_name):
+                    original_text = "/" + original_text[1:]
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        text = self._extract_slack_text_payload({**event, "text": original_text})
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
@@ -2659,7 +2727,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_type = event.get("channel_type", "")
         if not channel_type and channel_id.startswith("D"):
             channel_type = "im"
-        is_dm = channel_type in ("im", "mpim")  # Both 1:1 and group DMs
+        is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
 
         if self._channel_blocked_by_allowlist(channel_id, is_dm):
             logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
@@ -2697,6 +2765,12 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid:
+            # Check allowed channels — if set, only respond in these channels (whitelist)
+            allowed_channels = self._slack_allowed_channels()
+            if allowed_channels and channel_id not in allowed_channels:
+                logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
+                return
+
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
@@ -3417,14 +3491,17 @@ class SlackAdapter(BasePlatformAdapter):
             await self._handle_quay_admin_slash_command(command)
             return
 
-        if slash_name in ("hermes", ""):
+        if slash_name in {"hermes", ""}:
             # Legacy /hermes <subcommand> [args] routing + free-form questions.
             # Empty slash_name falls into this branch for backward compat
             # with any caller that didn't populate command["command"].
             from hermes_cli.commands import slack_subcommand_map
             subcommand_map = slack_subcommand_map()
             subcommand_map["compact"] = "/compress"
-            first_word = text.split()[0] if text else ""
+            # Guard against whitespace-only text where ``text`` is truthy but
+            # ``text.split()`` returns ``[]`` (e.g. user sends ``/hermes   ``).
+            parts = text.split() if text else []
+            first_word = parts[0] if parts else ""
             if first_word in subcommand_map:
                 rest = text[len(first_word):].strip()
                 text = f"{subcommand_map[first_word]} {rest}".strip() if rest else subcommand_map[first_word]
@@ -3676,9 +3753,9 @@ class SlackAdapter(BasePlatformAdapter):
         configured = self.config.extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() not in ("false", "0", "no", "off")
+                return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
+        return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
     def _slack_strict_mention(self) -> bool:
         """When true, channel threads require an explicit @-mention on every
@@ -3688,9 +3765,9 @@ class SlackAdapter(BasePlatformAdapter):
         configured = self.config.extra.get("strict_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() in ("true", "1", "yes", "on")
+                return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in ("true", "1", "yes", "on")
+        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
     def _slack_response_policy(self) -> str:
         """Return the Slack channel response policy.
@@ -3868,7 +3945,12 @@ class SlackAdapter(BasePlatformAdapter):
         return set()
 
     def _slack_allowed_channels(self) -> set:
-        """Channels the bot is allowed to respond in. Empty set = no gate."""
+        """Return the whitelist of channel IDs the bot will respond in.
+
+        When non-empty, messages from channels NOT in this set are silently
+        ignored — even if the bot is @mentioned.  DMs are never filtered.
+        Empty set means no restriction (fully backward compatible).
+        """
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
             raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")

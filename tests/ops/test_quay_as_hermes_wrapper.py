@@ -101,6 +101,7 @@ def wrapper_env(tmp_path: Path) -> dict:
         f'  printf "PWD: %s\\n" "$PWD"\n'
         f'  printf "QUAY_DATA_DIR: %s\\n" "${{QUAY_DATA_DIR:-}}"\n'
         f'  printf "HERMES_HOME: %s\\n" "${{HERMES_HOME:-}}"\n'
+        f'  printf "QUAY_WORKER_GH_TOKEN: %s\\n" "${{QUAY_WORKER_GH_TOKEN:-}}"\n'
         f'  printf "GH_TOKEN: %s\\n" "${{GH_TOKEN:-}}"\n'
         f'  printf "LINEAR_API_KEY: %s\\n" "${{LINEAR_API_KEY:-}}"\n'
         f'}} >> {quay_log}\n'
@@ -193,6 +194,7 @@ class TestQuayAsHermesWrapper:
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
         # Confirms the preamble ran in the agent branch too, not just
         # the sudo branch: env file got parsed and exported.
+        assert log["QUAY_WORKER_GH_TOKEN"] == "stub-from-envfile"
         assert log["GH_TOKEN"] == "stub-from-envfile"
         assert log["LINEAR_API_KEY"] == "lin-stub"
 
@@ -246,6 +248,7 @@ class TestQuayAsHermesWrapper:
         assert log["PWD"] == "/"
         assert log["QUAY_DATA_DIR"] == f"{wrapper_env['target']}/quay"
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
+        assert log["QUAY_WORKER_GH_TOKEN"] == "stub-from-envfile"
         assert log["GH_TOKEN"] == "stub-from-envfile"
 
     def test_operator_path_preserves_quay_data_dir_override(self, wrapper_env):
@@ -288,6 +291,7 @@ class TestQuayAsHermesWrapper:
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
 
         log = _parse_quay_log(wrapper_env["quay_log"])
+        assert log["QUAY_WORKER_GH_TOKEN"] == "minted-worker-token"
         assert log["GH_TOKEN"] == "minted-worker-token"
         assert "existing GitHub token is invalid; minting replacement" in result.stderr
         assert wrapper_env["helper_calls"].read_text(encoding="utf-8").splitlines() == ["mint"]

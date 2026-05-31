@@ -31,12 +31,15 @@
 # guard keeps the wrapper usable on fresh installs that haven't run
 # stage-secrets.sh yet.
 #
-# Finally, resolve $GH_TOKEN from the GitHub App helper so any operator
-# command that shells out to `gh` (enqueue's PR-existence pre-flight,
-# review-pr, …) authenticates against the same identity as the systemd
-# tick. Existing caller-supplied tokens are kept only when `gh api rate_limit`
-# accepts them; stale/expired values mint a replacement. This endpoint accepts
-# both user tokens and GitHub App installation tokens, which the helper mints.
+# Finally, resolve the worker GitHub token from the GitHub App helper so any
+# operator command that shells out to `gh` (enqueue's PR-existence pre-flight,
+# review-pr, …) authenticates against the same identity as the systemd tick.
+# Quay itself consumes $QUAY_WORKER_GH_TOKEN before spawning worker attempts,
+# while child tools still read $GH_TOKEN / $GITHUB_TOKEN, so all three names
+# are exported to the same token. Existing caller-supplied tokens are kept only
+# when `gh api rate_limit` accepts them; stale/expired values mint a
+# replacement. This endpoint accepts both user tokens and GitHub App
+# installation tokens, which the helper mints.
 # Mirrors
 # ops/quay-tick-runner and ops/hermes-upstream-sync's preamble. Permissive
 # on helper failure: missing PEM or transient mint error → exec and let
@@ -69,11 +72,18 @@ if [ -r "$ENV_FILE" ]; then
   done < "$ENV_FILE"
 fi
 token_is_valid() {
-  [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] || return 1
+  token="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+  [ -n "$token" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
-  GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" \
-    GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
+  GH_TOKEN="$token" \
+    GITHUB_TOKEN="$token" \
     gh api rate_limit >/dev/null 2>&1
+}
+
+export_worker_token() {
+  export QUAY_WORKER_GH_TOKEN="$1"
+  export GH_TOKEN="$1"
+  export GITHUB_TOKEN="$1"
 }
 
 mint_gh_token() {
@@ -86,19 +96,21 @@ mint_gh_token() {
   # quay-tick-runner. An operator command stays interactive even if the
   # App API hangs at the TCP/TLS layer.
   elif token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ]; then
-    export GH_TOKEN="$token"
-    export GITHUB_TOKEN="$token"
+    export_worker_token "$token"
   else
     printf "[quay-as-hermes] WARN: token mint failed; running quay without minted \$GH_TOKEN\n" >&2
     return 1
   fi
 }
 
-if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+existing_token="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+if [ -n "$existing_token" ]; then
   if ! token_is_valid; then
     printf "[quay-as-hermes] WARN: existing GitHub token is invalid; minting replacement\n" >&2
-    unset GH_TOKEN GITHUB_TOKEN
+    unset QUAY_WORKER_GH_TOKEN GH_TOKEN GITHUB_TOKEN
     mint_gh_token || true
+  else
+    export_worker_token "$existing_token"
   fi
 else
   mint_gh_token || true
