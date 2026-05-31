@@ -3887,7 +3887,7 @@ async def quay_admin_login(token: str = ""):
 
     return HTMLResponse(_quay_admin_login_confirmation_html(
         token,
-        str(record["slack_user_id"]),
+        str(record.get("display_name") or ""),
     ))
 
 
@@ -3906,7 +3906,10 @@ async def quay_admin_login_submit(request: Request):
     if not record:
         return JSONResponse({"detail": "Invalid or expired login link"}, status_code=401)
 
-    session_id, session = quay_admin_auth.create_session(str(record["slack_user_id"]))
+    session_id, session = quay_admin_auth.create_session(
+        str(record["slack_user_id"]),
+        display_name=str(record.get("display_name") or ""),
+    )
     with _QUAY_ADMIN_SESSIONS_LOCK:
         _QUAY_ADMIN_SESSIONS[session_id] = session
 
@@ -3923,9 +3926,14 @@ async def quay_admin_login_submit(request: Request):
     return response
 
 
-def _quay_admin_login_confirmation_html(token: str, slack_user_id: str) -> str:
+def _quay_admin_login_confirmation_html(token: str, display_name: str = "") -> str:
     safe_token = html.escape(token, quote=True)
-    safe_user = html.escape(slack_user_id, quote=True)
+    safe_display_name = html.escape(display_name, quote=True)
+    identity_html = (
+        f"Continue as <strong>{safe_display_name}</strong>."
+        if safe_display_name
+        else "Continue with your Slack account."
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -3969,7 +3977,7 @@ def _quay_admin_login_confirmation_html(token: str, slack_user_id: str) -> str:
 <body>
   <main>
     <h1>Quay Admin</h1>
-    <p>Continue as Slack user <strong>{safe_user}</strong>.</p>
+    <p>{identity_html}</p>
     <form method="post" action="/quay/admin/login">
       <input type="hidden" name="token" value="{safe_token}">
       <button type="submit">Continue to Quay Admin</button>
@@ -4009,6 +4017,13 @@ async def _proxy_quay_admin(request: Request, path: str = "") -> Response:
             forwarded_identity_header: str(session.get("slack_user_id") or ""),
             "Accept": request.headers.get("accept", "*/*"),
         }
+        display_name = str(session.get("display_name") or "").strip()
+        if display_name:
+            forwarded_display_name_header = os.getenv(
+                "QUAY_ADMIN_FORWARDED_DISPLAY_NAME_HEADER",
+                "X-Hermes-User-Display-Name",
+            )
+            headers[forwarded_display_name_header] = display_name
         content_type = request.headers.get("content-type")
         if content_type:
             headers["Content-Type"] = content_type
