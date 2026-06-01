@@ -629,15 +629,6 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
-  - id: quay-ui
-    url: https://github.com/InverterNetwork/quay-ui
-    base_branch: main
-    issue_tracker:
-      linear:
-        team: brix
-    quay:
-      package_manager: bun
-      install_cmd: "bun install"
   - id: hermes-agent
     url: https://github.com/InverterNetwork/hermes-agent
     base_branch: dev
