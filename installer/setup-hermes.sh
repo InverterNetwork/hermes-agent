@@ -59,6 +59,12 @@
 # passes it into `quay tick` so reviewer attempts post as the reviewer App.
 # Reviewer wiring is gated on --auth-method=app and skipped when no key has
 # ever been staged.
+#
+# Atlas App: when atlas.version is set in deploy.values.yaml, first install
+# requires --atlas-app-key-path for the Atlas manager GitHub App PEM. The
+# public App and installation IDs live under atlas.github_app; the PEM is
+# persisted under $TARGET/auth/ and is used for Atlas release downloads and
+# atlas-kb clone/fetch/push auth.
 
 set -euo pipefail
 
@@ -100,6 +106,9 @@ GH_API_BASE=""
 REVIEWER_APP_ID=""
 REVIEWER_APP_INSTALLATION_ID=""
 REVIEWER_APP_KEY_PATH=""
+ATLAS_APP_ID=""
+ATLAS_APP_INSTALLATION_ID=""
+ATLAS_APP_KEY_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -120,6 +129,9 @@ while [[ $# -gt 0 ]]; do
     --reviewer-app-id)              REVIEWER_APP_ID="$2";              shift 2 ;;
     --reviewer-app-installation-id) REVIEWER_APP_INSTALLATION_ID="$2"; shift 2 ;;
     --reviewer-app-key-path)        REVIEWER_APP_KEY_PATH="$2";        shift 2 ;;
+    --atlas-app-id)                 ATLAS_APP_ID="$2";                 shift 2 ;;
+    --atlas-app-installation-id)    ATLAS_APP_INSTALLATION_ID="$2";    shift 2 ;;
+    --atlas-app-key-path)           ATLAS_APP_KEY_PATH="$2";           shift 2 ;;
     --skip-auth-check)       SKIP_AUTH_CHECK=1;         shift   ;;
     --gh-api-base)           GH_API_BASE="$2";          shift 2 ;;
     --verify)                VERIFY=1;                  shift   ;;
@@ -309,6 +321,18 @@ VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
 [[ -f "$VALUES_HELPER" ]] \
   || { echo "values helper missing at $VALUES_HELPER" >&2; exit 1; }
 
+ATLAS_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.version 2>/dev/null || true)"
+ATLAS_ENABLED=0
+if [[ -n "$ATLAS_VERSION" ]]; then
+  ATLAS_ENABLED=1
+fi
+
+if [[ "$ATLAS_ENABLED" -eq 1 && "$AUTH_METHOD" != "app" ]]; then
+  echo "FAIL: atlas.version is set but --auth-method app was not passed." >&2
+  echo "      Atlas uses the Atlas manager GitHub App for release downloads and atlas-kb git auth." >&2
+  exit 2
+fi
+
 # quay-managed github.com entries require the App credential helper for HTTPS
 # clone/push; SSH deploy-key rewrites are skipped for those entries. Fail fast
 # before any provisioning so the operator doesn't half-install with an auth
@@ -480,16 +504,19 @@ PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
   ensure-runtimes --values "$VALUES_FILE"
 
 # ---------- agent CLI provisioning / prerequisite checks ----------
-# Each agent the deployment may invoke (claude, codex) gets its own gate,
-# triggered by a substring match against active quay agent invocations.
+# Each agent the deployment may invoke (claude, codex) gets its own gate.
+# Codex may be required by Quay worker/reviewer invocations or by Atlas'
+# codex-exec analysis mode. The binary is root-managed; `codex login`
+# remains an operator step under the agent user's home so OAuth material
+# stays agent-owned.
+agent_invocations=""
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   agent_invocations="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" active-agent-invocations)"
-  if [[ "$agent_invocations" == *codex* ]]; then
-    # Binary is root-managed; `codex login` remains an operator step under
-    # the agent user's home so OAuth material stays agent-owned.
-    PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
-      ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
-  fi
+fi
+PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+  ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
+
+if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   if [[ "$agent_invocations" == *claude* ]]; then
     echo "==> provisioning claude CLI for $AGENT_USER"
     sudo -u "$AGENT_USER" -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
@@ -507,6 +534,16 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
       echo "      check the ensure-codex error above, then run codex login as $AGENT_USER." >&2
       exit 1
     fi
+  fi
+fi
+
+ATLAS_AI_MODE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.mode 2>/dev/null || true)"
+if [[ "$ATLAS_ENABLED" -eq 1 && "$ATLAS_AI_MODE" == "codex-exec" ]]; then
+  if ! sudo -u "$AGENT_USER" -H bash -c 'command -v codex' >/dev/null 2>&1; then
+    echo "FAIL: Atlas is configured with atlas.ai.mode=codex-exec but codex is not on PATH for $AGENT_USER" >&2
+    echo "      setup-hermes.sh should have installed the pinned codex binary from quay.codex;" >&2
+    echo "      check the ensure-codex error above, then run codex login as $AGENT_USER." >&2
+    exit 1
   fi
 fi
 
@@ -667,11 +704,14 @@ find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 AUTH_DIR="$TARGET_DIR/auth"
 GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
+ATLAS_APP_KEY_DST="$AUTH_DIR/atlas-manager.pem"
+ATLAS_APP_ENV="$AUTH_DIR/atlas-manager.env"
 GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
 QUAY_ENV_FILE="$AUTH_DIR/quay.env"
 TOKEN_HELPER_PY="$TARGET_DIR/hermes-agent/installer/hermes_github_token.py"
 VENV_PY="$TARGET_DIR/hermes-agent/venv/bin/python"
 HERMES_BIN="$TARGET_DIR/hermes-agent/venv/bin/hermes"
+ATLAS_GIT_CRED_HELPER=""
 
 # auth/ is created here regardless of --auth-method because gateway-runtime.env
 # (values-derived, written below) lives in it. Strip setgid that propagates
@@ -808,6 +848,64 @@ EOF
     || { echo "FAIL: venv python missing at $VENV_PY" >&2; exit 1; }
 fi
 
+# ---------- Atlas manager App auth (separate identity from worker/reviewer) ----------
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
+  [[ "$AUTH_METHOD" == "app" ]] \
+    || { echo "FAIL: Atlas App wiring requires --auth-method=app (got: $AUTH_METHOD)" >&2; exit 1; }
+
+  echo "==> wiring Atlas manager GitHub App auth at $AUTH_DIR"
+
+  if [[ -n "$ATLAS_APP_KEY_PATH" ]]; then
+    [[ -f "$ATLAS_APP_KEY_PATH" ]] \
+      || { echo "FAIL: --atlas-app-key-path file not found: $ATLAS_APP_KEY_PATH" >&2; exit 1; }
+    head -1 "$ATLAS_APP_KEY_PATH" | grep -Eq '^-----BEGIN (RSA |EC )?PRIVATE KEY-----$' \
+      || { echo "FAIL: $ATLAS_APP_KEY_PATH does not look like an unencrypted PEM private key" >&2; exit 1; }
+    if grep -q 'ENCRYPTED' "$ATLAS_APP_KEY_PATH"; then
+      echo "FAIL: $ATLAS_APP_KEY_PATH is passphrase-protected; PyJWT requires an unencrypted key" >&2
+      exit 1
+    fi
+    install -o root -g "$AGENT_USER" -m 0640 "$ATLAS_APP_KEY_PATH" "$ATLAS_APP_KEY_DST"
+  elif [[ ! -f "$ATLAS_APP_KEY_DST" ]]; then
+    echo "FAIL: atlas.version is set but no key staged at $ATLAS_APP_KEY_DST and no --atlas-app-key-path given" >&2
+    exit 1
+  fi
+
+  chown root:"$AGENT_USER" "$ATLAS_APP_KEY_DST"
+  chmod 0640 "$ATLAS_APP_KEY_DST"
+
+  ATLAS_APP_ID="${ATLAS_APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.github_app.id 2>/dev/null || true)}"
+  ATLAS_APP_INSTALLATION_ID="${ATLAS_APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.github_app.installation_id 2>/dev/null || true)}"
+  ATLAS_GH_API_BASE="${CLI_GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.github_app.api_base 2>/dev/null || true)}"
+  if [[ -f "$ATLAS_APP_ENV" ]]; then
+    ATLAS_APP_ID="${ATLAS_APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$ATLAS_APP_ENV")}"
+    ATLAS_APP_INSTALLATION_ID="${ATLAS_APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$ATLAS_APP_ENV")}"
+    ATLAS_GH_API_BASE="${ATLAS_GH_API_BASE:-$(awk -F= '$1=="HERMES_GH_API"{print $2; exit}' "$ATLAS_APP_ENV")}"
+  fi
+  [[ "$ATLAS_APP_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --atlas-app-id must be a positive integer (got: '$ATLAS_APP_ID')" >&2; exit 1; }
+  [[ "$ATLAS_APP_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --atlas-app-installation-id must be a positive integer (got: '$ATLAS_APP_INSTALLATION_ID')" >&2; exit 1; }
+
+  umask 0027
+  cat > "$ATLAS_APP_ENV" <<EOF
+HERMES_GH_APP_ID=$ATLAS_APP_ID
+HERMES_GH_INSTALLATION_ID=$ATLAS_APP_INSTALLATION_ID
+HERMES_GH_APP_KEY=$ATLAS_APP_KEY_DST
+HERMES_GH_TOKEN_CACHE=$TARGET_DIR/cache/atlas-manager-token-cache.json
+${ATLAS_GH_API_BASE:+HERMES_GH_API=$ATLAS_GH_API_BASE}
+EOF
+  umask 0022
+  chown root:"$AGENT_USER" "$ATLAS_APP_ENV"
+  chmod 0640 "$ATLAS_APP_ENV"
+
+  [[ -x "$TOKEN_HELPER_PY" ]] \
+    || { echo "FAIL: token helper missing at $TOKEN_HELPER_PY" >&2; exit 1; }
+  [[ -x "$VENV_PY" ]] \
+    || { echo "FAIL: venv python missing at $VENV_PY" >&2; exit 1; }
+
+  ATLAS_GIT_CRED_HELPER="!HERMES_HOME='$TARGET_DIR' HERMES_GH_CONFIG='$ATLAS_APP_ENV' $VENV_PY $TOKEN_HELPER_PY credential"
+fi
+
 # ---------- reviewer App auth (separate identity from worker) ----------
 # Reviewer wiring is gated on --auth-method=app (it shares the token-helper
 # machinery). Activated when the operator passes --reviewer-app-key-path
@@ -929,6 +1027,18 @@ configure_github_app_clone_auth() {
     config --add url.https://github.com/.insteadOf "ssh://git@github.com/"
 }
 
+configure_atlas_github_app_clone_auth() {
+  local clone_path="$1"
+  [[ "$ATLAS_ENABLED" -eq 1 && -n "$ATLAS_GIT_CRED_HELPER" ]] || return 0
+
+  sudo -u "$AGENT_USER" git -C "$clone_path" \
+    config credential.https://github.com.helper "$ATLAS_GIT_CRED_HELPER"
+  sudo -u "$AGENT_USER" git -C "$clone_path" \
+    config --replace-all url.https://github.com/.insteadOf "git@github.com:"
+  sudo -u "$AGENT_USER" git -C "$clone_path" \
+    config --add url.https://github.com/.insteadOf "ssh://git@github.com/"
+}
+
 configure_quay_github_app_worktree_auth() {
   [[ "$QUAY_ENABLED" -eq 1 && -n "$GIT_CRED_HELPER" ]] || return 0
 
@@ -1020,6 +1130,129 @@ fi
 for d in sessions logs cache platforms platforms/pairing; do
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$TARGET_DIR/$d"
 done
+
+# `atlas/` is installed as a pinned release binary plus an agent-owned
+# knowledge-base checkout. Atlas uses its own GitHub App identity so its
+# release download and atlas-kb fetch/push permissions stay separate from
+# the general Hermes worker/reviewer Apps.
+ATLAS_KB_ROOT=""
+ATLAS_CODEX_BIN=""
+ATLAS_CODEX_TIMEOUT_MS=""
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
+  case "$(uname -m)" in
+    x86_64)  ATLAS_ARCH="amd64" ;;
+    aarch64) ATLAS_ARCH="arm64" ;;
+    *) echo "FAIL: unsupported architecture $(uname -m); Atlas ships amd64/arm64 Linux only" >&2; exit 1 ;;
+  esac
+
+  ATLAS_RELEASE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.release_repo 2>/dev/null || true)"
+  ATLAS_RELEASE_REPO="${ATLAS_RELEASE_REPO:-InverterNetwork/atlas}"
+  if [[ ! "$ATLAS_RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "FAIL: atlas.release_repo must be a GitHub owner/repo slug (got: $ATLAS_RELEASE_REPO)" >&2
+    exit 1
+  fi
+  ATLAS_RELEASE_URL="https://github.com/${ATLAS_RELEASE_REPO}/releases/download/${ATLAS_VERSION}"
+  ATLAS_ASSET="atlas-linux-${ATLAS_ARCH}"
+  ATLAS_BIN_DST="/usr/local/bin/atlas"
+
+  echo "==> installing atlas binary ${ATLAS_VERSION} from ${ATLAS_RELEASE_REPO} (${ATLAS_ARCH}) to $ATLAS_BIN_DST"
+  ATLAS_TMP="$(mktemp -d)"
+  trap 'rm -rf "$ATLAS_TMP"' EXIT
+  ATLAS_RELEASE_TOKEN="$(
+    sudo -u "$AGENT_USER" \
+      env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_APP_ENV" \
+      "$VENV_PY" "$TOKEN_HELPER_PY" mint --no-cache
+  )"
+  ATLAS_CURL_CONFIG="$ATLAS_TMP/github.curlrc"
+  install -o root -g root -m 0600 /dev/null "$ATLAS_CURL_CONFIG"
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$ATLAS_RELEASE_TOKEN"
+    printf 'header = "Accept: application/octet-stream"\n'
+  } >"$ATLAS_CURL_CONFIG"
+  unset ATLAS_RELEASE_TOKEN
+  curl -fsSL --retry 3 \
+    --config "$ATLAS_CURL_CONFIG" \
+    -o "$ATLAS_TMP/$ATLAS_ASSET" "$ATLAS_RELEASE_URL/$ATLAS_ASSET"
+  curl -fsSL --retry 3 \
+    --config "$ATLAS_CURL_CONFIG" \
+    -o "$ATLAS_TMP/SHA256SUMS" "$ATLAS_RELEASE_URL/SHA256SUMS"
+
+  ATLAS_EXPECTED_LINE="$(awk -v asset="$ATLAS_ASSET" \
+    '{ name=$2; sub(/^\*/, "", name) } name == asset { print; exit }' \
+    "$ATLAS_TMP/SHA256SUMS")"
+  [[ -n "$ATLAS_EXPECTED_LINE" ]] \
+    || { echo "FAIL: $ATLAS_ASSET not listed in SHA256SUMS for ${ATLAS_VERSION}" >&2; exit 1; }
+  ( cd "$ATLAS_TMP" && echo "$ATLAS_EXPECTED_LINE" | sha256sum -c --strict --status ) \
+    || { echo "FAIL: SHA256 mismatch for $ATLAS_ASSET (release ${ATLAS_VERSION})" >&2; exit 1; }
+
+  install -o root -g root -m 0755 "$ATLAS_TMP/$ATLAS_ASSET" "$ATLAS_BIN_DST"
+  rm -rf "$ATLAS_TMP"
+  trap - EXIT
+
+  ATLAS_KB_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.kb_repo 2>/dev/null || true)"
+  ATLAS_KB_REPO="${ATLAS_KB_REPO:-https://github.com/InverterNetwork/atlas-kb}"
+  [[ "$ATLAS_KB_REPO" =~ ^https://github\.com/[^/]+/[^/]+$ ]] \
+    || { echo "FAIL: atlas.kb_repo must be an https://github.com/<owner>/<repo> URL (got: $ATLAS_KB_REPO)" >&2; exit 1; }
+  ATLAS_KB_BRANCH="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.kb_branch 2>/dev/null || true)"
+  ATLAS_KB_BRANCH="${ATLAS_KB_BRANCH:-main}"
+  ATLAS_KB_ROOT="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.kb_root 2>/dev/null || true)"
+  if [[ -z "$ATLAS_KB_ROOT" ]]; then
+    ATLAS_KB_ROOT="$TARGET_DIR/atlas-kb"
+  elif [[ "$ATLAS_KB_ROOT" != /* ]]; then
+    ATLAS_KB_ROOT="$TARGET_DIR/$ATLAS_KB_ROOT"
+  fi
+  ATLAS_CODEX_BIN="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.codex_binary 2>/dev/null || true)"
+  ATLAS_CODEX_BIN="${ATLAS_CODEX_BIN:-/usr/local/bin/codex}"
+  ATLAS_CODEX_TIMEOUT_MS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.codex_timeout_ms 2>/dev/null || true)"
+  ATLAS_CODEX_TIMEOUT_MS="${ATLAS_CODEX_TIMEOUT_MS:-120000}"
+  ATLAS_AI_MODE="${ATLAS_AI_MODE:-codex-exec}"
+
+  if [[ -d "$ATLAS_KB_ROOT/.git" ]]; then
+    _check_clone_origin_or_die "Atlas KB" "$ATLAS_KB_ROOT" "$ATLAS_KB_REPO"
+    echo "==> Atlas KB already present at $ATLAS_KB_ROOT (preserving)"
+  else
+    echo "==> cloning Atlas KB from $ATLAS_KB_REPO into $ATLAS_KB_ROOT"
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$ATLAS_KB_ROOT"
+    sudo -u "$AGENT_USER" \
+      env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_APP_ENV" \
+      git -c "credential.https://github.com.helper=$ATLAS_GIT_CRED_HELPER" \
+        clone --quiet --branch "$ATLAS_KB_BRANCH" "$ATLAS_KB_REPO" "$ATLAS_KB_ROOT"
+  fi
+  configure_atlas_github_app_clone_auth "$ATLAS_KB_ROOT"
+  sudo -u "$AGENT_USER" git -C "$ATLAS_KB_ROOT" config user.name  "$GIT_IDENTITY_NAME"
+  sudo -u "$AGENT_USER" git -C "$ATLAS_KB_ROOT" config user.email "$GIT_IDENTITY_EMAIL"
+
+  ATLAS_WRAPPER_SRC="$FORK_DIR/ops/atlas-as-hermes"
+  if [[ -f "$ATLAS_WRAPPER_SRC" ]]; then
+    echo "==> installing /usr/local/bin/atlas-as-hermes wrapper"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        -e "s|__ATLAS_KB_ROOT__|$ATLAS_KB_ROOT|g" \
+        -e "s|__ATLAS_AI_MODE__|$ATLAS_AI_MODE|g" \
+        -e "s|__ATLAS_CODEX_BIN__|$ATLAS_CODEX_BIN|g" \
+        -e "s|__ATLAS_CODEX_TIMEOUT_MS__|$ATLAS_CODEX_TIMEOUT_MS|g" \
+        "$ATLAS_WRAPPER_SRC" \
+      | install -o root -g root -m 0755 /dev/stdin /usr/local/bin/atlas-as-hermes
+  else
+    echo "==> WARNING: $ATLAS_WRAPPER_SRC missing; skipping atlas-as-hermes wrapper" >&2
+  fi
+
+  ATLAS_PROFILE_SRC="$FORK_DIR/ops/profile.d/atlas-env.sh"
+  if [[ -f "$ATLAS_PROFILE_SRC" ]]; then
+    echo "==> installing /etc/profile.d/atlas-env.sh"
+    install -d -o root -g root -m 0755 /etc/profile.d
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        -e "s|__ATLAS_KB_ROOT__|$ATLAS_KB_ROOT|g" \
+        -e "s|__ATLAS_AI_MODE__|$ATLAS_AI_MODE|g" \
+        -e "s|__ATLAS_CODEX_BIN__|$ATLAS_CODEX_BIN|g" \
+        -e "s|__ATLAS_CODEX_TIMEOUT_MS__|$ATLAS_CODEX_TIMEOUT_MS|g" \
+        "$ATLAS_PROFILE_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/profile.d/atlas-env.sh
+  else
+    echo "==> WARNING: $ATLAS_PROFILE_SRC missing; skipping Atlas profile.d drop-in" >&2
+  fi
+fi
 
 # `quay/` is the data dir consumed by quay (sqlite, worktrees, repo bare
 # clones, logs); QUAY_DATA_DIR will point here from the systemd unit.
@@ -1968,6 +2201,21 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   [[ -x "$QUAY_BIN_DST" ]] \
     || { echo "FAIL: quay binary missing or non-executable at $QUAY_BIN_DST" >&2; exit 1; }
 fi
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
+  [[ -x /usr/local/bin/atlas ]] \
+    || { echo "FAIL: atlas binary missing or non-executable at /usr/local/bin/atlas" >&2; exit 1; }
+  [[ -x /usr/local/bin/atlas-as-hermes ]] \
+    || { echo "FAIL: atlas-as-hermes wrapper missing or non-executable at /usr/local/bin/atlas-as-hermes" >&2; exit 1; }
+  [[ -d "$ATLAS_KB_ROOT/.git" ]] \
+    || { echo "FAIL: Atlas KB clone missing .git at $ATLAS_KB_ROOT" >&2; exit 1; }
+  atlas_kb_owner="$(stat -c '%U' "$ATLAS_KB_ROOT/.git")"
+  [[ "$atlas_kb_owner" == "$AGENT_USER" ]] \
+    || { echo "FAIL: $ATLAS_KB_ROOT/.git owned by $atlas_kb_owner, expected $AGENT_USER" >&2; exit 1; }
+  atlas_helper="$(sudo -u "$AGENT_USER" git -C "$ATLAS_KB_ROOT" \
+    config credential.https://github.com.helper 2>/dev/null || true)"
+  [[ "$atlas_helper" == "$ATLAS_GIT_CRED_HELPER" ]] \
+    || { echo "FAIL: Atlas KB credential helper not configured (got: $atlas_helper)" >&2; exit 1; }
+fi
 
 # State assertions: the agent must own .git/ and the symlinks must resolve
 # into the clone, otherwise the auto-commit pipeline will silently fail later.
@@ -2009,6 +2257,18 @@ if [[ "$AUTH_METHOD" == "app" ]]; then
     fi
   else
     echo "==> --skip-auth-check: skipping live token mint smoke"
+  fi
+fi
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
+  if [[ "$SKIP_AUTH_CHECK" -eq 0 ]]; then
+    if ! sudo -u "$AGENT_USER" \
+          env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_APP_ENV" \
+          "$VENV_PY" "$TOKEN_HELPER_PY" check >/dev/null 2>&1; then
+      echo "FAIL: Atlas manager token helper check failed for $AGENT_USER" >&2
+      sudo -u "$AGENT_USER" env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_APP_ENV" \
+        "$VENV_PY" "$TOKEN_HELPER_PY" check >/dev/null || true
+      exit 1
+    fi
   fi
 fi
 

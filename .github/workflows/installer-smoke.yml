@@ -191,6 +191,11 @@ jobs:
           for entry in data.get("repos", []):
               if entry.get("id") in rewrite:
                   entry["url"] = f"file://{rewrite[entry['id']]}"
+          # The production values enable Atlas, which needs the Atlas manager
+          # GitHub App plus real release assets. This smoke job exercises the
+          # non-auth local-fixture installer path, so disable Atlas here and
+          # leave production deploy.values.yaml unchanged.
+          data.setdefault("atlas", {})["version"] = ""
           data["repos"].append({
               "id": "code-only-fixture",
               "url": f"file://{code_fixture}",

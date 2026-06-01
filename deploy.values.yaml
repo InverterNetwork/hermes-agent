@@ -782,6 +782,26 @@ quay:
     gate_quay_owned_done: true
     login: "app/didier-reviewer"
 
+atlas:
+  # Pinned Atlas CLI release tag. The installer downloads atlas-linux-<arch>
+  # from the release below, verifies it against SHA256SUMS, and installs it
+  # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
+  # exists, or to skip Atlas provisioning.
+  version: ""
+  release_repo: InverterNetwork/atlas
+  kb_repo: https://github.com/InverterNetwork/atlas-kb
+  kb_branch: main
+  # Empty means "$HERMES_HOME/atlas-kb". Keep non-secret paths/config here;
+  # App PEMs and Codex OAuth state are staged on the host.
+  kb_root: ""
+  ai:
+    mode: codex-exec
+    codex_binary: /usr/local/bin/codex
+    codex_timeout_ms: 120000
+  github_app:
+    id: "3925386"
+    installation_id: "137066070"
+
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the
 # skill. Threaded replies never re-trigger (require_top_level: true).

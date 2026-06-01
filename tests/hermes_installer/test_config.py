@@ -191,6 +191,39 @@ class TestRequiredCodexPin:
         }
         assert required_codex_pin(values) is not None
 
+    def test_atlas_codex_exec_triggers_pin_even_without_quay(self):
+        values = {
+            "atlas": {
+                "version": "v0.1.0",
+                "ai": {"mode": "codex-exec"},
+            },
+            "quay": {"codex": VALID_CODEX_PIN},
+        }
+        assert required_codex_pin(values) == CodexPin(
+            version=VALID_CODEX_PIN["version"],
+            linux_x64_sha256=VALID_CODEX_PIN["linux_x64_sha256"],
+        )
+
+    def test_atlas_without_version_does_not_trigger_pin(self):
+        values = {
+            "atlas": {
+                "version": "",
+                "ai": {"mode": "codex-exec"},
+            },
+            "quay": {"codex": VALID_CODEX_PIN},
+        }
+        assert required_codex_pin(values) is None
+
+    def test_atlas_api_mode_does_not_trigger_pin(self):
+        values = {
+            "atlas": {
+                "version": "v0.1.0",
+                "ai": {"mode": "api"},
+            },
+            "quay": {"codex": VALID_CODEX_PIN},
+        }
+        assert required_codex_pin(values) is None
+
     def test_unused_codex_invocation_does_not_trigger(self):
         values = _codex_values(worker="claude")
         assert required_codex_pin(values) is None

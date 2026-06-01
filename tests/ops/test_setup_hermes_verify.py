@@ -793,6 +793,207 @@ def _app_helper_cmd(install: dict) -> str:
     )
 
 
+ATLAS_VERSION = "v0.1.0"
+
+
+def _atlas_app_helper_cmd(install: dict) -> str:
+    target = install["target"]
+    env_file = target / "auth" / "atlas-manager.env"
+    return (
+        f"!HERMES_HOME='{target}' HERMES_GH_CONFIG='{env_file}' "
+        f"{install['rails'] / 'venv' / 'bin' / 'python'} "
+        f"{install['rails'] / 'installer' / 'hermes_github_token.py'} credential"
+    )
+
+
+def _write_atlas_stub(path: Path, version: str = ATLAS_VERSION) -> None:
+    semver = version.removeprefix("v")
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == "--version" ]]; then echo "{semver}"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+@pytest.fixture
+def atlas_install(install: dict) -> dict:
+    """Extend the base install fixture with Atlas artefacts and config."""
+    fork = install["fork"]
+    target = install["target"]
+    bin_dir = install["bin"]
+
+    (fork / "installer").mkdir(exist_ok=True)
+    repo_helper_src = REPO_ROOT / "installer" / "values_helper.py"
+    fork_helper = fork / "installer" / "values_helper.py"
+    if not fork_helper.exists():
+        os.symlink(repo_helper_src, fork_helper)
+
+    (fork / "deploy.values.yaml").write_text(
+        "org:\n"
+        "  name: Test\n"
+        "  agent_identity_name: didier\n"
+        "slack:\n"
+        "  app:\n"
+        "    display_name: t\n"
+        "    description: t\n"
+        "    background_color: \"#000\"\n"
+        "  runtime:\n"
+        "    allowed_channels: []\n"
+        "    home_channel: \"\"\n"
+        "    require_mention: true\n"
+        "    channel_prompts: {}\n"
+        "repos: []\n"
+        "atlas:\n"
+        f"  version: \"{ATLAS_VERSION}\"\n"
+        "  release_repo: InverterNetwork/atlas\n"
+        "  kb_repo: https://github.com/InverterNetwork/atlas-kb\n"
+        "  kb_branch: main\n"
+        "  kb_root: \"\"\n"
+        "  ai:\n"
+        "    mode: api\n"
+        "  github_app:\n"
+        "    id: \"3925386\"\n"
+        "    installation_id: \"137066070\"\n",
+        encoding="utf-8",
+    )
+
+    auth = target / "auth"
+    auth.mkdir(mode=0o750, exist_ok=True)
+    auth.chmod(0o750)
+    (auth / "github-app.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+    )
+    (auth / "github-app.pem").chmod(0o640)
+    (auth / "github-app.env").write_text("HERMES_GH_APP_ID=1\n")
+    (auth / "github-app.env").chmod(0o640)
+    (auth / "atlas-manager.pem").write_text(
+        "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n"
+    )
+    (auth / "atlas-manager.pem").chmod(0o640)
+    (auth / "atlas-manager.env").write_text(
+        "HERMES_GH_APP_ID=3925386\n"
+        "HERMES_GH_INSTALLATION_ID=137066070\n"
+        f"HERMES_GH_APP_KEY={auth / 'atlas-manager.pem'}\n"
+        f"HERMES_GH_TOKEN_CACHE={target / 'cache' / 'atlas-manager-token-cache.json'}\n",
+        encoding="utf-8",
+    )
+    (auth / "atlas-manager.env").chmod(0o640)
+
+    _git(install["state"], "config",
+         "credential.https://github.com.helper", _app_helper_cmd(install))
+
+    atlas_bin = bin_dir / "atlas"
+    _write_atlas_stub(atlas_bin)
+    atlas_wrapper = bin_dir / "atlas-as-hermes"
+    atlas_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n")
+    atlas_wrapper.chmod(0o755)
+    atlas_profile = bin_dir / "atlas-env.sh"
+    atlas_profile.write_text("# stub\n")
+    atlas_profile.chmod(0o644)
+
+    kb_root = target / "atlas-kb"
+    subprocess.run(["git", "clone", "--quiet", str(fork), str(kb_root)], check=True)
+    _git(kb_root, "remote", "set-url", "origin", "https://github.com/InverterNetwork/atlas-kb")
+    _git(kb_root, "config", "user.email", "didier@test")
+    _git(kb_root, "config", "user.name", "didier")
+    _git(kb_root, "config", "credential.https://github.com.helper", _atlas_app_helper_cmd(install))
+    _git(kb_root, "config", "--replace-all",
+         "url.https://github.com/.insteadOf", "git@github.com:")
+    _git(kb_root, "config", "--add",
+         "url.https://github.com/.insteadOf", "ssh://git@github.com/")
+
+    _write_curl_status_stub(bin_dir / "curl")
+
+    install["values_file"] = fork / "deploy.values.yaml"
+    install["atlas_bin"] = atlas_bin
+    install["atlas_wrapper"] = atlas_wrapper
+    install["atlas_profile"] = atlas_profile
+    install["atlas_kb_root"] = kb_root
+    return install
+
+
+def _atlas_env(install: dict) -> dict[str, str]:
+    return {
+        "HERMES_VERIFY_ATLAS_BIN": str(install["atlas_bin"]),
+        "HERMES_VERIFY_ATLAS_WRAPPER": str(install["atlas_wrapper"]),
+        "HERMES_VERIFY_ATLAS_PROFILE": str(install["atlas_profile"]),
+    }
+
+
+def _run_verify_atlas(
+    install: dict,
+    *,
+    auth_method: str = "app",
+    env_overrides: dict[str, str] | None = None,
+) -> SimpleNamespace:
+    overrides = _atlas_env(install)
+    if env_overrides:
+        overrides.update(env_overrides)
+    return _run_verify(
+        install,
+        auth_method=auth_method,
+        values=install["values_file"],
+        env_overrides=overrides,
+    )
+
+
+class TestAtlasVerify:
+    def test_clean_atlas_install_passes(self, atlas_install):
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 0, result.stderr
+        assert "[OK] atlas binary:" in result.stdout
+        assert "[OK] atlas binary version:" in result.stdout
+        assert "[OK] atlas-as-hermes wrapper:" in result.stdout
+        assert "[OK] atlas profile.d drop-in:" in result.stdout
+        assert "[OK] Atlas KB ownership:" in result.stdout
+        assert "[OK] Atlas KB credential helper configured" in result.stdout
+        assert "[OK] Atlas manager token helper check passes" in result.stdout
+        assert "[OK] Atlas manager App scope InverterNetwork/atlas: HTTP 200" in result.stdout
+        assert "[OK] Atlas manager App scope InverterNetwork/atlas-kb: HTTP 200" in result.stdout
+        assert "[DRIFT]" not in result.stderr
+
+    def test_missing_atlas_binary_is_drift(self, atlas_install):
+        atlas_install["atlas_bin"].unlink()
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] atlas binary" in result.stderr
+
+    def test_missing_atlas_kb_helper_is_drift(self, atlas_install):
+        _git(atlas_install["atlas_kb_root"], "config", "--unset", "credential.https://github.com.helper")
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas KB GitHub App credential helper" in result.stderr
+        assert "[DRIFT] Atlas KB credential helper" in result.stderr
+
+    def test_atlas_requires_app_auth_method(self, atlas_install):
+        result = _run_verify_atlas(atlas_install, auth_method="none")
+
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas auth method" in result.stderr
+
+    def test_atlas_repo_scope_failure_is_drift(self, atlas_install):
+        curl = atlas_install["bin"] / "curl"
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            "args=\"$*\"\n"
+            "cat >/dev/null || true\n"
+            "if [[ \"$args\" == *\"/repos/InverterNetwork/atlas-kb\"* ]]; then printf '404'; exit 0; fi\n"
+            "printf '200'\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas manager App scope InverterNetwork/atlas-kb" in result.stderr
+
+
 @pytest.fixture
 def quay_install(install: dict) -> dict:
     """Extend the base install fixture with quay artefacts on disk + a values
