@@ -1151,7 +1151,6 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     echo "FAIL: atlas.release_repo must be a GitHub owner/repo slug (got: $ATLAS_RELEASE_REPO)" >&2
     exit 1
   fi
-  ATLAS_RELEASE_URL="https://github.com/${ATLAS_RELEASE_REPO}/releases/download/${ATLAS_VERSION}"
   ATLAS_ASSET="atlas-linux-${ATLAS_ARCH}"
   ATLAS_BIN_DST="/usr/local/bin/atlas"
 
@@ -1163,19 +1162,15 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
       env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_APP_ENV" \
       "$VENV_PY" "$TOKEN_HELPER_PY" mint --no-cache
   )"
-  ATLAS_CURL_CONFIG="$ATLAS_TMP/github.curlrc"
-  install -o root -g root -m 0600 /dev/null "$ATLAS_CURL_CONFIG"
-  {
-    printf 'header = "Authorization: Bearer %s"\n' "$ATLAS_RELEASE_TOKEN"
-    printf 'header = "Accept: application/octet-stream"\n'
-  } >"$ATLAS_CURL_CONFIG"
+  # Atlas releases may live in a private repository. Browser-style
+  # /releases/download URLs return 404 for GitHub App installation tokens, so
+  # fetch through gh's authenticated release API path instead.
+  env GH_TOKEN="$ATLAS_RELEASE_TOKEN" gh release download "$ATLAS_VERSION" \
+    --repo "$ATLAS_RELEASE_REPO" \
+    --pattern "$ATLAS_ASSET" \
+    --pattern SHA256SUMS \
+    --dir "$ATLAS_TMP"
   unset ATLAS_RELEASE_TOKEN
-  curl -fsSL --retry 3 \
-    --config "$ATLAS_CURL_CONFIG" \
-    -o "$ATLAS_TMP/$ATLAS_ASSET" "$ATLAS_RELEASE_URL/$ATLAS_ASSET"
-  curl -fsSL --retry 3 \
-    --config "$ATLAS_CURL_CONFIG" \
-    -o "$ATLAS_TMP/SHA256SUMS" "$ATLAS_RELEASE_URL/SHA256SUMS"
 
   ATLAS_EXPECTED_LINE="$(awk -v asset="$ATLAS_ASSET" \
     '{ name=$2; sub(/^\*/, "", name) } name == asset { print; exit }' \

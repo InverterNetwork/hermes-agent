@@ -273,6 +273,17 @@ def test_installer_uses_configured_quay_release_repo():
     assert "quay.release_repo must be a GitHub owner/repo slug" in content
 
 
+def test_atlas_release_download_uses_authenticated_gh_path():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "get atlas.release_repo" in content
+    assert "ATLAS_RELEASE_REPO" in content
+    assert "gh release download \"$ATLAS_VERSION\"" in content
+    assert "--repo \"$ATLAS_RELEASE_REPO\"" in content
+    assert "GH_TOKEN=\"$ATLAS_RELEASE_TOKEN\"" in content
+    assert "github.com/${ATLAS_RELEASE_REPO}/releases/download" not in content
+
+
 def test_quay_tick_service_carries_reviewer_token_minting_env():
     service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
     runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")
