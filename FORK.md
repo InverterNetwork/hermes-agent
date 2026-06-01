@@ -7,7 +7,7 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 - Upstream source — at repo root (unchanged from upstream so `git merge upstream/main` is a clean fast-forward).
 - `SOUL.md` — customized persona file overlaid on top of upstream.
 - `hooks/` — overlay slot for deployment-specific hooks (currently empty).
-- `deploy.values.yaml` — single source of truth for org-specific values (identity, Slack manifest fields, runtime allowlist, quay deployment knobs). See [Re-forking for another org](#re-forking-for-another-org).
+- `deploy.values.yaml` — single source of truth for org-specific values (identity, Slack manifest fields, runtime allowlist, Quay deployment knobs, Atlas deployment knobs). See [Re-forking for another org](#re-forking-for-another-org).
 - `installer/` — `setup-hermes.sh`, the values helper, and the Slack manifest template.
 - `ops/` — launchd plists / systemd units, sync scripts (filled by the auto-commit and upstream-sync workstreams).
 
@@ -16,7 +16,7 @@ This repo is a fork of [`nousresearch/hermes-agent`](https://github.com/nousrese
 Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instantiate this fork for a different org:
 
 1. Fork this repo (or clone + push to a new origin).
-2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `gateway.*` (LLM provider pin and optional approval mode), `auth.github_app.*` (numeric IDs only — the PEM stays out-of-band), `linear.teams.*` (team UUIDs exposed as `LINEAR_TEAM_<KEY>`), `repos[]` (every entry produces a code mirror; entries with a `quay:` sub-block are additionally registered with quay), `quay.*` (set `quay.release_repo` to the public org-owned Quay release repo and `quay.version` to a published `v*` tag to enable quay provisioning, or leave `quay.version` empty to skip the quay binary + data dir entirely). Tokens never go here; they're staged at install time.
+2. Edit `deploy.values.yaml` end-to-end — `org.*`, `slack.app.*`, `slack.runtime.*`, `gateway.*` (LLM provider pin and optional approval mode), `auth.github_app.*` (numeric IDs only — the PEM stays out-of-band), `linear.teams.*` (team UUIDs exposed as `LINEAR_TEAM_<KEY>`), `repos[]` (every entry produces a code mirror; entries with a `quay:` sub-block are additionally registered with quay), `quay.*` (set `quay.release_repo` to the public org-owned Quay release repo and `quay.version` to a published `v*` tag to enable quay provisioning, or leave `quay.version` empty to skip the quay binary + data dir entirely), and `atlas.*` (set `atlas.version` to a published Atlas release tag to enable Atlas provisioning, or leave it empty until the release exists). Tokens never go here; they're staged at install time.
 3. Run `installer/setup-hermes.sh` on the target host. The installer:
    - reads `deploy.values.yaml` (override the path with `--values <file>` if needed),
    - renders `installer/slack-manifest.json.tmpl` to `<HERMES_HOME>/slack-manifest.json` for paste-install into Slack's manifest UI,
@@ -25,6 +25,7 @@ Everything org-specific in this fork lives in `deploy.values.yaml`. To re-instan
    - rewrites `<HERMES_HOME>/auth/gateway-runtime.env` from `slack.runtime.allowed_users`, `slack.runtime.allowed_channels`, `slack.runtime.home_channel`, `gateway.allow_all_users`, and `linear.teams.*` on every run (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `SLACK_HOME_CHANNEL`, `GATEWAY_ALLOW_ALL_USERS`, `LINEAR_TEAM_<KEY>` — non-secret, version-controlled, no operator re-typing on rotations),
    - renders `<HERMES_HOME>/gateway-org-defaults.md` from `repos[]` + `linear.teams` (compact org-defaults seed the gateway loads into its cached system prompt — code-mirror location + per-repo Linear team mapping; reflects values.yaml, rewritten every run),
    - regenerates `<HERMES_HOME>/auth/github-app.env` from `auth.github_app.*` on every `--auth-method app` run; CLI flags (`--app-id`, `--app-installation-id`) stay as per-run overrides,
+   - when `atlas.version` is set, installs the pinned Atlas release binary, stages the Atlas manager GitHub App auth from `--atlas-app-key-path`, clones/configures the Atlas knowledge base checkout, and installs the `atlas-as-hermes` wrapper plus shell profile defaults,
    - when the pinned Quay binary supports `quay serve`, generates and preserves `<HERMES_HOME>/auth/quay.env`'s `QUAY_ADMIN_TOKEN`, renders admin auth config, and installs `quay-serve.service` bound to `127.0.0.1:9731`,
    - configures `git user.name` on agent commits to `org.agent_identity_name`.
 4. Stage all runtime secrets with `stage-secrets.sh` (interactive — writes `<HERMES_HOME>/auth/slack.env`, `auth/hermes.env`, `auth/ops.env` and `auth/ops-prod.env` (only if any ops-skill creds are entered), and `auth/quay.env` in one pass). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, plus `LINEAR_API_KEY` when `quay.version` is set. `QUAY_ADMIN_TOKEN` is generated server-side and preserved; `ANTHROPIC_API_KEY` is an optional quay-side prompt, skipped on Linear-only deployments. The ops-skill prompts (`AWS_*` / `AWS_PROD_*` / `NEW_RELIC_API_KEY`) are all optional and unlock the `aws-lambda-debug{,-prod}`, `dynamodb-query{,-prod}`, and `new-relic-lambda` skills when staged. Re-runs preserve unchanged values; identical content skips service restarts.
@@ -91,6 +92,44 @@ Every run with `--auth-method app` ends with a live mint call (`hermes_github_to
 
 Key rotation: re-run with `--app-key-path <new-path>` to overwrite the staged PEM. The token cache at `$TARGET/cache/github-token.json` self-refreshes within 5 minutes of expiry; delete it to force-refresh sooner.
 
+### Atlas integration
+
+Atlas is installed like Quay: a pinned release artifact is downloaded by the installer, verified, and exposed through a stable binary path. Keep `atlas.version` empty until the matching GitHub release exists. To enable it, publish an Atlas release containing `atlas-linux-amd64`, `atlas-linux-arm64`, and `SHA256SUMS`, then set `atlas.version` to that tag in `deploy.values.yaml`.
+
+Atlas uses a separate GitHub App from the main Hermes worker App. Set the non-secret App identifiers under `atlas.github_app.*` in `deploy.values.yaml`, stage the private key on the host, and pass it on the first Atlas-enabled install:
+
+```sh
+sudo ./installer/setup-hermes.sh \
+  --fork  /srv/hermes/repos/hermes-agent \
+  --state-url https://github.com/InverterNetwork/hermes-state.git \
+  --user  hermes \
+  --auth-method app \
+  --app-key-path /root/<hermes-app>.pem \
+  --atlas-app-key-path /root/<atlas-manager>.pem
+```
+
+The installer copies the Atlas manager key into `$TARGET/auth/atlas-manager.pem`, renders `$TARGET/auth/atlas-manager.env`, and uses that identity for both Atlas release downloads and the Atlas knowledge-base checkout. The default knowledge-base path is `$TARGET/atlas-kb`; override it with `atlas.kb_root` only if the deployment needs a non-default location.
+
+For `atlas.ai.mode: codex-exec`, the Hermes user must also have a working Codex subscription login on the host. Run the Codex login as the Hermes user, not as root:
+
+```sh
+sudo -u hermes -H codex login
+```
+
+Smoke checks after an Atlas-enabled install:
+
+```sh
+/usr/local/bin/atlas --version
+/usr/local/bin/atlas-as-hermes --version
+bash installer/setup-hermes.sh --verify \
+  --fork /srv/hermes/repos/hermes-agent \
+  --target /home/hermes/.hermes \
+  --user hermes \
+  --auth-method app
+```
+
+Rollback is values-driven: set `atlas.version` back to the previous published tag and re-run the installer. Setting it to an empty string skips Atlas provisioning on future runs, but it does not delete an already installed binary or knowledge-base checkout.
+
 ### Render-target layout
 
 Under `$TARGET` (default: `~hermes/.hermes/`):
@@ -101,6 +140,7 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `SOUL.md`, `RUNTIME_VERSION` | `root:root` | 644 | rails overlay |
 | `hooks/` | `root:root` | 755 | rails overlay slot |
 | `state/` | `hermes:hermes` | 755 | clone of `hermes-state`; `.git/` agent-owned |
+| `atlas-kb/` | `hermes:hermes` | 755 | Atlas knowledge-base checkout. Only provisioned when `atlas.version` is set; default path can be overridden by `atlas.kb_root`. |
 | `skills`, `memories`, `cron` | `hermes:hermes` (symlink) | — | resolve to `state/<name>` |
 | `sessions/`, `logs/`, `cache/` | `hermes:hermes` | 755 | local-only (gitignored content) |
 | `code/` | `hermes:hermes` | 755 | code mirrors root. One subdir per `repos[]` entry, each a working-tree clone refreshed by `hermes-code-sync` (5-min cadence). Read by the gateway when answering codebase questions in Slack. |
@@ -108,6 +148,8 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `auth/` | `root:hermes` | 750 | Staged secrets (`slack.env`, `hermes.env`, `ops.env`, `ops-prod.env`, `quay.env`) and values-derived runtime config. `quay.env` includes the generated `QUAY_ADMIN_TOKEN` for the localhost Admin UI/API. Always present (created on every install). |
 | `auth/github-app.pem` | `root:hermes` | 640 | GitHub App private key (read-only to agent). Only with `--auth-method app`. |
 | `auth/github-app.env` | `root:hermes` | 640 | App ID, installation ID, key path. Regenerated from `auth.github_app.*` on every run. |
+| `auth/atlas-manager.pem` | `root:hermes` | 640 | Atlas manager GitHub App private key. Only staged when `atlas.version` is set and `--atlas-app-key-path` is provided or already persisted. |
+| `auth/atlas-manager.env` | `root:hermes` | 640 | Atlas manager App ID, installation ID, key path, and token cache path. Regenerated from `atlas.github_app.*` on Atlas-enabled runs. |
 | `auth/gateway-runtime.env` | `root:hermes` | 640 | Non-secret env vars from `deploy.values.yaml` (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `SLACK_HOME_CHANNEL`, `GATEWAY_ALLOW_ALL_USERS`, `LINEAR_TEAM_<KEY>`, …). Rewritten every run; do not hand-edit. |
 | `gateway-org-defaults.md` | `root:hermes` | 640 | Compact deployment-defaults seed loaded by the gateway agent into its cached system prompt: code-mirror location + per-repo Linear team mapping (`issue_tracker.linear.team` on each `repos[]` entry). Rendered from `deploy.values.yaml` on every run; do not hand-edit. |
 

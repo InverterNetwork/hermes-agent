@@ -62,6 +62,9 @@ class _State:
     quay_wrapper: str
     quay_runner: str
     quay_profile: str
+    atlas_bin: str
+    atlas_wrapper: str
+    atlas_profile: str
     runtime_dir: str
     systemd_dir: str
     reviewer_env: str
@@ -69,6 +72,8 @@ class _State:
     values_file: Path
     values_helper: Path
     quay_version: str
+    atlas_version: str
+    atlas_ai_mode: str
     agent_invocation: str
     codex_required: bool = False
     quay_tags_supported: bool = False
@@ -1002,6 +1007,209 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
             continue
         _check_mode_owner(s, label, rt_info, "755", s.rails_owner)
         _check_version_pin(s, f"{label} version", rt_path, rt_pin)
+
+
+def _atlas_kb_root(s: _State) -> Path:
+    raw = _values_get(s.values_file, s.values_helper, "atlas.kb_root")
+    if not raw:
+        return s.args.target / "atlas-kb"
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return s.args.target / path
+
+
+def _atlas_expected_credential_helper(s: _State) -> str:
+    target = s.args.target
+    rails = target / "hermes-agent"
+    env_file = target / "auth" / "atlas-manager.env"
+    venv_py = rails / "venv" / "bin" / "python"
+    helper_py = rails / "installer" / "hermes_github_token.py"
+    return (
+        f"!HERMES_HOME='{target}' HERMES_GH_CONFIG='{env_file}' "
+        f"{venv_py} {helper_py} credential"
+    )
+
+
+def _check_atlas_version_pin(s: _State, atlas_bin: Path) -> None:
+    actual = _first_stdout_line([str(atlas_bin), "--version"])
+    pin = s.atlas_version
+    normalized_pin = pin[1:] if pin.startswith("v") else pin
+    if actual and (pin in actual or normalized_pin in actual):
+        s.v_ok(f"atlas binary version: {actual}")
+    else:
+        expected = f"{pin} / {normalized_pin}" if pin != normalized_pin else pin
+        s.v_drift(
+            "atlas binary version",
+            f"got '{actual or '?'}' (expected to contain '{expected}')",
+        )
+
+
+def _github_repo_slug_from_url(url: str) -> str | None:
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", url)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def _atlas_required_repo_slugs(s: _State) -> list[str]:
+    slugs: list[str] = []
+
+    release_repo = _values_get(s.values_file, s.values_helper, "atlas.release_repo")
+    release_repo = release_repo or "InverterNetwork/atlas"
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", release_repo):
+        slugs.append(release_repo)
+
+    kb_repo = _values_get(s.values_file, s.values_helper, "atlas.kb_repo")
+    kb_repo = kb_repo or "https://github.com/InverterNetwork/atlas-kb"
+    kb_slug = _github_repo_slug_from_url(kb_repo)
+    if kb_slug:
+        slugs.append(kb_slug)
+
+    deduped: list[str] = []
+    for slug in slugs:
+        if slug not in deduped:
+            deduped.append(slug)
+    return deduped
+
+
+def _check_atlas_manager_token(s: _State) -> None:
+    """Atlas uses its own GitHub App identity. Verify must prove that the
+    staged App env/key can mint a token without falling back to the generic
+    Hermes worker App."""
+    target = s.args.target
+    rails = target / "hermes-agent"
+    helper_py = rails / "installer" / "hermes_github_token.py"
+    venv_py = rails / "venv" / "bin" / "python"
+    env_file = target / "auth" / "atlas-manager.env"
+    key_file = target / "auth" / "atlas-manager.pem"
+
+    _check_mode_owner(
+        s, "auth file atlas-manager.env", _stat_info(env_file),
+        "640", s.rails_owner, s.agent_group,
+    )
+    _check_mode_owner(
+        s, "auth file atlas-manager.pem", _stat_info(key_file),
+        "640", s.rails_owner, s.agent_group,
+    )
+
+    if not env_file.is_file() or not key_file.is_file():
+        return
+    if not helper_py.is_file():
+        s.v_drift("Atlas manager token helper", f"missing helper at {helper_py}")
+        return
+    if not (venv_py.exists() and os.access(venv_py, os.X_OK)):
+        s.v_drift("Atlas manager token helper", f"missing venv python at {venv_py}")
+        return
+
+    rc, mint_out, _ = _run([
+        *_sudo_prefix_for(s.agent_owner),
+        "env",
+        "-u", "HERMES_GH_APP_ID",
+        "-u", "HERMES_GH_INSTALLATION_ID",
+        "-u", "HERMES_GH_APP_KEY",
+        "-u", "HERMES_GH_API",
+        "-u", "HERMES_GH_TOKEN_CACHE",
+        "-u", "HERMES_GH_TOKEN_OVERRIDE",
+        f"HERMES_HOME={target}",
+        f"HERMES_GH_CONFIG={env_file}",
+        str(venv_py),
+        str(helper_py),
+        "mint",
+        "--no-cache",
+    ])
+    token = mint_out.strip() if rc == 0 else ""
+    if token:
+        s.v_ok("Atlas manager token helper check passes")
+    else:
+        s.v_drift("Atlas manager token helper check", "mint failed")
+        return
+
+    gh_api_base = s.args.gh_api_base or "https://api.github.com"
+    required_slugs = _atlas_required_repo_slugs(s)
+    if not required_slugs:
+        s.v_drift(
+            "Atlas manager App scope",
+            "could not derive atlas.release_repo or atlas.kb_repo repo slugs",
+        )
+        return
+    for slug in required_slugs:
+        api_url = f"{gh_api_base}/repos/{slug}"
+        http_code = _gh_api_http_code(token, api_url)
+        if http_code == "200":
+            s.v_ok(f"Atlas manager App scope {slug}: HTTP 200")
+        else:
+            s.v_drift(
+                f"Atlas manager App scope {slug}",
+                f"{api_url} returned HTTP {http_code}",
+            )
+
+
+def _check_atlas_artefacts(s: _State, *, app_auth_expected: bool) -> None:
+    if not app_auth_expected:
+        s.v_drift(
+            "Atlas auth method",
+            "atlas.version is set, so verify must run with --auth-method app",
+        )
+
+    atlas_bin = Path(s.atlas_bin)
+    atlas_bin_info = _executable_info(atlas_bin)
+    if atlas_bin_info is None:
+        s.v_drift("atlas binary", f"missing or non-executable: {atlas_bin}")
+    else:
+        _check_mode_owner(s, "atlas binary", atlas_bin_info, "755", s.rails_owner)
+        _check_atlas_version_pin(s, atlas_bin)
+
+    atlas_wrapper = Path(s.atlas_wrapper)
+    wrapper_info = _executable_info(atlas_wrapper)
+    if wrapper_info is None:
+        s.v_drift(
+            "atlas-as-hermes wrapper",
+            f"missing or non-executable: {atlas_wrapper}",
+        )
+    else:
+        _check_mode_owner(s, "atlas-as-hermes wrapper", wrapper_info, "755", s.rails_owner)
+
+    atlas_profile = Path(s.atlas_profile)
+    if not atlas_profile.is_file():
+        s.v_drift("atlas profile.d drop-in", f"missing: {atlas_profile}")
+    else:
+        _check_mode_owner(
+            s, "atlas profile.d drop-in", _stat_info(atlas_profile),
+            "644", s.rails_owner,
+        )
+
+    kb_root = _atlas_kb_root(s)
+    kb_repo = _values_get(s.values_file, s.values_helper, "atlas.kb_repo")
+    kb_repo = kb_repo or "https://github.com/InverterNetwork/atlas-kb"
+    if not (kb_root / ".git").is_dir():
+        s.v_drift("Atlas KB clone", f"missing .git at {kb_root}")
+    else:
+        _v_check_clone_basics(s, "Atlas KB", kb_root, kb_repo, s.agent_owner)
+        _v_check_github_app_clone_auth(
+            s, "Atlas KB", kb_root, required=app_auth_expected,
+        )
+        helper = _git_config_get(kb_root, "credential.https://github.com.helper")
+        expected_helper = _atlas_expected_credential_helper(s)
+        if helper == expected_helper:
+            s.v_ok("Atlas KB credential helper configured")
+        else:
+            s.v_drift(
+                "Atlas KB credential helper",
+                f"got '{helper or '?'}' (expected Atlas manager helper)",
+            )
+        user_name = _git_config_get(kb_root, "user.name")
+        user_email = _git_config_get(kb_root, "user.email")
+        if user_name:
+            s.v_ok(f"Atlas KB git user.name: {user_name}")
+        else:
+            s.v_drift("Atlas KB git user.name", "missing")
+        if user_email:
+            s.v_ok(f"Atlas KB git user.email: {user_email}")
+        else:
+            s.v_drift("Atlas KB git user.email", "missing")
+
+    _check_atlas_manager_token(s)
 
 
 def _check_codex_prereqs(s: _State) -> None:
@@ -1949,6 +2157,8 @@ def run(
         os.environ.get("VALUES_HELPER") or (args.fork / "installer" / "values_helper.py")
     )
     quay_version = ""
+    atlas_version = ""
+    atlas_ai_mode = ""
     agent_invocation = ""
     codex_required = False
     if values_file.is_file() and values_helper.is_file():
@@ -1964,6 +2174,12 @@ def run(
                     values_file, values_helper, "quay.agent_invocation",
                 )
             codex_required = "codex" in agent_invocation
+        atlas_version = _values_get(values_file, values_helper, "atlas.version")
+        if atlas_version:
+            atlas_ai_mode = _values_get(values_file, values_helper, "atlas.ai.mode")
+            atlas_ai_mode = atlas_ai_mode or "codex-exec"
+            if atlas_ai_mode == "codex-exec":
+                codex_required = True
 
     quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
 
@@ -2006,6 +2222,9 @@ def run(
         quay_wrapper=os.environ.get("HERMES_VERIFY_QUAY_WRAPPER") or "/usr/local/bin/quay-as-hermes",
         quay_runner=os.environ.get("HERMES_VERIFY_QUAY_RUNNER") or "/usr/local/sbin/quay-tick-runner",
         quay_profile=os.environ.get("HERMES_VERIFY_QUAY_PROFILE") or "/etc/profile.d/quay-data-dir.sh",
+        atlas_bin=os.environ.get("HERMES_VERIFY_ATLAS_BIN") or "/usr/local/bin/atlas",
+        atlas_wrapper=os.environ.get("HERMES_VERIFY_ATLAS_WRAPPER") or "/usr/local/bin/atlas-as-hermes",
+        atlas_profile=os.environ.get("HERMES_VERIFY_ATLAS_PROFILE") or "/etc/profile.d/atlas-env.sh",
         runtime_dir=os.environ.get("HERMES_VERIFY_RUNTIME_DIR") or "/usr/local/bin",
         systemd_dir=os.environ.get("HERMES_VERIFY_SYSTEMD_DIR") or "/etc/systemd/system",
         reviewer_env=os.environ.get("HERMES_VERIFY_REVIEWER_ENV") or "/etc/hermes/reviewer.env",
@@ -2013,6 +2232,8 @@ def run(
         values_file=values_file,
         values_helper=values_helper,
         quay_version=quay_version,
+        atlas_version=atlas_version,
+        atlas_ai_mode=atlas_ai_mode,
         agent_invocation=agent_invocation,
         codex_required=codex_required,
         quay_tags_supported=quay_tags_supported,
@@ -2054,6 +2275,8 @@ def run(
         _check_quay_github_app_gitconfig(s, required=app_auth_expected)
         if _quay_supports_reference_repos(quay_version):
             _check_quay_reference_repos(s, repos_tsv)
+    if atlas_version:
+        _check_atlas_artefacts(s, app_auth_expected=app_auth_expected)
     if s.codex_required:
         _check_codex_prereqs(s)
     _check_per_entry_repos(s, repos_tsv, app_auth_expected=app_auth_expected)
