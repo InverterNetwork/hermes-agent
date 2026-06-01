@@ -549,6 +549,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Cache for _fetch_thread_context results: cache_key → _ThreadContextCache
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         self._THREAD_CACHE_TTL = 60.0
+        # Threads whose parent attachment context has already been injected
+        # into an active session. This repairs sessions created before
+        # attachment-aware backfill without adding large parent docs every turn.
+        self._thread_parent_attachment_context_injected: set[str] = set()
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
         # Track active assistant thread status indicators so stop_typing can
@@ -2841,13 +2845,17 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        has_active_thread_session = False
+        if is_thread_reply:
+            has_active_thread_session = self._has_active_session_for_thread(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                user_id=user_id,
+            )
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
-            channel_id=channel_id,
-            thread_ts=event_thread_ts,
-            user_id=user_id,
-        ):
+        if is_thread_reply and not has_active_thread_session:
             thread_context = await self._fetch_thread_context(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
@@ -2856,6 +2864,30 @@ class SlackAdapter(BasePlatformAdapter):
             )
             if thread_context:
                 text = thread_context + text
+                self._thread_parent_attachment_context_injected.add(
+                    f"{channel_id}:{event_thread_ts}:{team_id}"
+                )
+
+        if is_thread_reply and has_active_thread_session:
+            attachment_context_key = f"{channel_id}:{event_thread_ts}:{team_id}"
+            if attachment_context_key not in self._thread_parent_attachment_context_injected:
+                parent_attachment_context = (
+                    await self._fetch_thread_parent_attachment_context(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        team_id=team_id,
+                    )
+                )
+                if parent_attachment_context:
+                    text = (
+                        "[Thread parent attachment context]\n"
+                        f"{parent_attachment_context}\n"
+                        "[End of thread parent attachment context]\n\n"
+                        f"{text}"
+                    )
+                    self._thread_parent_attachment_context_injected.add(
+                        attachment_context_key
+                    )
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -3481,6 +3513,45 @@ class SlackAdapter(BasePlatformAdapter):
             parts.append(non_inline_notes)
 
         return "\n\n".join(part for part in parts if part)
+
+    async def _fetch_thread_parent_attachment_context(
+        self, channel_id: str, thread_ts: str, team_id: str = "",
+    ) -> str:
+        """Return attachment context for the thread parent only.
+
+        Used for already-active sessions whose initial thread context was
+        captured before parent files were included in Slack backfill.
+        """
+        try:
+            client = self._get_client(channel_id)
+            result = await client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=1,
+                inclusive=True,
+            )
+            messages = result.get("messages", []) if result else []
+            if not messages:
+                return ""
+
+            parent = None
+            for msg in messages:
+                if msg.get("ts") == thread_ts:
+                    parent = msg
+                    break
+            parent = parent or messages[0]
+            return await self._format_thread_context_attachments(
+                parent,
+                channel_id=channel_id,
+                team_id=team_id,
+                is_parent=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Failed to fetch thread parent attachment context: %s",
+                exc,
+            )
+            return ""
 
     def _format_thread_context_media_notes(
         self,
