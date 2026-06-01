@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# atlas-as-hermes — sanctioned operator path for ad-hoc Atlas invocations.
+#
+# Atlas writes into the configured knowledge-base git checkout. Direct
+# operator calls often inherit an unreadable cwd or miss ATLAS_KB_ROOT /
+# Codex settings, so this wrapper always runs as the Hermes agent user,
+# pins Atlas to the config-as-code KB root, and executes from that repo.
+#
+# __AGENT_USER__ and __TARGET_DIR__ are substituted by setup-hermes.sh.
+
+AGENT_BODY='
+set -eu
+export HERMES_HOME=__TARGET_DIR__
+export ATLAS_KB_ROOT="${ATLAS_KB_ROOT:-__ATLAS_KB_ROOT__}"
+export ATLAS_AI_MODE="${ATLAS_AI_MODE:-__ATLAS_AI_MODE__}"
+export ATLAS_CODEX_BIN="${ATLAS_CODEX_BIN:-__ATLAS_CODEX_BIN__}"
+export ATLAS_CODEX_TIMEOUT_MS="${ATLAS_CODEX_TIMEOUT_MS:-__ATLAS_CODEX_TIMEOUT_MS__}"
+export ATLAS_SESSION_ID="${ATLAS_SESSION_ID:-hermes-agent}"
+cd "$ATLAS_KB_ROOT"
+exec /usr/local/bin/atlas "$@"
+'
+
+if [ "$(id -un)" = "__AGENT_USER__" ]; then
+  exec sh -c "$AGENT_BODY" -- "$@"
+else
+  exec sudo -u __AGENT_USER__ \
+       env HERMES_HOME=__TARGET_DIR__ \
+           "ATLAS_KB_ROOT=${ATLAS_KB_ROOT:-__ATLAS_KB_ROOT__}" \
+           "ATLAS_AI_MODE=${ATLAS_AI_MODE:-__ATLAS_AI_MODE__}" \
+           "ATLAS_CODEX_BIN=${ATLAS_CODEX_BIN:-__ATLAS_CODEX_BIN__}" \
+           "ATLAS_CODEX_TIMEOUT_MS=${ATLAS_CODEX_TIMEOUT_MS:-__ATLAS_CODEX_TIMEOUT_MS__}" \
+           "ATLAS_SESSION_ID=${ATLAS_SESSION_ID:-hermes-agent}" \
+       sh -c "$AGENT_BODY" -- "$@"
+fi

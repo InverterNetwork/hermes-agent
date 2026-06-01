@@ -4,7 +4,8 @@
 returns the matching ``quay.runtime_managers.<name>`` pins, failing loud
 with an actionable diagnostic when a declared manager has no pin block.
 ``required_codex_pin`` does the same for the Codex CLI, but only when the
-active quay agent invocation path references the ``codex`` binary.
+active quay agent invocation path references the ``codex`` binary or Atlas is
+enabled in ``codex-exec`` mode.
 """
 
 from __future__ import annotations
@@ -109,14 +110,16 @@ def required_runtime_managers(values: dict[str, Any]) -> dict[str, RuntimeManage
 
 
 def required_codex_pin(values: dict[str, Any]) -> CodexPin | None:
-    """Return the Codex CLI pin when the active quay agent path uses Codex.
+    """Return the Codex CLI pin when a configured tool path uses Codex.
 
     The legacy ``quay.agent_invocation`` field remains a valid trigger for
     old config. When the newer ``quay.agents`` block is present, only the
     selected worker/reviewer invocation entries are active; an unused
-    ``invocations.codex`` table should not force a Codex install.
+    ``invocations.codex`` table should not force a Codex install. Atlas also
+    requires Codex when ``atlas.version`` is non-empty and
+    ``atlas.ai.mode == codex-exec``.
     """
-    if not _codex_invocation_active(values):
+    if not (_codex_invocation_active(values) or _atlas_codex_active(values)):
         return None
 
     quay_block = values.get("quay") or {}
@@ -172,6 +175,19 @@ def _codex_invocation_active(values: dict[str, Any]) -> bool:
             active_cmds.append(legacy)
 
     return any(_command_references_binary(cmd, "codex") for cmd in active_cmds)
+
+
+def _atlas_codex_active(values: dict[str, Any]) -> bool:
+    atlas = values.get("atlas") or {}
+    if not isinstance(atlas, dict):
+        return False
+    version = atlas.get("version")
+    if not isinstance(version, str) or not version:
+        return False
+    ai = atlas.get("ai") or {}
+    if not isinstance(ai, dict):
+        return False
+    return ai.get("mode") == "codex-exec"
 
 
 def _command_references_binary(command: str, binary: str) -> bool:
