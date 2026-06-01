@@ -472,6 +472,58 @@ class TestSlackThreadContext:
         assert "DO NOT INCLUDE THIS" not in context
 
     @pytest.mark.asyncio
+    async def test_fetch_thread_context_includes_parent_markdown_attachment(self, tmp_path):
+        """Thread backfill must include opener file content, not just text."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        owner_guide = b"# Coordinating emUSD\n\nEach workstream has one owner."
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "user": "U1",
+                    "text": "please read this",
+                    "files": [
+                        {
+                            "mimetype": "text/markdown",
+                            "name": "OWNER-GUIDE.md",
+                            "url_private_download": "https://files.slack.com/OWNER-GUIDE.md",
+                            "size": len(owner_guide),
+                        }
+                    ],
+                },
+                {
+                    "ts": "1000.1",
+                    "user": "U2",
+                    "text": "<@U_BOT> can you read the doc? yes/no answer",
+                },
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Ataberk", "U2": "Fabian"}
+
+        cached_doc = tmp_path / "OWNER-GUIDE.md"
+        with patch.object(
+            adapter,
+            "_download_slack_file_bytes",
+            new_callable=AsyncMock,
+        ) as download, patch(
+            "gateway.platforms.slack.cache_document_from_bytes",
+            return_value=str(cached_doc),
+        ):
+            download.return_value = owner_guide
+            context = await adapter._fetch_thread_context(
+                channel_id="C1",
+                thread_ts="1000.0",
+                current_ts="1000.1",
+                team_id="T1",
+            )
+
+        assert "[thread parent] Ataberk: please read this" in context
+        assert "[Content of OWNER-GUIDE.md]" in context
+        assert "# Coordinating emUSD" in context
+        assert "can you read the doc" not in context
+
+    @pytest.mark.asyncio
     async def test_fetch_thread_parent_text_from_cache(self):
         """_fetch_thread_parent_text should reuse the thread-context cache
         when it is warm, avoiding an extra conversations.replies call."""

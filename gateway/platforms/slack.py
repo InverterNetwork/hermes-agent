@@ -3385,12 +3385,26 @@ class SlackAdapter(BasePlatformAdapter):
                     continue
 
                 msg_text = msg.get("text", "").strip()
-                if not msg_text:
-                    continue
 
                 # Strip bot mentions from context messages
                 if bot_uid:
                     msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+
+                attachment_text = await self._format_thread_context_attachments(
+                    msg,
+                    channel_id=channel_id,
+                    team_id=team_id,
+                    is_parent=is_parent,
+                )
+                if attachment_text:
+                    msg_text = (
+                        f"{msg_text}\n\n{attachment_text}".strip()
+                        if msg_text
+                        else attachment_text
+                    )
+
+                if not msg_text:
+                    continue
 
                 prefix = "[thread parent] " if is_parent else ""
                 display_user = msg_user or "unknown"
@@ -3421,6 +3435,105 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to fetch thread context: %s", e)
             return ""
+
+    async def _format_thread_context_attachments(
+        self,
+        msg: dict,
+        *,
+        channel_id: str,
+        team_id: str,
+        is_parent: bool,
+    ) -> str:
+        """Return agent-visible attachment context for a fetched thread message."""
+        if not (msg.get("files") or self._extract_gif_payloads_from_event(msg)):
+            return ""
+
+        try:
+            media_urls, media_types, attachment_notices, inline_text = (
+                await self._extract_slack_media(
+                    msg,
+                    channel_id=channel_id,
+                    team_id=team_id,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[Slack] Failed to extract thread attachment context: %s", exc)
+            return ""
+
+        parts: list[str] = []
+        if inline_text:
+            parts.append(inline_text)
+
+        if attachment_notices:
+            label = "thread parent" if is_parent else "thread message"
+            parts.append(
+                f"[Slack attachment notice on {label}]\n"
+                + "\n".join(f"- {notice}" for notice in attachment_notices)
+            )
+
+        non_inline_notes = self._format_thread_context_media_notes(
+            msg,
+            media_urls,
+            media_types,
+            has_inline_text=bool(inline_text),
+        )
+        if non_inline_notes:
+            parts.append(non_inline_notes)
+
+        return "\n\n".join(part for part in parts if part)
+
+    def _format_thread_context_media_notes(
+        self,
+        msg: dict,
+        media_urls: list[str],
+        media_types: list[str],
+        *,
+        has_inline_text: bool,
+    ) -> str:
+        """Describe cached non-inline thread attachments with agent-visible paths."""
+        if not media_urls:
+            return ""
+
+        from tools.credential_files import to_agent_visible_cache_path
+
+        files = msg.get("files") or []
+        file_names = []
+        inline_file_indexes: set[int] = set()
+        text_inline_extensions = {
+            ".md", ".txt", ".csv", ".log", ".json", ".xml",
+            ".yaml", ".yml", ".toml", ".ini", ".cfg",
+        }
+        for file_idx, file_obj in enumerate(files):
+            name = str(file_obj.get("name") or file_obj.get("title") or "attachment")
+            file_names.append(re.sub(r'[^\w.\- ]', '_', name))
+            ext = os.path.splitext(name)[1].lower()
+            size = file_obj.get("size", 0)
+            if ext in text_inline_extensions and size and size <= 100 * 1024:
+                inline_file_indexes.add(file_idx)
+
+        notes: list[str] = []
+        for idx, media_path in enumerate(media_urls):
+            mtype = media_types[idx] if idx < len(media_types) else ""
+            if has_inline_text and idx in inline_file_indexes:
+                continue
+
+            display_name = (
+                file_names[idx] if idx < len(file_names) else os.path.basename(media_path)
+            )
+            agent_path = to_agent_visible_cache_path(media_path)
+            if mtype.startswith("image/"):
+                kind = "image attachment"
+            elif mtype.startswith("audio/"):
+                kind = "audio attachment"
+            elif mtype.startswith(("application/", "text/")):
+                kind = "document attachment"
+            else:
+                kind = "attachment"
+            notes.append(
+                f"[Thread {kind}: '{display_name}' is saved at: {agent_path}]"
+            )
+
+        return "\n".join(notes)
 
     async def _fetch_thread_parent_text(
         self, channel_id: str, thread_ts: str, team_id: str = "",
