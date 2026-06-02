@@ -2236,10 +2236,10 @@ class TestThreadReplyHandling:
         adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_thread_reply_without_mention_with_session_processed(
+    async def test_thread_reply_without_mention_with_session_ignored_by_default(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Thread replies without mention should be processed if there's an active session."""
+        """Thread replies without mention stay silent even if there's an active session."""
         # Simulate an active session for this thread
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
@@ -2254,11 +2254,7 @@ class TestThreadReplyHandling:
             "team": "T_TEAM",
         }
         await adapter_with_session_store._handle_slack_message(event)
-        adapter_with_session_store.handle_message.assert_called_once()
-
-        # Verify the text is passed through unchanged (no mention stripping needed)
-        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        assert msg_event.text == "Follow-up question"
+        adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_thread_reply_with_mention_strips_bot_id(
@@ -2354,15 +2350,10 @@ class TestThreadReplyHandling:
         return a
 
     @pytest.mark.asyncio
-    async def test_trigger_bound_thread_reply_with_session_falls_through_to_discussion(
+    async def test_trigger_bound_thread_reply_with_session_requires_mention(
         self, trigger_adapter_with_session_store, mock_session_store
     ):
-        """Trigger-bound channel replies must not be swallowed by the router.
-
-        The top-level trigger should still reject thread replies so the entry
-        skill does not re-fire, but those replies are the human discussion path
-        for blocker handoffs and must continue through normal session routing.
-        """
+        """Trigger-bound channel replies also need an explicit mention."""
         session_key = "agent:main:slack:group:C0FEEDBACK:1700000000.000050"
         mock_session_store._entries = {session_key: MagicMock()}
 
@@ -2378,11 +2369,7 @@ class TestThreadReplyHandling:
 
         await trigger_adapter_with_session_store._handle_slack_message(event)
 
-        trigger_adapter_with_session_store.handle_message.assert_awaited_once()
-        msg_event = trigger_adapter_with_session_store.handle_message.await_args.args[0]
-        assert msg_event.text == "Can you clarify the failure mode?"
-        assert msg_event.source.thread_id == "1700000000.000050"
-        assert msg_event.reply_to_message_id == "1700000000.000050"
+        trigger_adapter_with_session_store.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_trigger_bound_thread_reply_without_session_stays_ignored(

@@ -2770,15 +2770,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         if not is_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
-            allowed_channels = self._slack_allowed_channels()
-            if allowed_channels and channel_id not in allowed_channels:
+            if self._channel_blocked_by_allowlist(channel_id, is_dm):
                 logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
                 return
 
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
-            elif not self._slack_require_mention():
-                pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
                 if not (
                     is_thread_reply
@@ -2789,7 +2786,9 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 ):
-                    return  # Strict mode: ignore until @-mentioned again
+                    return  # Mention-only mode: ignore until @-mentioned again
+            elif not self._slack_require_mention():
+                pass  # Mention requirement disabled globally for Slack
             elif not is_mentioned:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
@@ -3944,26 +3943,24 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_strict_mention(self) -> bool:
         """When true, channel threads require an explicit @-mention on every
         message. Disables all auto-triggers (mentioned-thread memory,
-        bot-message follow-up, session-presence). Defaults to False.
+        bot-message follow-up, session-presence). Defaults to True.
         """
         configured = self.config.extra.get("strict_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
+                return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return os.getenv("SLACK_STRICT_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
     def _slack_response_policy(self) -> str:
         """Return the Slack channel response policy.
 
-        ``mention_to_wake_quiet_thread`` is the cost/noise-conscious default:
-        an explicit mention starts a channel thread, then unmentioned thread
-        replies are processed when they look like asks, status changes,
-        failures, completions, or pending clarification answers. Low-value
-        chatter is still suppressed. ``thread_followup`` keeps the historical
-        behavior where any reply in an engaged thread wakes the agent. Use
-        ``slack.strict_mention`` for the separate "mention on every channel
-        message" mode.
+        When ``slack.strict_mention`` is disabled, the response policy decides
+        which unmentioned thread replies can wake Hermes. The default
+        ``mention_to_wake_quiet_thread`` processes only asks, task-state
+        updates, failures, completions, or pending clarification answers.
+        ``thread_followup`` keeps the historical behavior where any reply in
+        an engaged thread wakes the agent.
         """
         configured = self.config.extra.get("response_policy")
         if configured is None:
