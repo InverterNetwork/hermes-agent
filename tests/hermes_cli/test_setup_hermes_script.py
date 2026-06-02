@@ -139,25 +139,23 @@ def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
     ).returncode == 1
 
 
-def test_installer_renders_quay_config_with_force_on_every_run():
-    """Boundary guard: setup-hermes.sh must call render-quay-config with
-    --force for the Hermes-owned launch/auth/context keys. Quay behavior
-    fields must not be added to that renderer just because they live under
-    deploy.values.yaml's transitional quay: block.
+def test_installer_creates_quay_config_once_then_preserves_it():
+    """Boundary guard: setup-hermes.sh bootstraps quay/config.toml only when
+    missing. Once present, Quay owns the whole file and installer reruns must
+    not re-render selected runtime blocks or force-overwrite operator/Quay
+    changes.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    # Allow any whitespace/line-continuations between the subcommand and the
-    # --force flag, but require they appear in the same invocation block.
-    pattern = r'render-quay-config[^\n]*--out[^\n]*"[^\n]*"\s*(?:\\\s*\n\s*)?--force'
-    assert re.search(pattern, content), (
-        "installer must invoke `render-quay-config --out … --force` so the "
-        "Hermes-owned Quay boundary is reconciled from deploy.values.yaml"
-    )
+    assert 'if [[ ! -e "$QUAY_CONFIG_OUT" ]]; then' in content
+    assert 'echo "==> preserving existing $QUAY_CONFIG_OUT"' in content
     assert '--reference-repos-root "$TARGET_DIR/code"' in content
-    assert "Hermes-owned launch/auth/context boundary" in content
-    # Belt-and-suspenders: the old preserve branch printed this exact phrase.
-    # Its presence would mean the gate snuck back in.
-    assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
+    block = re.search(
+        r'render-quay-config --out "\$QUAY_CONFIG_OUT"(?P<body>.*?)\n    chown ',
+        content,
+        re.S,
+    )
+    assert block is not None
+    assert "--force" not in block.group("body")
 
 
 def test_installer_reconciles_existing_quay_repo_metadata():
@@ -203,16 +201,20 @@ def test_installer_translates_legacy_orchestrator_env_keys():
         )
 
 
-def test_installer_provisions_claude_cli_from_active_invocations():
+def test_installer_provisions_agent_clis_for_quay():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    assert "active-agent-invocations" in content
-    assert 'if [[ "$agent_invocations" == *claude* ]]; then' in content
+    assert "active-agent-invocations" not in content
     assert (
         "sudo -u \"$AGENT_USER\" -H bash -c "
         "'curl -fsSL https://claude.ai/install.sh | bash'"
     ) in content
     assert 'CLAUDE_AGENT_BIN="$AGENT_HOME/.local/bin/claude"' in content
     assert 'ln -sf "$CLAUDE_AGENT_BIN" /usr/local/bin/claude' in content
+    assert (
+        'ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER" --required'
+        in content
+    )
+    assert 'if [[ "$QUAY_ENABLED" -eq 1 ]]; then' in content
     assert "quay.agent_invocation references 'claude'" not in content
 
 

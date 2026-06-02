@@ -77,7 +77,6 @@ class _State:
     quay_version: str
     atlas_version: str
     atlas_ai_mode: str
-    agent_invocation: str
     codex_required: bool = False
     quay_tags_supported: bool = False
     quay_serve_supported: bool = False
@@ -1278,11 +1277,14 @@ def _check_codex_prereqs(s: _State) -> None:
         return
     s.v_ok(f"codex binary: {(out.splitlines() or [''])[0] or '?'}")
 
-    try:
-        agent_home = Path(pwd.getpwnam(s.agent_owner).pw_dir)
-    except KeyError:
-        s.v_drift("codex auth dir", f"agent user not found: {s.agent_owner}")
-        return
+    if os.environ.get("HERMES_VERIFY_AGENT_HOME"):
+        agent_home = _agent_home(s)
+    else:
+        try:
+            agent_home = Path(pwd.getpwnam(s.agent_owner).pw_dir)
+        except KeyError:
+            s.v_drift("codex auth dir", f"agent user not found: {s.agent_owner}")
+            return
     codex_dir = agent_home / ".codex"
     info = _stat_info(codex_dir)
     if info is None:
@@ -1452,7 +1454,7 @@ def _values_get_namespaces(
 ) -> tuple[dict | None, str | None]:
     """Run ``values_helper.py …`` and extract a normalised ``namespaces``
     dict. ``args`` is the subcommand and any positional flags
-    (``"get-repo-tags", repo_id`` / ``"get-deployment-tags"``)."""
+    (currently ``"get-repo-tags", repo_id``)."""
     rc, out, errs = _values_helper_run(
         s.values_helper, *args, values_file=s.values_file,
     )
@@ -1530,33 +1532,6 @@ def _check_repo_tag_vocab(s: _State, repo_id: str) -> None:
         # Subsequent lines under the same drift subject — surface them so the
         # operator can read the full picture without re-running the helpers.
         # Each extra line counts as part of the same drift, not a new one.
-        print(f"        {extra}", file=s.err, flush=True)
-
-
-def _check_deployment_tag_vocab(s: _State) -> None:
-    """Drift check for deployment tag vocab. Gated on quay.version being
-    set AND the binary supporting the `tags` noun (matches the
-    install-time capability probe in setup-hermes.sh — otherwise
-    `tags get-deployment` exits non-zero and would surface as
-    spurious drift on a perfectly valid pre-tag-vocab install)."""
-    if not s.quay_version or not s.quay_tags_supported:
-        return
-    label = "quay deployment tag vocab"
-    live, live_err = _quay_get_namespaces(s, "tags", "get-deployment")
-    desired, desired_err = _values_get_namespaces(s, "get-deployment-tags")
-    if live_err is not None:
-        s.v_drift(label, live_err)
-        return
-    if desired_err is not None:
-        s.v_drift(label, desired_err)
-        return
-    assert live is not None and desired is not None
-    if live == desired:
-        s.v_ok(label)
-        return
-    diffs = _diff_namespaces(live, desired)
-    s.v_drift(label, diffs[0] if diffs else "shapes differ")
-    for extra in diffs[1:]:
         print(f"        {extra}", file=s.err, flush=True)
 
 
@@ -2396,21 +2371,11 @@ def run(
     quay_version = ""
     atlas_version = ""
     atlas_ai_mode = ""
-    agent_invocation = ""
     codex_required = False
     if values_file.is_file() and values_helper.is_file():
         quay_version = _values_get(values_file, values_helper, "quay.version")
         if quay_version:
-            rc, active_out, _ = _values_helper_run(
-                values_helper, "active-agent-invocations", values_file=values_file,
-            )
-            if rc == 0:
-                agent_invocation = active_out
-            else:
-                agent_invocation = _values_get(
-                    values_file, values_helper, "quay.agent_invocation",
-                )
-            codex_required = "codex" in agent_invocation
+            codex_required = True
         atlas_version = _values_get(values_file, values_helper, "atlas.version")
         if atlas_version:
             atlas_ai_mode = _values_get(values_file, values_helper, "atlas.ai.mode")
@@ -2423,7 +2388,7 @@ def run(
     # Capability probe — mirrors the install-time gate in setup-hermes.sh.
     # `quay tags --help` returns 0 only when the tag-vocab noun is
     # registered; older quay binaries return non-zero,
-    # and the tag-vocab drift checks would otherwise fire spurious
+    # and the per-repo tag-vocab drift checks would otherwise fire spurious
     # "could not read live state" lines on a perfectly valid pre-tag-vocab
     # install. Only probes when quay is enabled and the binary exists.
     quay_tags_supported = False
@@ -2473,7 +2438,6 @@ def run(
         quay_version=quay_version,
         atlas_version=atlas_version,
         atlas_ai_mode=atlas_ai_mode,
-        agent_invocation=agent_invocation,
         codex_required=codex_required,
         quay_tags_supported=quay_tags_supported,
         quay_serve_supported=quay_serve_supported,
@@ -2519,7 +2483,6 @@ def run(
     if s.codex_required:
         _check_codex_prereqs(s)
     _check_per_entry_repos(s, repos_tsv, app_auth_expected=app_auth_expected)
-    _check_deployment_tag_vocab(s)
     _check_systemd(s)
     if quay_version:
         if s.quay_serve_supported:

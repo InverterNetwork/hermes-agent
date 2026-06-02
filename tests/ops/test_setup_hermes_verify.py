@@ -46,6 +46,31 @@ if str(INSTALLER_DIR) not in sys.path:
 from hermes_installer.verify import VerifyArgs, run as run_verify  # noqa: E402
 
 
+def _minimal_quay_values(path: Path) -> None:
+    path.write_text(
+        "quay:\n"
+        "  version: \"v0.3.34\"\n"
+        "  adapters:\n"
+        "    slack:\n"
+        "      enabled: false\n",
+        encoding="utf-8",
+    )
+
+
+def _run_values_helper(
+    values: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "installer" / "values_helper.py"),
+         "--values", str(values), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         list(args), cwd=cwd, check=check, capture_output=True, text=True,
@@ -54,6 +79,70 @@ def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 def _git(repo: Path, *args: str, **kw) -> subprocess.CompletedProcess:
     return _run(repo, "git", "-C", str(repo), *args, **kw)
+
+
+def test_render_quay_config_without_runtime_settings_uses_quay_defaults(tmp_path: Path):
+    values = tmp_path / "values.yaml"
+    out = tmp_path / "quay" / "config.toml"
+    code_root = tmp_path / "code"
+    _minimal_quay_values(values)
+
+    result = _run_values_helper(
+        values,
+        "render-quay-config",
+        "--out", str(out),
+        "--enable-admin-auth",
+        "--reference-repos-root", str(code_root),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rendered = out.read_text(encoding="utf-8")
+    assert "[admin]" in rendered
+    assert "[context]" in rendered
+    assert "agent_invocation" not in rendered
+    assert "[agents]" not in rendered
+    assert "[agents.invocations" not in rendered
+    assert "[reviewer]" not in rendered
+
+
+def test_render_quay_config_preserves_existing_file_without_force(tmp_path: Path):
+    values = tmp_path / "values.yaml"
+    out = tmp_path / "quay" / "config.toml"
+    code_root = tmp_path / "code"
+    _minimal_quay_values(values)
+    out.parent.mkdir()
+    existing = (
+        'agent_invocation = "legacy < {prompt_file}"\n'
+        "\n"
+        "[agents]\n"
+        'worker = "codex"\n'
+        'reviewer = "codex"\n'
+        'reviewer_model = "gpt-5.4"\n'
+        "\n"
+        "[agents.invocations.codex]\n"
+        'worker = "codex exec --model gpt-5.4 < {prompt_file}"\n'
+        'reviewer = "codex exec --model gpt-5.4 < {prompt_file}"\n'
+        "\n"
+        "[reviewer]\n"
+        "enabled = true\n"
+        'login = "app/didier-reviewer"\n'
+    )
+    out.write_text(
+        existing,
+        encoding="utf-8",
+    )
+
+    result = _run_values_helper(
+        values,
+        "render-quay-config",
+        "--out", str(out),
+        "--enable-admin-auth",
+        "--reference-repos-root", str(code_root),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "preserved" in result.stdout
+    assert out.read_text(encoding="utf-8") == existing
 
 
 @pytest.fixture
@@ -1259,6 +1348,24 @@ def quay_install(install: dict) -> dict:
     )
     bun_stub.chmod(0o755)
 
+    codex_stub = bin_dir / "codex"
+    codex_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "--version" ]]; then echo "codex-cli 0.133.0"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    codex_stub.chmod(0o755)
+
+    agent_home = install["tmp"] / "agent-home"
+    agent_home.mkdir(exist_ok=True)
+    codex_dir = agent_home / ".codex"
+    codex_dir.mkdir(mode=0o700, exist_ok=True)
+    codex_dir.chmod(0o700)
+    (codex_dir / "auth.json").write_text(
+        '{"tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}\n',
+        encoding="utf-8",
+    )
+
     _write_curl_status_stub(bin_dir / "curl")
 
     install["values_file"] = fork / "deploy.values.yaml"
@@ -1273,6 +1380,8 @@ def quay_install(install: dict) -> dict:
     install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
     install["bun_bin"] = bun_stub
+    install["codex_bin"] = codex_stub
+    install["agent_home"] = agent_home
     install["systemd_dir"] = systemd_dir
     return install
 
@@ -1342,8 +1451,8 @@ def _configure_quay_app_auth(
         _git(repo, "config", "--add",
              "url.https://github.com/.insteadOf", "ssh://git@github.com/")
 
-    agent_home = install["tmp"] / "agent-home"
-    agent_home.mkdir()
+    agent_home = install.get("agent_home") or install["tmp"] / "agent-home"
+    agent_home.mkdir(exist_ok=True)
     if include_gitconfig:
         include_file = auth / "quay-github-app.gitconfig"
         rewrite_lines = ""
@@ -1376,7 +1485,7 @@ def _configure_quay_app_auth(
 
 
 def _quay_env(install: dict) -> dict[str, str]:
-    return {
+    env = {
         "HERMES_VERIFY_QUAY_BIN": str(install["quay_bin"]),
         "HERMES_VERIFY_QUAY_WRAPPER": str(install["quay_wrapper"]),
         "HERMES_VERIFY_QUAY_RUNNER": str(install["quay_runner"]),
@@ -1384,6 +1493,9 @@ def _quay_env(install: dict) -> dict[str, str]:
         "HERMES_VERIFY_RUNTIME_DIR": str(install["bin"]),
         "HERMES_VERIFY_SYSTEMD_DIR": str(install["systemd_dir"]),
     }
+    if install.get("agent_home"):
+        env["HERMES_VERIFY_AGENT_HOME"] = str(install["agent_home"])
+    return env
 
 
 def _run_verify_quay(
@@ -1638,6 +1750,32 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay_via_wrapper(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "[OK] quay binary:" in result.stdout
+
+    def test_verify_codex_required_for_quay_install(self, quay_install):
+        # Quay-enabled hosts provision the standard local agent CLI set.
+        # Verify should therefore check Codex even when deploy values no longer
+        # own agent runtime settings.
+        (quay_install["quay_dir"] / "config.toml").write_text(
+            'agent_invocation = "codex exec < {prompt_file}"\n'
+            "\n"
+            "[admin]\n"
+            "require_auth = true\n"
+            'token_env = "QUAY_ADMIN_TOKEN"\n'
+            'forwarded_identity_header = "X-Hermes-User-Id"\n'
+            "\n"
+            "[context]\n"
+            f'reference_repos_root = "{quay_install["target"] / "code"}"\n'
+            "\n",
+            encoding="utf-8",
+        )
+        codex = quay_install["bin"] / "codex"
+        codex.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
+        codex.chmod(0o755)
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] codex binary" in result.stderr
 
     def test_pre_ast136_quay_pin_skips_reference_repo_check(self, quay_install):
         values = quay_install["values_file"]
@@ -1899,12 +2037,13 @@ class TestSetupHermesVerifyQuay:
 
 
 class TestSetupHermesVerifyTagVocab:
-    """Drift detection for `repos[].quay.tags` and `quay.tag_namespaces`.
+    """Drift detection for `repos[].quay.tags`.
 
     The strict-reconciliation contract is the load-bearing piece: values
-    is the source of truth, anything in quay not in values is drift.
-    Each test starts from `quay_install` (clean install, no tag vocab on
-    either side) and pokes one side of the comparison."""
+    is the source of truth for per-repo vocab, anything in quay not in
+    values is drift. Each test starts from `quay_install` (clean install,
+    no per-repo tag vocab on either side) and pokes one side of the
+    comparison."""
 
     def _patch_repo_tags(self, install: dict, body: str) -> None:
         """Insert ``body`` (already 6-space indented) into the repo's
@@ -1916,24 +2055,13 @@ class TestSetupHermesVerifyTagVocab:
         assert anchor in text, "fixture shape changed; update _patch_repo_tags anchor"
         install["values_file"].write_text(text.replace(anchor, anchor + body))
 
-    def _patch_deployment_tags(self, install: dict, body: str) -> None:
-        """Insert ``body`` (already 2-space indented) into the top-level
-        `quay:` block. Anchored on the `version:` line for the same
-        reason as `_patch_repo_tags`."""
-        anchor_re = re.compile(r"^  version: \"v[0-9.]+\"\n", re.MULTILINE)
-        text = install["values_file"].read_text()
-        new, n = anchor_re.subn(lambda m: m.group(0) + body, text, count=1)
-        assert n == 1, "fixture shape changed; update _patch_deployment_tags anchor"
-        install["values_file"].write_text(new)
-
     def test_clean_install_no_tag_vocab_is_ok(self, quay_install):
-        # Baseline: with no tags configured anywhere, both checks must
-        # pass — empty live state matches empty desired state.
+        # Baseline: with no repo tags configured anywhere, the per-repo
+        # check must pass — empty live state matches empty desired state.
         result = _run_verify_quay(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         repo_id = quay_install["quay_repo_id"]
         assert f"[OK] quay repo {repo_id} tag vocab" in result.stdout
-        assert "[OK] quay deployment tag vocab" in result.stdout
 
     def test_per_repo_drift_add_in_values_surfaces(self, quay_install):
         # values.yaml gains a tag namespace; live quay still empty → drift.
@@ -2027,92 +2155,6 @@ class TestSetupHermesVerifyTagVocab:
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert f"[OK] quay repo {repo_id} tag vocab" in result.stdout
 
-    def test_deployment_drift_add_in_values_surfaces(self, quay_install):
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    risk:\n"
-            "      values: [pii]\n",
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 1
-        assert "[DRIFT] quay deployment tag vocab" in result.stderr
-
-    def test_deployment_drift_remove_from_values_surfaces(self, quay_install):
-        repo_id = quay_install["quay_repo_id"]
-        _write_live_quay_stub(
-            quay_install,
-            QUAY_VERSION,
-            [repo_id],
-            deployment_tags={
-                "namespaces": {
-                    "tasktype": {
-                        "values": ["bugfix"],
-                        "required": True,
-                    },
-                },
-            },
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 1
-        assert "[DRIFT] quay deployment tag vocab" in result.stderr
-
-    def test_deployment_required_flag_drift_surfaces(self, quay_install):
-        # Same values, same namespace; only the `required` flag differs.
-        # Strict reconciliation must catch this — `required: true` vs
-        # `false` is the difference between every ticket needing a
-        # tasktype tag and none needing one.
-        repo_id = quay_install["quay_repo_id"]
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    tasktype:\n"
-            "      required: true\n"
-            "      values: [bugfix]\n",
-        )
-        _write_live_quay_stub(
-            quay_install,
-            QUAY_VERSION,
-            [repo_id],
-            deployment_tags={
-                "namespaces": {
-                    "tasktype": {
-                        "values": ["bugfix"],
-                        "required": False,
-                    },
-                },
-            },
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 1
-        assert "[DRIFT] quay deployment tag vocab" in result.stderr
-
-    def test_deployment_match_is_ok(self, quay_install):
-        repo_id = quay_install["quay_repo_id"]
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    tasktype:\n"
-            "      required: true\n"
-            "      values: [bugfix, refactor]\n",
-        )
-        _write_live_quay_stub(
-            quay_install,
-            QUAY_VERSION,
-            [repo_id],
-            deployment_tags={
-                "namespaces": {
-                    "tasktype": {
-                        "values": ["bugfix", "refactor"],
-                        "required": True,
-                    },
-                },
-            },
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 0, result.stderr + "\n" + result.stdout
-        assert "[OK] quay deployment tag vocab" in result.stdout
-
     def test_unregistered_repo_skips_tag_vocab_check(self, quay_install):
         # `quay repo get-tags` on an unregistered id exits with
         # `unknown_repo`; running the tag-vocab check there would surface
@@ -2125,25 +2167,19 @@ class TestSetupHermesVerifyTagVocab:
         assert "not registered" in result.stderr
         assert f"quay repo {repo_id} tag vocab" not in result.stderr
 
-    def test_pre_ast87_binary_skips_both_tag_vocab_checks(self, quay_install):
+    def test_pre_ast87_binary_skips_tag_vocab_check(self, quay_install):
         # A quay binary without the `tags` noun must skip both
-        # per-repo and deployment tag-vocab drift checks; otherwise a
-        # fork with quay.version still pinned at a pre-tag-vocab
-        # release would surface spurious drift on every verify run.
-        # Even WITH non-empty tag vocab in values, the check must skip
-        # — the install-time path also skips, so checking here would
-        # just amplify the same upgrade-not-yet-taken signal.
+        # per-repo tag-vocab drift checks; otherwise a fork with
+        # quay.version still pinned at a pre-tag-vocab release would
+        # surface spurious drift on every verify run. Even WITH
+        # non-empty tag vocab in values, the check must skip — the
+        # install-time path also skips, so checking here would just
+        # amplify the same upgrade-not-yet-taken signal.
         repo_id = quay_install["quay_repo_id"]
         self._patch_repo_tags(
             quay_install,
             "      tags:\n"
             "        area: [bonding-curve]\n",
-        )
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    risk:\n"
-            "      values: [pii]\n",
         )
         _write_live_quay_stub(
             quay_install, QUAY_VERSION, [repo_id],
