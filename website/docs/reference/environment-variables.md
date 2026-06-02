@@ -260,8 +260,8 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `SLACK_BOT_TOKEN` | Slack bot token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | Slack app-level token (`xapp-...`, required for Socket Mode) |
 | `SLACK_ALLOWED_USERS` | Comma-separated Slack user IDs |
-| `SLACK_RESPONSE_POLICY` | Channel response policy: `mention_to_wake_quiet_thread` (default) or `thread_followup` |
-| `SLACK_STRICT_MENTION` | Require an explicit `@mention` on every Slack channel message (default: `false`) |
+| `SLACK_RESPONSE_POLICY` | Channel response policy: `mention_to_wake_quiet_thread` (default) or `thread_followup`. Use `thread_followup` to preserve legacy engaged-thread replies without a fresh mention. |
+| `SLACK_STRICT_MENTION` | Require an explicit `@mention` on every Slack channel thread reply. Defaults to `true` unless `SLACK_RESPONSE_POLICY=thread_followup`; set `false` to allow legacy actionable thread follow-ups. |
 | `SLACK_HOME_CHANNEL` | Default Slack channel for cron delivery |
 | `SLACK_HOME_CHANNEL_NAME` | Display name for the Slack home channel |
 | `WHATSAPP_ENABLED` | Enable the WhatsApp bridge (`true`/`false`) |
