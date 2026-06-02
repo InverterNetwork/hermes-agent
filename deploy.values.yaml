@@ -400,14 +400,14 @@ gateway:
   # Default model used by scheduled/background jobs that do not carry their
   # own model pin. Without this, openai-codex cron turns reach the provider
   # with an empty model string.
-  model_default: gpt-5.3-codex
+  model_default: gpt-5.4
   # Empty = use the provider's default endpoint. Set only for routing
   # through a self-hosted gateway or an org-internal proxy.
   model_base_url: ""
   # See schema header (gateway.vision_provider / gateway.vision_model)
   # for why this is pinned. Empty values fall back to auto-detect.
   vision_provider: codex
-  vision_model: gpt-5.3-codex
+  vision_model: gpt-5.4
   # Per-user authz is replaced by per-channel gating in this deployment:
   # bot membership in a Slack channel is operator-controlled, and the
   # slack.runtime.allowed_channels list below is the access boundary.
