@@ -151,10 +151,10 @@ def test_require_mention_env_var_default_true(monkeypatch):
 # Tests: _slack_strict_mention
 # ---------------------------------------------------------------------------
 
-def test_strict_mention_defaults_to_false(monkeypatch):
+def test_strict_mention_defaults_to_true(monkeypatch):
     monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
     adapter = _make_adapter()
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_true():
@@ -177,10 +177,10 @@ def test_strict_mention_string_off():
     assert adapter._slack_strict_mention() is False
 
 
-def test_strict_mention_malformed_stays_false():
-    """Unrecognised values keep strict mode OFF (fail-open to legacy behavior)."""
+def test_strict_mention_malformed_stays_true():
+    """Unrecognised values keep strict mode ON (fail-closed to mention-only behavior)."""
     adapter = _make_adapter(strict_mention="maybe")
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_env_var_fallback(monkeypatch):
@@ -208,7 +208,7 @@ def test_response_policy_legacy_alias_allows_thread_followups():
 def test_response_policy_does_not_enable_strict_mention():
     adapter = _make_adapter(response_policy="strict_mention")
     assert adapter._slack_response_policy() == "mention_to_wake_quiet_thread"
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_quiet_thread_suppresses_acknowledgements_and_jokes():
@@ -519,14 +519,14 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
 
         if channel_id in adapter._slack_free_response_channels():
             return True
-        elif not adapter._slack_require_mention():
-            return True
         elif adapter._slack_strict_mention() and not is_mentioned:
             return bool(
                 thread_reply
                 and active_session
                 and adapter._slack_text_is_gateway_command(text)
             )
+        elif not adapter._slack_require_mention():
+            return True
         elif not is_mentioned:
             if thread_reply and active_session:
                 if adapter._slack_text_is_gateway_command(text):
@@ -548,8 +548,13 @@ def test_default_require_mention_channel_without_mention_ignored():
 
 
 def test_require_mention_false_channel_without_mention_processed():
-    adapter = _make_adapter(require_mention=False)
+    adapter = _make_adapter(require_mention=False, strict_mention=False)
     assert _would_process(adapter, text="hello everyone") is True
+
+
+def test_default_strict_mention_overrides_require_mention_false():
+    adapter = _make_adapter(require_mention=False)
+    assert _would_process(adapter, text="hello everyone") is False
 
 
 def test_channel_in_free_response_processed_without_mention():
@@ -579,7 +584,7 @@ def test_mentioned_message_always_processed():
 
 
 def test_thread_reply_with_active_session_processed():
-    adapter = _make_adapter(require_mention=True)
+    adapter = _make_adapter(require_mention=True, strict_mention=False)
     assert _would_process(
         adapter, text="can you check the logs?",
         thread_reply=True, active_session=True,
@@ -587,7 +592,7 @@ def test_thread_reply_with_active_session_processed():
 
 
 def test_thread_reply_with_active_session_allows_short_clarification_answer():
-    adapter = _make_adapter(require_mention=True)
+    adapter = _make_adapter(require_mention=True, strict_mention=False)
     assert _would_process(
         adapter, text="yes",
         thread_reply=True, active_session=True, pending_user_prompt=True,
@@ -595,7 +600,7 @@ def test_thread_reply_with_active_session_allows_short_clarification_answer():
 
 
 def test_thread_reply_with_active_session_but_chatter_ignored():
-    adapter = _make_adapter(require_mention=True)
+    adapter = _make_adapter(require_mention=True, strict_mention=False)
     assert _would_process(
         adapter, text="thanks",
         thread_reply=True, active_session=True,
@@ -635,7 +640,11 @@ def test_strict_mention_allows_active_session_gateway_control_command():
 
 
 def test_legacy_response_policy_processes_thread_chatter():
-    adapter = _make_adapter(require_mention=True, response_policy="thread_followup")
+    adapter = _make_adapter(
+        require_mention=True,
+        strict_mention=False,
+        response_policy="thread_followup",
+    )
     assert _would_process(
         adapter, text="thanks",
         thread_reply=True, active_session=True,
