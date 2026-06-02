@@ -1909,6 +1909,8 @@ if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 && -f "$QUAY_SERVE_
 
   if command -v systemctl >/dev/null 2>&1; then
     echo "==> installing systemd service for quay-serve (user=$AGENT_USER, bind=127.0.0.1:9731)"
+    quay_serve_was_active=0
+    systemctl is-active quay-serve.service >/dev/null 2>&1 && quay_serve_was_active=1
     PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
       render-systemd-unit \
       --template "$QUAY_SERVE_SRC" \
@@ -1917,6 +1919,10 @@ if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 && -f "$QUAY_SERVE_
       --set "TARGET_DIR=$TARGET_DIR"
     systemctl daemon-reload
     systemctl enable --now quay-serve.service
+    if (( quay_serve_was_active )); then
+      echo "==> restarting quay-serve.service to pick up the installed quay binary/UI"
+      systemctl try-restart quay-serve.service
+    fi
   else
     echo "==> systemctl not present; skipping quay-serve service enable" >&2
   fi

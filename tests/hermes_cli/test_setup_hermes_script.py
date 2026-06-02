@@ -321,7 +321,10 @@ def test_quay_serve_service_is_localhost_and_token_protected():
     assert "ensure_quay_admin_token" in installer
     assert "secrets.token_urlsafe(48)" in installer
     assert '[[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1' in installer
+    assert "quay_serve_was_active=0" in installer
+    assert "systemctl is-active quay-serve.service" in installer
     assert "systemctl enable --now quay-serve.service" in installer
+    assert "systemctl try-restart quay-serve.service" in installer
     assert "QUAY_ADMIN_TOKEN=${existing_quay_admin_token}" in stage
     assert "API_SERVER_KEY=${existing_api_server_key}" in stage
     assert "QUAY_HERMES_API_KEY=${existing_api_server_key}" in stage
