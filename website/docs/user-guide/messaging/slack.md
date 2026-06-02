@@ -286,10 +286,10 @@ Understanding how Hermes behaves in different contexts:
 |---------|----------|
 | **DMs** | Bot responds to every message — no @mention needed |
 | **Channels** | Bot **only responds when @mentioned** (e.g., `@Hermes Agent what time is it?`). In channels, Hermes replies in a thread attached to that message. |
-| **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. Once the bot has an active session in a thread, **subsequent replies in that thread do not require @mention** — the bot follows the conversation naturally. |
+| **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. By default, later channel-thread replies stay silent unless they also @mention Hermes. |
 
 :::tip
-In channels, always @mention the bot to start a conversation. Once the bot is active in a thread, you can reply in that thread without mentioning it. Outside of threads, messages without @mention are ignored to prevent noise in busy channels.
+In channels, always @mention the bot to start or continue a conversation. Set `strict_mention: false` or `response_policy: thread_followup` only when you want legacy unmentioned thread follow-ups.
 :::
 
 ---
@@ -356,7 +356,7 @@ slack:
   # Optional legacy opt-out. When omitted, Hermes requires @mention on
   # channel-thread replies. Set false to allow legacy actionable follow-ups
   # in engaged threads without a fresh mention.
-  strict_mention: false
+  # strict_mention: false
 
   # Custom mention patterns that trigger the bot
   # (in addition to the default @mention detection)
