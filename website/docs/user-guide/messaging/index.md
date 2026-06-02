@@ -531,6 +531,23 @@ display:
       long_running_notifications: false
 ```
 
+Slack is tuned separately because progress/status messages are often posted
+into shared work threads. By default:
+
+- **`tool_progress`** defaults to **`off`** — no per-tool breadcrumb stream.
+- **`status_callbacks`** defaults to **`warn`** — warnings still surface, but
+  lifecycle breadcrumbs such as context-compaction and retry notices stay out
+  of Slack.
+
+Override with `display.platforms.slack.status_callbacks`:
+
+```yaml
+display:
+  platforms:
+    slack:
+      status_callbacks: warn   # all | warn | off
+```
+
 ### Progress bubble cleanup (opt-in)
 
 Tool-progress messages, the "still working…" heartbeat, and status-callback bubbles can also be auto-deleted after the final response lands. Enable per-platform via `display.platforms.<platform>.cleanup_progress`:

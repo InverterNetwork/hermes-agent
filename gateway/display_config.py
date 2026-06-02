@@ -40,6 +40,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    # Gateway status callbacks emitted by agent lifecycle plumbing. Values:
+    # "all" = deliver lifecycle + warning statuses; "warn" = warnings only;
+    # "off" = suppress both. Booleans map to all/off for YAML convenience.
+    "status_callbacks": "all",
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -64,6 +68,7 @@ _TIER_HIGH = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    "status_callbacks": "all",
 }
 
 _TIER_MEDIUM = {
@@ -74,6 +79,7 @@ _TIER_MEDIUM = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    "status_callbacks": "all",
 }
 
 _TIER_LOW = {
@@ -84,6 +90,7 @@ _TIER_LOW = {
     "interim_assistant_messages": False,
     "long_running_notifications": False,
     "busy_ack_detail": False,
+    "status_callbacks": "all",
 }
 
 _TIER_MINIMAL = {
@@ -94,6 +101,7 @@ _TIER_MINIMAL = {
     "interim_assistant_messages": False,
     "long_running_notifications": False,
     "busy_ack_detail": False,
+    "status_callbacks": "all",
 }
 
 _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -115,7 +123,9 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
     # "new"/"all" spam permanent lines in channels (hermes-agent#14663).
-    "slack":           {**_TIER_MEDIUM, "tool_progress": "off"},
+    # Lifecycle status callbacks are warnings-only by default so compression
+    # and retry breadcrumbs do not leak into public Slack threads.
+    "slack":           {**_TIER_MEDIUM, "tool_progress": "off", "status_callbacks": "warn"},
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
     "feishu":          _TIER_MEDIUM,
@@ -218,6 +228,31 @@ def _normalise(setting: str, value: Any) -> Any:
         if value is True:
             return "all"
         return str(value).lower()
+    if setting == "status_callbacks":
+        if value is False:
+            return "off"
+        if value is True:
+            return "all"
+        normalised = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "": "all",
+            "true": "all",
+            "yes": "all",
+            "on": "all",
+            "1": "all",
+            "all": "all",
+            "false": "off",
+            "no": "off",
+            "off": "off",
+            "0": "off",
+            "none": "off",
+            "warn": "warn",
+            "warning": "warn",
+            "warnings": "warn",
+            "warn_only": "warn",
+            "warnings_only": "warn",
+        }
+        return aliases.get(normalised, "all")
     if setting in {
         "show_reasoning",
         "streaming",
