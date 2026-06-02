@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -228,6 +229,38 @@ _ensure_telegram_mock()
 _ensure_discord_mock()
 
 
+_SLACK_ROUTING_ENV_VARS = (
+    "SLACK_ALLOWED_CHANNELS",
+    "SLACK_ALLOW_BOTS",
+    "SLACK_ALLOW_ALL_USERS",
+    "SLACK_ALLOWED_USERS",
+    "SLACK_FREE_RESPONSE_CHANNELS",
+    "SLACK_HOME_CHANNEL",
+    "SLACK_REACTIONS",
+    "SLACK_REQUIRE_MENTION",
+    "SLACK_RESPONSE_POLICY",
+    "SLACK_STRICT_MENTION",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_slack_routing_env():
+    """Prevent Slack config-bridge env writes from leaking between gateway tests."""
+    sentinel = object()
+    original = {
+        name: os.environ.get(name, sentinel)
+        for name in _SLACK_ROUTING_ENV_VARS
+    }
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            if value is sentinel:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 # ---------------------------------------------------------------------------
 # Plugin-adapter anti-pattern guard
 # ---------------------------------------------------------------------------
@@ -419,7 +452,6 @@ def pytest_configure(config):
         lock = FileLock(str(lock_file), timeout=120)
     except ImportError:
         # Fallback: no locking (still correct, just slower under contention).
-        import contextlib
 
         class _NoLock:
             def __enter__(self):
@@ -449,4 +481,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-
