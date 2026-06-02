@@ -3,16 +3,15 @@
 ``required_runtime_managers`` walks ``repos[].quay.package_manager`` and
 returns the matching ``quay.runtime_managers.<name>`` pins, failing loud
 with an actionable diagnostic when a declared manager has no pin block.
-``required_codex_pin`` does the same for the Codex CLI, but only when the
-active quay agent invocation path references the ``codex`` binary or Atlas is
-enabled in ``codex-exec`` mode.
+``required_codex_pin`` does the same for the Codex CLI, but only when setup is
+provisioning Quay's standard local agent CLI set, or Atlas is enabled in
+``codex-exec`` mode.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import shlex
 from typing import Any
 
 import yaml
@@ -109,24 +108,22 @@ def required_runtime_managers(values: dict[str, Any]) -> dict[str, RuntimeManage
     return out
 
 
-def required_codex_pin(values: dict[str, Any]) -> CodexPin | None:
-    """Return the Codex CLI pin when a configured tool path uses Codex.
+def required_codex_pin(values: dict[str, Any], *, force: bool = False) -> CodexPin | None:
+    """Return the Codex CLI pin when Atlas or live Quay config requires Codex.
 
-    The legacy ``quay.agent_invocation`` field remains a valid trigger for
-    old config. When the newer ``quay.agents`` block is present, only the
-    selected worker/reviewer invocation entries are active; an unused
-    ``invocations.codex`` table should not force a Codex install. Atlas also
-    requires Codex when ``atlas.version`` is non-empty and
-    ``atlas.ai.mode == codex-exec``.
+    Quay-owned agent runtime settings are intentionally not sourced from
+    deploy values. Atlas requires Codex when ``atlas.version`` is non-empty and
+    ``atlas.ai.mode == codex-exec``. ``force`` is used by setup-hermes.sh when
+    Quay is enabled and the standard local agent CLI set should be provisioned.
     """
-    if not (_codex_invocation_active(values) or _atlas_codex_active(values)):
+    if not (force or _atlas_codex_active(values)):
         return None
 
     quay_block = values.get("quay") or {}
     spec = quay_block.get("codex") if isinstance(quay_block, dict) else None
     if not isinstance(spec, dict):
         fail(
-            "quay agent invocation references codex, but no usable "
+            "Codex is required, but no usable "
             "quay.codex.{version, linux_x64_sha256} pin exists in deploy.values.yaml"
         )
     version = spec.get("version")
@@ -143,38 +140,10 @@ def required_codex_pin(values: dict[str, Any]) -> CodexPin | None:
             invalid.append("`linux_x64_sha256` must be a 64-char hex string")
     if invalid:
         fail(
-            "quay agent invocation references codex, but quay.codex is invalid:\n"
+            "Codex is required, but quay.codex is invalid:\n"
             + "\n".join(f"  - {item}" for item in invalid)
         )
     return CodexPin(version=version, linux_x64_sha256=sha.lower())
-
-
-def _codex_invocation_active(values: dict[str, Any]) -> bool:
-    quay = values.get("quay") or {}
-    if not isinstance(quay, dict):
-        return False
-
-    active_cmds: list[str] = []
-    agents = quay.get("agents")
-    if isinstance(agents, dict):
-        invocations = agents.get("invocations")
-        invocations = invocations if isinstance(invocations, dict) else {}
-        for role in ("worker", "reviewer"):
-            agent_id = agents.get(role)
-            if not isinstance(agent_id, str) or not agent_id:
-                continue
-            agent_spec = invocations.get(agent_id)
-            if not isinstance(agent_spec, dict):
-                continue
-            cmd = agent_spec.get(role)
-            if isinstance(cmd, str):
-                active_cmds.append(cmd)
-    else:
-        legacy = quay.get("agent_invocation")
-        if isinstance(legacy, str):
-            active_cmds.append(legacy)
-
-    return any(_command_references_binary(cmd, "codex") for cmd in active_cmds)
 
 
 def _atlas_codex_active(values: dict[str, Any]) -> bool:
@@ -188,11 +157,3 @@ def _atlas_codex_active(values: dict[str, Any]) -> bool:
     if not isinstance(ai, dict):
         return False
     return ai.get("mode") == "codex-exec"
-
-
-def _command_references_binary(command: str, binary: str) -> bool:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    return any(Path(tok).name == binary for tok in tokens)

@@ -99,10 +99,9 @@ Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
 
 ## Pre-install: claude auth (quay workers)
 
-`quay-tick` shells out to `claude` to run the agent worker. When an active
-quay invocation references `claude`, `setup-hermes.sh` installs the CLI as the
-agent user and reconciles `/usr/local/bin/claude` to
-`~<agent>/.local/bin/claude`.
+`quay-tick` may shell out to `claude` to run an agent worker. When Quay is
+enabled, `setup-hermes.sh` installs the CLI as the agent user and reconciles
+`/usr/local/bin/claude` to `~<agent>/.local/bin/claude`.
 
 Log in once after the installer has provisioned the binary (subscription mode
 — interactive browser OAuth):
@@ -116,12 +115,11 @@ worker process which runs as the agent user.
 
 ## Pre-install: codex CLI (quay workers)
 
-Alternative to claude for quay's worker invocation. Configure by pointing
-the active `quay.agents.{worker,reviewer}` invocation in
-`deploy.values.yaml` at `codex` (e.g. `codex exec --json -- … <
-{prompt_file} > .quay-tool-trace.log`). The installer provisions the
-pinned static binary automatically when the active invocation references
-`codex`.
+Alternative to claude for quay's worker invocation. Configure Quay's runtime
+config so the active worker/reviewer invocation calls `codex` (e.g.
+`codex exec --json -- … < {prompt_file} > .quay-tool-trace.log`). The
+installer provisions the pinned static binary automatically when Quay is
+enabled.
 
 Subscription model: **ChatGPT subscription via `codex login`**, *not* an
 `OPENAI_API_KEY`. This is the same subscription class as the gateway's
@@ -679,9 +677,8 @@ content actually changed.
 
 Quay-only prompts (skipped when `/usr/local/bin/quay` is absent):
 
-* `ANTHROPIC_API_KEY` — optional; needed only if `quay.agent_invocation`
-  shells out to a tool that requires it (e.g. `claude` without a global
-  login).
+* `ANTHROPIC_API_KEY` — optional; needed only if Quay's runtime config shells
+  out to a tool that requires it (e.g. `claude` without a global login).
 * `QUAY_ADMIN_TOKEN` is not prompted. `setup-hermes.sh` / `stage-secrets.sh`
   generate it into `auth/quay.env` and preserve it on re-runs.
 * `API_SERVER_KEY` is not prompted. On quay-provisioned hosts,
