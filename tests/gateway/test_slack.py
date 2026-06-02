@@ -2288,15 +2288,10 @@ class TestThreadReplyHandling:
         return a
 
     @pytest.mark.asyncio
-    async def test_trigger_bound_thread_reply_with_session_falls_through_to_discussion(
+    async def test_trigger_bound_thread_reply_with_session_requires_mention(
         self, trigger_adapter_with_session_store, mock_session_store
     ):
-        """Trigger-bound channel replies must not be swallowed by the router.
-
-        The top-level trigger should still reject thread replies so the entry
-        skill does not re-fire, but those replies are the human discussion path
-        for blocker handoffs and must continue through normal session routing.
-        """
+        """Trigger-bound channel replies also need an explicit mention."""
         session_key = "agent:main:slack:group:C0FEEDBACK:1700000000.000050"
         mock_session_store._entries = {session_key: MagicMock()}
 
@@ -2312,11 +2307,7 @@ class TestThreadReplyHandling:
 
         await trigger_adapter_with_session_store._handle_slack_message(event)
 
-        trigger_adapter_with_session_store.handle_message.assert_awaited_once()
-        msg_event = trigger_adapter_with_session_store.handle_message.await_args.args[0]
-        assert msg_event.text == "Can you clarify the failure mode?"
-        assert msg_event.source.thread_id == "1700000000.000050"
-        assert msg_event.reply_to_message_id == "1700000000.000050"
+        trigger_adapter_with_session_store.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_trigger_bound_thread_reply_without_session_stays_ignored(

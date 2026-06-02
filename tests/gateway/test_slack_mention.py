@@ -175,10 +175,10 @@ def test_strict_mention_string_off():
     assert adapter._slack_strict_mention() is False
 
 
-def test_strict_mention_malformed_stays_false():
-    """Unrecognised values keep strict mode OFF (fail-open to legacy behavior)."""
+def test_strict_mention_malformed_stays_true():
+    """Unrecognised values keep strict mode ON (fail-closed to mention-only behavior)."""
     adapter = _make_adapter(strict_mention="maybe")
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_env_var_fallback(monkeypatch):
@@ -509,15 +509,8 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         text = f"<@{bot_uid}> {text}"
     is_mentioned = bot_uid and f"<@{bot_uid}>" in text
 
-    if not is_dm:
-        if adapter._slack_strict_mention() and thread_reply and not is_mentioned:
-            return bool(
-                active_session
-                and adapter._slack_text_is_gateway_command(text)
-            )
+    if not is_dm and bot_uid:
         if channel_id in adapter._slack_free_response_channels():
-            return True
-        elif not adapter._slack_require_mention():
             return True
         elif adapter._slack_strict_mention() and not is_mentioned:
             return bool(
@@ -525,6 +518,8 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
                 and active_session
                 and adapter._slack_text_is_gateway_command(text)
             )
+        elif not adapter._slack_require_mention():
+            return True
         elif not is_mentioned:
             if thread_reply and active_session:
                 if adapter._slack_text_is_gateway_command(text):
@@ -546,8 +541,13 @@ def test_default_require_mention_channel_without_mention_ignored():
 
 
 def test_require_mention_false_channel_without_mention_processed():
-    adapter = _make_adapter(require_mention=False)
+    adapter = _make_adapter(require_mention=False, strict_mention=False)
     assert _would_process(adapter, text="hello everyone") is True
+
+
+def test_default_strict_mention_overrides_require_mention_false():
+    adapter = _make_adapter(require_mention=False)
+    assert _would_process(adapter, text="hello everyone") is False
 
 
 def test_require_mention_false_thread_reply_still_requires_mention_by_default():
@@ -568,7 +568,7 @@ def test_channel_in_free_response_processed_without_mention():
     assert _would_process(adapter, channel_id=CHANNEL_ID, text="hello") is True
 
 
-def test_channel_in_free_response_thread_reply_still_requires_mention_by_default():
+def test_channel_in_free_response_thread_reply_processed_without_mention():
     adapter = _make_adapter(
         require_mention=True,
         free_response_channels=[CHANNEL_ID],
@@ -579,7 +579,7 @@ def test_channel_in_free_response_thread_reply_still_requires_mention_by_default
         text="can you check the logs?",
         thread_reply=True,
         active_session=True,
-    ) is False
+    ) is True
 
 
 def test_other_channel_not_in_free_response_still_gated():
@@ -657,7 +657,11 @@ def test_strict_mention_allows_active_session_gateway_control_command():
 
 
 def test_legacy_response_policy_processes_thread_chatter():
-    adapter = _make_adapter(require_mention=True, response_policy="thread_followup")
+    adapter = _make_adapter(
+        require_mention=True,
+        strict_mention=False,
+        response_policy="thread_followup",
+    )
     assert _would_process(
         adapter, text="thanks",
         thread_reply=True, active_session=True,
