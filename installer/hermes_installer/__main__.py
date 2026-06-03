@@ -5,7 +5,7 @@
   on SHA mismatch or missing pin. Requires euid 0 unless
   ``--skip-root-check`` is passed (tests only).
 * ``ensure-codex`` — provision the pinned Codex CLI as a root-managed
-  binary when the active quay agent invocation path references ``codex``.
+  binary when Atlas or the caller say Codex is required.
 * ``seed-systemd-default-env`` — create a preserved /etc/default override
   file for an installer-managed service.
 * ``render-systemd-unit`` — render a systemd unit template with explicit
@@ -62,6 +62,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path("/usr/local/bin/codex"),
         help="system symlink to create (default: /usr/local/bin/codex)",
+    )
+    ec.add_argument(
+        "--required",
+        action="store_true",
+        help="force provisioning from quay.codex even when deploy values do not reference codex",
     )
     ec.add_argument(
         "--skip-root-check",
@@ -161,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.skip_root_check:
             require_root()
         values = load_values(args.values)
-        pin = required_codex_pin(values)
+        pin = required_codex_pin(values, force=args.required)
         ensure_codex(pin, agent_user=args.agent_user, symlink_path=args.symlink_path)
         return 0
 

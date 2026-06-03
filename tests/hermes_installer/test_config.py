@@ -172,24 +172,32 @@ def _codex_values(*, worker: str = "codex", invocations: dict | None = None) -> 
 
 
 class TestRequiredCodexPin:
-    def test_active_codex_invocation_returns_pin(self):
-        assert required_codex_pin(_codex_values()) == CodexPin(
-            version=VALID_CODEX_PIN["version"],
-            linux_x64_sha256=VALID_CODEX_PIN["linux_x64_sha256"],
-        )
+    def test_values_codex_invocation_is_noop(self):
+        assert required_codex_pin(_codex_values()) is None
 
     def test_claude_only_invocation_is_noop(self):
         values = _codex_values(worker="claude")
         assert required_codex_pin(values) is None
 
-    def test_legacy_agent_invocation_still_triggers(self):
+    def test_force_returns_pin_without_values_invocation(self):
+        values = {
+            "quay": {
+                "codex": VALID_CODEX_PIN,
+            }
+        }
+        assert required_codex_pin(values, force=True) == CodexPin(
+            version=VALID_CODEX_PIN["version"],
+            linux_x64_sha256=VALID_CODEX_PIN["linux_x64_sha256"],
+        )
+
+    def test_legacy_agent_invocation_is_noop(self):
         values = {
             "quay": {
                 "agent_invocation": "codex exec < {prompt_file}",
                 "codex": VALID_CODEX_PIN,
             }
         }
-        assert required_codex_pin(values) is not None
+        assert required_codex_pin(values) is None
 
     def test_atlas_codex_exec_triggers_pin_even_without_quay(self):
         values = {
@@ -228,17 +236,17 @@ class TestRequiredCodexPin:
         values = _codex_values(worker="claude")
         assert required_codex_pin(values) is None
 
-    def test_missing_pin_fails_when_codex_active(self, capsys):
+    def test_missing_pin_fails_when_forced(self, capsys):
         values = _codex_values()
         del values["quay"]["codex"]
         with pytest.raises(SystemExit) as excinfo:
-            required_codex_pin(values)
+            required_codex_pin(values, force=True)
         assert excinfo.value.code == 1
         assert "quay.codex" in capsys.readouterr().err
 
-    def test_invalid_sha_fails_when_codex_active(self, capsys):
+    def test_invalid_sha_fails_when_forced(self, capsys):
         values = _codex_values()
         values["quay"]["codex"]["linux_x64_sha256"] = "deadbeef"
         with pytest.raises(SystemExit):
-            required_codex_pin(values)
+            required_codex_pin(values, force=True)
         assert "linux_x64_sha256" in capsys.readouterr().err

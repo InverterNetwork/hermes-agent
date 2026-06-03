@@ -1,11 +1,12 @@
 from hermes_cli import quay_admin_auth
 
 
-def _install_quay_admin_session(web_server, slack_user_id="U123"):
+def _install_quay_admin_session(web_server, slack_user_id="U123", display_name=""):
     web_server._QUAY_ADMIN_SESSIONS.clear()
     web_server._QUAY_ADMIN_SESSIONS["sid"] = {
         "session_id": "sid",
         "slack_user_id": slack_user_id,
+        "display_name": display_name,
         "created_at": 1000,
         "expires_at": 9999999999,
     }
@@ -16,7 +17,7 @@ def test_quay_admin_login_get_is_non_mutating_confirmation(_isolate_hermes_home)
     from starlette.testclient import TestClient
     import hermes_cli.web_server as web_server
 
-    token, _record = quay_admin_auth.create_login_token("U123")
+    token, _record = quay_admin_auth.create_login_token("U123", display_name="Mira T.")
     web_server._QUAY_ADMIN_SESSIONS.clear()
 
     client = TestClient(web_server.app)
@@ -24,6 +25,7 @@ def test_quay_admin_login_get_is_non_mutating_confirmation(_isolate_hermes_home)
 
     assert resp.status_code == 200
     assert "Continue to Quay Admin" in resp.text
+    assert "Continue as <strong>Mira T.</strong>" in resp.text
     assert "set-cookie" not in resp.headers
     assert len(web_server._QUAY_ADMIN_SESSIONS) == 0
 
@@ -41,7 +43,7 @@ def test_quay_admin_login_post_sets_http_only_secure_cookie(_isolate_hermes_home
     from starlette.testclient import TestClient
     import hermes_cli.web_server as web_server
 
-    token, _record = quay_admin_auth.create_login_token("U123")
+    token, _record = quay_admin_auth.create_login_token("U123", display_name="Mira T.")
     web_server._QUAY_ADMIN_SESSIONS.clear()
 
     client = TestClient(web_server.app)
@@ -60,7 +62,9 @@ def test_quay_admin_login_post_sets_http_only_secure_cookie(_isolate_hermes_home
     assert "QUAY_ADMIN_TOKEN" not in cookie
     assert "service-token" not in cookie
     assert len(web_server._QUAY_ADMIN_SESSIONS) == 1
-    assert next(iter(web_server._QUAY_ADMIN_SESSIONS.values()))["slack_user_id"] == "U123"
+    session = next(iter(web_server._QUAY_ADMIN_SESSIONS.values()))
+    assert session["slack_user_id"] == "U123"
+    assert session["display_name"] == "Mira T."
 
 
 def test_quay_admin_login_rejects_reused_token(_isolate_hermes_home):
@@ -101,7 +105,7 @@ def test_quay_admin_proxy_uses_server_side_token_and_slack_identity(monkeypatch,
     from starlette.testclient import TestClient
     import hermes_cli.web_server as web_server
 
-    cookies = _install_quay_admin_session(web_server)
+    cookies = _install_quay_admin_session(web_server, display_name="Mira T.")
     monkeypatch.setenv("QUAY_ADMIN_TOKEN", "service-token")
     seen = {}
 
@@ -137,6 +141,7 @@ def test_quay_admin_proxy_uses_server_side_token_and_slack_identity(monkeypatch,
     assert seen["url"] == "http://127.0.0.1:9731/v1/status"
     assert seen["headers"]["Authorization"] == "Bearer service-token"
     assert seen["headers"]["X-Hermes-User-Id"] == "U123"
+    assert seen["headers"]["X-Hermes-User-Display-Name"] == "Mira T."
     assert "set-cookie" not in {k.lower() for k in resp.headers}
 
 

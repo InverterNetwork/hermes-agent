@@ -43,7 +43,12 @@ def session_ttl_seconds() -> int:
     return _positive_int_env("QUAY_ADMIN_SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL_SECONDS)
 
 
-def create_login_token(slack_user_id: str, *, now: float | None = None) -> tuple[str, dict[str, Any]]:
+def create_login_token(
+    slack_user_id: str,
+    *,
+    display_name: str | None = None,
+    now: float | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Create a short-lived one-time login token and persist only its hash."""
     if not slack_user_id:
         raise ValueError("slack_user_id is required")
@@ -54,6 +59,7 @@ def create_login_token(slack_user_id: str, *, now: float | None = None) -> tuple
     record = {
         "token_hash": token_hash,
         "slack_user_id": slack_user_id,
+        "display_name": _clean_display_name(display_name),
         "created_at": issued_at,
         "expires_at": issued_at + login_ttl_seconds(),
         "used_at": None,
@@ -110,12 +116,18 @@ def consume_login_token(token: str, *, now: float | None = None) -> dict[str, An
         return dict(record)
 
 
-def create_session(slack_user_id: str, *, now: float | None = None) -> tuple[str, dict[str, Any]]:
+def create_session(
+    slack_user_id: str,
+    *,
+    display_name: str | None = None,
+    now: float | None = None,
+) -> tuple[str, dict[str, Any]]:
     current = time.time() if now is None else now
     session_id = secrets.token_urlsafe(32)
     return session_id, {
         "session_id": session_id,
         "slack_user_id": slack_user_id,
+        "display_name": _clean_display_name(display_name),
         "created_at": current,
         "expires_at": current + session_ttl_seconds(),
     }
@@ -146,6 +158,12 @@ def _positive_int_env(name: str, default: int) -> int:
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _clean_display_name(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(str(value).split())[:80]
 
 
 def _load_state_unlocked() -> dict[str, Any]:

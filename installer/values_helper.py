@@ -40,11 +40,6 @@ Subcommands:
                                   When --reference-repos-root is passed and
                                   quay.version is new enough for AST-136,
                                   also renders [context].reference_repos_root.
-  active-agent-invocations     — emit one active quay agent invocation command
-                                  per line. Uses legacy ``quay.agent_invocation``
-                                  when no ``quay.agents`` block exists; otherwise
-                                  resolves ``quay.agents.<role>`` through
-                                  ``quay.agents.invocations.<id>.<role>``.
   render-quay-orchestrator-config <out>
                                 — write ~/.hermes/quay/orchestrator.json from
                                   quay.orchestrator. This is sidecar config
@@ -91,8 +86,7 @@ Subcommands:
                                   field-level error otherwise. Used by
                                   setup-hermes.sh --verify so the legacy-key
                                   rejection lives in one place. Also walks
-                                  per-repo `quay.tags` and deployment-level
-                                  `quay.tag_namespaces` so a malformed vocab
+                                  per-repo `quay.tags` so a malformed vocab
                                   block fails at verify-time, not mid-install.
   get-repo-tags <repo_id>      — emit per-repo tag vocab as JSON shaped for
                                   `quay repo apply-tags --from -`. Bare-list
@@ -101,11 +95,6 @@ Subcommands:
                                   Empty/absent `tags:` block emits
                                   `{"namespaces": {}}` (explicit-clear
                                   payload — strict reconciliation).
-  get-deployment-tags          — emit deployment tag vocab as JSON shaped for
-                                  `quay tags apply-deployment --from -`.
-                                  Reads `quay.tag_namespaces`. Same
-                                  explicit-clear semantics on empty/absent.
-
 Legacy `quay.repos[]` is rejected on every subcommand that touches the repo
 list — migrate the block to top-level `repos[]` (with the per-entry
 `quay:` sub-block carrying `package_manager` + `install_cmd`).
@@ -617,6 +606,9 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     * ``SLACK_HOME_CHANNEL`` from ``slack.runtime.home_channel``.
     * ``QUAY_ADMIN_ALLOWED_USERS`` from ``quay.admin.allowed_users``.
     * ``QUAY_ADMIN_PUBLIC_BASE_URL`` from ``quay.admin.public_base_url``.
+    * ``API_SERVER_*`` non-secret toggles from ``gateway.api_server``.
+    * ``QUAY_AGENT_PROVIDER`` / ``QUAY_HERMES_*`` non-secret toggles from
+      ``quay.agent_interface``.
     * ``GATEWAY_ALLOW_ALL_USERS`` from ``gateway.allow_all_users``.
     * ``LINEAR_TEAM_<KEY>`` from ``linear.teams``.
 
@@ -739,6 +731,92 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
             return 1
         lines.append(f"GATEWAY_ALLOW_ALL_USERS={'true' if flag else 'false'}")
 
+    gateway_api_server = gateway.get("api_server") if isinstance(gateway, dict) else None
+    if gateway_api_server is not None:
+        if not isinstance(gateway_api_server, dict):
+            sys.stderr.write("values_helper.py: gateway.api_server must be a mapping\n")
+            return 1
+        enabled = gateway_api_server.get("enabled")
+        if enabled is not None:
+            if not isinstance(enabled, bool):
+                sys.stderr.write("values_helper.py: gateway.api_server.enabled must be a bool\n")
+                return 1
+            lines.append(f"API_SERVER_ENABLED={'true' if enabled else 'false'}")
+        host = gateway_api_server.get("host")
+        if host is not None:
+            if not isinstance(host, str):
+                sys.stderr.write("values_helper.py: gateway.api_server.host must be a string\n")
+                return 1
+            lines.append(f"API_SERVER_HOST={_env_safe('gateway.api_server.host', host.strip())}")
+        port = gateway_api_server.get("port")
+        if port is not None:
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                sys.stderr.write("values_helper.py: gateway.api_server.port must be an integer 1-65535\n")
+                return 1
+            lines.append(f"API_SERVER_PORT={port}")
+        model_name = gateway_api_server.get("model_name")
+        if model_name is not None:
+            if not isinstance(model_name, str):
+                sys.stderr.write("values_helper.py: gateway.api_server.model_name must be a string\n")
+                return 1
+            lines.append(f"API_SERVER_MODEL_NAME={_env_safe('gateway.api_server.model_name', model_name.strip())}")
+
+    quay_agent = (data.get("quay") or {}).get("agent_interface") or {}
+    if quay_agent:
+        if not isinstance(quay_agent, dict):
+            sys.stderr.write("values_helper.py: quay.agent_interface must be a mapping\n")
+            return 1
+        enabled = quay_agent.get("enabled")
+        if enabled is not None and not isinstance(enabled, bool):
+            sys.stderr.write("values_helper.py: quay.agent_interface.enabled must be a bool\n")
+            return 1
+        raw_provider = quay_agent.get("provider") or "hermes"
+        if not isinstance(raw_provider, str):
+            sys.stderr.write("values_helper.py: quay.agent_interface.provider must be a string\n")
+            return 1
+        provider = raw_provider.strip()
+        if provider not in {"echo", "hermes"}:
+            sys.stderr.write("values_helper.py: quay.agent_interface.provider must be echo or hermes\n")
+            return 1
+        if enabled is False:
+            provider = "echo"
+        lines.append(f"QUAY_AGENT_PROVIDER={_env_safe('quay.agent_interface.provider', provider)}")
+        if provider == "hermes":
+            api_base_url = quay_agent.get("hermes_api_base_url")
+            if api_base_url is not None:
+                if not isinstance(api_base_url, str):
+                    sys.stderr.write("values_helper.py: quay.agent_interface.hermes_api_base_url must be a string\n")
+                    return 1
+                api_base_url = api_base_url.strip().rstrip("/")
+                parsed = urlparse(api_base_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    sys.stderr.write(
+                        "values_helper.py: quay.agent_interface.hermes_api_base_url must be an "
+                        "http(s) URL like http://127.0.0.1:8642\n"
+                    )
+                    return 1
+                lines.append(
+                    "QUAY_HERMES_API_BASE_URL="
+                    f"{_env_safe('quay.agent_interface.hermes_api_base_url', api_base_url)}"
+                )
+            hermes_model = quay_agent.get("hermes_model")
+            if hermes_model is not None:
+                if not isinstance(hermes_model, str):
+                    sys.stderr.write("values_helper.py: quay.agent_interface.hermes_model must be a string\n")
+                    return 1
+                lines.append(f"QUAY_HERMES_MODEL={_env_safe('quay.agent_interface.hermes_model', hermes_model.strip())}")
+            session_key_prefix = quay_agent.get("hermes_session_key_prefix")
+            if session_key_prefix is not None:
+                if not isinstance(session_key_prefix, str):
+                    sys.stderr.write(
+                        "values_helper.py: quay.agent_interface.hermes_session_key_prefix must be a string\n"
+                    )
+                    return 1
+                lines.append(
+                    "QUAY_HERMES_SESSION_KEY_PREFIX="
+                    f"{_env_safe('quay.agent_interface.hermes_session_key_prefix', session_key_prefix.strip())}"
+                )
+
     # linear.teams.<key>: <uuid>  →  LINEAR_TEAM_<KEY>=<uuid>
     # Lets skills (e.g. inverter-linear) reference team UUIDs by env var
     # instead of hardcoding them. Adding a new team to values.yaml is enough
@@ -767,134 +845,11 @@ def cmd_render_gateway_runtime_env(args: argparse.Namespace) -> int:
     return 0
 
 
-# Per-agent invocation tables carry exactly these role keys today; reviewer
-# and worker spawn are the only consumers. Any other key is almost certainly
-# a typo (e.g. `workers`) and should fail loud at validate time rather than
-# silently drop on the floor.
-_AGENT_ROLE_KEYS = ("worker", "reviewer")
 _REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
 _REFERENCE_REPOS_MIN_QUAY_VERSION_STR = "v0.3.10"
 
-# Stricter than `_REPO_ID_RE`: agent ids are interpolated bare into TOML
-# table headers (`[agents.invocations.<id>]`), and a dotted id like `gpt.5`
-# would parse as nested keys (`agents.invocations.gpt.5`) rather than as a
-# single agent entry. Reject dots here so the renderer can keep emitting a
-# bare header without quoting.
-_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SLACK_CHANNEL_RE = re.compile(r"^[CDG][A-Z0-9]{2,}$")
-
-
-def _validate_quay_agents_block(
-    block: Any,
-) -> tuple[
-    dict[str, Any] | None,
-    str | None,
-]:
-    """Validate ``quay.agents`` and return a normalised view (or error string).
-
-    Schema::
-
-        agents:
-          worker: <agent_id>       # optional default for worker spawns
-          reviewer: <agent_id>     # optional default for reviewer spawns
-          invocations:             # required when worker/reviewer reference an id
-            <agent_id>:
-              worker: "<cmd>"      # both roles optional individually; at
-              reviewer: "<cmd>"    # least one must be present per agent
-
-    Absent block → ``(None, None)`` (legacy ``agent_invocation`` path).
-    """
-    if block is None:
-        return None, None
-    if not isinstance(block, dict):
-        return None, "quay.agents must be a mapping when present"
-
-    allowed_top = {*_AGENT_ROLE_KEYS, "invocations"}
-    unknown = sorted(set(block.keys()) - allowed_top)
-    if unknown:
-        return None, (
-            f"quay.agents has unknown key(s): {unknown!r} "
-            f"(allowed: {sorted(allowed_top)!r})"
-        )
-
-    out: dict[str, Any] = {}
-    for role in _AGENT_ROLE_KEYS:
-        if role in block:
-            v = block[role]
-            if not isinstance(v, str) or not v:
-                return None, (
-                    f"quay.agents.{role} must be a non-empty string "
-                    f"(got {type(v).__name__}: {v!r})"
-                )
-            if not _AGENT_ID_RE.match(v):
-                return None, (
-                    f"quay.agents.{role}={v!r} must match "
-                    f"{_AGENT_ID_RE.pattern}"
-                )
-            out[role] = v
-
-    invocations = block.get("invocations")
-    if invocations is None:
-        invocations = {}
-    if not isinstance(invocations, dict):
-        return None, "quay.agents.invocations must be a mapping"
-
-    parsed_inv: dict[str, dict[str, str]] = {}
-    for agent_id, roles in invocations.items():
-        if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
-            return None, (
-                f"quay.agents.invocations.{agent_id!r}: agent id must match "
-                f"{_AGENT_ID_RE.pattern}"
-            )
-        if not isinstance(roles, dict):
-            return None, (
-                f"quay.agents.invocations.{agent_id} must be a mapping "
-                f"(got {type(roles).__name__})"
-            )
-        bad_role = sorted(set(roles.keys()) - set(_AGENT_ROLE_KEYS))
-        if bad_role:
-            return None, (
-                f"quay.agents.invocations.{agent_id} has unknown key(s): "
-                f"{bad_role!r} (allowed: {list(_AGENT_ROLE_KEYS)!r})"
-            )
-        roles_out: dict[str, str] = {}
-        for role in _AGENT_ROLE_KEYS:
-            if role in roles:
-                v = roles[role]
-                if not isinstance(v, str) or not v:
-                    return None, (
-                        f"quay.agents.invocations.{agent_id}.{role} must be a "
-                        f"non-empty string (got {type(v).__name__}: {v!r})"
-                    )
-                roles_out[role] = v
-        if not roles_out:
-            return None, (
-                f"quay.agents.invocations.{agent_id} must define at least one "
-                f"of {list(_AGENT_ROLE_KEYS)!r}"
-            )
-        parsed_inv[agent_id] = roles_out
-
-    # Cross-check: if `worker`/`reviewer` defaults name an agent id, that id
-    # must have a matching role entry in `invocations`. Otherwise the rendered
-    # config.toml would point at an agent quay can't resolve.
-    for role in _AGENT_ROLE_KEYS:
-        ref = out.get(role)
-        if ref is None:
-            continue
-        if ref not in parsed_inv:
-            return None, (
-                f"quay.agents.{role}={ref!r} but no quay.agents.invocations."
-                f"{ref} entry is defined"
-            )
-        if role not in parsed_inv[ref]:
-            return None, (
-                f"quay.agents.{role}={ref!r} but quay.agents.invocations."
-                f"{ref}.{role} is not set"
-            )
-
-    out["invocations"] = parsed_inv
-    return out, None
 
 
 def _toml_basic_string(s: str) -> str:
@@ -932,6 +887,51 @@ def _extract_top_level_toml_table(text: str, table: str) -> list[str]:
         while block and not block[-1].strip():
             block.pop()
         return block
+    return []
+
+
+def _extract_top_level_toml_table_family(text: str, table: str) -> list[str]:
+    """Return all top-level TOML table blocks in a dotted table family."""
+    lines = text.splitlines()
+    blocks: list[list[str]] = []
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        if not (
+            stripped == f"[{table}]"
+            or stripped.startswith(f"[{table}.") and stripped.endswith("]")
+        ):
+            idx += 1
+            continue
+        end = len(lines)
+        for next_idx in range(idx + 1, len(lines)):
+            next_stripped = lines[next_idx].strip()
+            if next_stripped.startswith("[") and next_stripped.endswith("]"):
+                end = next_idx
+                break
+        block = lines[idx:end]
+        while block and not block[-1].strip():
+            block.pop()
+        if block:
+            blocks.append(block)
+        idx = end
+
+    out: list[str] = []
+    for block in blocks:
+        if out:
+            out.append("")
+        out.extend(block)
+    return out
+
+
+def _extract_top_level_toml_key(text: str, key: str) -> list[str]:
+    """Return a top-level ``key = value`` line from existing config text."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            return []
+        if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} "):
+            return [line]
     return []
 
 
@@ -1054,10 +1054,8 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
     """Render <target>/quay/config.toml for the Hermes/Quay boundary.
 
     Refuses to overwrite an existing file unless --force is passed. The
-    installer passes --force for the Hermes-owned launch/auth/context keys
-    below, not for Quay product/runtime behavior. Always creates a file when
-    inputs validate, so setup-hermes.sh can chown/chmod the path without
-    racing the helper.
+    installer does not pass --force; once created, this file is persistently
+    Quay-owned.
 
     Deliberately omitted from the rendered TOML:
       * data_dir   — set via QUAY_DATA_DIR in the systemd unit env, so the
@@ -1066,33 +1064,19 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
                      where we want for free.
       * version    — consumed by setup-hermes.sh to fetch the binary, not by
                      quay at runtime; lives in deploy.values.yaml only.
-      * reviewer   — Quay-owned behavior. Existing deployments keep whatever
-                     is already in their Quay config; new installs use Quay's
-                     release defaults until Quay exposes a dedicated contract.
+      * agent_invocation / agents / reviewer
+                   — Quay-owned runtime behavior.
     """
     data = _load(Path(args.values))
     out_path = Path(args.out)
-    existing_reviewer_block: list[str] = []
 
     if out_path.exists() and not args.force:
         sys.stdout.write(f"preserved: {out_path}\n")
         return 0
-    if out_path.exists() and args.force:
-        existing_reviewer_block = _extract_top_level_toml_table(
-            out_path.read_text(encoding="utf-8"),
-            "reviewer",
-        )
 
     quay = data.get("quay") or {}
     if not isinstance(quay, dict):
         sys.stderr.write("values_helper.py: quay must be a mapping\n")
-        return 1
-
-    agent_invocation = quay.get("agent_invocation")
-    if not isinstance(agent_invocation, str) or not agent_invocation:
-        sys.stderr.write(
-            "values_helper.py: quay.agent_invocation is required (non-empty string)\n"
-        )
         return 1
 
     reference_repos_root = args.reference_repos_root
@@ -1110,11 +1094,6 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         )
         return 1
 
-    agents_block, agents_err = _validate_quay_agents_block(quay.get("agents"))
-    if agents_err is not None:
-        sys.stderr.write(f"values_helper.py: {agents_err}\n")
-        return 1
-
     adapters = quay.get("adapters") or {}
     if not isinstance(adapters, dict):
         sys.stderr.write("values_helper.py: quay.adapters must be a mapping\n")
@@ -1126,8 +1105,6 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
         "#",
         "# data_dir comes from QUAY_DATA_DIR set in the systemd unit; repos_root",
         "# defaults to ${data_dir}/repos.",
-        "",
-        f"agent_invocation = {_toml_basic_string(agent_invocation)}",
     ]
     if args.enable_admin_auth:
         lines.extend([
@@ -1139,26 +1116,6 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
             'token_env = "QUAY_ADMIN_TOKEN"',
             'forwarded_identity_header = "X-Hermes-User-Id"',
         ])
-
-    # Legacy `agent_invocation` above continues to render unchanged — quay's
-    # back-compat path treats it as the worker default when no `[agents]`
-    # block is present.
-    if agents_block is not None:
-        lines.append("")
-        lines.append("[agents]")
-        for role in _AGENT_ROLE_KEYS:
-            v = agents_block.get(role)
-            if isinstance(v, str):
-                lines.append(f"{role} = {_toml_basic_string(v)}")
-        # Sort invocation keys so re-rendering the same values.yaml produces
-        # byte-identical TOML — hermes-sync's drift detector relies on it.
-        for agent_id in sorted(agents_block["invocations"]):
-            roles = agents_block["invocations"][agent_id]
-            lines.append("")
-            lines.append(f"[agents.invocations.{agent_id}]")
-            for role in _AGENT_ROLE_KEYS:
-                if role in roles:
-                    lines.append(f"{role} = {_toml_basic_string(roles[role])}")
 
     linear = adapters.get("linear") or {}
     if isinstance(linear, dict) and linear.get("enabled"):
@@ -1205,52 +1162,9 @@ def cmd_render_quay_config(args: argparse.Namespace) -> int:
             f"{_REFERENCE_REPOS_MIN_QUAY_VERSION_STR} (got {got_version!r})\n"
         )
 
-    if existing_reviewer_block:
-        lines.append("")
-        lines.append("# Preserved from existing config.toml; Quay owns reviewer behavior.")
-        lines.extend(existing_reviewer_block)
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     sys.stdout.write(f"wrote: {out_path}\n")
-    return 0
-
-
-def _active_quay_agent_invocations(data: dict) -> tuple[list[str] | None, str | None]:
-    quay = data.get("quay") or {}
-    if not isinstance(quay, dict):
-        return None, "quay must be a mapping"
-
-    agent_invocation = quay.get("agent_invocation")
-    if not isinstance(agent_invocation, str) or not agent_invocation:
-        return None, "quay.agent_invocation is required (non-empty string)"
-
-    agents_block, agents_err = _validate_quay_agents_block(quay.get("agents"))
-    if agents_err is not None:
-        return None, agents_err
-    if agents_block is None:
-        return [agent_invocation], None
-
-    active: list[str] = []
-    for role in _AGENT_ROLE_KEYS:
-        agent_id = agents_block.get(role)
-        if not isinstance(agent_id, str):
-            continue
-        invocation = agents_block["invocations"][agent_id][role]
-        if invocation not in active:
-            active.append(invocation)
-    return active, None
-
-
-def cmd_active_agent_invocations(args: argparse.Namespace) -> int:
-    data = _load(Path(args.values))
-    invocations, err = _active_quay_agent_invocations(data)
-    if err is not None:
-        sys.stderr.write(f"values_helper.py: {err}\n")
-        return 1
-    sys.stdout.write("\n".join(invocations or []))
-    if invocations:
-        sys.stdout.write("\n")
     return 0
 
 
@@ -1839,98 +1753,13 @@ def _collect_known_skills(skills_root: Path) -> set[str] | None:
     return names
 
 
-def _validate_tag_namespaces_block(
-    block: Any,
-) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
-    """Validate the deployment-level ``quay.tag_namespaces:`` block.
-
-    Deployment shape is the full envelope:
-
-        tag_namespaces:
-          task-type:
-            required: true
-            values: [bugfix, new-feature]
-          risk:
-            values: [pii]
-
-    Per-namespace ``required`` defaults to ``false`` when omitted.
-    ``required: true`` with an empty/absent ``values:`` is rejected
-    locally — quay's apply-deployment rejects it too, but failing at
-    schema-validate time gives the operator a single error rather than
-    a partial install. Returns ``(parsed, None)`` on success or
-    ``(None, error)`` on failure. Sorting matches
-    ``_validate_repo_tags_block``.
-    """
-    label = "quay.tag_namespaces"
-    if block is None:
-        return {}, None
-    if not isinstance(block, dict):
-        return None, f"{label} must be a mapping"
-    out: dict[str, dict[str, Any]] = {}
-    for ns_raw, spec in block.items():
-        ns = str(ns_raw)
-        if not _TAG_NS_RE.match(ns):
-            return None, (
-                f"{label}.{ns!r}: namespace must match {_TAG_NS_RE.pattern}"
-            )
-        if not isinstance(spec, dict):
-            return None, (
-                f"{label}.{ns}: must be a mapping with `values:` "
-                f"(and optional `required:`); got {type(spec).__name__}"
-            )
-        unknown = set(spec.keys()) - {"required", "values"}
-        if unknown:
-            return None, (
-                f"{label}.{ns}: unknown key(s) {sorted(unknown)!r} "
-                f"(allowed: required, values)"
-            )
-        required_raw = spec.get("required", False)
-        if not isinstance(required_raw, bool):
-            return None, (
-                f"{label}.{ns}.required: must be a bool "
-                f"(got {type(required_raw).__name__})"
-            )
-        values_raw = spec.get("values", [])
-        if not isinstance(values_raw, list):
-            return None, (
-                f"{label}.{ns}.values: must be a list "
-                f"(got {type(values_raw).__name__})"
-            )
-        seen: set[str] = set()
-        cleaned: list[str] = []
-        for j, v in enumerate(values_raw):
-            if not isinstance(v, str):
-                return None, (
-                    f"{label}.{ns}.values[{j}]: must be a string "
-                    f"(got {type(v).__name__})"
-                )
-            if not _TAG_VALUE_RE.match(v):
-                return None, (
-                    f"{label}.{ns}.values[{j}]={v!r}: must match {_TAG_VALUE_RE.pattern}"
-                )
-            if v in seen:
-                return None, f"{label}.{ns}.values: duplicate value {v!r}"
-            seen.add(v)
-            cleaned.append(v)
-        cleaned.sort()
-        if required_raw and not cleaned:
-            return None, (
-                f"{label}.{ns}: required=true with no values is rejected by "
-                f"`quay tags apply-deployment` (would emit TAG_REQUIRED_MISSING "
-                f"on every validation with no satisfying tag possible)"
-            )
-        out[ns] = {"values": cleaned, "required": required_raw}
-    return dict(sorted(out.items())), None
-
-
 def _emit_apply_payload(namespaces: dict[str, dict[str, Any]]) -> str:
     """Render a ``namespaces`` dict in the JSON shape ``quay … apply-tags
-    --from -`` and ``quay tags apply-deployment --from -`` accept.
+    --from -`` accepts.
 
     ``json.dumps`` with ``sort_keys=True`` is deterministic over insertion
     order, which matters because verify-path drift checks string-compare
-    against ``quay … get-tags`` / ``quay tags get-deployment`` (both of
-    which themselves sort). An empty namespaces dict round-trips to
+    against ``quay … get-tags``. An empty namespaces dict round-trips to
     ``{"namespaces": {}}`` — the explicit "clear" payload.
     """
     return json.dumps({"namespaces": namespaces}, sort_keys=True) + "\n"
@@ -1979,27 +1808,6 @@ def cmd_get_repo_tags(args: argparse.Namespace) -> int:
         for ns, values in (parsed or {}).items()
     }
     sys.stdout.write(_emit_apply_payload(namespaces))
-    return 0
-
-
-def cmd_get_deployment_tags(args: argparse.Namespace) -> int:
-    """Emit deployment tag vocab as JSON for ``quay tags apply-deployment``.
-
-    Reads ``quay.tag_namespaces``. Empty / absent block emits
-    ``{"namespaces": {}}`` — the explicit-clear payload that reverts
-    the deployment vocab. Strict reconciliation: dropping a namespace
-    from values flows through to a removal in quay.
-    """
-    data = _load(Path(args.values))
-    quay = data.get("quay") or {}
-    if not isinstance(quay, dict):
-        sys.stderr.write("values_helper.py: quay must be a mapping\n")
-        return 1
-    parsed, err = _validate_tag_namespaces_block(quay.get("tag_namespaces"))
-    if err is not None:
-        sys.stderr.write(f"values_helper.py: {err}\n")
-        return 1
-    sys.stdout.write(_emit_apply_payload(parsed or {}))
     return 0
 
 
@@ -2119,12 +1927,6 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
             return 1
 
     quay_top = data.get("quay") if isinstance(data.get("quay"), dict) else None
-    _, ag_err = _validate_quay_agents_block(
-        quay_top.get("agents") if quay_top else None
-    )
-    if ag_err is not None:
-        sys.stderr.write(f"values_helper.py: {ag_err}\n")
-        return 1
     _, orch_err = _validate_quay_orchestrator_block(
         quay_top.get("orchestrator") if quay_top else None
     )
@@ -2144,12 +1946,6 @@ def cmd_validate_schema(args: argparse.Namespace) -> int:
         )
         if it_err is not None:
             sys.stderr.write(f"values_helper.py: {it_err}\n")
-            return 1
-
-    if quay_top is not None:
-        _, ns_err = _validate_tag_namespaces_block(quay_top.get("tag_namespaces"))
-        if ns_err is not None:
-            sys.stderr.write(f"values_helper.py: {ns_err}\n")
             return 1
 
     # slack_triggers[] — top-level. `--skills-root` is optional: when set
@@ -2294,12 +2090,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_quay.set_defaults(func=cmd_render_quay_config)
 
-    p_active_inv = sub.add_parser(
-        "active-agent-invocations",
-        help="emit active quay agent invocation commands, one per line",
-    )
-    p_active_inv.set_defaults(func=cmd_active_agent_invocations)
-
     p_quay_orch = sub.add_parser(
         "render-quay-orchestrator-config",
         help="write <target>/quay/orchestrator.json from quay.orchestrator",
@@ -2385,12 +2175,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_repo_tags.add_argument("repo", help="repos[].id to look up")
     p_repo_tags.set_defaults(func=cmd_get_repo_tags)
-
-    p_dep_tags = sub.add_parser(
-        "get-deployment-tags",
-        help="emit deployment tag vocab JSON for `quay tags apply-deployment --from -`",
-    )
-    p_dep_tags.set_defaults(func=cmd_get_deployment_tags)
 
     args = parser.parse_args(argv)
     return args.func(args)

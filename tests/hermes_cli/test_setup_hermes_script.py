@@ -19,6 +19,13 @@ def test_installer_script_is_valid_shell():
     assert result.returncode == 0, result.stderr
 
 
+def test_installer_gateway_install_is_noninteractive():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert '"$HERMES_BIN" gateway install --system \\' in content
+    assert "--no-start-now --no-start-on-login" in content
+
+
 def test_setup_hermes_script_has_termux_path():
     content = SETUP_SCRIPT.read_text(encoding="utf-8")
 
@@ -26,7 +33,7 @@ def test_setup_hermes_script_has_termux_path():
     assert ".[termux]" in content
     assert "constraints-termux.txt" in content
     assert "$PREFIX/bin" in content
-    assert "Skipping tinker-atropos on Termux" in content
+    assert "tested Android bundle" in content
 
 
 def test_installer_unsets_stale_insteadof_for_quay_entries(tmp_path):
@@ -132,25 +139,23 @@ def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
     ).returncode == 1
 
 
-def test_installer_renders_quay_config_with_force_on_every_run():
-    """Boundary guard: setup-hermes.sh must call render-quay-config with
-    --force for the Hermes-owned launch/auth/context keys. Quay behavior
-    fields must not be added to that renderer just because they live under
-    deploy.values.yaml's transitional quay: block.
+def test_installer_creates_quay_config_once_then_preserves_it():
+    """Boundary guard: setup-hermes.sh bootstraps quay/config.toml only when
+    missing. Once present, Quay owns the whole file and installer reruns must
+    not re-render selected runtime blocks or force-overwrite operator/Quay
+    changes.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    # Allow any whitespace/line-continuations between the subcommand and the
-    # --force flag, but require they appear in the same invocation block.
-    pattern = r'render-quay-config[^\n]*--out[^\n]*"[^\n]*"\s*(?:\\\s*\n\s*)?--force'
-    assert re.search(pattern, content), (
-        "installer must invoke `render-quay-config --out … --force` so the "
-        "Hermes-owned Quay boundary is reconciled from deploy.values.yaml"
-    )
+    assert 'if [[ ! -e "$QUAY_CONFIG_OUT" ]]; then' in content
+    assert 'echo "==> preserving existing $QUAY_CONFIG_OUT"' in content
     assert '--reference-repos-root "$TARGET_DIR/code"' in content
-    assert "Hermes-owned launch/auth/context boundary" in content
-    # Belt-and-suspenders: the old preserve branch printed this exact phrase.
-    # Its presence would mean the gate snuck back in.
-    assert "$QUAY_CONFIG_OUT already present (preserving)" not in content
+    block = re.search(
+        r'render-quay-config --out "\$QUAY_CONFIG_OUT"(?P<body>.*?)\n    chown ',
+        content,
+        re.S,
+    )
+    assert block is not None
+    assert "--force" not in block.group("body")
 
 
 def test_installer_reconciles_existing_quay_repo_metadata():
@@ -196,16 +201,20 @@ def test_installer_translates_legacy_orchestrator_env_keys():
         )
 
 
-def test_installer_provisions_claude_cli_from_active_invocations():
+def test_installer_provisions_agent_clis_for_quay():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    assert "active-agent-invocations" in content
-    assert 'if [[ "$agent_invocations" == *claude* ]]; then' in content
+    assert "active-agent-invocations" not in content
     assert (
         "sudo -u \"$AGENT_USER\" -H bash -c "
         "'curl -fsSL https://claude.ai/install.sh | bash'"
     ) in content
     assert 'CLAUDE_AGENT_BIN="$AGENT_HOME/.local/bin/claude"' in content
     assert 'ln -sf "$CLAUDE_AGENT_BIN" /usr/local/bin/claude' in content
+    assert (
+        'ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER" --required'
+        in content
+    )
+    assert 'if [[ "$QUAY_ENABLED" -eq 1 ]]; then' in content
     assert "quay.agent_invocation references 'claude'" not in content
 
 
@@ -301,6 +310,7 @@ def test_quay_serve_service_is_localhost_and_token_protected():
 
     assert "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731" in service
     assert "Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay" in service
+    assert "EnvironmentFile=-__TARGET_DIR__/auth/gateway-runtime.env" in service
     assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in service
     assert "QUAY_ADMIN_TOKEN" in service
     assert "quay-serve.service" in installer
@@ -313,8 +323,13 @@ def test_quay_serve_service_is_localhost_and_token_protected():
     assert "ensure_quay_admin_token" in installer
     assert "secrets.token_urlsafe(48)" in installer
     assert '[[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1' in installer
+    assert "quay_serve_was_active=0" in installer
+    assert "systemctl is-active quay-serve.service" in installer
     assert "systemctl enable --now quay-serve.service" in installer
+    assert "systemctl try-restart quay-serve.service" in installer
     assert "QUAY_ADMIN_TOKEN=${existing_quay_admin_token}" in stage
+    assert "API_SERVER_KEY=${existing_api_server_key}" in stage
+    assert "QUAY_HERMES_API_KEY=${existing_api_server_key}" in stage
 
 
 def test_installer_removes_legacy_reviewer_token_timer():

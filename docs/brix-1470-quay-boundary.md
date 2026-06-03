@@ -34,18 +34,18 @@ separate Quay task.
 | --- | --- | --- |
 | `quay.version` | Keep in Hermes | Release pin and SHA verification boundary. |
 | `quay.release_repo` | Keep in Hermes | Download location for the pinned Quay binary. |
-| `quay.codex` | Keep in Hermes | Worker CLI provisioning for local launch. |
+| `quay.codex` | Keep in Hermes | Root-managed Codex CLI binary pin. Used when Atlas or Quay is enabled. |
 | `quay.runtime_managers` | Keep in Hermes | Ensures package managers required by registered repos exist on PATH. |
-| `quay.agent_invocation` | Keep in Hermes | Launch command for the worker process; kept for legacy Quay compatibility. |
-| `quay.agents` | Keep in Hermes | Launch command registry for worker/reviewer processes. |
+| `quay.agent_invocation` | Move to Quay | No longer sourced from `deploy.values.yaml`; existing deployed `config.toml` values are preserved and Quay defaults apply on fresh installs. |
+| `quay.agents` | Move to Quay | Same as `quay.agent_invocation`; setup provisions the standard local agent CLI set for Quay-enabled hosts. |
 | `quay.adapters.*.*_env` | Keep in Hermes | Secret env-var names are wiring. |
 | `quay.adapters.*.enabled` | Transitional | Still rendered where needed for existing Linear/Slack flows; Quay should own adapter behavior defaults. |
 | `quay.orchestrator` | Keep in Hermes | Hermes sidecar config, rendered to `quay/orchestrator.json`, not Quay `config.toml`. |
 | `quay.reviewer` | Move to Quay | No longer rendered by `setup-hermes.sh`; new installs use Quay defaults. Existing deployed `config.toml` values remain until operators or Quay migration tooling change them. |
-| `quay.tag_namespaces` | Transitional | Still reconciled for compatibility with current ticket validation. Move to a Quay-owned admin/config contract before removing from Hermes values. |
+| `quay.tag_namespaces` | Move to Quay | No longer sourced, validated, or reconciled by Hermes setup. |
 | `repos[].quay.package_manager` | Keep in Hermes | Launch prerequisite for worktree bootstrap. |
 | `repos[].quay.install_cmd` | Transitional | Required by current Quay repo registration payload. Quay should own longer-term repo bootstrap contracts. |
-| `repos[].quay.tags` | Transitional | Same compatibility status as `quay.tag_namespaces`. |
+| `repos[].quay.tags` | Transitional | Still reconciled per repo while repo onboarding metadata lives in deploy values. |
 
 ## Verification
 
@@ -53,15 +53,15 @@ Before deploy:
 
 ```bash
 scripts/run_tests.sh tests/installer/test_values_helper.py tests/hermes_cli/test_setup_hermes_script.py
-python3 installer/values_helper.py --values deploy.values.yaml render-quay-config --out /tmp/quay-config.toml --force --enable-admin-auth --reference-repos-root /tmp/hermes-code
+python3 installer/values_helper.py --values deploy.values.yaml render-quay-config --out /tmp/quay-config.toml --enable-admin-auth --reference-repos-root /tmp/hermes-code
 ```
 
-For a fresh output path, the rendered config should contain launch/auth/context wiring such as
-`agent_invocation`, `[agents]`, `[admin]`, `[context]`, and adapter env names.
-It should not contain `[reviewer]`. When re-rendering an existing deployed
-config, `setup-hermes.sh` preserves the existing `[reviewer]` table verbatim as
-a migration bridge, but it no longer sources reviewer behavior from
-`deploy.values.yaml`.
+For a fresh output path, the rendered config should contain launch/auth/context
+wiring such as `[admin]`, `[context]`, and adapter env names. It should not
+contain `agent_invocation`, `[agents]`, or `[reviewer]`. On an existing
+deployment, `setup-hermes.sh` does not re-render `quay/config.toml`; it leaves
+the whole file untouched so Quay/operator-managed runtime behavior persists
+across installer reruns.
 
 After deploy:
 

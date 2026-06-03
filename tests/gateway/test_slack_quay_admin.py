@@ -1,9 +1,11 @@
+import re
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
+from hermes_cli import quay_admin_auth
 
 
 def _ensure_slack_mock():
@@ -52,6 +54,9 @@ async def test_quay_admin_slash_dms_allowed_user(monkeypatch, adapter, _isolate_
     adapter._respond_to_slash_command = AsyncMock()
 
     client = MagicMock()
+    client.users_info = AsyncMock(return_value={
+        "user": {"profile": {"display_name": "Mira T.", "real_name": "Mira Tester"}},
+    })
     client.conversations_open = AsyncMock(return_value={"channel": {"id": "D123"}})
     client.chat_postMessage = AsyncMock(return_value={"ok": True})
     adapter._team_clients["T1"] = client
@@ -70,6 +75,11 @@ async def test_quay_admin_slash_dms_allowed_user(monkeypatch, adapter, _isolate_
     dm_kwargs = client.chat_postMessage.call_args.kwargs
     assert dm_kwargs["channel"] == "D123"
     assert "https://hermes.example.test/quay/admin/login?token=" in dm_kwargs["text"]
+    match = re.search(r"token=([A-Za-z0-9_-]+)", dm_kwargs["text"])
+    assert match is not None
+    record = quay_admin_auth.inspect_login_token(match.group(1))
+    assert record is not None
+    assert record["display_name"] == "Mira T."
     assert "QUAY_ADMIN_TOKEN" not in dm_kwargs["text"]
     adapter._respond_to_slash_command.assert_awaited_once()
     assert "DM" in adapter._respond_to_slash_command.call_args.args[1]

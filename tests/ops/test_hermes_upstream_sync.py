@@ -94,6 +94,9 @@ def _run_script(triplet: dict, **env_overrides) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["FORK_DIR"] = str(triplet["fork"])
     env["PATH"] = f"{triplet['bin']}{os.pathsep}{env['PATH']}"
+    env["HERMES_HOME"] = str(triplet["tmp"] / "hermes-home")
+    env["HERMES_UPSTREAM_SYNC_WORKTREE_ROOT"] = str(triplet["tmp"] / "worktrees")
+    env["GITHUB_REPOSITORY"] = "InverterNetwork/hermes-agent"
     env.update(env_overrides)
     return subprocess.run(
         ["bash", str(SCRIPT)],
@@ -123,6 +126,12 @@ class TestHermesUpstreamSync:
         assert "fully merged" in result.stdout
         assert not triplet["gh_log"].exists()
 
+    def test_no_divergence_does_not_need_github_repository(self, triplet):
+        result = _run_script(triplet, GITHUB_REPOSITORY="")
+        assert result.returncode == 0, result.stderr
+        assert "fully merged" in result.stdout
+        assert not triplet["gh_log"].exists()
+
     def test_dry_run_with_divergence_does_not_create_branch(self, triplet):
         upstream_short = _advance_upstream(triplet)
         result = _run_script(triplet, PR_DRY_RUN="1")
@@ -145,9 +154,11 @@ class TestHermesUpstreamSync:
 
         assert triplet["gh_log"].exists()
         gh_args = triplet["gh_log"].read_text()
-        assert "pr create" in gh_args
-        assert "--base main" in gh_args
-        assert "--draft" not in gh_args
+        assert "api repos/InverterNetwork/hermes-agent/pulls" in gh_args
+        assert "-X POST" in gh_args
+        assert "base=main" in gh_args
+        assert "head=upstream-sync/" in gh_args
+        assert "draft=true" not in gh_args
         assert "Sync upstream hermes-agent @" in gh_args
         assert "(CONFLICTS)" not in gh_args
 
@@ -185,7 +196,8 @@ class TestHermesUpstreamSync:
         assert result.returncode == 0, result.stderr
 
         gh_args = triplet["gh_log"].read_text()
-        assert "--draft" in gh_args
+        assert "api repos/InverterNetwork/hermes-agent/pulls" in gh_args
+        assert "draft=true" in gh_args
         assert "(CONFLICTS)" in gh_args
         assert "SHARED.md" in gh_args  # listed in body's conflict-files block
 
@@ -197,14 +209,21 @@ class TestHermesUpstreamSync:
         ).stdout.strip()
         assert msg == "WIP: upstream sync with conflicts (resolve before merging)"
 
-    def test_dirty_working_tree_is_refused(self, triplet):
-        _advance_upstream(triplet)
-        # Dirty the fork without committing.
-        (triplet["fork"] / "DIRTY.md").write_text("uncommitted\n")
+    def test_dirty_primary_working_tree_uses_isolated_worktree(self, triplet):
+        upstream_short = _advance_upstream(triplet)
+        # Dirty the primary fork checkout without committing. The service
+        # should still run because merge work happens in a temp worktree.
+        dirty = triplet["fork"] / "DIRTY.md"
+        dirty.write_text("uncommitted\n")
         result = _run_script(triplet)
-        assert result.returncode != 0
-        assert "working tree dirty" in result.stderr
-        assert not triplet["gh_log"].exists()
+        assert result.returncode == 0, result.stderr
+        assert "primary checkout is dirty" in result.stderr
+        assert dirty.read_text() == "uncommitted\n"
+
+        branches = _git(triplet["origin_bare"], "branch").stdout
+        assert "upstream-sync/" in branches
+        assert upstream_short in branches
+        assert triplet["gh_log"].exists()
 
     def test_missing_upstream_remote_fails_loudly(self, triplet):
         # Remove the upstream remote.
@@ -249,6 +268,36 @@ class TestHermesUpstreamSync:
         assert result.returncode == 0, result.stderr
         env_seen = triplet["gh_env_log"].read_text().strip()
         assert env_seen == "GH_TOKEN=caller-supplied-token"
+
+    def test_status_file_records_success(self, triplet, tmp_path):
+        _advance_upstream(triplet)
+        state_dir = tmp_path / "state"
+        result = _run_script(
+            triplet,
+            HERMES_UPSTREAM_SYNC_STATE_DIR=str(state_dir),
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        status = (state_dir / "status.env").read_text()
+        assert "state=ok" in status
+        assert "branch=upstream-sync/" in status
+        assert "upstream_sha=" in status
+
+    def test_active_lock_skips_without_opening_pr(self, triplet, tmp_path):
+        _advance_upstream(triplet)
+        state_dir = tmp_path / "state"
+        lock_dir = state_dir / "lock"
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "pid").write_text(str(os.getpid()))
+
+        result = _run_script(
+            triplet,
+            HERMES_UPSTREAM_SYNC_STATE_DIR=str(state_dir),
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+        assert "another hermes-upstream-sync run is active" in result.stderr
+        assert not triplet["gh_log"].exists()
+        status = (state_dir / "status.env").read_text()
+        assert "state=skipped" in status
 
     @staticmethod
     def _install_git_push_spy(triplet: dict, log_path: Path) -> None:
@@ -338,7 +387,7 @@ class TestHermesUpstreamSync:
     ):
         """A token supplied via $GH_TOKEN (e.g. from EnvironmentFile, or
         an operator bypassing the helper) must reach `git push` too, not
-        just `gh pr create`. Without this the override is silently broken
+        just the GitHub REST API call. Without this the override is silently broken
         and the push falls back to whatever git auth is — typically none,
         so the timer dies on the username prompt.
         """

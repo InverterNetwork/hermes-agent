@@ -46,6 +46,31 @@ if str(INSTALLER_DIR) not in sys.path:
 from hermes_installer.verify import VerifyArgs, run as run_verify  # noqa: E402
 
 
+def _minimal_quay_values(path: Path) -> None:
+    path.write_text(
+        "quay:\n"
+        "  version: \"v0.3.34\"\n"
+        "  adapters:\n"
+        "    slack:\n"
+        "      enabled: false\n",
+        encoding="utf-8",
+    )
+
+
+def _run_values_helper(
+    values: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(REPO_ROOT / "installer" / "values_helper.py"),
+         "--values", str(values), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         list(args), cwd=cwd, check=check, capture_output=True, text=True,
@@ -54,6 +79,70 @@ def _run(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 def _git(repo: Path, *args: str, **kw) -> subprocess.CompletedProcess:
     return _run(repo, "git", "-C", str(repo), *args, **kw)
+
+
+def test_render_quay_config_without_runtime_settings_uses_quay_defaults(tmp_path: Path):
+    values = tmp_path / "values.yaml"
+    out = tmp_path / "quay" / "config.toml"
+    code_root = tmp_path / "code"
+    _minimal_quay_values(values)
+
+    result = _run_values_helper(
+        values,
+        "render-quay-config",
+        "--out", str(out),
+        "--enable-admin-auth",
+        "--reference-repos-root", str(code_root),
+    )
+
+    assert result.returncode == 0, result.stderr
+    rendered = out.read_text(encoding="utf-8")
+    assert "[admin]" in rendered
+    assert "[context]" in rendered
+    assert "agent_invocation" not in rendered
+    assert "[agents]" not in rendered
+    assert "[agents.invocations" not in rendered
+    assert "[reviewer]" not in rendered
+
+
+def test_render_quay_config_preserves_existing_file_without_force(tmp_path: Path):
+    values = tmp_path / "values.yaml"
+    out = tmp_path / "quay" / "config.toml"
+    code_root = tmp_path / "code"
+    _minimal_quay_values(values)
+    out.parent.mkdir()
+    existing = (
+        'agent_invocation = "legacy < {prompt_file}"\n'
+        "\n"
+        "[agents]\n"
+        'worker = "codex"\n'
+        'reviewer = "codex"\n'
+        'reviewer_model = "gpt-5.4"\n'
+        "\n"
+        "[agents.invocations.codex]\n"
+        'worker = "codex exec --model gpt-5.4 < {prompt_file}"\n'
+        'reviewer = "codex exec --model gpt-5.4 < {prompt_file}"\n'
+        "\n"
+        "[reviewer]\n"
+        "enabled = true\n"
+        'login = "app/didier-reviewer"\n'
+    )
+    out.write_text(
+        existing,
+        encoding="utf-8",
+    )
+
+    result = _run_values_helper(
+        values,
+        "render-quay-config",
+        "--out", str(out),
+        "--enable-admin-auth",
+        "--reference-repos-root", str(code_root),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "preserved" in result.stdout
+    assert out.read_text(encoding="utf-8") == existing
 
 
 @pytest.fixture
@@ -76,6 +165,7 @@ def install(tmp_path: Path) -> dict:
     (fork / "README.md").write_text("seed\n")
     _git(fork, "add", "-A")
     _git(fork, "commit", "-q", "-m", "seed")
+    _git(fork, "remote", "add", "origin", "https://github.com/example/hermes-agent.git")
     fork_sha = _git(fork, "describe", "--always", "--dirty", "--abbrev=40").stdout.strip()
 
     # ---- target (the rendered install) ----
@@ -83,6 +173,10 @@ def install(tmp_path: Path) -> dict:
     # HERMES_HOME mirror: prod is root:hermes 02775 (setgid). The test runs
     # as the developer so ownership is $USER:$primary_group; mode still
     # carries the setgid bit so verify's mode check stays exercised.
+    try:
+        os.chown(target, -1, os.getegid())
+    except PermissionError:
+        pass
     target.chmod(0o2775)
 
     # rails: a few files mimicking the rsynced hermes-agent tree.
@@ -119,6 +213,18 @@ def install(tmp_path: Path) -> dict:
     # Verify treats a missing code/ root as drift, so the base fixture
     # has to mirror what the installer always provisions.
     (target / "code").mkdir(mode=0o755)
+
+    upstream_workspace = target / "upstream-workspace"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(fork), str(upstream_workspace)],
+        check=True,
+    )
+    _git(upstream_workspace, "remote", "set-url",
+         "origin", "https://github.com/example/hermes-agent.git")
+    _git(upstream_workspace, "remote", "add",
+         "upstream", "https://github.com/nousresearch/hermes-agent.git")
+    _git(upstream_workspace, "config", "user.email", "didier@test")
+    _git(upstream_workspace, "config", "user.name", "didier")
 
     # Symlinks at render-target root pointing into state/ (matches the
     # installer's wiring).
@@ -169,11 +275,51 @@ def install(tmp_path: Path) -> dict:
     )
     systemctl.chmod(0o755)
 
+    upstream_sync_script = bin_dir / "hermes-upstream-sync"
+    upstream_sync_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    upstream_sync_script.chmod(0o755)
+
+    etc_default = tmp_path / "etc-default"
+    etc_default.mkdir()
+    upstream_sync_env = etc_default / "hermes-upstream-sync"
+    upstream_sync_env.write_text(f"FORK_DIR={upstream_workspace}\n")
+    upstream_sync_env.chmod(0o644)
+
+    systemd_dir = tmp_path / "systemd"
+    systemd_dir.mkdir()
+    (systemd_dir / "hermes-upstream-sync.service").write_text(
+        "[Unit]\n"
+        "Description=Propose an upstream hermes-agent merge as a PR\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"User={user}\n"
+        f"Group={user}\n"
+        f"EnvironmentFile=-{upstream_sync_env}\n"
+        f"ExecStart={upstream_sync_script}\n"
+        "Restart=no\n"
+        "TimeoutStartSec=300\n",
+        encoding="utf-8",
+    )
+    (systemd_dir / "hermes-upstream-sync.service").chmod(0o644)
+    (systemd_dir / "hermes-upstream-sync.timer").write_text(
+        "[Unit]\n"
+        "Description=Run hermes-upstream-sync weekly\n"
+        "[Timer]\n"
+        "OnCalendar=Mon *-*-* 09:00:00 UTC\n"
+        "RandomizedDelaySec=15min\n"
+        "Persistent=true\n"
+        "Unit=hermes-upstream-sync.service\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n",
+        encoding="utf-8",
+    )
+    (systemd_dir / "hermes-upstream-sync.timer").chmod(0o644)
+
     # On Linux production, useradd creates a primary group named after the
-    # user so $AGENT_USER works as both owner and group. On macOS test, the
-    # user's primary group is "staff" — feed the actual gid name through
-    # the override so the auth-dir owner check has matching expectations.
-    primary_group = grp.getgrgid(os.getegid()).gr_name
+    # user so $AGENT_USER works as both owner and group. In tests, use the
+    # group that the setgid target actually carries so child files inherit
+    # matching expectations on macOS temp directories too.
+    primary_group = grp.getgrgid(target.stat().st_gid).gr_name
 
     return {
         "tmp": tmp_path,
@@ -186,6 +332,10 @@ def install(tmp_path: Path) -> dict:
         "group": primary_group,
         "bin": bin_dir,
         "systemctl_log": systemctl_log,
+        "systemd_dir": systemd_dir,
+        "upstream_workspace": upstream_workspace,
+        "upstream_sync_script": upstream_sync_script,
+        "upstream_sync_env": upstream_sync_env,
     }
 
 
@@ -212,6 +362,9 @@ def _base_env(install: dict, env_overrides: dict[str, str] | None = None) -> dic
         "HERMES_VERIFY_EXPECT_RAILS_OWNER": install["user"],
         "HERMES_VERIFY_EXPECT_AGENT_OWNER": install["user"],
         "HERMES_VERIFY_EXPECT_AGENT_GROUP": install["group"],
+        "HERMES_VERIFY_SYSTEMD_DIR": str(install["systemd_dir"]),
+        "HERMES_VERIFY_UPSTREAM_SYNC_SCRIPT": str(install["upstream_sync_script"]),
+        "HERMES_VERIFY_UPSTREAM_SYNC_ENV": str(install["upstream_sync_env"]),
     }
     if env_overrides:
         env.update(env_overrides)
@@ -578,15 +731,54 @@ class TestSetupHermesVerify:
 
     def test_upstream_workspace_non_github_origin_is_drift(self, install):
         """When upstream-workspace exists, both remotes must be on github.com."""
-        target = install["target"]
-        ws = target / "upstream-workspace"
-        subprocess.run(["git", "clone", "--quiet", str(install["fork"]), str(ws)], check=True)
-        _git(ws, "remote", "add", "upstream",
-             "https://github.com/nousresearch/hermes-agent.git")
+        ws = install["upstream_workspace"]
+        _git(ws, "remote", "set-url", "origin", str(install["fork"]))
         # origin still points at the local fork path → drift.
         result = _run_verify(install)
         assert result.returncode == 1
         assert "[DRIFT] upstream-workspace origin" in result.stderr
+
+    def test_upstream_sync_missing_script_is_drift(self, install):
+        install["upstream_sync_script"].unlink()
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync script" in result.stderr
+
+    def test_upstream_sync_failed_status_is_drift(self, install):
+        status_dir = install["target"] / "state" / "hermes-upstream-sync"
+        status_dir.mkdir(parents=True)
+        (status_dir / "status.env").write_text(
+            "timestamp=2026-05-27T09:00:00Z\n"
+            "state=failed\n"
+            "detail='fetch upstream failed'\n",
+            encoding="utf-8",
+        )
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync status" in result.stderr
+        assert "fetch upstream failed" in result.stderr
+
+    def test_upstream_sync_stale_lock_is_drift(self, install):
+        lock_dir = install["target"] / "state" / "hermes-upstream-sync" / "lock"
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "pid").write_text("999999999\n", encoding="utf-8")
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync lock" in result.stderr
+
+    def test_upstream_sync_service_exec_mismatch_is_drift(self, install):
+        unit = install["systemd_dir"] / "hermes-upstream-sync.service"
+        text = unit.read_text(encoding="utf-8")
+        unit.write_text(
+            text.replace(
+                f"ExecStart={install['upstream_sync_script']}",
+                "ExecStart=/usr/local/bin/old-hermes-upstream-sync",
+            ),
+            encoding="utf-8",
+        )
+        result = _run_verify(install)
+        assert result.returncode == 1
+        assert "[DRIFT] hermes-upstream-sync.service exec" in result.stderr
 
     def test_quay_artefacts_skipped_when_no_values_file(self, install):
         """The verify-only fixture has no deploy.values.yaml in the fork —
@@ -1105,11 +1297,12 @@ def quay_install(install: dict) -> dict:
     (auth / "quay.env").write_text("QUAY_ADMIN_TOKEN=test-admin-token\n")
     (auth / "quay.env").chmod(0o640)
 
-    systemd_dir = install["tmp"] / "systemd"
-    systemd_dir.mkdir()
+    systemd_dir = install["systemd_dir"]
+    systemd_dir.mkdir(exist_ok=True)
     (systemd_dir / "quay-serve.service").write_text(
         "[Service]\n"
         f"Environment=QUAY_DATA_DIR={target / 'quay'}\n"
+        f"EnvironmentFile=-{target / 'auth' / 'gateway-runtime.env'}\n"
         f"EnvironmentFile={target / 'auth' / 'quay.env'}\n"
         "ExecStart=/usr/local/bin/quay serve --host 127.0.0.1 --port 9731\n",
         encoding="utf-8",
@@ -1155,6 +1348,24 @@ def quay_install(install: dict) -> dict:
     )
     bun_stub.chmod(0o755)
 
+    codex_stub = bin_dir / "codex"
+    codex_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "--version" ]]; then echo "codex-cli 0.133.0"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    codex_stub.chmod(0o755)
+
+    agent_home = install["tmp"] / "agent-home"
+    agent_home.mkdir(exist_ok=True)
+    codex_dir = agent_home / ".codex"
+    codex_dir.mkdir(mode=0o700, exist_ok=True)
+    codex_dir.chmod(0o700)
+    (codex_dir / "auth.json").write_text(
+        '{"tokens":{"access_token":"test-access","refresh_token":"test-refresh"}}\n',
+        encoding="utf-8",
+    )
+
     _write_curl_status_stub(bin_dir / "curl")
 
     install["values_file"] = fork / "deploy.values.yaml"
@@ -1169,6 +1380,8 @@ def quay_install(install: dict) -> dict:
     install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
     install["bun_bin"] = bun_stub
+    install["codex_bin"] = codex_stub
+    install["agent_home"] = agent_home
     install["systemd_dir"] = systemd_dir
     return install
 
@@ -1238,8 +1451,8 @@ def _configure_quay_app_auth(
         _git(repo, "config", "--add",
              "url.https://github.com/.insteadOf", "ssh://git@github.com/")
 
-    agent_home = install["tmp"] / "agent-home"
-    agent_home.mkdir()
+    agent_home = install.get("agent_home") or install["tmp"] / "agent-home"
+    agent_home.mkdir(exist_ok=True)
     if include_gitconfig:
         include_file = auth / "quay-github-app.gitconfig"
         rewrite_lines = ""
@@ -1272,7 +1485,7 @@ def _configure_quay_app_auth(
 
 
 def _quay_env(install: dict) -> dict[str, str]:
-    return {
+    env = {
         "HERMES_VERIFY_QUAY_BIN": str(install["quay_bin"]),
         "HERMES_VERIFY_QUAY_WRAPPER": str(install["quay_wrapper"]),
         "HERMES_VERIFY_QUAY_RUNNER": str(install["quay_runner"]),
@@ -1280,6 +1493,9 @@ def _quay_env(install: dict) -> dict[str, str]:
         "HERMES_VERIFY_RUNTIME_DIR": str(install["bin"]),
         "HERMES_VERIFY_SYSTEMD_DIR": str(install["systemd_dir"]),
     }
+    if install.get("agent_home"):
+        env["HERMES_VERIFY_AGENT_HOME"] = str(install["agent_home"])
+    return env
 
 
 def _run_verify_quay(
@@ -1345,6 +1561,7 @@ class TestSetupHermesVerifyQuay:
         assert "[OK] quay-serve.service: active loaded enabled" in result.stdout
         assert "[OK] quay-serve.service QUAY_DATA_DIR" in result.stdout
         assert "[OK] quay-serve.service auth env" in result.stdout
+        assert "[OK] quay-serve.service runtime env" in result.stdout
         assert "[OK] quay-serve.service loopback bind: 127.0.0.1" in result.stdout
         assert "[OK] quay admin token present" in result.stdout
         assert "[OK] quay admin local health: HTTP 200" in result.stdout
@@ -1533,6 +1750,32 @@ class TestSetupHermesVerifyQuay:
         result = _run_verify_quay_via_wrapper(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "[OK] quay binary:" in result.stdout
+
+    def test_verify_codex_required_for_quay_install(self, quay_install):
+        # Quay-enabled hosts provision the standard local agent CLI set.
+        # Verify should therefore check Codex even when deploy values no longer
+        # own agent runtime settings.
+        (quay_install["quay_dir"] / "config.toml").write_text(
+            'agent_invocation = "codex exec < {prompt_file}"\n'
+            "\n"
+            "[admin]\n"
+            "require_auth = true\n"
+            'token_env = "QUAY_ADMIN_TOKEN"\n'
+            'forwarded_identity_header = "X-Hermes-User-Id"\n'
+            "\n"
+            "[context]\n"
+            f'reference_repos_root = "{quay_install["target"] / "code"}"\n'
+            "\n",
+            encoding="utf-8",
+        )
+        codex = quay_install["bin"] / "codex"
+        codex.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
+        codex.chmod(0o755)
+
+        result = _run_verify_quay(quay_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] codex binary" in result.stderr
 
     def test_pre_ast136_quay_pin_skips_reference_repo_check(self, quay_install):
         values = quay_install["values_file"]
@@ -1740,6 +1983,12 @@ class TestSetupHermesVerifyQuay:
             "-----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
             encoding="utf-8",
         )
+        try:
+            gid = grp.getgrnam(quay_install["group"]).gr_gid
+            os.chown(reviewer_env, -1, gid)
+            os.chown(reviewer_key, -1, gid)
+        except PermissionError:
+            pass
         reviewer_env.chmod(0o640)
         reviewer_key.chmod(0o640)
 
@@ -1788,12 +2037,13 @@ class TestSetupHermesVerifyQuay:
 
 
 class TestSetupHermesVerifyTagVocab:
-    """Drift detection for `repos[].quay.tags` and `quay.tag_namespaces`.
+    """Drift detection for `repos[].quay.tags`.
 
     The strict-reconciliation contract is the load-bearing piece: values
-    is the source of truth, anything in quay not in values is drift.
-    Each test starts from `quay_install` (clean install, no tag vocab on
-    either side) and pokes one side of the comparison."""
+    is the source of truth for per-repo vocab, anything in quay not in
+    values is drift. Each test starts from `quay_install` (clean install,
+    no per-repo tag vocab on either side) and pokes one side of the
+    comparison."""
 
     def _patch_repo_tags(self, install: dict, body: str) -> None:
         """Insert ``body`` (already 6-space indented) into the repo's
@@ -1805,24 +2055,13 @@ class TestSetupHermesVerifyTagVocab:
         assert anchor in text, "fixture shape changed; update _patch_repo_tags anchor"
         install["values_file"].write_text(text.replace(anchor, anchor + body))
 
-    def _patch_deployment_tags(self, install: dict, body: str) -> None:
-        """Insert ``body`` (already 2-space indented) into the top-level
-        `quay:` block. Anchored on the `version:` line for the same
-        reason as `_patch_repo_tags`."""
-        anchor_re = re.compile(r"^  version: \"v[0-9.]+\"\n", re.MULTILINE)
-        text = install["values_file"].read_text()
-        new, n = anchor_re.subn(lambda m: m.group(0) + body, text, count=1)
-        assert n == 1, "fixture shape changed; update _patch_deployment_tags anchor"
-        install["values_file"].write_text(new)
-
     def test_clean_install_no_tag_vocab_is_ok(self, quay_install):
-        # Baseline: with no tags configured anywhere, both checks must
-        # pass — empty live state matches empty desired state.
+        # Baseline: with no repo tags configured anywhere, the per-repo
+        # check must pass — empty live state matches empty desired state.
         result = _run_verify_quay(quay_install)
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         repo_id = quay_install["quay_repo_id"]
         assert f"[OK] quay repo {repo_id} tag vocab" in result.stdout
-        assert "[OK] quay deployment tag vocab" in result.stdout
 
     def test_per_repo_drift_add_in_values_surfaces(self, quay_install):
         # values.yaml gains a tag namespace; live quay still empty → drift.
@@ -1916,92 +2155,6 @@ class TestSetupHermesVerifyTagVocab:
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert f"[OK] quay repo {repo_id} tag vocab" in result.stdout
 
-    def test_deployment_drift_add_in_values_surfaces(self, quay_install):
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    risk:\n"
-            "      values: [pii]\n",
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 1
-        assert "[DRIFT] quay deployment tag vocab" in result.stderr
-
-    def test_deployment_drift_remove_from_values_surfaces(self, quay_install):
-        repo_id = quay_install["quay_repo_id"]
-        _write_live_quay_stub(
-            quay_install,
-            QUAY_VERSION,
-            [repo_id],
-            deployment_tags={
-                "namespaces": {
-                    "tasktype": {
-                        "values": ["bugfix"],
-                        "required": True,
-                    },
-                },
-            },
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 1
-        assert "[DRIFT] quay deployment tag vocab" in result.stderr
-
-    def test_deployment_required_flag_drift_surfaces(self, quay_install):
-        # Same values, same namespace; only the `required` flag differs.
-        # Strict reconciliation must catch this — `required: true` vs
-        # `false` is the difference between every ticket needing a
-        # tasktype tag and none needing one.
-        repo_id = quay_install["quay_repo_id"]
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    tasktype:\n"
-            "      required: true\n"
-            "      values: [bugfix]\n",
-        )
-        _write_live_quay_stub(
-            quay_install,
-            QUAY_VERSION,
-            [repo_id],
-            deployment_tags={
-                "namespaces": {
-                    "tasktype": {
-                        "values": ["bugfix"],
-                        "required": False,
-                    },
-                },
-            },
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 1
-        assert "[DRIFT] quay deployment tag vocab" in result.stderr
-
-    def test_deployment_match_is_ok(self, quay_install):
-        repo_id = quay_install["quay_repo_id"]
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    tasktype:\n"
-            "      required: true\n"
-            "      values: [bugfix, refactor]\n",
-        )
-        _write_live_quay_stub(
-            quay_install,
-            QUAY_VERSION,
-            [repo_id],
-            deployment_tags={
-                "namespaces": {
-                    "tasktype": {
-                        "values": ["bugfix", "refactor"],
-                        "required": True,
-                    },
-                },
-            },
-        )
-        result = _run_verify_quay(quay_install)
-        assert result.returncode == 0, result.stderr + "\n" + result.stdout
-        assert "[OK] quay deployment tag vocab" in result.stdout
-
     def test_unregistered_repo_skips_tag_vocab_check(self, quay_install):
         # `quay repo get-tags` on an unregistered id exits with
         # `unknown_repo`; running the tag-vocab check there would surface
@@ -2014,25 +2167,19 @@ class TestSetupHermesVerifyTagVocab:
         assert "not registered" in result.stderr
         assert f"quay repo {repo_id} tag vocab" not in result.stderr
 
-    def test_pre_ast87_binary_skips_both_tag_vocab_checks(self, quay_install):
+    def test_pre_ast87_binary_skips_tag_vocab_check(self, quay_install):
         # A quay binary without the `tags` noun must skip both
-        # per-repo and deployment tag-vocab drift checks; otherwise a
-        # fork with quay.version still pinned at a pre-tag-vocab
-        # release would surface spurious drift on every verify run.
-        # Even WITH non-empty tag vocab in values, the check must skip
-        # — the install-time path also skips, so checking here would
-        # just amplify the same upgrade-not-yet-taken signal.
+        # per-repo tag-vocab drift checks; otherwise a fork with
+        # quay.version still pinned at a pre-tag-vocab release would
+        # surface spurious drift on every verify run. Even WITH
+        # non-empty tag vocab in values, the check must skip — the
+        # install-time path also skips, so checking here would just
+        # amplify the same upgrade-not-yet-taken signal.
         repo_id = quay_install["quay_repo_id"]
         self._patch_repo_tags(
             quay_install,
             "      tags:\n"
             "        area: [bonding-curve]\n",
-        )
-        self._patch_deployment_tags(
-            quay_install,
-            "  tag_namespaces:\n"
-            "    risk:\n"
-            "      values: [pii]\n",
         )
         _write_live_quay_stub(
             quay_install, QUAY_VERSION, [repo_id],

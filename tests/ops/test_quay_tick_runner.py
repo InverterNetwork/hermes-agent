@@ -66,6 +66,8 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
         quay,
         "#!/usr/bin/env bash\n"
         f'printf "args=%s\\n" "$*" > {quay_log}\n'
+        f'printf "QUAY_WORKER_GH_TOKEN=%s\\n" '
+        f'"${{QUAY_WORKER_GH_TOKEN:-}}" >> {quay_log}\n'
         f'printf "GH_TOKEN=%s\\n" "${{GH_TOKEN:-}}" >> {quay_log}\n'
         f'printf "QUAY_REVIEWER_GH_TOKEN=%s\\n" '
         f'"${{QUAY_REVIEWER_GH_TOKEN:-}}" >> {quay_log}\n',
@@ -107,6 +109,7 @@ def test_quay_tick_runner_exports_worker_and_reviewer_tokens(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
     assert "args=tick --once" in log
+    assert "QUAY_WORKER_GH_TOKEN=worker-token" in log
     assert "GH_TOKEN=worker-token" in log
     assert "QUAY_REVIEWER_GH_TOKEN=reviewer-token" in log
 
@@ -134,6 +137,7 @@ def test_reviewer_mint_ignores_generic_worker_helper_env(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "QUAY_WORKER_GH_TOKEN=caller-worker-token" in log
     assert "GH_TOKEN=caller-worker-token" in log
     assert "QUAY_REVIEWER_GH_TOKEN=reviewer-token" in log
 
@@ -158,6 +162,7 @@ def test_valid_existing_worker_token_uses_installation_token_compatible_probe(
 
     assert result.returncode == 0, result.stderr
     log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "QUAY_WORKER_GH_TOKEN=caller-worker-token" in log
     assert "GH_TOKEN=caller-worker-token" in log
     assert not Path(env["HELPER_CALLS"]).exists()
     gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
@@ -179,6 +184,7 @@ def test_invalid_existing_worker_token_mints_replacement(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "QUAY_WORKER_GH_TOKEN=worker-token" in log
     assert "GH_TOKEN=worker-token" in log
     assert "existing worker GitHub token is invalid; minting replacement" in result.stderr
     calls = Path(env["HELPER_CALLS"]).read_text(encoding="utf-8").splitlines()
@@ -199,6 +205,7 @@ def test_quay_tick_runner_skips_reviewer_token_without_config(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     log = Path(env["QUAY_LOG"]).read_text(encoding="utf-8")
+    assert "QUAY_WORKER_GH_TOKEN=worker-token" in log
     assert "GH_TOKEN=worker-token" in log
     assert "QUAY_REVIEWER_GH_TOKEN=" in log
     calls = Path(env["HELPER_CALLS"]).read_text(encoding="utf-8").splitlines()

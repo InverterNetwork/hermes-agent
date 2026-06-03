@@ -2,9 +2,10 @@
 # hermes-upstream-sync — propose an upstream merge as a PR.
 #
 # Detects when upstream/main is ahead of the merge-base with origin/main and
-# opens a PR for human review. Conflicts produce a draft PR flagged in the
-# title — never attempts auto-resolution. Branch protection on origin/main
-# enforces that the agent (with non-admin write access) cannot merge.
+# opens a PR for human review from an isolated temporary worktree. Conflicts
+# produce a draft PR flagged in the title — never attempts auto-resolution.
+# Branch protection on origin/main enforces that the agent (with non-admin
+# write access) cannot merge.
 #
 # Run manually or from a low-frequency timer (weekly is the intended
 # default — code, not state).
@@ -29,14 +30,21 @@
 #   BASE_BRANCH          — origin branch the PR targets (default: main)
 #   UPSTREAM_BRANCH      — upstream branch to merge (default: main)
 #   PR_DRY_RUN           — when set, prints what would happen and exits 0
+#   GITHUB_REPOSITORY    — owner/repo for the GitHub REST API PR endpoint
+#                          (default: derived from the origin remote URL)
 #   HERMES_HOME          — install root (default: $HOME/.hermes)
 #   HERMES_TOKEN_HELPER  — token helper path (default: render under
 #                          $HERMES_HOME/hermes-agent/installer/hermes_github_token.py)
 #   HERMES_TOKEN_PYTHON  — venv python for the helper (default: render
 #                          under $HERMES_HOME/hermes-agent/venv/bin/python)
+#   HERMES_UPSTREAM_SYNC_STATE_DIR
+#                        — status/lock directory (default:
+#                          $HERMES_HOME/state/hermes-upstream-sync)
+#   HERMES_UPSTREAM_SYNC_WORKTREE_ROOT
+#                        — temp-worktree parent (default: ${TMPDIR:-/tmp})
 #   GH_TOKEN             — when set, used as-is and the helper is skipped
 
-set -u
+set -uo pipefail
 
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 ORIGIN_REMOTE="${ORIGIN_REMOTE:-origin}"
@@ -46,7 +54,63 @@ LOG_PREFIX="hermes-upstream-sync"
 
 log()  { printf '[%s] %s\n' "$LOG_PREFIX" "$*"; }
 warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
-die()  { printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
+
+record_status() {
+  [[ -n "${STATUS_FILE:-}" ]] || return 0
+  local state="$1"
+  local detail="${2:-}"
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  {
+    printf 'timestamp=%q\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'state=%q\n' "$state"
+    printf 'detail=%q\n' "$detail"
+    printf 'fork_dir=%q\n' "${FORK_DIR:-}"
+    printf 'branch=%q\n' "${BRANCH:-}"
+    printf 'upstream_ref=%q\n' "${UPSTREAM_REF:-}"
+    printf 'upstream_sha=%q\n' "${UPSTREAM_SHA:-}"
+    printf 'origin_ref=%q\n' "${ORIGIN_REF:-}"
+  } > "${STATUS_FILE}.tmp" 2>/dev/null && mv "${STATUS_FILE}.tmp" "$STATUS_FILE" 2>/dev/null || true
+}
+
+die()  {
+  printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2
+  record_status failed "$*"
+  exit 1
+}
+
+github_repo_full_name() {
+  local remote_url="$1"
+  local repo=""
+
+  case "$remote_url" in
+    https://github.com/*)
+      repo="${remote_url#https://github.com/}"
+      ;;
+    http://github.com/*)
+      repo="${remote_url#http://github.com/}"
+      ;;
+    https://*@github.com/*)
+      repo="${remote_url#https://*@github.com/}"
+      ;;
+    http://*@github.com/*)
+      repo="${remote_url#http://*@github.com/}"
+      ;;
+    git@github.com:*)
+      repo="${remote_url#git@github.com:}"
+      ;;
+    ssh://git@github.com/*)
+      repo="${remote_url#ssh://git@github.com/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  repo="${repo%/}"
+  repo="${repo%.git}"
+  [[ "$repo" =~ ^[^/]+/[^/]+$ ]] || return 1
+  printf '%s\n' "$repo"
+}
 
 # Resolve the fork working copy. Fall back to a few well-known paths so the
 # script can run from a timer without an explicit cwd.
@@ -74,6 +138,50 @@ command -v gh >/dev/null 2>&1 \
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_TOKEN_HELPER="${HERMES_TOKEN_HELPER:-$HERMES_HOME/hermes-agent/installer/hermes_github_token.py}"
 HERMES_TOKEN_PYTHON="${HERMES_TOKEN_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
+STATE_DIR="${HERMES_UPSTREAM_SYNC_STATE_DIR:-$HERMES_HOME/state/hermes-upstream-sync}"
+STATUS_FILE="$STATE_DIR/status.env"
+LOCK_DIR="${HERMES_UPSTREAM_SYNC_LOCK_DIR:-$STATE_DIR/lock}"
+WORKTREE_DIR=""
+LOCK_ACQUIRED=0
+
+cleanup() {
+  local rc=$?
+  if [[ -n "$WORKTREE_DIR" && -d "$WORKTREE_DIR" ]]; then
+    git -C "$FORK_DIR" worktree remove --force "$WORKTREE_DIR" >/dev/null 2>&1 \
+      || rm -rf "$WORKTREE_DIR" >/dev/null 2>&1 || true
+  fi
+  if [[ "$LOCK_ACQUIRED" -eq 1 ]]; then
+    rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true
+  fi
+  return "$rc"
+}
+
+acquire_lock() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || die "cannot create state dir: $STATE_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_ACQUIRED=1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+    return 0
+  fi
+
+  local old_pid=""
+  old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    warn "another hermes-upstream-sync run is active (pid $old_pid); skipping"
+    record_status skipped "another run active pid=$old_pid"
+    exit 0
+  fi
+
+  warn "removing stale lock at $LOCK_DIR"
+  rm -rf "$LOCK_DIR" 2>/dev/null || die "stale lock exists and cannot be removed: $LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null || die "cannot acquire lock: $LOCK_DIR"
+  LOCK_ACQUIRED=1
+  printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+acquire_lock
+record_status running "starting upstream sync"
 
 HELPER_AVAILABLE=0
 if [[ -x "$HERMES_TOKEN_PYTHON" && -f "$HERMES_TOKEN_HELPER" ]]; then
@@ -99,7 +207,7 @@ fi
 # Per-push git credential helper. Emits whatever $GH_TOKEN ended up in
 # scope above — caller-supplied via EnvironmentFile or freshly minted
 # from $HERMES_TOKEN_HELPER — so a single resolved token covers both
-# `gh pr create` and the preceding `git push`.
+# GitHub REST API calls and the preceding `git push`.
 #
 # The helper body is single-quoted so $GH_TOKEN stays literal in the
 # config; git invokes it via `sh -c`, and that sh expands it from our
@@ -118,10 +226,11 @@ git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1 \
 git remote get-url "$ORIGIN_REMOTE" >/dev/null 2>&1 \
   || die "no '$ORIGIN_REMOTE' remote configured in $FORK_DIR"
 
-# Refuse to run with a dirty working tree — we'd lose uncommitted operator
-# work if we checked out a fresh sync branch on top.
+# A dirty primary checkout no longer blocks the timer. All merge work happens
+# in an isolated temporary worktree below; this warning is only operational
+# context for the journal/status file.
 if [[ -n "$(git status --porcelain)" ]]; then
-  die "working tree dirty; commit or stash before running"
+  warn "primary checkout is dirty; continuing in an isolated sync worktree"
 fi
 
 log "fetching $UPSTREAM_REMOTE/$UPSTREAM_BRANCH and $ORIGIN_REMOTE/$BASE_BRANCH"
@@ -138,6 +247,7 @@ MERGE_BASE="$(git merge-base "$UPSTREAM_REF" "$ORIGIN_REF")"
 # No new upstream commits → nothing to do.
 if [[ "$UPSTREAM_SHA" == "$MERGE_BASE" ]]; then
   log "$UPSTREAM_REF is fully merged into $ORIGIN_REF; nothing to do"
+  record_status ok "$UPSTREAM_REF already merged into $ORIGIN_REF"
   exit 0
 fi
 
@@ -150,32 +260,45 @@ BRANCH="upstream-sync/${DATE_TAG}-${UPSTREAM_SHORT}"
 # open and the operator needs to deal with it before we propose another.
 if git ls-remote --exit-code --heads "$ORIGIN_REMOTE" "$BRANCH" >/dev/null 2>&1; then
   warn "$BRANCH already exists on $ORIGIN_REMOTE; skipping"
+  record_status skipped "$BRANCH already exists on $ORIGIN_REMOTE"
   exit 0
 fi
 
 if [[ -n "${PR_DRY_RUN:-}" ]]; then
   log "DRY RUN: would propose merge of $UPSTREAM_REF (@$UPSTREAM_SHORT) onto $ORIGIN_REF as $BRANCH"
+  record_status dry-run "would propose $BRANCH"
   exit 0
 fi
 
-# Restore the operator's prior branch on exit so a noisy run doesn't leave
-# them stranded on the sync branch. Capture + register BEFORE the checkout
-# so a signal between the two doesn't strand us with no cleanup.
-ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-trap 'git checkout -q "$ORIGINAL_BRANCH" 2>/dev/null || true' EXIT
+if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
+  ORIGIN_URL="$(git remote get-url "$ORIGIN_REMOTE")"
+  GITHUB_REPOSITORY="$(github_repo_full_name "$ORIGIN_URL")" \
+    || die "could not derive GitHub owner/repo from '$ORIGIN_REMOTE' remote; set GITHUB_REPOSITORY=owner/repo"
+fi
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY%/}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY%.git}"
+[[ "$GITHUB_REPOSITORY" =~ ^[^/]+/[^/]+$ ]] \
+  || die "GITHUB_REPOSITORY must be owner/repo, got: $GITHUB_REPOSITORY"
 
 # A previous tick that pushed-and-died (or was killed mid-merge) can leave
 # a local branch with the same name. The remote check above already
 # returned "no such branch on origin", so the local one is stale —
-# delete it so `checkout -b` can recreate cleanly. -D over -d because the
+# delete it so `worktree add -b` can recreate cleanly. -D over -d because the
 # stale branch may have unmerged commits from a half-completed previous run.
 if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
   warn "stale local $BRANCH from a previous failed tick; deleting"
   git branch -D "$BRANCH" >/dev/null
 fi
 
-log "branching $BRANCH off $ORIGIN_REF"
-git checkout -q -b "$BRANCH" "$ORIGIN_REF"
+WORKTREE_ROOT="${HERMES_UPSTREAM_SYNC_WORKTREE_ROOT:-${TMPDIR:-/tmp}}"
+mkdir -p "$WORKTREE_ROOT" 2>/dev/null || die "cannot create worktree root: $WORKTREE_ROOT"
+WORKTREE_DIR="$WORKTREE_ROOT/hermes-upstream-sync-${DATE_TAG}-${UPSTREAM_SHORT}-$$"
+
+log "creating isolated worktree $WORKTREE_DIR for $BRANCH off $ORIGIN_REF"
+git worktree add -q -b "$BRANCH" "$WORKTREE_DIR" "$ORIGIN_REF" \
+  || die "failed to create sync worktree for $BRANCH"
+cd "$WORKTREE_DIR"
+record_status running "created sync worktree for $BRANCH"
 
 PR_TITLE="Sync upstream hermes-agent @ $UPSTREAM_SHORT"
 # Tilde fences (CommonMark-valid) instead of triple-backtick so commit
@@ -190,7 +313,7 @@ enforces that the agent cannot self-merge — review and merge manually.
 $(git log --oneline "$MERGE_BASE..$UPSTREAM_SHA" | head -50)
 ~~~"
 
-PR_FLAGS=(--base "$BASE_BRANCH" --head "$BRANCH")
+PR_DRAFT=0
 
 if git merge --no-edit --no-ff "$UPSTREAM_REF"; then
   log "clean merge; pushing $BRANCH"
@@ -210,7 +333,8 @@ $CONFLICT_FILES
 ~~~
 
 $PR_BODY"
-  PR_FLAGS+=(--draft)
+  PR_DRAFT=1
+  record_status conflicts "opened draft PR branch $BRANCH with conflicts"
 fi
 
 # Reset any inherited credential.helper chain on github.com (the empty
@@ -230,7 +354,22 @@ else
 fi
 
 log "opening PR: $PR_TITLE"
-gh pr create "${PR_FLAGS[@]}" --title "$PR_TITLE" --body "$PR_BODY" \
-  || die "gh pr create failed"
+PR_API_FIELDS=(
+  -f "title=$PR_TITLE"
+  -f "head=$BRANCH"
+  -f "base=$BASE_BRANCH"
+  -f "body=$PR_BODY"
+)
+if [[ "$PR_DRAFT" -eq 1 ]]; then
+  PR_API_FIELDS+=(-F "draft=true")
+fi
 
-log "done — PR opened against $ORIGIN_REMOTE/$BASE_BRANCH"
+PR_URL="$(gh api "repos/$GITHUB_REPOSITORY/pulls" -X POST "${PR_API_FIELDS[@]}" --jq .html_url)" \
+  || die "gh api create pull request failed"
+
+if [[ -n "$PR_URL" ]]; then
+  log "done — PR opened against $ORIGIN_REMOTE/$BASE_BRANCH: $PR_URL"
+else
+  log "done — PR opened against $ORIGIN_REMOTE/$BASE_BRANCH"
+fi
+record_status ok "PR opened for $BRANCH against $ORIGIN_REMOTE/$BASE_BRANCH"

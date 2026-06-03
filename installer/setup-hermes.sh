@@ -504,37 +504,31 @@ PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
   ensure-runtimes --values "$VALUES_FILE"
 
 # ---------- agent CLI provisioning / prerequisite checks ----------
-# Each agent the deployment may invoke (claude, codex) gets its own gate.
-# Codex may be required by Quay worker/reviewer invocations or by Atlas'
-# codex-exec analysis mode. The binary is root-managed; `codex login`
-# remains an operator step under the agent user's home so OAuth material
-# stays agent-owned.
-agent_invocations=""
+# Quay can shell out to either supported local agent CLI. Provision the full
+# local dependency set for quay-enabled hosts instead of inferring runtime
+# defaults from Quay config. Atlas without Quay still provisions Codex only
+# when its codex-exec mode is active.
 if [[ "$QUAY_ENABLED" -eq 1 ]]; then
-  agent_invocations="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" active-agent-invocations)"
-fi
-PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
-  ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
+  echo "==> provisioning claude CLI for $AGENT_USER"
+  sudo -u "$AGENT_USER" -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+  CLAUDE_AGENT_BIN="$AGENT_HOME/.local/bin/claude"
+  if [[ ! -x "$CLAUDE_AGENT_BIN" ]]; then
+    echo "FAIL: claude installer completed but $CLAUDE_AGENT_BIN is missing or not executable" >&2
+    exit 1
+  fi
+  ln -sf "$CLAUDE_AGENT_BIN" /usr/local/bin/claude
 
-if [[ "$QUAY_ENABLED" -eq 1 ]]; then
-  if [[ "$agent_invocations" == *claude* ]]; then
-    echo "==> provisioning claude CLI for $AGENT_USER"
-    sudo -u "$AGENT_USER" -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
-    CLAUDE_AGENT_BIN="$AGENT_HOME/.local/bin/claude"
-    if [[ ! -x "$CLAUDE_AGENT_BIN" ]]; then
-      echo "FAIL: claude installer completed but $CLAUDE_AGENT_BIN is missing or not executable" >&2
-      exit 1
-    fi
-    ln -sf "$CLAUDE_AGENT_BIN" /usr/local/bin/claude
+  PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+    ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER" --required
+  if ! sudo -u "$AGENT_USER" -H bash -c 'command -v codex' >/dev/null 2>&1; then
+    echo "FAIL: quay is enabled but the codex binary is not on PATH for $AGENT_USER" >&2
+    echo "      setup-hermes.sh should have installed the pinned codex binary from quay.codex;" >&2
+    echo "      check the ensure-codex error above, then run codex login as $AGENT_USER." >&2
+    exit 1
   fi
-  if [[ "$agent_invocations" == *codex* ]]; then
-    if ! sudo -u "$AGENT_USER" -H bash -c 'command -v codex' >/dev/null 2>&1; then
-      echo "FAIL: an active quay invocation references 'codex' but the codex binary is not on PATH for $AGENT_USER" >&2
-      echo "      setup-hermes.sh should have installed the pinned codex binary from quay.codex;" >&2
-      echo "      check the ensure-codex error above, then run codex login as $AGENT_USER." >&2
-      exit 1
-    fi
-  fi
+else
+  PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+    ensure-codex --values "$VALUES_FILE" --agent-user "$AGENT_USER"
 fi
 
 ATLAS_AI_MODE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.mode 2>/dev/null || true)"
@@ -1264,23 +1258,24 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   printf '%s  %s\n' "$QUAY_EXPECTED_SHA" "$QUAY_BIN_DST" \
     | install -o root -g root -m 0644 /dev/stdin "$QUAY_EXPECTED_SHA_DST"
 
-  # quay/config.toml is rendered from deploy.values.yaml only for the
-  # Hermes-owned launch/auth/context boundary. Quay product/runtime behavior
-  # belongs to Quay defaults or a Quay-owned config contract; keep new fields
-  # out of this renderer unless they are needed to install, launch, bind, or
-  # proxy the service safely.
+  # quay/config.toml is Quay-owned after initial bootstrap. Create it when
+  # missing, then leave it untouched on later installer runs.
   QUAY_CONFIG_OUT="$TARGET_DIR/quay/config.toml"
-  echo "==> rendering $QUAY_CONFIG_OUT from $VALUES_FILE"
-  QUAY_RENDER_ADMIN_AUTH_ARGS=()
-  if [[ "$QUAY_SERVE_SUPPORTED" -eq 1 ]]; then
-    QUAY_RENDER_ADMIN_AUTH_ARGS+=(--enable-admin-auth)
+  if [[ ! -e "$QUAY_CONFIG_OUT" ]]; then
+    echo "==> creating $QUAY_CONFIG_OUT from $VALUES_FILE"
+    QUAY_RENDER_ADMIN_AUTH_ARGS=()
+    if [[ "$QUAY_SERVE_SUPPORTED" -eq 1 ]]; then
+      QUAY_RENDER_ADMIN_AUTH_ARGS+=(--enable-admin-auth)
+    fi
+    python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
+      render-quay-config --out "$QUAY_CONFIG_OUT" \
+      --reference-repos-root "$TARGET_DIR/code" \
+      "${QUAY_RENDER_ADMIN_AUTH_ARGS[@]}"
+    chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
+    chmod 0644 "$QUAY_CONFIG_OUT"
+  else
+    echo "==> preserving existing $QUAY_CONFIG_OUT"
   fi
-  python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
-    render-quay-config --out "$QUAY_CONFIG_OUT" --force \
-    --reference-repos-root "$TARGET_DIR/code" \
-    "${QUAY_RENDER_ADMIN_AUTH_ARGS[@]}"
-  chown "$AGENT_USER:$AGENT_USER" "$QUAY_CONFIG_OUT"
-  chmod 0644 "$QUAY_CONFIG_OUT"
 
   # Quay orchestrator config is separate from quay/config.toml because these
   # are sidecar runtime knobs. The runner reads this file for Slack fallback
@@ -1438,9 +1433,9 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   )"
 fi
 
-# Tag-vocab reconciliation lives behind a capability probe rather than a
-# version compare. The `tags` noun (apply-tags / apply-deployment /
-# get-tags / get-deployment) is recent — older quay binaries don't have
+# Per-repo tag-vocab reconciliation lives behind a capability probe rather
+# than a version compare. The `tags` noun (repo apply-tags / repo get-tags)
+# is recent — older quay binaries don't have
 # it. `quay tags --help` returns 0 only when the noun is registered,
 # so it's a clean dispatch-table probe with no DB side effects (the
 # binary still touches ~/.quay/ via the help path, but
@@ -1602,19 +1597,6 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
       fi
     fi
   done <<<"$ALL_REPOS_TSV"
-fi
-
-# Reconcile deployment-level tag vocab once after the per-repo loop so
-# deployment-required namespaces are in place before any worker (or the
-# inverter-linear skill) calls `quay tags list --repo`. Same strict-
-# reconciliation semantics as the per-repo case: empty input clears,
-# any namespace not in values is removed.
-if [[ "$QUAY_TAGS_SUPPORTED" -eq 1 ]]; then
-  echo "==> reconciling deployment tag vocab"
-  python3 "$VALUES_HELPER" --values "$VALUES_FILE" get-deployment-tags \
-    | sudo -u "$AGENT_USER" \
-        env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" \
-          tags apply-deployment --from - >/dev/null
 fi
 
 # Symlinks at render-target root so the agent's existing paths
@@ -1840,8 +1822,9 @@ fi
 # worker → submit-brief). Same install model as hermes-sync — sed-
 # templated unit, /etc/default/ env preserved across re-runs, plus a
 # companion script at /usr/local/sbin/quay-tick-runner that mints
-# $GH_TOKEN before exec'ing `quay tick` so the worker pipeline's `gh`
-# calls authenticate against the App identity.
+# $QUAY_WORKER_GH_TOKEN / $GH_TOKEN before exec'ing `quay tick` so Quay
+# can spawn workers and the worker pipeline's `gh` calls authenticate
+# against the App identity.
 #
 # Skipped entirely when quay isn't enabled — see the binary block at the
 # top of the script.
@@ -1908,6 +1891,8 @@ if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 && -f "$QUAY_SERVE_
 
   if command -v systemctl >/dev/null 2>&1; then
     echo "==> installing systemd service for quay-serve (user=$AGENT_USER, bind=127.0.0.1:9731)"
+    quay_serve_was_active=0
+    systemctl is-active quay-serve.service >/dev/null 2>&1 && quay_serve_was_active=1
     PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
       render-systemd-unit \
       --template "$QUAY_SERVE_SRC" \
@@ -1916,6 +1901,10 @@ if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_SERVE_SUPPORTED" -eq 1 && -f "$QUAY_SERVE_
       --set "TARGET_DIR=$TARGET_DIR"
     systemctl daemon-reload
     systemctl enable --now quay-serve.service
+    if (( quay_serve_was_active )); then
+      echo "==> restarting quay-serve.service to pick up the installed quay binary/UI"
+      systemctl try-restart quay-serve.service
+    fi
   else
     echo "==> systemctl not present; skipping quay-serve service enable" >&2
   fi
@@ -2116,7 +2105,8 @@ EOF
     echo "==> installing canonical hermes-gateway unit via upstream CLI"
     HERMES_HOME="$TARGET_DIR" HERMES_HOME_MODE=02775 \
       "$HERMES_BIN" gateway install --system \
-      --force --run-as-user "$AGENT_USER"
+      --force --run-as-user "$AGENT_USER" \
+      --no-start-now --no-start-on-login
     # Re-assert mode + group ownership regardless: if a future CLI change
     # ignores HERMES_HOME_MODE or _secure_dir clamps stricter, the gateway
     # would lose write access to its runtime files.

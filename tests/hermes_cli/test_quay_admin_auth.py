@@ -9,18 +9,25 @@ def test_allowed_user_can_create_and_consume_one_time_token(monkeypatch, _isolat
 
     assert quay_admin_auth.is_slack_user_allowed("U123")
 
-    token, record = quay_admin_auth.create_login_token("U123", now=1000)
+    token, record = quay_admin_auth.create_login_token(
+        "U123",
+        display_name="  Mira   T.  ",
+        now=1000,
+    )
     assert token
     assert record["slack_user_id"] == "U123"
+    assert record["display_name"] == "Mira T."
     assert token not in json.dumps(quay_admin_auth.state_path().read_text(encoding="utf-8"))
 
     inspected = quay_admin_auth.inspect_login_token(token, now=1001)
     assert inspected is not None
     assert inspected["slack_user_id"] == "U123"
+    assert inspected["display_name"] == "Mira T."
 
     consumed = quay_admin_auth.consume_login_token(token, now=1001)
     assert consumed is not None
     assert consumed["slack_user_id"] == "U123"
+    assert consumed["display_name"] == "Mira T."
     assert quay_admin_auth.consume_login_token(token, now=1002) is None
 
 
@@ -44,8 +51,13 @@ def test_build_login_url_uses_public_base_url(monkeypatch):
 
 
 def test_create_session_binds_slack_user_and_expires():
-    session_id, session = quay_admin_auth.create_session("U123", now=time.time())
+    session_id, session = quay_admin_auth.create_session(
+        "U123",
+        display_name="Mira T.",
+        now=time.time(),
+    )
 
     assert session_id
     assert session["slack_user_id"] == "U123"
+    assert session["display_name"] == "Mira T."
     assert session["expires_at"] > session["created_at"]
