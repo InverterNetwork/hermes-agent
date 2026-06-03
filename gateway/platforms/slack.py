@@ -3097,14 +3097,15 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
         # In channels, respond if:
-        #   0. strict_mention is enabled and this is an unmentioned thread
-        #      reply — stay silent, even in free-response/listen-all channels.
+        #   0. Channel is in free_response_channels — explicit opt-out from
+        #      mention gating, including channel-thread replies.
+        #   1. strict_mention is enabled and this is unmentioned — stay silent.
         #      Gateway control commands may still pass through when tied to
         #      an active session so approvals/stops do not deadlock.
-        #   1. Channel is in free_response_channels, OR require_mention is
-        #      disabled — process top-level/listen-all traffic.
-        #   2. The bot is @mentioned in this message, OR
-        #   3. strict_mention is explicitly disabled and the message is an
+        #   2. require_mention is disabled — process top-level/listen-all
+        #      traffic that was not stopped by strict_mention.
+        #   3. The bot is @mentioned in this message, OR
+        #   4. strict_mention is explicitly disabled and the message is an
         #      actionable reply in a thread the bot started/participated in,
         #      a thread where the bot was previously @mentioned, or a thread
         #      with an existing session.
@@ -3116,11 +3117,6 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid:
-            # Check allowed channels — if set, only respond in these channels (whitelist)
-            if self._channel_blocked_by_allowlist(channel_id, is_dm):
-                logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
-                return
-
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif self._slack_strict_mention() and not is_mentioned:

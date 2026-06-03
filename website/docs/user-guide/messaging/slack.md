@@ -305,7 +305,7 @@ Understanding how Hermes behaves in different contexts:
 | **Threads** | If you @mention Hermes inside an existing thread, it replies in that same thread. By default, later channel-thread replies stay silent unless they also @mention Hermes. |
 
 :::tip
-In channels, always @mention the bot to start or continue a conversation. Set `strict_mention: false` or `response_policy: thread_followup` only when you want legacy unmentioned thread follow-ups.
+In channels, always @mention the bot to start or continue a conversation. Set `strict_mention: false` when you want legacy unmentioned thread follow-ups; use `response_policy: thread_followup` with it only when every engaged-thread reply should wake Hermes.
 :::
 
 ---
@@ -366,12 +366,13 @@ slack:
   # Default: @mention wakes Hermes in a channel, and later channel-thread
   # replies stay silent unless they also @mention Hermes.
   # Other values:
-  #   thread_followup — legacy: every reply in an engaged thread wakes Hermes
+  #   thread_followup — legacy: every reply in an engaged thread wakes Hermes,
+  #       but only when strict_mention is false
   response_policy: mention_to_wake_quiet_thread
 
   # Optional legacy opt-out. When omitted, Hermes requires @mention on
-  # channel-thread replies. Set false to allow legacy actionable follow-ups
-  # in engaged threads without a fresh mention.
+  # channel-thread replies. Set false to allow response_policy to route
+  # legacy follow-ups in engaged threads without a fresh mention.
   # strict_mention: false
 
   # Custom mention patterns that trigger the bot
@@ -389,7 +390,7 @@ You usually do not need to set this because strict channel-thread mention gating
 :::
 
 :::info
-Slack's default `mention_to_wake_quiet_thread` policy requires `@mention` to start a channel conversation and keeps channel-thread replies silent unless they also mention Hermes. Persisted session history keeps context available, but does not by itself wake Hermes for ambient chatter. Use `strict_mention: false` if you want legacy actionable follow-ups in engaged threads, or `thread_followup` if you want the older behavior where every reply in an engaged thread wakes Hermes. In DMs the bot always responds without needing a mention.
+Slack's default `mention_to_wake_quiet_thread` policy requires `@mention` to start a channel conversation and keeps channel-thread replies silent unless they also mention Hermes. Persisted session history keeps context available, but does not by itself wake Hermes for ambient chatter. Set `strict_mention: false` if you want legacy actionable follow-ups in engaged threads; add `response_policy: thread_followup` if you want every reply in an engaged thread to wake Hermes. In DMs the bot always responds without needing a mention.
 :::
 
 ### Channel allowlist (`allowed_channels`)
