@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# atlas-source-sync-runner — run one configured Atlas source sync with a
+# read-only source-reader GitHub App token.
+#
+# The Atlas manager App remains configured on the atlas-kb checkout as its
+# credential helper for KB writes. This runner only mints the source-reader
+# token needed for source repo clone/fetch and exports it as GH_TOKEN /
+# GITHUB_TOKEN for the Atlas process.
+
+set -euo pipefail
+
+LOG_PREFIX="atlas-source-sync-runner"
+warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
+die() { printf '[%s] FAIL: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_TOKEN_HELPER="${HERMES_TOKEN_HELPER:-$HERMES_HOME/hermes-agent/installer/hermes_github_token.py}"
+HERMES_TOKEN_PYTHON="${HERMES_TOKEN_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
+HERMES_ATLAS_SOURCE_READER_GH_CONFIG="${HERMES_ATLAS_SOURCE_READER_GH_CONFIG:-$HERMES_HOME/auth/atlas-source-reader.env}"
+ATLAS_SYNC_SOURCE_NAME="${ATLAS_SYNC_SOURCE_NAME:-emusd-docs}"
+ATLAS_AS_HERMES_BIN="${ATLAS_AS_HERMES_BIN:-/usr/local/bin/atlas-as-hermes}"
+
+[[ -x "$HERMES_TOKEN_PYTHON" ]] || die "missing token-helper python: $HERMES_TOKEN_PYTHON"
+[[ -f "$HERMES_TOKEN_HELPER" ]] || die "missing token helper: $HERMES_TOKEN_HELPER"
+[[ -f "$HERMES_ATLAS_SOURCE_READER_GH_CONFIG" ]] \
+  || die "missing source-reader config: $HERMES_ATLAS_SOURCE_READER_GH_CONFIG"
+[[ -x "$ATLAS_AS_HERMES_BIN" ]] || die "missing atlas wrapper: $ATLAS_AS_HERMES_BIN"
+
+token="$(
+  timeout 30 env \
+    -u HERMES_GH_CONFIG \
+    -u HERMES_GH_APP_ID \
+    -u HERMES_GH_INSTALLATION_ID \
+    -u HERMES_GH_APP_KEY \
+    -u HERMES_GH_API \
+    -u HERMES_GH_TOKEN_CACHE \
+    -u HERMES_GH_TOKEN_OVERRIDE \
+    HERMES_HOME="$HERMES_HOME" \
+    HERMES_GH_CONFIG="$HERMES_ATLAS_SOURCE_READER_GH_CONFIG" \
+    "$HERMES_TOKEN_PYTHON" "$HERMES_TOKEN_HELPER" mint --no-cache
+)" || die "source-reader token mint failed"
+
+[[ -n "$token" ]] || die "source-reader token mint returned empty token"
+
+export ATLAS_SOURCE_READER_GH_TOKEN="$token"
+export GH_TOKEN="$token"
+export GITHUB_TOKEN="$token"
+
+warn "running atlas sync source $ATLAS_SYNC_SOURCE_NAME"
+exec "$ATLAS_AS_HERMES_BIN" sync source "$ATLAS_SYNC_SOURCE_NAME" "$@"

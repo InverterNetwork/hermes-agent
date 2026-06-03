@@ -11,6 +11,7 @@
 AGENT_BODY='
 set -eu
 export HERMES_HOME=__TARGET_DIR__
+export ATLAS_CONFIG="${ATLAS_CONFIG:-__ATLAS_CONFIG__}"
 export ATLAS_KB_ROOT="${ATLAS_KB_ROOT:-__ATLAS_KB_ROOT__}"
 export ATLAS_AI_MODE="${ATLAS_AI_MODE:-__ATLAS_AI_MODE__}"
 export ATLAS_CODEX_BIN="${ATLAS_CODEX_BIN:-__ATLAS_CODEX_BIN__}"
@@ -25,6 +26,7 @@ if [ "$(id -un)" = "__AGENT_USER__" ]; then
 else
   exec sudo -u __AGENT_USER__ \
        env HERMES_HOME=__TARGET_DIR__ \
+           "ATLAS_CONFIG=${ATLAS_CONFIG:-__ATLAS_CONFIG__}" \
            "ATLAS_KB_ROOT=${ATLAS_KB_ROOT:-__ATLAS_KB_ROOT__}" \
            "ATLAS_AI_MODE=${ATLAS_AI_MODE:-__ATLAS_AI_MODE__}" \
            "ATLAS_CODEX_BIN=${ATLAS_CODEX_BIN:-__ATLAS_CODEX_BIN__}" \
