@@ -389,11 +389,12 @@ jobs:
             pin=$(python3 /srv/hermes/repos/hermes-agent/installer/values_helper.py \
               --values /srv/hermes/repos/hermes-agent/deploy.values.yaml \
               get "quay.runtime_managers.${name}.version")
-            actual=$(/usr/local/bin/"$name" --version 2>&1 | head -n1)
+            raw_version="$(cd /tmp && /usr/local/bin/"$name" --version 2>&1)"
+            actual="$(printf '%s\n' "$raw_version" | sed -n "/$pin/{p;q;}")"
             # Substring match — absorbs build suffixes the upstream binary
             # may emit (e.g. `+commit-sha`) without flaking the probe.
-            [[ "$actual" == *"$pin"* ]] \
-              || { echo "FAIL: $name --version='$actual' does not contain pin '$pin'"; exit 1; }
+            [[ -n "$actual" ]] \
+              || { echo "FAIL: $name --version output does not contain pin '$pin':"; printf '%s\n' "$raw_version"; exit 1; }
             # /bin/sh -c is what quay's bootstrap uses; assert the binary
             # is reachable there (PATH must contain /usr/local/bin without
             # sourcing a profile).

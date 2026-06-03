@@ -25,6 +25,7 @@ def _render_wrapper(
     body = WRAPPER_SRC.read_text()
     body = body.replace("__AGENT_USER__", agent_user)
     body = body.replace("__TARGET_DIR__", str(target_dir))
+    body = body.replace("__ATLAS_CONFIG__", str(target_dir / "config" / "atlas.yaml"))
     body = body.replace("__ATLAS_KB_ROOT__", str(kb_root))
     body = body.replace("__ATLAS_AI_MODE__", "codex-exec")
     body = body.replace("__ATLAS_CODEX_BIN__", "/usr/local/bin/codex")
@@ -51,6 +52,7 @@ def wrapper_env(tmp_path: Path) -> dict:
         f'  printf "ARGS: %s\\n" "$*"\n'
         f'  printf "PWD: %s\\n" "$PWD"\n'
         f'  printf "HERMES_HOME: %s\\n" "${{HERMES_HOME:-}}"\n'
+        f'  printf "ATLAS_CONFIG: %s\\n" "${{ATLAS_CONFIG:-}}"\n'
         f'  printf "ATLAS_KB_ROOT: %s\\n" "${{ATLAS_KB_ROOT:-}}"\n'
         f'  printf "ATLAS_AI_MODE: %s\\n" "${{ATLAS_AI_MODE:-}}"\n'
         f'  printf "ATLAS_CODEX_BIN: %s\\n" "${{ATLAS_CODEX_BIN:-}}"\n'
@@ -121,6 +123,7 @@ class TestAtlasAsHermesWrapper:
         assert log["ARGS"] == "--version"
         assert log["PWD"] == str(wrapper_env["kb_root"])
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
+        assert log["ATLAS_CONFIG"] == str(wrapper_env["target"] / "config" / "atlas.yaml")
         assert log["ATLAS_KB_ROOT"] == str(wrapper_env["kb_root"])
         assert log["ATLAS_AI_MODE"] == "codex-exec"
         assert log["ATLAS_CODEX_BIN"] == "/usr/local/bin/codex"
@@ -145,4 +148,5 @@ class TestAtlasAsHermesWrapper:
 
         log = _parse_log(wrapper_env["atlas_log"])
         assert log["PWD"] == str(wrapper_env["kb_root"])
+        assert log["ATLAS_CONFIG"] == str(wrapper_env["target"] / "config" / "atlas.yaml")
         assert log["ATLAS_KB_ROOT"] == str(wrapper_env["kb_root"])

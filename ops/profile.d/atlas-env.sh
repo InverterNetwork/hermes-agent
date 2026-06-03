@@ -5,6 +5,7 @@
 # setup-hermes.sh from deploy.values.yaml.
 if [ "$(id -un)" = "__AGENT_USER__" ]; then
   export HERMES_HOME="__TARGET_DIR__"
+  export ATLAS_CONFIG="__ATLAS_CONFIG__"
   export ATLAS_KB_ROOT="__ATLAS_KB_ROOT__"
   export ATLAS_AI_MODE="__ATLAS_AI_MODE__"
   export ATLAS_CODEX_BIN="__ATLAS_CODEX_BIN__"
