@@ -17,7 +17,7 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_TOKEN_HELPER="${HERMES_TOKEN_HELPER:-$HERMES_HOME/hermes-agent/installer/hermes_github_token.py}"
 HERMES_TOKEN_PYTHON="${HERMES_TOKEN_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
 HERMES_ATLAS_SOURCE_READER_GH_CONFIG="${HERMES_ATLAS_SOURCE_READER_GH_CONFIG:-$HERMES_HOME/auth/atlas-source-reader.env}"
-ATLAS_SYNC_SOURCE_NAME="${ATLAS_SYNC_SOURCE_NAME:-emusd-docs}"
+ATLAS_SYNC_SOURCE_NAMES="${ATLAS_SYNC_SOURCE_NAMES:-${ATLAS_SYNC_SOURCE_NAME:-emusd-docs}}"
 ATLAS_AS_HERMES_BIN="${ATLAS_AS_HERMES_BIN:-/usr/local/bin/atlas-as-hermes}"
 
 [[ -x "$HERMES_TOKEN_PYTHON" ]] || die "missing token-helper python: $HERMES_TOKEN_PYTHON"
@@ -46,5 +46,9 @@ export ATLAS_SOURCE_READER_GH_TOKEN="$token"
 export GH_TOKEN="$token"
 export GITHUB_TOKEN="$token"
 
-warn "running atlas sync source $ATLAS_SYNC_SOURCE_NAME"
-exec "$ATLAS_AS_HERMES_BIN" sync source "$ATLAS_SYNC_SOURCE_NAME" "$@"
+IFS=', ' read -r -a source_names <<<"$ATLAS_SYNC_SOURCE_NAMES"
+for source_name in "${source_names[@]}"; do
+  [[ -n "$source_name" ]] || continue
+  warn "running atlas sync source $source_name"
+  "$ATLAS_AS_HERMES_BIN" sync source "$source_name" "$@"
+done
