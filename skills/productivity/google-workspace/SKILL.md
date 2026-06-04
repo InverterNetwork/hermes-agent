@@ -10,16 +10,20 @@ required_credential_files:
     description: Google OAuth2 token (created by setup script)
   - path: google_client_secret.json
     description: Google OAuth2 client credentials (downloaded from Google Cloud Console)
+  - path: auth/google-sa-key.json
+    config_key: skills.config.google_workspace.service_account_key_path
+    optional: true
+    description: Optional Google service account JSON for Drive, Docs, and Sheets
 metadata:
   hermes:
-    tags: [Google, Gmail, Calendar, Drive, Sheets, Docs, Contacts, Email, OAuth]
+    tags: [Google, Gmail, Calendar, Drive, Sheets, Docs, Contacts, Email, OAuth, Service Account]
     homepage: https://github.com/NousResearch/hermes-agent
     related_skills: [himalaya]
 ---
 
 # Google Workspace
 
-Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation.
+Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OAuth and a thin CLI wrapper. When `gws` is installed, the skill uses it as the execution backend for broader Google Workspace coverage; otherwise it falls back to the bundled Python client implementation. Drive, Docs, and Sheets can also use file-level service-account access when `skills.config.google_workspace.service_account_key_path` is set.
 
 ## References
 
@@ -163,6 +167,69 @@ Should print `AUTHENTICATED`. Setup is complete — token refreshes automaticall
 - Pending OAuth session state/verifier are stored temporarily at `~/.hermes/google_oauth_pending.json` until exchange completes.
 - If `gws` is installed, `google_api.py` points it at the same `~/.hermes/google_token.json` credentials file. Users do not need to run a separate `gws auth login` flow.
 - To revoke: `$GSETUP --revoke`
+
+## Service-Account Setup for Drive, Docs, and Sheets
+
+Use this when Hermes should access only files explicitly shared with a Google
+service account, without granting domain-wide Workspace access. Gmail,
+Calendar, and Contacts still use the OAuth setup above.
+
+1. In Google Cloud, create or select the project that owns the Hermes service
+   account.
+2. Enable the Google Drive API, Google Sheets API, and Google Docs API.
+3. Create a service account, then create and download a JSON key for it.
+4. Store the JSON key under the active Hermes profile, for example:
+
+```bash
+mkdir -p ${HERMES_HOME:-$HOME/.hermes}/auth
+install -m 0640 /path/to/downloaded-key.json ${HERMES_HOME:-$HOME/.hermes}/auth/google-sa-key.json
+```
+
+5. Add a portable path to `${HERMES_HOME:-$HOME/.hermes}/config.yaml`:
+
+```yaml
+skills:
+  config:
+    google_workspace:
+      service_account_key_path: "${HERMES_HOME}/auth/google-sa-key.json"
+```
+
+6. If you use a custom filename, also add that relative path to
+   `terminal.credential_files` so Docker/Modal sandboxes mount it:
+
+```yaml
+terminal:
+  credential_files:
+    - auth/otto-google-sa.json
+skills:
+  config:
+    google_workspace:
+      service_account_key_path: "${HERMES_HOME}/auth/otto-google-sa.json"
+```
+
+7. Share each Google Doc, Sheet, or Drive folder with the service account's
+   email address. Use Viewer access for read-only searches/downloads and
+   Editor access when Hermes needs to update Sheets, append Docs, or modify
+   shared Drive files. Files created by the service account live in the
+   service account's own Drive until shared elsewhere.
+
+You can also set it with:
+
+```bash
+hermes config set skills.config.google_workspace.service_account_key_path '${HERMES_HOME}/auth/google-sa-key.json'
+```
+
+When `skills.config.google_workspace.service_account_key_path` is set,
+`google_api.py` uses service-account credentials for `drive`, `docs`, and
+`sheets` commands, even if `gws` is installed. Files not shared with the
+service account remain inaccessible. Clear the config value to fall back to
+OAuth for these commands. The default `auth/google-sa-key.json` path is
+registered as an optional credential file so sandboxed Docker/Modal backends
+can mount it at the same `${HERMES_HOME}/auth/google-sa-key.json` path they
+see inside the sandbox.
+
+`GOOGLE_SA_KEY_PATH` is still accepted as a legacy fallback when the config
+value is empty, but new deployments should use `config.yaml`.
 
 ## Usage
 

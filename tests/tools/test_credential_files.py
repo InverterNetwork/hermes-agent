@@ -84,6 +84,82 @@ class TestRegisterCredentialFiles:
         assert "does_not_exist.json" in missing
         assert get_credential_file_mounts() == []
 
+    def test_optional_missing_file_not_reported(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            missing = register_credential_files([
+                {"path": "auth/google-sa-key.json", "optional": True},
+            ])
+
+        assert missing == []
+        assert get_credential_file_mounts() == []
+
+    def test_config_key_mounts_configured_file_inside_hermes_home(self, tmp_path, monkeypatch):
+        import yaml
+
+        hermes_home = tmp_path / ".hermes"
+        key_path = hermes_home / "auth" / "otto-google-sa.json"
+        key_path.parent.mkdir(parents=True)
+        key_path.write_text("{}")
+        (hermes_home / "config.yaml").write_text(
+            yaml.dump({
+                "skills": {
+                    "config": {
+                        "google_workspace": {
+                            "service_account_key_path": "${HERMES_HOME}/auth/otto-google-sa.json",
+                        },
+                    },
+                },
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        missing = register_credential_files([
+            {
+                "path": "auth/google-sa-key.json",
+                "config_key": "skills.config.google_workspace.service_account_key_path",
+                "optional": True,
+            },
+        ])
+
+        assert missing == []
+        mounts = get_credential_file_mounts()
+        assert mounts == [{
+            "host_path": str(key_path),
+            "container_path": "/root/.hermes/auth/otto-google-sa.json",
+        }]
+
+    def test_config_key_missing_configured_file_is_reported(self, tmp_path, monkeypatch):
+        import yaml
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.dump({
+                "skills": {
+                    "config": {
+                        "google_workspace": {
+                            "service_account_key_path": "${HERMES_HOME}/auth/missing-sa.json",
+                        },
+                    },
+                },
+            })
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        missing = register_credential_files([
+            {
+                "path": "auth/google-sa-key.json",
+                "config_key": "skills.config.google_workspace.service_account_key_path",
+                "optional": True,
+            },
+        ])
+
+        assert missing == ["auth/missing-sa.json"]
+        assert get_credential_file_mounts() == []
+
     def test_path_takes_precedence_over_name(self, tmp_path):
         """When both path and name are present, path wins."""
         hermes_home = tmp_path / ".hermes"

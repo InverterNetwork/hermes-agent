@@ -1649,25 +1649,49 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             "url.${ssh_url}.insteadOf" "$repo_url" )
       else
         # git applies url.insteadOf before credential lookup, so a stale
-        # rewrite from a pre-consolidation install would silently shadow
-        # the App helper and keep pushing via the deploy key. Exit 5 =
-        # "key not present"; anything else is a real failure (perm denied,
-        # malformed gitconfig) and shouldn't be swallowed.
-        # Try both suffix variants — the pre-consolidation installer wrote
-        # the rewrite key without `.git`, while the current write branch
-        # uses `.git`. git accepts either form on read, so a single shape
-        # would silently no-op against the other.
-        for unset_suffix in "" ".git"; do
-          unset_ssh_url="git@github.com:${org}/${repo_short}${unset_suffix}"
+        # rewrite from a pre-consolidation install would shadow the App
+        # helper. Clear any global rewrite that targets this repo's HTTPS or
+        # SSH-shaped GitHub URL, regardless of the replacement host/key name.
+        # That covers old deploy-key aliases like git@github-frontends:...
+        # whose key cannot be reconstructed from deploy.values.yaml.
+        stale_insteadof_values=(
+          "$repo_url"
+          "${repo_url}.git"
+          "git@github.com:${org}/${repo_short}"
+          "git@github.com:${org}/${repo_short}.git"
+          "ssh://git@github.com/${org}/${repo_short}"
+          "ssh://git@github.com/${org}/${repo_short}.git"
+        )
+        stale_insteadof_entries=""
+        stale_list_rc=0
+        stale_insteadof_entries="$(
+          cd "$AGENT_HOME" && \
+            sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
+              --get-regexp '^url\..*\.insteadof$'
+        )" || stale_list_rc=$?
+        if (( stale_list_rc != 0 && stale_list_rc != 1 )); then
+          echo "FAIL: listing stale url.insteadOf entries for $repo_id failed (git config exit $stale_list_rc)" >&2
+          exit 1
+        fi
+        while IFS=$' \t' read -r stale_key stale_value; do
+          [[ -n "$stale_key" && -n "$stale_value" ]] || continue
+          stale_match=0
+          for stale_expected in "${stale_insteadof_values[@]}"; do
+            if [[ "$stale_value" == "$stale_expected" ]]; then
+              stale_match=1
+              break
+            fi
+          done
+          [[ "$stale_match" -eq 1 ]] || continue
           unset_rc=0
           ( cd "$AGENT_HOME" && \
             sudo -u "$AGENT_USER" git config --file "$AGENT_GITCONFIG" \
-              --unset-all "url.${unset_ssh_url}.insteadOf" ) || unset_rc=$?
+              --unset-all "$stale_key" "$stale_value" ) || unset_rc=$?
           if (( unset_rc != 0 && unset_rc != 5 )); then
-            echo "FAIL: clearing stale url.insteadOf for $repo_id (key url.${unset_ssh_url}.insteadOf) failed (git config exit $unset_rc)" >&2
+            echo "FAIL: clearing stale url.insteadOf for $repo_id (key $stale_key) failed (git config exit $unset_rc)" >&2
             exit 1
           fi
-        done
+        done <<<"$stale_insteadof_entries"
       fi
     fi
 

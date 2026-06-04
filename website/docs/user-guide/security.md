@@ -418,6 +418,10 @@ required_credential_files:
     description: Google OAuth2 token (created by setup script)
   - path: google_client_secret.json
     description: Google OAuth2 client credentials
+  - path: auth/google-sa-key.json
+    config_key: skills.config.google_workspace.service_account_key_path
+    optional: true
+    description: Optional Google service account JSON
 ```
 
 When loaded, Hermes checks if these files exist in the active profile's `HERMES_HOME` and registers them for mounting:
@@ -436,6 +440,8 @@ terminal:
 ```
 
 Paths are relative to `~/.hermes/`. Files are mounted to `/root/.hermes/` inside the container. This list is read by `tools/credential_files.py` (`terminal.credential_files`) — it lives under the `terminal:` block but is loaded by the credential-files module, not the core terminal backend, so it isn't part of the bundled `DEFAULT_CONFIG` snapshot.
+
+Skill declarations can mark a file as `optional: true` to mount it when present without requiring setup when absent. A declaration can also use `config_key` when the file path is stored in `config.yaml`; the configured path must resolve inside the active `HERMES_HOME`.
 
 ### What Each Sandbox Filters
 

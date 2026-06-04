@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: stage fork at /srv/hermes/repos/hermes-agent
         run: |
@@ -114,6 +114,7 @@ jobs:
           ITRY_CONTRACTS_FIXTURE=/srv/hermes/repos/quay-fixtures/iTry-contracts
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/quay
           HERMES_AGENT_FIXTURE=/srv/hermes/repos/quay-fixtures/hermes-agent
+          BRIX_PROTOTYPES_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-prototypes
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
           git_in() { sudo git -C "$1" -c user.email=ci@example.com -c user.name=ci "${@:2}"; }
@@ -136,6 +137,7 @@ jobs:
           init_fixture "$ITRY_CONTRACTS_FIXTURE" "init fixture"
           init_fixture "$QUAY_FIXTURE" "init fixture" dev
           init_fixture "$HERMES_AGENT_FIXTURE" "init fixture"
+          init_fixture "$BRIX_PROTOTYPES_FIXTURE" "init fixture"
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -156,7 +158,7 @@ jobs:
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$HERMES_AGENT_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$HERMES_AGENT_FIXTURE" "$BRIX_PROTOTYPES_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
           (
               brix_landing_fixture,
@@ -167,9 +169,10 @@ jobs:
               itry_contracts_fixture,
               quay_fixture,
               hermes_agent_fixture,
+              brix_prototypes_fixture,
               code_fixture,
               dev_fixture,
-          ) = sys.argv[1:11]
+          ) = sys.argv[1:12]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
@@ -182,6 +185,7 @@ jobs:
               "iTry-contracts": itry_contracts_fixture,
               "quay": quay_fixture,
               "hermes-agent": hermes_agent_fixture,
+              "brix-prototypes": brix_prototypes_fixture,
           }
           for entry in data.get("repos", []):
               if entry.get("id") in rewrite:
@@ -425,7 +429,8 @@ jobs:
               erpc:/srv/hermes/repos/quay-fixtures/erpc \
               iTry-contracts:/srv/hermes/repos/quay-fixtures/iTry-contracts \
               quay:/srv/hermes/repos/quay-fixtures/quay \
-              hermes-agent:/srv/hermes/repos/quay-fixtures/hermes-agent; do
+              hermes-agent:/srv/hermes/repos/quay-fixtures/hermes-agent \
+              brix-prototypes:/srv/hermes/repos/quay-fixtures/brix-prototypes; do
               id="${spec%%:*}"
               fixture="${spec#*:}"
               [[ -d "$T/quay/repos/$id.git" ]] \

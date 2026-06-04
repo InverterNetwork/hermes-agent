@@ -256,14 +256,13 @@ def replay_compression_warning(agent: Any) -> None:
     During ``__init__`` the gateway's ``status_callback`` is not yet
     wired, so ``_emit_status`` only reaches ``_vprint`` (CLI).  This
     method is called once at the start of the first
-    ``run_conversation()`` — by then the gateway has set the callback,
-    so every platform (Telegram, Discord, Slack, etc.) receives the
-    warning.
+    ``run_conversation()`` — by then the gateway has set the callback.
+    Replay it as a warning so warning-only gateway modes still deliver it.
     """
     msg = getattr(agent, "_compression_warning", None)
     if msg and agent.status_callback:
         try:
-            agent.status_callback("lifecycle", msg)
+            agent.status_callback("warn", msg)
         except Exception:
             pass
 

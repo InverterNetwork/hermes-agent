@@ -74,6 +74,40 @@ def test_installer_unsets_stale_insteadof_for_quay_entries(tmp_path):
     ).returncode == 1
 
 
+def test_stale_insteadof_can_be_removed_by_value_for_alias_host(tmp_path):
+    """A stale deploy-key rewrite may use an arbitrary SSH host alias.
+
+    The installer cannot reconstruct keys like `github-frontends` from
+    deploy.values.yaml, so the upgrade path must remove rewrites by matching
+    the `insteadOf` value for the quay-managed repo.
+    """
+    gitconfig = tmp_path / ".gitconfig"
+    key = "url.git@github-frontends:InverterNetwork/iTRY-frontends.insteadOf"
+    value = "git@github.com:InverterNetwork/iTRY-frontends.git"
+
+    subprocess.run(
+        ["git", "config", "--file", str(gitconfig), "--add", key, value],
+        check=True,
+    )
+
+    listed = subprocess.run(
+        ["git", "config", "--file", str(gitconfig), "--get-regexp",
+         r"^url\..*\.insteadof$"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().split(None, 1)
+    assert listed == [key.replace("insteadOf", "insteadof"), value]
+
+    subprocess.run(
+        ["git", "config", "--file", str(gitconfig),
+         "--unset-all", listed[0], listed[1]],
+        check=True,
+    )
+    assert subprocess.run(
+        ["git", "config", "--file", str(gitconfig), "--get", key],
+        capture_output=True, text=True,
+    ).returncode == 1
+
+
 def test_installer_unsets_url_insteadof_somewhere():
     """Guards the upgrade-path fix: setup-hermes.sh must contain a
     `git config --unset-all` call on a `url.*.insteadOf` key. Loose regex
@@ -82,8 +116,11 @@ def test_installer_unsets_url_insteadof_somewhere():
     logic is still in the script.
     """
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    assert re.search(r'--unset-all\s+"url\..*?\.insteadOf"', content), \
-        "installer must clear stale url.<ssh>.insteadOf for upgraded quay-managed entries"
+    assert "--get-regexp '^url\\..*\\.insteadof$'" in content
+    assert "stale_list_rc != 0 && stale_list_rc != 1" in content
+    assert "listing stale url.insteadOf entries" in content
+    assert re.search(r'--unset-all\s+"\$stale_key"\s+"\$stale_value"', content), \
+        "installer must clear stale url.insteadOf entries by matched value"
 
 
 def test_git_config_unset_all_keys_are_suffix_sensitive(tmp_path):
@@ -375,14 +412,12 @@ def test_installer_removes_legacy_reviewer_token_timer():
     assert "systemctl start hermes-reviewer-token.service" not in content
 
 
-def test_installer_unset_loop_iterates_both_suffixes():
-    """Static guard: the installer's quay-managed unset branch must
-    iterate over both the empty suffix and `.git`. Without this loop a
-    pre-consolidation key (no `.git`) silently survives a re-run because
-    the stored shape doesn't match the constructed lookup key.
-    """
+def test_installer_stale_insteadof_values_cover_suffixes_and_ssh_shapes():
+    """Static guard for the quay-managed stale-rewrite upgrade path."""
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
-    # Match `for <var> in "" ".git"` (or `.git` ""), with flexible whitespace.
-    pattern = r'for\s+\w+\s+in\s+(?:""\s+"\.git"|"\.git"\s+"")'
-    assert re.search(pattern, content), \
-        "installer must loop over both '' and '.git' suffixes when clearing stale url.insteadOf"
+    assert '"$repo_url"' in content
+    assert '"${repo_url}.git"' in content
+    assert '"git@github.com:${org}/${repo_short}"' in content
+    assert '"git@github.com:${org}/${repo_short}.git"' in content
+    assert '"ssh://git@github.com/${org}/${repo_short}"' in content
+    assert '"ssh://git@github.com/${org}/${repo_short}.git"' in content
