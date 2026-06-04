@@ -236,6 +236,7 @@ as_hermes mkdir -p \
     "$HERMES_HOME/hooks" \
     "$HERMES_HOME/memories" \
     "$HERMES_HOME/skills" \
+    "$HERMES_HOME/scripts" \
     "$HERMES_HOME/skins" \
     "$HERMES_HOME/plans" \
     "$HERMES_HOME/workspace" \

@@ -50,7 +50,7 @@ Manifest format (``distribution.yaml`` at the profile root)::
 
 Update semantics:
 
-* Distribution-owned paths (SOUL.md, mcp.json, skills/, cron/,
+* Distribution-owned paths (SOUL.md, mcp.json, skills/, scripts/, cron/,
   distribution.yaml) are replaced from the new source.
 * ``config.yaml`` is distribution-owned but preserved on update unless
   ``--force-config`` is passed (user overrides typically live here).
@@ -89,6 +89,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
     "config.yaml",
     "mcp.json",
     "skills",
+    "scripts",
     "cron",
     MANIFEST_FILENAME,
 )
@@ -593,7 +594,7 @@ def _copy_dist_payload(
 
 def _bootstrap_user_dirs(target: Path) -> None:
     """Create the bootstrap dirs a fresh profile expects."""
-    for d in ("memories", "sessions", "skills", "skins", "logs",
+    for d in ("memories", "sessions", "skills", "scripts", "skins", "logs",
               "plans", "workspace", "cron", "home"):
         (target / d).mkdir(parents=True, exist_ok=True)
 
