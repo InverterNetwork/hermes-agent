@@ -701,6 +701,7 @@ find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 # Stored under $TARGET/auth/:
 #   github-app.pem      — the GitHub App private key (mode 0640, root:hermes)
 #   github-app.env      — config consumed by hermes_github_token.py
+#   atlas.env           — Atlas runtime secrets such as GITBOOK_API_TOKEN
 #   gateway-runtime.env — non-secret env vars derived from deploy.values.yaml
 #                         (SLACK_ALLOWED_USERS, …). Rewritten every run so
 #                         values.yaml stays the single source of truth.
@@ -716,6 +717,7 @@ GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
 ATLAS_APP_KEY_DST="$AUTH_DIR/atlas-manager.pem"
 ATLAS_APP_ENV="$AUTH_DIR/atlas-manager.env"
+ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"
 ATLAS_SOURCE_READER_APP_KEY_DST="$AUTH_DIR/atlas-source-reader.pem"
 ATLAS_SOURCE_READER_APP_ENV="$AUTH_DIR/atlas-source-reader.env"
 GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
@@ -1207,7 +1209,7 @@ ATLAS_KB_ROOT=""
 ATLAS_CONFIG=""
 ATLAS_CODEX_BIN=""
 ATLAS_CODEX_TIMEOUT_MS=""
-ATLAS_SYNC_SOURCE_NAME=""
+ATLAS_SYNC_SOURCE_NAMES=""
 if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   case "$(uname -m)" in
     x86_64)  ATLAS_ARCH="amd64" ;;
@@ -1273,8 +1275,26 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   ATLAS_AI_MODE="${ATLAS_AI_MODE:-codex-exec}"
   ATLAS_CONFIG="$TARGET_DIR/config/atlas.yaml"
   ATLAS_CACHE_DIR="$TARGET_DIR/cache/atlas"
-  ATLAS_SYNC_SOURCE_NAME="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_name 2>/dev/null || true)"
-  ATLAS_SYNC_SOURCE_NAME="${ATLAS_SYNC_SOURCE_NAME:-emusd-docs}"
+  ATLAS_SYNC_SOURCE_NAMES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_names --sep "," 2>/dev/null || true)"
+  if [[ -z "$ATLAS_SYNC_SOURCE_NAMES" ]]; then
+    ATLAS_SYNC_SOURCE_NAMES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_name 2>/dev/null || true)"
+  fi
+  ATLAS_SYNC_SOURCE_NAMES="${ATLAS_SYNC_SOURCE_NAMES:-emusd-docs}"
+
+  if [[ ! -f "$ATLAS_SECRET_ENV" ]]; then
+    echo "==> seeding $ATLAS_SECRET_ENV for Atlas runtime secrets"
+    umask 0027
+    cat > "$ATLAS_SECRET_ENV" <<'EOF'
+# Atlas runtime secrets. Staged out-of-band; setup-hermes.sh preserves this file.
+# Example for GitBook source sync:
+# GITBOOK_API_TOKEN=...
+EOF
+    umask 0022
+  else
+    echo "==> $ATLAS_SECRET_ENV already present (preserving)"
+  fi
+  chown root:"$AGENT_USER" "$ATLAS_SECRET_ENV"
+  chmod 0640 "$ATLAS_SECRET_ENV"
 
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config" "$ATLAS_CACHE_DIR"
   echo "==> rendering Atlas runtime config at $ATLAS_CONFIG"
@@ -1289,30 +1309,53 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     printf '  codex_bin: "%s"\n' "$ATLAS_CODEX_BIN"
     printf '  timeout_ms: %s\n' "$ATLAS_CODEX_TIMEOUT_MS"
     if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
-      ATLAS_SOURCE_TYPE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$ATLAS_SYNC_SOURCE_NAME.type" 2>/dev/null || true)"
-      ATLAS_SOURCE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$ATLAS_SYNC_SOURCE_NAME.repo" 2>/dev/null || true)"
-      ATLAS_SOURCE_BRANCH="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$ATLAS_SYNC_SOURCE_NAME.branch" 2>/dev/null || true)"
-      ATLAS_SOURCE_INCLUDE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$ATLAS_SYNC_SOURCE_NAME.include" --sep $'\n' 2>/dev/null || true)"
-      ATLAS_SOURCE_EXCLUDE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$ATLAS_SYNC_SOURCE_NAME.exclude" --sep $'\n' 2>/dev/null || true)"
-      [[ "$ATLAS_SOURCE_TYPE" == "github" ]] \
-        || { echo "FAIL: atlas.sources.$ATLAS_SYNC_SOURCE_NAME.type must be github" >&2; exit 1; }
-      [[ "$ATLAS_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
-        || { echo "FAIL: atlas.sources.$ATLAS_SYNC_SOURCE_NAME.repo must be owner/repo (got: $ATLAS_SOURCE_REPO)" >&2; exit 1; }
-      [[ -n "$ATLAS_SOURCE_BRANCH" ]] \
-        || { echo "FAIL: atlas.sources.$ATLAS_SYNC_SOURCE_NAME.branch is required" >&2; exit 1; }
       printf 'sources:\n'
-      printf '  %s:\n' "$ATLAS_SYNC_SOURCE_NAME"
-      printf '    type: github\n'
-      printf '    repo: "%s"\n' "$ATLAS_SOURCE_REPO"
-      printf '    branch: "%s"\n' "$ATLAS_SOURCE_BRANCH"
-      printf '    include:\n'
-      while IFS= read -r atlas_glob; do
-        [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
-      done <<<"$ATLAS_SOURCE_INCLUDE"
-      printf '    exclude:\n'
-      while IFS= read -r atlas_glob; do
-        [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
-      done <<<"$ATLAS_SOURCE_EXCLUDE"
+      IFS=',' read -r -a atlas_source_names <<<"$ATLAS_SYNC_SOURCE_NAMES"
+      for atlas_source_name in "${atlas_source_names[@]}"; do
+        [[ -n "$atlas_source_name" ]] || continue
+        ATLAS_SOURCE_TYPE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.type" 2>/dev/null || true)"
+        ATLAS_SOURCE_INCLUDE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.include" --sep $'\n' 2>/dev/null || true)"
+        ATLAS_SOURCE_EXCLUDE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.exclude" --sep $'\n' 2>/dev/null || true)"
+        printf '  %s:\n' "$atlas_source_name"
+        if [[ "$ATLAS_SOURCE_TYPE" == "github" ]]; then
+          ATLAS_SOURCE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.repo" 2>/dev/null || true)"
+          ATLAS_SOURCE_BRANCH="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.branch" 2>/dev/null || true)"
+          [[ "$ATLAS_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.repo must be owner/repo (got: $ATLAS_SOURCE_REPO)" >&2; exit 1; }
+          [[ -n "$ATLAS_SOURCE_BRANCH" ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.branch is required" >&2; exit 1; }
+          printf '    type: github\n'
+          printf '    repo: "%s"\n' "$ATLAS_SOURCE_REPO"
+          printf '    branch: "%s"\n' "$ATLAS_SOURCE_BRANCH"
+        elif [[ "$ATLAS_SOURCE_TYPE" == "gitbook" ]]; then
+          ATLAS_SOURCE_SPACE_ID="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.space_id" 2>/dev/null || true)"
+          ATLAS_SOURCE_TOKEN_ENV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.token_env" 2>/dev/null || true)"
+          [[ "$ATLAS_SOURCE_SPACE_ID" =~ ^[A-Za-z0-9_-]+$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.space_id must be a GitBook space id (got: $ATLAS_SOURCE_SPACE_ID)" >&2; exit 1; }
+          [[ "$ATLAS_SOURCE_TOKEN_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.token_env must name an env var (got: $ATLAS_SOURCE_TOKEN_ENV)" >&2; exit 1; }
+          printf '    type: gitbook\n'
+          printf '    space_id: "%s"\n' "$ATLAS_SOURCE_SPACE_ID"
+          printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
+        else
+          echo "FAIL: atlas.sources.$atlas_source_name.type must be github or gitbook" >&2
+          exit 1
+        fi
+        if [[ -n "$ATLAS_SOURCE_INCLUDE" ]]; then
+          printf '    include:\n'
+          while IFS= read -r atlas_glob; do
+            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+          done <<<"$ATLAS_SOURCE_INCLUDE"
+        fi
+        if [[ -n "$ATLAS_SOURCE_EXCLUDE" ]]; then
+          printf '    exclude:\n'
+          while IFS= read -r atlas_glob; do
+            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+          done <<<"$ATLAS_SOURCE_EXCLUDE"
+        else
+          printf '    exclude: []\n'
+        fi
+      done
     fi
   } > "$ATLAS_CONFIG"
   chown "$AGENT_USER:$AGENT_USER" "$ATLAS_CONFIG"
@@ -1796,11 +1839,11 @@ EOF
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
-    echo "==> installing systemd timer for atlas-source-sync (source=$ATLAS_SYNC_SOURCE_NAME)"
+    echo "==> installing systemd timer for atlas-source-sync (sources=$ATLAS_SYNC_SOURCE_NAMES)"
     sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
         -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
         -e "s|__ATLAS_CONFIG__|$ATLAS_CONFIG|g" \
-        -e "s|__ATLAS_SYNC_SOURCE_NAME__|$ATLAS_SYNC_SOURCE_NAME|g" \
+        -e "s|__ATLAS_SYNC_SOURCE_NAMES__|$ATLAS_SYNC_SOURCE_NAMES|g" \
         "$ATLAS_SOURCE_SYNC_SRC" \
       | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-source-sync.service
     install -o root -g root -m 0644 \

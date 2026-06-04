@@ -679,7 +679,7 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.5"
+  version: "v0.1.6"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
@@ -695,7 +695,9 @@ atlas:
     installation_id: "137066070"
   source_sync:
     enabled: true
-    source_name: emusd-docs
+    source_names:
+      - emusd-docs
+      - brix-product-docs
     github_app:
       # GitHub App slug is intentionally `atlast-source-reader`.
       id: "3944782"
@@ -714,6 +716,13 @@ atlas:
         - "node_modules/**"
         - "dist/**"
         - "build/**"
+    brix-product-docs:
+      type: gitbook
+      space_id: JZwK8SE9GDTka1EcS5dD
+      token_env: GITBOOK_API_TOKEN
+      include:
+        - "**/*.md"
+      exclude: []
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the
