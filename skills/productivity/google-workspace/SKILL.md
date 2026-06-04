@@ -191,8 +191,10 @@ skills:
 ```
 
 6. Share each Google Doc, Sheet, or Drive folder with the service account's
-   email address. Use Viewer access for read-only Docs/Drive searches and
-   Editor access when Hermes needs to update Sheets.
+   email address. Use Viewer access for read-only searches/downloads and
+   Editor access when Hermes needs to update Sheets, append Docs, or modify
+   shared Drive files. Files created by the service account live in the
+   service account's own Drive until shared elsewhere.
 
 You can also set it with:
 

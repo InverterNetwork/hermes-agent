@@ -1,6 +1,7 @@
 """Tests for Google Workspace gws bridge and CLI wrapper."""
 
 import importlib.util
+import inspect
 import json
 import subprocess
 import sys
@@ -599,6 +600,40 @@ def test_api_service_account_disables_gws_only_for_file_apis(api_module, monkeyp
     assert api_module._should_use_gws("gmail")
     assert api_module._should_use_gws("calendar")
     assert api_module._should_use_gws("contacts")
+
+
+def test_api_file_write_scopes_are_available_to_service_account(api_module):
+    assert "https://www.googleapis.com/auth/drive" in api_module.SERVICE_ACCOUNT_SCOPES
+    assert "https://www.googleapis.com/auth/spreadsheets" in api_module.SERVICE_ACCOUNT_SCOPES
+    assert "https://www.googleapis.com/auth/documents" in api_module.SERVICE_ACCOUNT_SCOPES
+    assert "https://www.googleapis.com/auth/drive.readonly" not in api_module.SERVICE_ACCOUNT_SCOPES
+    assert "https://www.googleapis.com/auth/documents.readonly" not in api_module.SERVICE_ACCOUNT_SCOPES
+
+
+def test_api_file_commands_do_not_bypass_service_account_gws_gate(api_module):
+    file_command_helpers = [
+        api_module.drive_search,
+        api_module.drive_get,
+        api_module.drive_upload,
+        api_module.drive_download,
+        api_module.drive_create_folder,
+        api_module.drive_share,
+        api_module.drive_delete,
+        api_module.sheets_get,
+        api_module.sheets_update,
+        api_module.sheets_append,
+        api_module.sheets_create,
+        api_module.docs_get,
+        api_module.docs_create,
+        api_module.docs_append,
+        api_module._docs_insert_text,
+    ]
+
+    for helper in file_command_helpers:
+        source = inspect.getsource(helper)
+        assert "_gws_binary()" not in source
+        if "_run_gws" in source:
+            assert "_should_use_gws(" in source
 
 
 def test_api_service_account_key_path_falls_back_to_legacy_env(api_module, monkeypatch):

@@ -60,9 +60,9 @@ SERVICE_ACCOUNT_CONFIG_KEY = (
 )
 SERVICE_ACCOUNT_APIS = {"drive", "sheets", "docs"}
 SERVICE_ACCOUNT_SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/documents",
 ]
 
 
@@ -696,7 +696,7 @@ def drive_search(args):
 def drive_get(args):
     """Get metadata for a single Drive file by ID."""
     fields = "id, name, mimeType, modifiedTime, size, webViewLink, parents, owners(emailAddress)"
-    if _gws_binary():
+    if _should_use_gws("drive"):
         result = _run_gws(
             ["drive", "files", "get"],
             params={"fileId": args.file_id, "fields": fields},
@@ -798,7 +798,7 @@ def drive_create_folder(args):
     if args.parent:
         body["parents"] = [args.parent]
 
-    if _gws_binary():
+    if _should_use_gws("drive"):
         result = _run_gws(
             ["drive", "files", "create"],
             params={"fields": "id, name, webViewLink"},
@@ -838,7 +838,7 @@ def drive_share(args):
             sys.exit(1)
         permission["domain"] = args.domain
 
-    if _gws_binary():
+    if _should_use_gws("drive"):
         result = _run_gws(
             ["drive", "permissions", "create"],
             params={
@@ -875,7 +875,7 @@ def drive_share(args):
 def drive_delete(args):
     """Trash or permanently delete a Drive file. Defaults to trash (reversible)."""
     if args.permanent:
-        if _gws_binary():
+        if _should_use_gws("drive"):
             _run_gws(["drive", "files", "delete"], params={"fileId": args.file_id})
             print(json.dumps({"status": "deleted", "fileId": args.file_id, "permanent": True}))
             return
@@ -886,7 +886,7 @@ def drive_delete(args):
 
     # Trash (reversible). Use files.update with trashed=True.
     body = {"trashed": True}
-    if _gws_binary():
+    if _should_use_gws("drive"):
         _run_gws(
             ["drive", "files", "update"],
             params={"fileId": args.file_id},
@@ -1027,7 +1027,7 @@ def sheets_create(args):
     if args.sheet_name:
         body["sheets"] = [{"properties": {"title": args.sheet_name}}]
 
-    if _gws_binary():
+    if _should_use_gws("sheets"):
         result = _run_gws(["sheets", "spreadsheets", "create"], body=body)
         print(json.dumps({
             "status": "created",
@@ -1079,7 +1079,7 @@ def docs_create(args):
     """Create a new Doc. Optionally seed it with initial body text."""
     body = {"title": args.title}
 
-    if _gws_binary():
+    if _should_use_gws("docs"):
         doc = _run_gws(["docs", "documents", "create"], body=body)
     else:
         service = build_service("docs", "v1")
@@ -1100,7 +1100,7 @@ def docs_create(args):
 
 def docs_append(args):
     """Append text to the end of an existing Doc."""
-    if _gws_binary():
+    if _should_use_gws("docs"):
         doc = _run_gws(["docs", "documents", "get"], params={"documentId": args.doc_id})
     else:
         service = build_service("docs", "v1")
@@ -1136,7 +1136,7 @@ def _docs_insert_text(doc_id: str, text: str, index: int) -> None:
             "text": text,
         }
     }]
-    if _gws_binary():
+    if _should_use_gws("docs"):
         _run_gws(
             ["docs", "documents", "batchUpdate"],
             params={"documentId": doc_id},
