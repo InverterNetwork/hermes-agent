@@ -4,6 +4,7 @@ from gateway.config import Platform
 from gateway.run import (
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
+    _status_callback_mode_allows,
 )
 
 
@@ -29,6 +30,15 @@ def test_non_telegram_status_is_unchanged():
 
     assert _prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message
     assert _prepare_gateway_status_message("local", "lifecycle", message) == message
+
+
+def test_status_callback_mode_allows_expected_event_types():
+    assert _status_callback_mode_allows("all", "lifecycle") is True
+    assert _status_callback_mode_allows("all", "warn") is True
+    assert _status_callback_mode_allows("warn", "lifecycle") is False
+    assert _status_callback_mode_allows("warn", "warn") is True
+    assert _status_callback_mode_allows("off", "warn") is False
+    assert _status_callback_mode_allows(False, "warn") is False
 
 
 def test_telegram_status_sanitizes_raw_provider_security_errors():

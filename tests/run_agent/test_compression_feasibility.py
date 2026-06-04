@@ -5,7 +5,7 @@ compression threshold.
 Two-phase design:
   1. __init__  → runs the check, prints via _vprint (CLI), stores warning
   2. run_conversation (first call) → replays stored warning through
-     status_callback (gateway platforms)
+     status_callback("warn", ...) (gateway platforms)
 """
 
 from unittest.mock import MagicMock, patch
@@ -401,10 +401,7 @@ def test_warning_stored_for_gateway_replay(mock_get_client, mock_ctx_len):
     agent.status_callback = lambda ev, msg: callback_events.append((ev, msg))
     agent._replay_compression_warning()
 
-    assert any(
-        ev == "lifecycle" and "Auto-lowered" in msg
-        for ev, msg in callback_events
-    )
+    assert any(ev == "warn" and "Auto-lowered" in msg for ev, msg in callback_events)
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=200_000)

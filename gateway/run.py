@@ -326,6 +326,16 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _status_callback_mode_allows(mode: Any, event_type: str) -> bool:
+    """Return whether a configured status-callback mode permits an event."""
+    normalized = str("all" if mode is None else mode).strip().lower().replace("-", "_")
+    if normalized in {"off", "false", "0", "no", "none"}:
+        return False
+    if normalized in {"warn", "warning", "warnings", "warn_only", "warnings_only"}:
+        return str(event_type or "").strip().lower() == "warn"
+    return True
+
+
 async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
     """Route a status message through adapter.send_or_update_status when supported.
 
@@ -17337,6 +17347,21 @@ class GatewayRunner:
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
+                return
+            status_callback_mode = resolve_display_setting(
+                user_config,
+                platform_key,
+                "status_callbacks",
+                "all",
+            )
+            if not _status_callback_mode_allows(status_callback_mode, event_type):
+                logger.debug(
+                    "status_callback disabled for %s/%s mode=%s: %s",
+                    source.platform.value if source.platform else "unknown",
+                    event_type,
+                    status_callback_mode,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
                 return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,

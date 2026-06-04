@@ -436,3 +436,57 @@ class TestCleanupProgress:
                 }
             }
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
+
+
+# ---------------------------------------------------------------------------
+# status_callbacks — lifecycle/warning status bubble controls
+# ---------------------------------------------------------------------------
+
+class TestStatusCallbacks:
+    """``status_callbacks`` controls gateway lifecycle/warning bubbles."""
+
+    def test_global_default_all(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "telegram", "status_callbacks") == "all"
+        assert resolve_display_setting({}, "discord", "status_callbacks") == "all"
+
+    def test_slack_defaults_to_warnings_only(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "slack", "status_callbacks") == "warn"
+
+    def test_per_platform_override_wins(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "status_callbacks": "all",
+                "platforms": {
+                    "slack": {"status_callbacks": "off"},
+                },
+            }
+        }
+        assert resolve_display_setting(config, "slack", "status_callbacks") == "off"
+        assert resolve_display_setting(config, "discord", "status_callbacks") == "all"
+
+    def test_boolean_values_normalise_to_all_or_off(self):
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting(
+            {"display": {"status_callbacks": True}},
+            "slack",
+            "status_callbacks",
+        ) == "all"
+        assert resolve_display_setting(
+            {"display": {"status_callbacks": False}},
+            "slack",
+            "status_callbacks",
+        ) == "off"
+
+    def test_warning_aliases_normalise_to_warn(self):
+        from gateway.display_config import resolve_display_setting
+
+        for value in ("warn", "warning", "warnings", "warn-only", "warnings_only"):
+            config = {"display": {"status_callbacks": value}}
+            assert resolve_display_setting(config, "telegram", "status_callbacks") == "warn"
