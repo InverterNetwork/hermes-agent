@@ -40,7 +40,13 @@ def test_installer_writes_no_agent_dev_nav_job(tmp_path, monkeypatch):
     assert "setNav(uint256,uint256)" in payload
     assert "lastNavUpdate()(uint256)" in payload
     assert "latestReportedPrice()(uint256)" in payload
-    assert "--private-key \"$private_key\"" in payload
+    assert 'signer_args+=(--account "$DEV_NAV_PUBLISH_ACCOUNT")' in payload
+    assert 'signer_args+=(--keystore "$DEV_NAV_PUBLISH_KEYSTORE")' in payload
+    assert 'signer_args+=(--password-file "$DEV_NAV_PUBLISH_PASSWORD_FILE")' in payload
+    assert "--private-key" not in payload
+    assert "private_key=" not in payload
+    assert "PRIVATE_KEY:-" not in payload
+    assert "raw private-key env vars are not accepted" in payload
 
     jobs_data = json.loads((home / "cron" / "jobs.json").read_text())
     jobs = jobs_data["jobs"]

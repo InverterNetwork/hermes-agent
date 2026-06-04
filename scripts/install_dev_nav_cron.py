@@ -71,9 +71,26 @@ if [ -z "$sepolia_rpc_url" ]; then
   exit 1
 fi
 
-private_key="${DEV_NAV_PUBLISH_PRIVATE_KEY:-${NAV_PUBLISH_PRIVATE_KEY:-${PRIVATE_KEY:-}}}"
-if [ -z "$private_key" ]; then
-  echo "dev-nav-publish failed: set DEV_NAV_PUBLISH_PRIVATE_KEY or NAV_PUBLISH_PRIVATE_KEY" >&2
+signer_args=()
+if [ -n "${DEV_NAV_PUBLISH_KEYSTORE:-}" ]; then
+  signer_args+=(--keystore "$DEV_NAV_PUBLISH_KEYSTORE")
+elif [ -n "${DEV_NAV_PUBLISH_ACCOUNT:-}" ]; then
+  signer_args+=(--account "$DEV_NAV_PUBLISH_ACCOUNT")
+else
+  echo "dev-nav-publish failed: set DEV_NAV_PUBLISH_ACCOUNT or DEV_NAV_PUBLISH_KEYSTORE" >&2
+  exit 1
+fi
+
+if [ -n "${DEV_NAV_PUBLISH_PASSWORD_FILE:-}" ]; then
+  if [ ! -r "$DEV_NAV_PUBLISH_PASSWORD_FILE" ]; then
+    echo "dev-nav-publish failed: DEV_NAV_PUBLISH_PASSWORD_FILE is not readable: $DEV_NAV_PUBLISH_PASSWORD_FILE" >&2
+    exit 1
+  fi
+  signer_args+=(--password-file "$DEV_NAV_PUBLISH_PASSWORD_FILE")
+fi
+
+if [ -n "${DEV_NAV_PUBLISH_PRIVATE_KEY:-}${NAV_PUBLISH_PRIVATE_KEY:-}" ]; then
+  echo "dev-nav-publish failed: raw private-key env vars are not accepted; use a Foundry keystore account" >&2
   exit 1
 fi
 
@@ -125,7 +142,7 @@ send_json="$(
   cast send "$DEV_NAV_ORACLE_ADDRESS" \
     "setNav(uint256,uint256)" "$nav_price" "$nav_timestamp" \
     --rpc-url "$sepolia_rpc_url" \
-    --private-key "$private_key" \
+    "${signer_args[@]}" \
     --json
 )"
 

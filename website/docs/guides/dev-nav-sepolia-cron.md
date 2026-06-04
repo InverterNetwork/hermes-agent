@@ -26,8 +26,14 @@ Required host tools and secrets:
 - `aws` with read access to the DynamoDB row above
 - `cast` from Foundry
 - `SEPOLIA_RPC_URL`
-- `DEV_NAV_PUBLISH_PRIVATE_KEY` or `NAV_PUBLISH_PRIVATE_KEY`
+- `DEV_NAV_PUBLISH_ACCOUNT` for a Foundry keystore account, or
+  `DEV_NAV_PUBLISH_KEYSTORE` for an explicit keystore file/folder
+- `DEV_NAV_PUBLISH_PASSWORD_FILE` when the keystore requires a password
 - Either `DEV_NAV_PRICE_WEI` or `PROD_ETH_RPC_URL`/`MAINNET_RPC_URL`/`ETH_RPC_URL`
+
+The publish signer must be a dedicated dev NAV credential. The script rejects
+raw private-key environment variables and does not pass signing secrets on the
+`cast send` command line.
 
 When `DEV_NAV_PRICE_WEI` is not set, the script reads the prod oracle
 `latestReportedPrice()` from
