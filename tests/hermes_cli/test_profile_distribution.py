@@ -112,6 +112,7 @@ class TestManifestParsing:
             "distribution_owned:\n"
             "  - SOUL.md\n"
             "  - skills/\n"
+            "  - scripts/\n"
         )
         m = read_manifest(tmp_path)
         assert m.name == "telem"
@@ -123,7 +124,7 @@ class TestManifestParsing:
         assert m.env_requires[0].required is True
         assert m.env_requires[1].required is False
         assert m.env_requires[1].default == "http://127.0.0.1:8000"
-        assert m.distribution_owned == ["SOUL.md", "skills"]
+        assert m.distribution_owned == ["SOUL.md", "skills", "scripts"]
 
     def test_missing_name_rejected(self, tmp_path):
         (tmp_path / MANIFEST_FILENAME).write_text("version: 1.0\n")
