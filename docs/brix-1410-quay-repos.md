@@ -1,6 +1,6 @@
 # BRIX-1410: Quay Repo Registration
 
-Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all nine are quay-managed):
+Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all eight are quay-managed):
 
 | repo id | remote | base branch | package manager | install cmd |
 | --- | --- | --- | --- | --- |
@@ -28,7 +28,7 @@ Deployed host (post-deploy):
 sudo /usr/local/bin/quay-as-hermes repo list
 ```
 
-Expected: all nine repo ids above are present.
+Expected: all eight repo ids above are present.
 
 ## Enqueue verification / dry-run equivalent
 
