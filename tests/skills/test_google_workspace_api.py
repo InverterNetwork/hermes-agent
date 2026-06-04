@@ -673,9 +673,10 @@ def test_api_service_account_missing_file_exits(api_module, monkeypatch, tmp_pat
 
 
 def test_default_config_exposes_google_workspace_service_account_path():
-    from hermes_cli.config import DEFAULT_CONFIG
+    from hermes_cli.config import DEFAULT_CONFIG, _EXTRA_ENV_KEYS
 
     assert (
         DEFAULT_CONFIG["skills"]["config"]["google_workspace"]["service_account_key_path"]
         == ""
     )
+    assert "GOOGLE_SA_KEY_PATH" in _EXTRA_ENV_KEYS

@@ -222,6 +222,8 @@ _EXTRA_ENV_KEYS = frozenset({
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
     "LANGFUSE_BASE_URL",
+    # Google Workspace skill legacy fallback; config.yaml is preferred.
+    "GOOGLE_SA_KEY_PATH",
 })
 import yaml
 
