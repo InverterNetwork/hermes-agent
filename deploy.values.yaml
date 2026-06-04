@@ -590,7 +590,7 @@ repos:
       install_cmd: "bun install"
   - id: hermes-agent
     url: https://github.com/InverterNetwork/hermes-agent
-    base_branch: dev
+    base_branch: main
     issue_tracker:
       linear:
         team: brix
@@ -679,7 +679,7 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.3"
+  version: "v0.1.6"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
@@ -693,6 +693,36 @@ atlas:
   github_app:
     id: "3925386"
     installation_id: "137066070"
+  source_sync:
+    enabled: true
+    source_names:
+      - emusd-docs
+      - brix-product-docs
+    github_app:
+      # GitHub App slug is intentionally `atlast-source-reader`.
+      id: "3944782"
+      installation_id: "137564290"
+  sources:
+    emusd-docs:
+      type: github
+      repo: InverterNetwork/emusd-docs
+      branch: main
+      include:
+        - "**/*.md"
+      exclude:
+        - ".git/**"
+        - ".github/**"
+        - "**/.*/**"
+        - "node_modules/**"
+        - "dist/**"
+        - "build/**"
+    brix-product-docs:
+      type: gitbook
+      space_id: JZwK8SE9GDTka1EcS5dD
+      token_env: GITBOOK_API_TOKEN
+      include:
+        - "**/*.md"
+      exclude: []
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the

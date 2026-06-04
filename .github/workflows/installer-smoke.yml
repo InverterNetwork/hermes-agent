@@ -91,7 +91,7 @@ jobs:
         #   * erpc                — quay-managed, base_branch: main
         #   * iTry-contracts      — quay-managed, base_branch: main
         #   * quay                — quay-managed, base_branch: dev
-        #   * hermes-agent        — quay-managed, base_branch: dev
+        #   * hermes-agent        — quay-managed, base_branch: main
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
         #                           repos[] loop.
@@ -135,7 +135,7 @@ jobs:
           init_fixture "$ERPC_FIXTURE" "init fixture"
           init_fixture "$ITRY_CONTRACTS_FIXTURE" "init fixture"
           init_fixture "$QUAY_FIXTURE" "init fixture" dev
-          init_fixture "$HERMES_AGENT_FIXTURE" "init fixture" dev
+          init_fixture "$HERMES_AGENT_FIXTURE" "init fixture"
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -389,11 +389,12 @@ jobs:
             pin=$(python3 /srv/hermes/repos/hermes-agent/installer/values_helper.py \
               --values /srv/hermes/repos/hermes-agent/deploy.values.yaml \
               get "quay.runtime_managers.${name}.version")
-            actual=$(/usr/local/bin/"$name" --version 2>&1 | head -n1)
+            raw_version="$(cd /tmp && /usr/local/bin/"$name" --version 2>&1)"
+            actual="$(printf '%s\n' "$raw_version" | sed -n "/$pin/{p;q;}")"
             # Substring match — absorbs build suffixes the upstream binary
             # may emit (e.g. `+commit-sha`) without flaking the probe.
-            [[ "$actual" == *"$pin"* ]] \
-              || { echo "FAIL: $name --version='$actual' does not contain pin '$pin'"; exit 1; }
+            [[ -n "$actual" ]] \
+              || { echo "FAIL: $name --version output does not contain pin '$pin':"; printf '%s\n' "$raw_version"; exit 1; }
             # /bin/sh -c is what quay's bootstrap uses; assert the binary
             # is reachable there (PATH must contain /usr/local/bin without
             # sourcing a profile).
@@ -464,7 +465,7 @@ jobs:
               erpc:main \
               iTry-contracts:main \
               quay:dev \
-              hermes-agent:dev \
+              hermes-agent:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"
@@ -515,7 +516,7 @@ jobs:
               erpc:main \
               iTry-contracts:main \
               quay:dev \
-              hermes-agent:dev \
+              hermes-agent:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"

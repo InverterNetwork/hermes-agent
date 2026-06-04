@@ -109,6 +109,9 @@ REVIEWER_APP_KEY_PATH=""
 ATLAS_APP_ID=""
 ATLAS_APP_INSTALLATION_ID=""
 ATLAS_APP_KEY_PATH=""
+ATLAS_SOURCE_READER_APP_ID=""
+ATLAS_SOURCE_READER_APP_INSTALLATION_ID=""
+ATLAS_SOURCE_READER_APP_KEY_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -132,6 +135,9 @@ while [[ $# -gt 0 ]]; do
     --atlas-app-id)                 ATLAS_APP_ID="$2";                 shift 2 ;;
     --atlas-app-installation-id)    ATLAS_APP_INSTALLATION_ID="$2";    shift 2 ;;
     --atlas-app-key-path)           ATLAS_APP_KEY_PATH="$2";           shift 2 ;;
+    --atlas-source-reader-app-id)              ATLAS_SOURCE_READER_APP_ID="$2";              shift 2 ;;
+    --atlas-source-reader-app-installation-id) ATLAS_SOURCE_READER_APP_INSTALLATION_ID="$2"; shift 2 ;;
+    --atlas-source-reader-app-key-path)        ATLAS_SOURCE_READER_APP_KEY_PATH="$2";        shift 2 ;;
     --skip-auth-check)       SKIP_AUTH_CHECK=1;         shift   ;;
     --gh-api-base)           GH_API_BASE="$2";          shift 2 ;;
     --verify)                VERIFY=1;                  shift   ;;
@@ -323,13 +329,23 @@ VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
 
 ATLAS_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.version 2>/dev/null || true)"
 ATLAS_ENABLED=0
+ATLAS_SOURCE_SYNC_ENABLED=0
 if [[ -n "$ATLAS_VERSION" ]]; then
   ATLAS_ENABLED=1
+  ATLAS_SOURCE_SYNC_ENABLED_RAW="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.enabled 2>/dev/null || true)"
+  if [[ "$ATLAS_SOURCE_SYNC_ENABLED_RAW" == "true" ]]; then
+    ATLAS_SOURCE_SYNC_ENABLED=1
+  fi
 fi
 
 if [[ "$ATLAS_ENABLED" -eq 1 && "$AUTH_METHOD" != "app" ]]; then
   echo "FAIL: atlas.version is set but --auth-method app was not passed." >&2
   echo "      Atlas uses the Atlas manager GitHub App for release downloads and atlas-kb git auth." >&2
+  exit 2
+fi
+
+if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
+  echo "FAIL: atlas.source_sync.enabled=true requires atlas.version to be set." >&2
   exit 2
 fi
 
@@ -685,6 +701,7 @@ find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 # Stored under $TARGET/auth/:
 #   github-app.pem      — the GitHub App private key (mode 0640, root:hermes)
 #   github-app.env      — config consumed by hermes_github_token.py
+#   atlas.env           — Atlas runtime secrets such as GITBOOK_API_TOKEN
 #   gateway-runtime.env — non-secret env vars derived from deploy.values.yaml
 #                         (SLACK_ALLOWED_USERS, …). Rewritten every run so
 #                         values.yaml stays the single source of truth.
@@ -700,6 +717,9 @@ GH_APP_KEY_DST="$AUTH_DIR/github-app.pem"
 GH_APP_ENV="$AUTH_DIR/github-app.env"
 ATLAS_APP_KEY_DST="$AUTH_DIR/atlas-manager.pem"
 ATLAS_APP_ENV="$AUTH_DIR/atlas-manager.env"
+ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"
+ATLAS_SOURCE_READER_APP_KEY_DST="$AUTH_DIR/atlas-source-reader.pem"
+ATLAS_SOURCE_READER_APP_ENV="$AUTH_DIR/atlas-source-reader.env"
 GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
 QUAY_ENV_FILE="$AUTH_DIR/quay.env"
 TOKEN_HELPER_PY="$TARGET_DIR/hermes-agent/installer/hermes_github_token.py"
@@ -898,6 +918,62 @@ EOF
     || { echo "FAIL: venv python missing at $VENV_PY" >&2; exit 1; }
 
   ATLAS_GIT_CRED_HELPER="!HERMES_HOME='$TARGET_DIR' HERMES_GH_CONFIG='$ATLAS_APP_ENV' $VENV_PY $TOKEN_HELPER_PY credential"
+fi
+
+# ---------- Atlas source-reader App auth (read-only source repo identity) ----------
+if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
+  [[ "$AUTH_METHOD" == "app" ]] \
+    || { echo "FAIL: Atlas source sync requires --auth-method=app (got: $AUTH_METHOD)" >&2; exit 1; }
+
+  echo "==> wiring Atlas source-reader GitHub App auth at $AUTH_DIR"
+
+  if [[ -n "$ATLAS_SOURCE_READER_APP_KEY_PATH" ]]; then
+    [[ -f "$ATLAS_SOURCE_READER_APP_KEY_PATH" ]] \
+      || { echo "FAIL: --atlas-source-reader-app-key-path file not found: $ATLAS_SOURCE_READER_APP_KEY_PATH" >&2; exit 1; }
+    head -1 "$ATLAS_SOURCE_READER_APP_KEY_PATH" | grep -Eq '^-----BEGIN (RSA |EC )?PRIVATE KEY-----$' \
+      || { echo "FAIL: $ATLAS_SOURCE_READER_APP_KEY_PATH does not look like an unencrypted PEM private key" >&2; exit 1; }
+    if grep -q 'ENCRYPTED' "$ATLAS_SOURCE_READER_APP_KEY_PATH"; then
+      echo "FAIL: $ATLAS_SOURCE_READER_APP_KEY_PATH is passphrase-protected; PyJWT requires an unencrypted key" >&2
+      exit 1
+    fi
+    install -o root -g "$AGENT_USER" -m 0640 "$ATLAS_SOURCE_READER_APP_KEY_PATH" "$ATLAS_SOURCE_READER_APP_KEY_DST"
+  elif [[ ! -f "$ATLAS_SOURCE_READER_APP_KEY_DST" ]]; then
+    echo "FAIL: atlas.source_sync.enabled=true but no key staged at $ATLAS_SOURCE_READER_APP_KEY_DST and no --atlas-source-reader-app-key-path given" >&2
+    exit 1
+  fi
+
+  chown root:"$AGENT_USER" "$ATLAS_SOURCE_READER_APP_KEY_DST"
+  chmod 0640 "$ATLAS_SOURCE_READER_APP_KEY_DST"
+
+  ATLAS_SOURCE_READER_APP_ID="${ATLAS_SOURCE_READER_APP_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.github_app.id 2>/dev/null || true)}"
+  ATLAS_SOURCE_READER_APP_INSTALLATION_ID="${ATLAS_SOURCE_READER_APP_INSTALLATION_ID:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.github_app.installation_id 2>/dev/null || true)}"
+  ATLAS_SOURCE_READER_GH_API_BASE="${CLI_GH_API_BASE:-$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.github_app.api_base 2>/dev/null || true)}"
+  if [[ -f "$ATLAS_SOURCE_READER_APP_ENV" ]]; then
+    ATLAS_SOURCE_READER_APP_ID="${ATLAS_SOURCE_READER_APP_ID:-$(awk -F= '$1=="HERMES_GH_APP_ID"{print $2; exit}' "$ATLAS_SOURCE_READER_APP_ENV")}"
+    ATLAS_SOURCE_READER_APP_INSTALLATION_ID="${ATLAS_SOURCE_READER_APP_INSTALLATION_ID:-$(awk -F= '$1=="HERMES_GH_INSTALLATION_ID"{print $2; exit}' "$ATLAS_SOURCE_READER_APP_ENV")}"
+    ATLAS_SOURCE_READER_GH_API_BASE="${ATLAS_SOURCE_READER_GH_API_BASE:-$(awk -F= '$1=="HERMES_GH_API"{print $2; exit}' "$ATLAS_SOURCE_READER_APP_ENV")}"
+  fi
+  [[ "$ATLAS_SOURCE_READER_APP_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --atlas-source-reader-app-id must be a positive integer (got: '$ATLAS_SOURCE_READER_APP_ID')" >&2; exit 1; }
+  [[ "$ATLAS_SOURCE_READER_APP_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "FAIL: --atlas-source-reader-app-installation-id must be a positive integer (got: '$ATLAS_SOURCE_READER_APP_INSTALLATION_ID')" >&2; exit 1; }
+
+  umask 0027
+  cat > "$ATLAS_SOURCE_READER_APP_ENV" <<EOF
+HERMES_GH_APP_ID=$ATLAS_SOURCE_READER_APP_ID
+HERMES_GH_INSTALLATION_ID=$ATLAS_SOURCE_READER_APP_INSTALLATION_ID
+HERMES_GH_APP_KEY=$ATLAS_SOURCE_READER_APP_KEY_DST
+HERMES_GH_TOKEN_CACHE=$TARGET_DIR/cache/atlas-source-reader-token-cache.json
+${ATLAS_SOURCE_READER_GH_API_BASE:+HERMES_GH_API=$ATLAS_SOURCE_READER_GH_API_BASE}
+EOF
+  umask 0022
+  chown root:"$AGENT_USER" "$ATLAS_SOURCE_READER_APP_ENV"
+  chmod 0640 "$ATLAS_SOURCE_READER_APP_ENV"
+
+  [[ -x "$TOKEN_HELPER_PY" ]] \
+    || { echo "FAIL: token helper missing at $TOKEN_HELPER_PY" >&2; exit 1; }
+  [[ -x "$VENV_PY" ]] \
+    || { echo "FAIL: venv python missing at $VENV_PY" >&2; exit 1; }
 fi
 
 # ---------- reviewer App auth (separate identity from worker) ----------
@@ -1130,8 +1206,10 @@ done
 # release download and atlas-kb fetch/push permissions stay separate from
 # the general Hermes worker/reviewer Apps.
 ATLAS_KB_ROOT=""
+ATLAS_CONFIG=""
 ATLAS_CODEX_BIN=""
 ATLAS_CODEX_TIMEOUT_MS=""
+ATLAS_SYNC_SOURCE_NAMES=""
 if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   case "$(uname -m)" in
     x86_64)  ATLAS_ARCH="amd64" ;;
@@ -1195,6 +1273,93 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   ATLAS_CODEX_TIMEOUT_MS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.codex_timeout_ms 2>/dev/null || true)"
   ATLAS_CODEX_TIMEOUT_MS="${ATLAS_CODEX_TIMEOUT_MS:-120000}"
   ATLAS_AI_MODE="${ATLAS_AI_MODE:-codex-exec}"
+  ATLAS_CONFIG="$TARGET_DIR/config/atlas.yaml"
+  ATLAS_CACHE_DIR="$TARGET_DIR/cache/atlas"
+  ATLAS_SYNC_SOURCE_NAMES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_names --sep "," 2>/dev/null || true)"
+  if [[ -z "$ATLAS_SYNC_SOURCE_NAMES" ]]; then
+    ATLAS_SYNC_SOURCE_NAMES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_name 2>/dev/null || true)"
+  fi
+  ATLAS_SYNC_SOURCE_NAMES="${ATLAS_SYNC_SOURCE_NAMES:-emusd-docs}"
+
+  if [[ ! -f "$ATLAS_SECRET_ENV" ]]; then
+    echo "==> seeding $ATLAS_SECRET_ENV for Atlas runtime secrets"
+    umask 0027
+    cat > "$ATLAS_SECRET_ENV" <<'EOF'
+# Atlas runtime secrets. Staged out-of-band; setup-hermes.sh preserves this file.
+# Example for GitBook source sync:
+# GITBOOK_API_TOKEN=...
+EOF
+    umask 0022
+  else
+    echo "==> $ATLAS_SECRET_ENV already present (preserving)"
+  fi
+  chown root:"$AGENT_USER" "$ATLAS_SECRET_ENV"
+  chmod 0640 "$ATLAS_SECRET_ENV"
+
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config" "$ATLAS_CACHE_DIR"
+  echo "==> rendering Atlas runtime config at $ATLAS_CONFIG"
+  {
+    printf '# Generated by setup-hermes.sh from deploy.values.yaml. Do not hand-edit.\n'
+    printf 'kb_root: "%s"\n' "$ATLAS_KB_ROOT"
+    printf 'kb_branch: "%s"\n' "$ATLAS_KB_BRANCH"
+    printf 'push: true\n'
+    printf 'cache_dir: "%s"\n' "$ATLAS_CACHE_DIR"
+    printf 'ai:\n'
+    printf '  mode: "%s"\n' "$ATLAS_AI_MODE"
+    printf '  codex_bin: "%s"\n' "$ATLAS_CODEX_BIN"
+    printf '  timeout_ms: %s\n' "$ATLAS_CODEX_TIMEOUT_MS"
+    if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
+      printf 'sources:\n'
+      IFS=',' read -r -a atlas_source_names <<<"$ATLAS_SYNC_SOURCE_NAMES"
+      for atlas_source_name in "${atlas_source_names[@]}"; do
+        [[ -n "$atlas_source_name" ]] || continue
+        ATLAS_SOURCE_TYPE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.type" 2>/dev/null || true)"
+        ATLAS_SOURCE_INCLUDE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.include" --sep $'\n' 2>/dev/null || true)"
+        ATLAS_SOURCE_EXCLUDE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.exclude" --sep $'\n' 2>/dev/null || true)"
+        printf '  %s:\n' "$atlas_source_name"
+        if [[ "$ATLAS_SOURCE_TYPE" == "github" ]]; then
+          ATLAS_SOURCE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.repo" 2>/dev/null || true)"
+          ATLAS_SOURCE_BRANCH="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.branch" 2>/dev/null || true)"
+          [[ "$ATLAS_SOURCE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.repo must be owner/repo (got: $ATLAS_SOURCE_REPO)" >&2; exit 1; }
+          [[ -n "$ATLAS_SOURCE_BRANCH" ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.branch is required" >&2; exit 1; }
+          printf '    type: github\n'
+          printf '    repo: "%s"\n' "$ATLAS_SOURCE_REPO"
+          printf '    branch: "%s"\n' "$ATLAS_SOURCE_BRANCH"
+        elif [[ "$ATLAS_SOURCE_TYPE" == "gitbook" ]]; then
+          ATLAS_SOURCE_SPACE_ID="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.space_id" 2>/dev/null || true)"
+          ATLAS_SOURCE_TOKEN_ENV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.token_env" 2>/dev/null || true)"
+          [[ "$ATLAS_SOURCE_SPACE_ID" =~ ^[A-Za-z0-9_-]+$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.space_id must be a GitBook space id (got: $ATLAS_SOURCE_SPACE_ID)" >&2; exit 1; }
+          [[ "$ATLAS_SOURCE_TOKEN_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.token_env must name an env var (got: $ATLAS_SOURCE_TOKEN_ENV)" >&2; exit 1; }
+          printf '    type: gitbook\n'
+          printf '    space_id: "%s"\n' "$ATLAS_SOURCE_SPACE_ID"
+          printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
+        else
+          echo "FAIL: atlas.sources.$atlas_source_name.type must be github or gitbook" >&2
+          exit 1
+        fi
+        if [[ -n "$ATLAS_SOURCE_INCLUDE" ]]; then
+          printf '    include:\n'
+          while IFS= read -r atlas_glob; do
+            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+          done <<<"$ATLAS_SOURCE_INCLUDE"
+        fi
+        if [[ -n "$ATLAS_SOURCE_EXCLUDE" ]]; then
+          printf '    exclude:\n'
+          while IFS= read -r atlas_glob; do
+            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+          done <<<"$ATLAS_SOURCE_EXCLUDE"
+        else
+          printf '    exclude: []\n'
+        fi
+      done
+    fi
+  } > "$ATLAS_CONFIG"
+  chown "$AGENT_USER:$AGENT_USER" "$ATLAS_CONFIG"
+  chmod 0644 "$ATLAS_CONFIG"
 
   if [[ -d "$ATLAS_KB_ROOT/.git" ]]; then
     _check_clone_origin_or_die "Atlas KB" "$ATLAS_KB_ROOT" "$ATLAS_KB_REPO"
@@ -1216,6 +1381,7 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     echo "==> installing /usr/local/bin/atlas-as-hermes wrapper"
     sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
         -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        -e "s|__ATLAS_CONFIG__|$ATLAS_CONFIG|g" \
         -e "s|__ATLAS_KB_ROOT__|$ATLAS_KB_ROOT|g" \
         -e "s|__ATLAS_AI_MODE__|$ATLAS_AI_MODE|g" \
         -e "s|__ATLAS_CODEX_BIN__|$ATLAS_CODEX_BIN|g" \
@@ -1232,6 +1398,7 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     install -d -o root -g root -m 0755 /etc/profile.d
     sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
         -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        -e "s|__ATLAS_CONFIG__|$ATLAS_CONFIG|g" \
         -e "s|__ATLAS_KB_ROOT__|$ATLAS_KB_ROOT|g" \
         -e "s|__ATLAS_AI_MODE__|$ATLAS_AI_MODE|g" \
         -e "s|__ATLAS_CODEX_BIN__|$ATLAS_CODEX_BIN|g" \
@@ -1643,6 +1810,58 @@ python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
 # launchd path tracks under the existing macOS TODO at the top of this file.
 
 OPS_DIR="$FORK_DIR/ops"
+
+# ---------- Atlas source sync ----------
+# Hourly scheduled sync of configured external Markdown sources. The runner
+# mints a source-reader App token for source clone/fetch only; atlas-kb
+# commit/push continues to use the Atlas manager helper configured above.
+ATLAS_SOURCE_SYNC_SRC="$OPS_DIR/atlas-source-sync.service"
+ATLAS_SOURCE_SYNC_TIMER_SRC="$OPS_DIR/atlas-source-sync.timer"
+ATLAS_SOURCE_SYNC_RUNNER_SRC="$OPS_DIR/atlas-source-sync-runner"
+ATLAS_SOURCE_SYNC_RUNNER_DST="/usr/local/sbin/atlas-source-sync-runner"
+
+if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 && -f "$ATLAS_SOURCE_SYNC_SRC" && -f "$ATLAS_SOURCE_SYNC_TIMER_SRC" && -f "$ATLAS_SOURCE_SYNC_RUNNER_SRC" ]]; then
+  echo "==> installing atlas-source-sync-runner at $ATLAS_SOURCE_SYNC_RUNNER_DST"
+  install -o root -g root -m 0755 "$ATLAS_SOURCE_SYNC_RUNNER_SRC" "$ATLAS_SOURCE_SYNC_RUNNER_DST"
+
+  install -d -o root -g root -m 0755 /etc/default
+  if [[ -f /etc/default/atlas-source-sync ]]; then
+    echo "==> /etc/default/atlas-source-sync already present (preserving)"
+  else
+    echo "==> seeding /etc/default/atlas-source-sync"
+    cat >/etc/default/atlas-source-sync <<'EOF'
+# Generated by setup-hermes.sh — overrides for atlas-source-sync.service.
+# Edits here survive re-runs of the installer. Empty by default; Atlas
+# runtime config and source-reader auth paths flow from deploy.values.yaml.
+EOF
+    chown root:root /etc/default/atlas-source-sync
+    chmod 0644 /etc/default/atlas-source-sync
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd timer for atlas-source-sync (sources=$ATLAS_SYNC_SOURCE_NAMES)"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        -e "s|__ATLAS_CONFIG__|$ATLAS_CONFIG|g" \
+        -e "s|__ATLAS_SYNC_SOURCE_NAMES__|$ATLAS_SYNC_SOURCE_NAMES|g" \
+        "$ATLAS_SOURCE_SYNC_SRC" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-source-sync.service
+    install -o root -g root -m 0644 \
+      "$ATLAS_SOURCE_SYNC_TIMER_SRC" /etc/systemd/system/atlas-source-sync.timer
+    systemctl daemon-reload
+    systemctl enable --now atlas-source-sync.timer
+  else
+    echo "==> systemctl not present; skipping atlas-source-sync timer enable" >&2
+  fi
+elif [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
+  [[ -f "$ATLAS_SOURCE_SYNC_SRC" ]] \
+    || echo "==> WARNING: $ATLAS_SOURCE_SYNC_SRC missing; skipping atlas-source-sync install" >&2
+  [[ -f "$ATLAS_SOURCE_SYNC_TIMER_SRC" ]] \
+    || echo "==> WARNING: $ATLAS_SOURCE_SYNC_TIMER_SRC missing; skipping atlas-source-sync install" >&2
+  [[ -f "$ATLAS_SOURCE_SYNC_RUNNER_SRC" ]] \
+    || echo "==> WARNING: $ATLAS_SOURCE_SYNC_RUNNER_SRC missing; skipping atlas-source-sync install" >&2
+fi
+
 SYNC_SCRIPT_SRC="$OPS_DIR/hermes-sync"
 SYNC_SCRIPT_DST="/usr/local/sbin/hermes-sync"
 
@@ -2191,6 +2410,8 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     || { echo "FAIL: atlas binary missing or non-executable at /usr/local/bin/atlas" >&2; exit 1; }
   [[ -x /usr/local/bin/atlas-as-hermes ]] \
     || { echo "FAIL: atlas-as-hermes wrapper missing or non-executable at /usr/local/bin/atlas-as-hermes" >&2; exit 1; }
+  [[ -f "$ATLAS_CONFIG" ]] \
+    || { echo "FAIL: Atlas runtime config missing at $ATLAS_CONFIG" >&2; exit 1; }
   [[ -d "$ATLAS_KB_ROOT/.git" ]] \
     || { echo "FAIL: Atlas KB clone missing .git at $ATLAS_KB_ROOT" >&2; exit 1; }
   atlas_kb_owner="$(stat -c '%U' "$ATLAS_KB_ROOT/.git")"
@@ -2200,6 +2421,14 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     config credential.https://github.com.helper 2>/dev/null || true)"
   [[ "$atlas_helper" == "$ATLAS_GIT_CRED_HELPER" ]] \
     || { echo "FAIL: Atlas KB credential helper not configured (got: $atlas_helper)" >&2; exit 1; }
+fi
+if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
+  [[ -x /usr/local/sbin/atlas-source-sync-runner ]] \
+    || { echo "FAIL: atlas-source-sync-runner missing or non-executable at /usr/local/sbin/atlas-source-sync-runner" >&2; exit 1; }
+  [[ -f "$ATLAS_SOURCE_READER_APP_ENV" ]] \
+    || { echo "FAIL: Atlas source-reader env missing at $ATLAS_SOURCE_READER_APP_ENV" >&2; exit 1; }
+  [[ -f "$ATLAS_SOURCE_READER_APP_KEY_DST" ]] \
+    || { echo "FAIL: Atlas source-reader key missing at $ATLAS_SOURCE_READER_APP_KEY_DST" >&2; exit 1; }
 fi
 
 # State assertions: the agent must own .git/ and the symlinks must resolve
@@ -2256,6 +2485,27 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     fi
   fi
 fi
+if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
+  if [[ "$SKIP_AUTH_CHECK" -eq 0 ]]; then
+    if ! sudo -u "$AGENT_USER" \
+          env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_SOURCE_READER_APP_ENV" \
+          "$VENV_PY" "$TOKEN_HELPER_PY" check >/dev/null 2>&1; then
+      echo "FAIL: Atlas source-reader token helper check failed for $AGENT_USER" >&2
+      sudo -u "$AGENT_USER" env HERMES_HOME="$TARGET_DIR" HERMES_GH_CONFIG="$ATLAS_SOURCE_READER_APP_ENV" \
+        "$VENV_PY" "$TOKEN_HELPER_PY" check >/dev/null || true
+      exit 1
+    fi
+  fi
+fi
+
+# The state-backed roots are the agent's writable surface. Some install-time
+# probes or package hooks can materialize generated metadata through the
+# symlinks after the initial state clone chown; restore the ownership invariant
+# before the installer returns so future `git add .` from the agent cannot
+# trip on root-owned files.
+for d in skills memories cron; do
+  [[ -e "$STATE_TARGET/$d" ]] && chown -R "$AGENT_USER:$AGENT_USER" "$STATE_TARGET/$d"
+done
 
 # Read state HEAD as the agent — root would otherwise hit git's safe.directory
 # guard ("dubious ownership") because the clone is hermes-owned.
