@@ -53,6 +53,65 @@ def _resolve_hermes_home() -> Path:
     return get_hermes_home()
 
 
+def _expand_hermes_home_path(raw_path: str, hermes_home: Path) -> Path:
+    """Expand a path that may reference the active Hermes profile home."""
+    value = raw_path.strip()
+    for token in ("${HERMES_HOME}", "$HERMES_HOME"):
+        if value == token or value.startswith(token + os.sep) or value.startswith(token + "/"):
+            value = str(hermes_home) + value[len(token):]
+            break
+    return Path(os.path.expandvars(os.path.expanduser(value)))
+
+
+def _config_credential_relative_path(config_key: str) -> tuple[str | None, bool]:
+    """Resolve a config dotpath into a credential path relative to HERMES_HOME.
+
+    Returns ``(relative_path, configured)``. ``configured`` is true when the
+    user set a non-empty config value, even if it later fails validation.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        from tools.path_security import validate_within_dir
+    except Exception:
+        return None, False
+
+    try:
+        cfg = read_raw_config()
+        raw = cfg_get(cfg, *config_key.split("."))
+    except Exception as e:
+        logger.debug("credential_files: could not read config key %s: %s", config_key, e)
+        return None, False
+
+    if not isinstance(raw, str) or not raw.strip():
+        return None, False
+
+    hermes_home = _resolve_hermes_home()
+    path = _expand_hermes_home_path(raw, hermes_home)
+    if not path.is_absolute():
+        return path.as_posix(), True
+
+    containment_error = validate_within_dir(path, hermes_home)
+    if containment_error:
+        logger.warning(
+            "credential_files: rejected config credential path %r from %s (%s)",
+            raw,
+            config_key,
+            containment_error,
+        )
+        return None, True
+
+    try:
+        rel = path.resolve().relative_to(hermes_home.resolve())
+    except ValueError:
+        logger.warning(
+            "credential_files: rejected config credential path %r from %s",
+            raw,
+            config_key,
+        )
+        return None, True
+    return rel.as_posix(), True
+
+
 def register_credential_file(
     relative_path: str,
     container_base: str = "/root/.hermes",
@@ -109,22 +168,36 @@ def register_credential_files(
 ) -> List[str]:
     """Register multiple credential files from skill frontmatter entries.
 
-    Each entry is either a string (relative path) or a dict with a ``path``
-    key.  Returns the list of relative paths that were NOT found on the host
+    Each entry is either a string (relative path) or a dict with a ``path``,
+    ``name``, or ``config_key`` key.  Dict entries may set ``optional: true``
+    to mount the file when present without marking setup as missing when
+    absent.  Config-backed optional entries are still reported missing when
+    the user explicitly configured a path and the file cannot be registered.
+    Returns the list of relative paths that were NOT found on the host
     (i.e. missing files).
     """
     missing = []
     for entry in entries:
+        optional = False
+        configured_path = False
         if isinstance(entry, str):
             rel_path = entry.strip()
         elif isinstance(entry, dict):
-            rel_path = (entry.get("path") or entry.get("name") or "").strip()
+            optional = bool(entry.get("optional"))
+            rel_path = ""
+            config_key = (entry.get("config_key") or "").strip()
+            if config_key:
+                rel_path, configured_path = _config_credential_relative_path(config_key)
+                rel_path = rel_path or ""
+            if not rel_path:
+                rel_path = (entry.get("path") or entry.get("name") or "").strip()
         else:
             continue
         if not rel_path:
             continue
         if not register_credential_file(rel_path, container_base):
-            missing.append(rel_path)
+            if not optional or configured_path:
+                missing.append(rel_path)
     return missing
 
 
@@ -432,5 +505,4 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
 
