@@ -246,6 +246,8 @@ required_credential_files:
 Each entry supports:
 - `path` (required) — file path relative to `~/.hermes/`
 - `description` (optional) — explains what the file is and how it's created
+- `optional` (optional) — when `true`, mount the file if present without marking setup as missing when absent
+- `config_key` (optional) — config dotpath that points at the credential file; absolute values must resolve inside `HERMES_HOME`
 
 When loaded, Hermes checks if these files exist. Missing files trigger `setup_needed`. Existing files are automatically:
 - **Mounted into Docker** containers as read-only bind mounts

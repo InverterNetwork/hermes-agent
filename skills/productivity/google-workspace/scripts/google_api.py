@@ -125,8 +125,16 @@ def _service_account_key_path_from_config() -> Path | None:
     raw_path = _resolve_config_dotpath(parsed, SERVICE_ACCOUNT_CONFIG_KEY)
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
-    expanded = os.path.expandvars(os.path.expanduser(raw_path.strip()))
-    return Path(expanded)
+    return _expand_service_account_key_path(raw_path)
+
+
+def _expand_service_account_key_path(raw_path: str) -> Path:
+    value = raw_path.strip()
+    for token in ("${HERMES_HOME}", "$HERMES_HOME"):
+        if value == token or value.startswith(token + os.sep) or value.startswith(token + "/"):
+            value = str(HERMES_HOME) + value[len(token):]
+            break
+    return Path(os.path.expandvars(os.path.expanduser(value)))
 
 
 def _service_account_key_path() -> Path | None:
@@ -137,8 +145,7 @@ def _service_account_key_path() -> Path | None:
     raw_path = os.getenv(SERVICE_ACCOUNT_ENV, "").strip()
     if not raw_path:
         return None
-    expanded = os.path.expandvars(os.path.expanduser(raw_path))
-    return Path(expanded)
+    return _expand_service_account_key_path(raw_path)
 
 
 def _service_account_enabled_for(api: str | None) -> bool:

@@ -649,6 +649,24 @@ def test_api_service_account_config_takes_precedence_over_legacy_env(api_module,
     assert api_module._service_account_key_path() == Path("/config/google-sa-key.json")
 
 
+def test_api_service_account_config_expands_hermes_home_token(api_module):
+    _write_service_account_config(api_module, "${HERMES_HOME}/auth/google-sa-key.json")
+
+    assert (
+        api_module._service_account_key_path()
+        == api_module.HERMES_HOME / "auth" / "google-sa-key.json"
+    )
+
+
+def test_api_service_account_env_expands_hermes_home_token(api_module, monkeypatch):
+    monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "${HERMES_HOME}/auth/google-sa-key.json")
+
+    assert (
+        api_module._service_account_key_path()
+        == api_module.HERMES_HOME / "auth" / "google-sa-key.json"
+    )
+
+
 def test_api_drive_search_bypasses_gws_when_service_account_configured(
     api_module, monkeypatch, capsys
 ):
