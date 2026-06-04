@@ -522,6 +522,15 @@ repos:
     quay:
       package_manager: pnpm
       install_cmd: "pnpm install --frozen-lockfile"
+  - id: brix-prototypes
+    url: https://github.com/InverterNetwork/brix-prototypes
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "cd looping/backend && bun install && cd ../frontend && bun install"
   - id: iTRY-frontends
     url: https://github.com/InverterNetwork/iTRY-frontends
     # GH default branch is `master` (not `main`).
