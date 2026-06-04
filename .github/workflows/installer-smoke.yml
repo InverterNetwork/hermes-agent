@@ -91,7 +91,7 @@ jobs:
         #   * erpc                — quay-managed, base_branch: main
         #   * iTry-contracts      — quay-managed, base_branch: main
         #   * quay                — quay-managed, base_branch: dev
-        #   * hermes-agent        — quay-managed, base_branch: dev
+        #   * hermes-agent        — quay-managed, base_branch: main
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
         #                           repos[] loop.
@@ -135,7 +135,7 @@ jobs:
           init_fixture "$ERPC_FIXTURE" "init fixture"
           init_fixture "$ITRY_CONTRACTS_FIXTURE" "init fixture"
           init_fixture "$QUAY_FIXTURE" "init fixture" dev
-          init_fixture "$HERMES_AGENT_FIXTURE" "init fixture" dev
+          init_fixture "$HERMES_AGENT_FIXTURE" "init fixture"
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
           # add a develop branch with a distinct commit, then return HEAD
@@ -465,7 +465,7 @@ jobs:
               erpc:main \
               iTry-contracts:main \
               quay:dev \
-              hermes-agent:dev \
+              hermes-agent:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"
@@ -516,7 +516,7 @@ jobs:
               erpc:main \
               iTry-contracts:main \
               quay:dev \
-              hermes-agent:dev \
+              hermes-agent:main \
               code-only-fixture:main \
               non-default-branch-fixture:develop; do
               id="${spec%:*}"

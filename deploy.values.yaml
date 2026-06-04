@@ -590,7 +590,7 @@ repos:
       install_cmd: "bun install"
   - id: hermes-agent
     url: https://github.com/InverterNetwork/hermes-agent
-    base_branch: dev
+    base_branch: main
     issue_tracker:
       linear:
         team: brix
