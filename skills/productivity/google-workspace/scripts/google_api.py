@@ -125,7 +125,7 @@ def _service_account_key_path_from_config() -> Path | None:
     raw_path = _resolve_config_dotpath(parsed, SERVICE_ACCOUNT_CONFIG_KEY)
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
-    return _expand_service_account_key_path(raw_path)
+    return _expand_config_service_account_key_path(raw_path)
 
 
 def _expand_service_account_key_path(raw_path: str) -> Path:
@@ -135,6 +135,23 @@ def _expand_service_account_key_path(raw_path: str) -> Path:
             value = str(HERMES_HOME) + value[len(token):]
             break
     return Path(os.path.expandvars(os.path.expanduser(value)))
+
+
+def _expand_config_service_account_key_path(raw_path: str) -> Path | None:
+    path = _expand_service_account_key_path(raw_path)
+    if not path.is_absolute():
+        return HERMES_HOME / path
+
+    try:
+        path.resolve().relative_to(HERMES_HOME.resolve())
+    except ValueError:
+        print(
+            "Google service-account config path must be inside HERMES_HOME: "
+            f"{path}",
+            file=sys.stderr,
+        )
+        return None
+    return path
 
 
 def _service_account_key_path() -> Path | None:

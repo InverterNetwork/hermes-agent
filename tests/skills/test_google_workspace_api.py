@@ -502,7 +502,8 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
 
 
 def test_api_get_credentials_uses_service_account_for_file_apis(api_module, monkeypatch, tmp_path):
-    key_path = tmp_path / "google-sa-key.json"
+    key_path = api_module.HERMES_HOME / "auth" / "google-sa-key.json"
+    key_path.parent.mkdir()
     key_path.write_text("{}")
     _write_service_account_config(api_module, key_path)
     monkeypatch.setattr(
@@ -543,7 +544,8 @@ def test_api_get_credentials_uses_service_account_for_file_apis(api_module, monk
 def test_api_get_credentials_keeps_non_file_apis_on_oauth_with_service_account(
     api_module, monkeypatch, tmp_path
 ):
-    key_path = tmp_path / "google-sa-key.json"
+    key_path = api_module.HERMES_HOME / "auth" / "google-sa-key.json"
+    key_path.parent.mkdir()
     key_path.write_text("{}")
     token_path = api_module.TOKEN_PATH
     _write_token(token_path)
@@ -591,7 +593,7 @@ def test_api_get_credentials_keeps_non_file_apis_on_oauth_with_service_account(
 
 
 def test_api_service_account_disables_gws_only_for_file_apis(api_module, monkeypatch):
-    _write_service_account_config(api_module, "/tmp/google-sa-key.json")
+    _write_service_account_config(api_module, "${HERMES_HOME}/auth/google-sa-key.json")
     monkeypatch.setattr(api_module, "_gws_binary", lambda: "/usr/bin/gws")
 
     assert not api_module._should_use_gws("drive")
@@ -643,10 +645,13 @@ def test_api_service_account_key_path_falls_back_to_legacy_env(api_module, monke
 
 
 def test_api_service_account_config_takes_precedence_over_legacy_env(api_module, monkeypatch):
-    _write_service_account_config(api_module, "/config/google-sa-key.json")
+    _write_service_account_config(api_module, "${HERMES_HOME}/auth/google-sa-key.json")
     monkeypatch.setenv("GOOGLE_SA_KEY_PATH", "/legacy/google-sa-key.json")
 
-    assert api_module._service_account_key_path() == Path("/config/google-sa-key.json")
+    assert (
+        api_module._service_account_key_path()
+        == api_module.HERMES_HOME / "auth" / "google-sa-key.json"
+    )
 
 
 def test_api_service_account_config_expands_hermes_home_token(api_module):
@@ -656,6 +661,24 @@ def test_api_service_account_config_expands_hermes_home_token(api_module):
         api_module._service_account_key_path()
         == api_module.HERMES_HOME / "auth" / "google-sa-key.json"
     )
+
+
+def test_api_service_account_config_resolves_relative_paths_under_hermes_home(api_module):
+    _write_service_account_config(api_module, "auth/google-sa-key.json")
+
+    assert (
+        api_module._service_account_key_path()
+        == api_module.HERMES_HOME / "auth" / "google-sa-key.json"
+    )
+
+
+def test_api_service_account_config_rejects_absolute_paths_outside_hermes_home(
+    api_module, capsys
+):
+    _write_service_account_config(api_module, "/tmp/google-sa-key.json")
+
+    assert api_module._service_account_key_path() is None
+    assert "must be inside HERMES_HOME" in capsys.readouterr().err
 
 
 def test_api_service_account_env_expands_hermes_home_token(api_module, monkeypatch):
@@ -670,7 +693,7 @@ def test_api_service_account_env_expands_hermes_home_token(api_module, monkeypat
 def test_api_drive_search_bypasses_gws_when_service_account_configured(
     api_module, monkeypatch, capsys
 ):
-    _write_service_account_config(api_module, "/tmp/google-sa-key.json")
+    _write_service_account_config(api_module, "${HERMES_HOME}/auth/google-sa-key.json")
     monkeypatch.setattr(
         api_module,
         "_run_gws",
@@ -715,7 +738,7 @@ def test_api_drive_search_bypasses_gws_when_service_account_configured(
 
 
 def test_api_service_account_missing_file_exits(api_module, monkeypatch, tmp_path, capsys):
-    missing_path = tmp_path / "missing-google-sa-key.json"
+    missing_path = api_module.HERMES_HOME / "auth" / "missing-google-sa-key.json"
     _write_service_account_config(api_module, missing_path)
 
     with pytest.raises(SystemExit) as exc:
