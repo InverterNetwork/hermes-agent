@@ -606,6 +606,15 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+  - id: atlas
+    url: https://github.com/InverterNetwork/atlas
+    base_branch: dev
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "bun install"
 
 quay:
   # Pinned quay release tag (e.g. "v0.1.0"). Leave empty to skip quay
