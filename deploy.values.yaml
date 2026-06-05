@@ -608,7 +608,7 @@ repos:
       install_cmd: "bun install"
   - id: atlas
     url: https://github.com/InverterNetwork/atlas
-    base_branch: main
+    base_branch: dev
     issue_tracker:
       linear:
         team: brix
