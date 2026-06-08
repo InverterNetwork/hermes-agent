@@ -1,17 +1,20 @@
 # BRIX-1410: Quay Repo Registration
 
-Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all eight are quay-managed):
+Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all 11 are quay-managed):
 
 | repo id | remote | base branch | package manager | install cmd |
 | --- | --- | --- | --- | --- |
 | `brix-landing` | `https://github.com/InverterNetwork/brix-landing` | `main` | `pnpm` | `pnpm install --frozen-lockfile` |
+| `brix-prototypes` | `https://github.com/InverterNetwork/brix-prototypes` | `main` | `bun` | `cd looping/backend && bun install && cd ../frontend && bun install` |
 | `iTRY-frontends` | `https://github.com/InverterNetwork/iTRY-frontends` | `master` | `bun` | `bun install` |
 | `iTRY-monorepo` | `https://github.com/InverterNetwork/iTRY-monorepo` | `dev` | `bun` | `bun install` |
+| `itry-liquidation-bot` | `https://github.com/InverterNetwork/itry-liquidation-bot` | `main` | `pnpm` | `pnpm install --frozen-lockfile` |
 | `brix-indexer` | `https://github.com/InverterNetwork/brix-indexer` | `dev` | `pnpm` | `pnpm install --frozen-lockfile` |
 | `erpc` | `https://github.com/InverterNetwork/erpc` | `main` | `pnpm` | `pnpm install --frozen-lockfile` |
 | `iTry-contracts` | `https://github.com/InverterNetwork/iTry-contracts` | `main` | `bun` | `true` |
 | `quay` | `https://github.com/InverterNetwork/quay` | `dev` | `bun` | `bun install` |
-| `hermes-agent` | `https://github.com/InverterNetwork/hermes-agent` | `dev` | `bun` | `bun install` |
+| `hermes-agent` | `https://github.com/InverterNetwork/hermes-agent` | `main` | `bun` | `bun install` |
+| `atlas` | `https://github.com/InverterNetwork/atlas` | `dev` | `bun` | `bun install` |
 
 ## Verification commands
 
@@ -28,7 +31,7 @@ Deployed host (post-deploy):
 sudo /usr/local/bin/quay-as-hermes repo list
 ```
 
-Expected: all eight repo ids above are present.
+Expected: all 11 repo ids above are present.
 
 ## Enqueue verification / dry-run equivalent
 

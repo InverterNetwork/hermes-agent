@@ -550,6 +550,15 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+  - id: itry-liquidation-bot
+    url: https://github.com/InverterNetwork/itry-liquidation-bot
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: itry
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
   - id: brix-indexer
     url: https://github.com/InverterNetwork/brix-indexer
     # GH default branch is `dev` (not `main`). The code-sync timer
