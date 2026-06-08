@@ -144,7 +144,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -408,6 +408,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "ntfy":
+        topic = target_ref.strip()
+        if topic:
+            return topic, None, True
     if platform_name == "email":
         match = _EMAIL_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -515,6 +519,7 @@ async def _send_via_adapter(
          the runner weakref is ``None``).
       3. A descriptive error explaining both options.
     """
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner = None
     try:
         from gateway.run import _gateway_runner_ref
@@ -529,7 +534,13 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = {"thread_id": thread_id} if thread_id else None
+                metadata = {}
+                if thread_id:
+                    metadata["thread_id"] = thread_id
+                if platform_name == "ntfy" and chat_id:
+                    metadata["publish_topic"] = chat_id
+                if not metadata:
+                    metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
@@ -539,7 +550,6 @@ async def _send_via_adapter(
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {result.error}"}
 
-    platform_name = platform.value if hasattr(platform, "value") else str(platform)
     entry = None
     try:
         from gateway.platform_registry import platform_registry
@@ -605,6 +615,16 @@ async def _send_to_platform(
             every chunk under the given root message.
     """
     from gateway.config import Platform
+
+    media_files = media_files or []
+
+    # Weixin handles text/media delivery inside its native helper and does not
+    # need the optional platform adapter imports below. Keep this branch early
+    # so a Weixin send is not blocked by unrelated optional dependencies (for
+    # example lark-oapi's heavy Feishu import path).
+    if platform == Platform.WEIXIN:
+        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
     from gateway.platforms.slack import SlackAdapter
 
@@ -621,8 +641,6 @@ async def _send_to_platform(
         _feishu_available = True
     except ImportError:
         _feishu_available = False
-
-    media_files = media_files or []
 
     if platform == Platform.SLACK and message:
         try:
@@ -679,10 +697,6 @@ async def _send_to_platform(
                 return result
             last_result = result
         return last_result
-
-    # --- Weixin: use the native one-shot adapter helper for text + media ---
-    if platform == Platform.WEIXIN:
-        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
     # The plugin's ``_standalone_send`` (registered in
@@ -801,12 +815,16 @@ async def _send_to_platform(
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
+<<<<<<< HEAD
             result = await _send_slack(
                 pconfig.token,
                 chat_id,
                 chunk,
                 **_slack_kwargs,
             )
+=======
+            result = await _send_slack(pconfig.token, chat_id, chunk, thread_ts=thread_id)
+>>>>>>> upstream/main
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -817,8 +835,6 @@ async def _send_to_platform(
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
         elif platform == Platform.MATRIX:
             result = await _send_matrix(pconfig.token, pconfig.extra, chat_id, chunk)
-        elif platform == Platform.HOMEASSISTANT:
-            result = await _send_homeassistant(pconfig.token, pconfig.extra, chat_id, chunk)
         elif platform == Platform.DINGTALK:
             result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
@@ -1096,6 +1112,7 @@ def _derive_forum_thread_name(message: str) -> str:
         first_line = "New Post"
     return first_line[:100]
 
+<<<<<<< HEAD
 
 # Process-local cache for Discord channel-type probes.  Avoids re-probing the
 # same channel on every send when the directory cache has no entry (e.g. fresh
@@ -1313,6 +1330,10 @@ async def _send_slack(token, chat_id, message, *, thread_ts=None):
 
     thread_ts: optional Slack message_ts to thread under.
     """
+=======
+async def _send_slack(token, chat_id, message, thread_ts=None):
+    """Send via Slack Web API."""
+>>>>>>> upstream/main
     try:
         import aiohttp
     except ImportError:
@@ -1736,29 +1757,6 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
             await adapter.disconnect()
         except Exception:
             pass
-
-
-async def _send_homeassistant(token, extra, chat_id, message):
-    """Send via Home Assistant notify service."""
-    try:
-        import aiohttp
-    except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
-    try:
-        hass_url = (extra.get("url") or os.getenv("HASS_URL", "")).rstrip("/")
-        token = token or os.getenv("HASS_TOKEN", "")
-        if not hass_url or not token:
-            return {"error": "Home Assistant not configured (HASS_URL, HASS_TOKEN required)"}
-        url = f"{hass_url}/api/services/notify/notify"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, headers=headers, json={"message": message, "target": chat_id}) as resp:
-                if resp.status not in {200, 201}:
-                    body = await resp.text()
-                    return _error(f"Home Assistant API error ({resp.status}): {body}")
-        return {"success": True, "platform": "homeassistant", "chat_id": chat_id}
-    except Exception as e:
-        return _error(f"Home Assistant send failed: {e}")
 
 
 async def _send_dingtalk(extra, chat_id, message):
