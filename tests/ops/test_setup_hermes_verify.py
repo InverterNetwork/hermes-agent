@@ -1045,6 +1045,12 @@ def atlas_install(install: dict) -> dict:
         "  kb_root: \"\"\n"
         "  ai:\n"
         "    mode: api\n"
+        "  hub:\n"
+        "    enabled: true\n"
+        "    host: 127.0.0.1\n"
+        "    port: 8765\n"
+        "    data_dir: \"\"\n"
+        "    query_concurrency: 4\n"
         "  github_app:\n"
         "    id: \"3925386\"\n"
         "    installation_id: \"137066070\"\n",
@@ -1072,6 +1078,18 @@ def atlas_install(install: dict) -> dict:
         encoding="utf-8",
     )
     (auth / "atlas-manager.env").chmod(0o640)
+    (auth / "atlas.env").write_text("GITBOOK_API_TOKEN=test-token\n", encoding="utf-8")
+    (auth / "atlas.env").chmod(0o640)
+    (auth / "atlas-hub-auth.json").write_text(
+        '{"keys":[{"id":"key_test","hash":"sha256:test","scopes":["v1:*"]}]}\n',
+        encoding="utf-8",
+    )
+    (auth / "atlas-hub-auth.json").chmod(0o640)
+    (auth / "atlas-hub-client-api-key").write_text(
+        "atlas_hub_sk_test\n",
+        encoding="utf-8",
+    )
+    (auth / "atlas-hub-client-api-key").chmod(0o640)
 
     _git(install["state"], "config",
          "credential.https://github.com.helper", _app_helper_cmd(install))
@@ -1096,7 +1114,36 @@ def atlas_install(install: dict) -> dict:
     _git(kb_root, "config", "--add",
          "url.https://github.com/.insteadOf", "ssh://git@github.com/")
 
+    atlas_hub_data_dir = target / "atlas-hub"
+    atlas_hub_data_dir.mkdir(mode=0o755)
+    atlas_config_dir = target / "config"
+    atlas_config_dir.mkdir(mode=0o755, exist_ok=True)
+    (atlas_config_dir / "atlas.yaml").write_text(
+        "# test Atlas config\n"
+        f"kb_root: \"{kb_root}\"\n"
+        "kb_branch: \"main\"\n"
+        "push: true\n"
+        "hub:\n"
+        f"  auth_file: \"{auth / 'atlas-hub-auth.json'}\"\n"
+        f"  data_dir: \"{atlas_hub_data_dir}\"\n"
+        "  query_concurrency: 4\n",
+        encoding="utf-8",
+    )
+    (install["systemd_dir"] / "atlas-hub.service").write_text(
+        "[Service]\n"
+        f"Environment=ATLAS_CONFIG={atlas_config_dir / 'atlas.yaml'}\n"
+        f"Environment=ATLAS_KB_ROOT={kb_root}\n"
+        f"EnvironmentFile=-{auth / 'atlas.env'}\n"
+        "ExecStart=/usr/local/bin/atlas --config "
+        f"{atlas_config_dir / 'atlas.yaml'} serve --host 127.0.0.1 --port 8765\n",
+        encoding="utf-8",
+    )
+
     _write_curl_status_stub(bin_dir / "curl")
+
+    # Some git/filesystem operations in the extended fixture can clear the
+    # parent setgid bit on macOS; restore the base install invariant.
+    target.chmod(0o2775)
 
     install["values_file"] = fork / "deploy.values.yaml"
     install["atlas_bin"] = atlas_bin
@@ -1145,6 +1192,21 @@ class TestAtlasVerify:
         assert "[OK] Atlas manager token helper check passes" in result.stdout
         assert "[OK] Atlas manager App scope InverterNetwork/atlas: HTTP 200" in result.stdout
         assert "[OK] Atlas manager App scope InverterNetwork/atlas-kb: HTTP 200" in result.stdout
+        assert "[OK] Atlas Hub auth file:" in result.stdout
+        assert "[OK] Atlas Hub auth file keys present" in result.stdout
+        assert "[OK] Atlas Hub client API key:" in result.stdout
+        assert "[OK] Atlas Hub client API key present" in result.stdout
+        assert "[OK] Atlas runtime config hub auth_file" in result.stdout
+        assert "[OK] Atlas runtime config hub data_dir" in result.stdout
+        assert "[OK] Atlas runtime config hub query_concurrency" in result.stdout
+        assert "[OK] atlas-hub.service: active loaded enabled" in result.stdout
+        assert "[OK] atlas-hub.service ATLAS_CONFIG" in result.stdout
+        assert "[OK] atlas-hub.service ATLAS_KB_ROOT" in result.stdout
+        assert "[OK] atlas-hub.service secrets env" in result.stdout
+        assert "[OK] atlas-hub.service ExecStart uses atlas serve" in result.stdout
+        assert "[OK] atlas-hub.service loopback bind: 127.0.0.1:8765" in result.stdout
+        assert "[OK] atlas-hub.service port: 8765" in result.stdout
+        assert "[OK] Atlas Hub local health: HTTP 200" in result.stdout
         assert "[DRIFT]" not in result.stderr
 
     def test_missing_atlas_binary_is_drift(self, atlas_install):
@@ -1184,6 +1246,28 @@ class TestAtlasVerify:
 
         assert result.returncode == 1
         assert "[DRIFT] Atlas manager App scope InverterNetwork/atlas-kb" in result.stderr
+
+    def test_atlas_hub_public_bind_is_drift(self, atlas_install):
+        unit = atlas_install["systemd_dir"] / "atlas-hub.service"
+        unit.write_text(
+            unit.read_text(encoding="utf-8").replace(
+                "--host 127.0.0.1", "--host 0.0.0.0"
+            ),
+            encoding="utf-8",
+        )
+
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] atlas-hub.service bind address" in result.stderr
+
+    def test_atlas_hub_missing_client_key_is_drift(self, atlas_install):
+        (atlas_install["target"] / "auth" / "atlas-hub-client-api-key").unlink()
+
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas Hub client API key" in result.stderr
 
 
 @pytest.fixture
