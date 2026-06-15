@@ -1,6 +1,6 @@
-# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + quay-serve + hermes-dashboard + quay-orchestrator
+# Operator runbook: hermes-sync + hermes-code-sync + hermes-upstream-sync + hermes-gateway + quay-tick + quay-serve + hermes-dashboard + quay-orchestrator + atlas-hub
 
-Eight units live here:
+Nine units live here:
 
 * **`hermes-sync`** — frequent (2-min) two-way sync of the agent's state
   repo (`~/.hermes/state/`). Inline commit hooks record skill writes and
@@ -47,6 +47,11 @@ Eight units live here:
   reads `<HERMES_HOME>/quay/orchestrator.json` for Slack fallback
   routing and polling while using the Quay CLI for delivery outbox and
   handoff state.
+* **`atlas-hub`** — localhost-only Atlas Hub API service. Installed only
+  when `atlas.hub.enabled=true`; binds to `127.0.0.1:8765`, uses
+  `<HERMES_HOME>/config/atlas.yaml`, and authenticates with the
+  installer-managed key material under `<HERMES_HOME>/auth/`. Public
+  access belongs behind a TLS reverse proxy or an operator SSH tunnel.
 
 ## Files
 
@@ -71,6 +76,7 @@ Eight units live here:
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
 | `ops/quay-serve.service`                   | systemd service unit for the embedded Quay Admin UI/API. Installed only when the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `QUAY_DATA_DIR=<TARGET>/quay`, `EnvironmentFile=<TARGET>/auth/gateway-runtime.env` for non-secret agent-interface config, and `EnvironmentFile=<TARGET>/auth/quay.env` for service tokens; binds `127.0.0.1:9731` and requires `QUAY_ADMIN_TOKEN`. |
 | `ops/hermes-dashboard.service`             | systemd service unit for the Hermes dashboard and Quay Admin proxy. Installed only when `quay.admin.public_base_url` is set and the pinned Quay binary supports `quay serve`; templated with `User=__AGENT_USER__`, `HERMES_HOME=<TARGET>`, `HERMES_WEB_DIST=<TARGET>/hermes-agent/hermes_cli/web_dist`, `EnvironmentFile=<TARGET>/auth/quay.env`, and `EnvironmentFile=<TARGET>/auth/gateway-runtime.env`; binds `127.0.0.1:9119` and proxies `/quay/admin/` to `quay-serve.service`. `HERMES_WEB_DIST` prevents this service from attempting an npm build at startup; the Quay Admin proxy routes do not need the Hermes SPA bundle. |
+| `ops/atlas-hub.service`                    | systemd service unit for Atlas Hub. Installed when `atlas.hub.enabled=true`; templated with `User=__AGENT_USER__`, `ATLAS_CONFIG=<TARGET>/config/atlas.yaml`, `ATLAS_KB_ROOT`, and Atlas AI env; loads `<TARGET>/auth/atlas.env`, binds `127.0.0.1:8765`, and relies on installer-managed Hub API key material in `<TARGET>/auth/atlas-hub-auth.json` plus `<TARGET>/auth/atlas-hub-client-api-key`. |
 | `ops/quay_orchestrator.py`                 | Quay delivery-outbox and handoff drain loop. Defines the Quay CLI adapter, delivery-only Slack posts, human-advice Slack question/discussion flow with original-thread routing plus fallback-channel support, orchestrator decision handling, JSON event logging, metrics, and lock wrapper. Existing-thread human handoffs validate the thread and post a fresh guidance prompt before either waiting inline or parking for a later poll. |
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Executes `quay_orchestrator.py drain-one --park-human-waits` with `<HERMES_HOME>/quay/orchestrator.json`, so the deployed oneshot exits after posting a human prompt and later ticks poll parked replies. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. The installed runner does not remain active for the full human reply timeout. |
@@ -810,6 +816,15 @@ The hosted Slack-authenticated proxy runs separately under
 ```sh
 sudo systemctl status hermes-dashboard.service
 curl -i http://127.0.0.1:9119/quay/admin/
+```
+
+Atlas Hub runs separately under `atlas-hub.service`:
+
+```sh
+sudo systemctl status atlas-hub.service
+ATLAS_HUB_API_KEY="$(sudo tr -d '\r\n' < ~hermes/.hermes/auth/atlas-hub-client-api-key)"
+curl -fsS -H "Authorization: Bearer $ATLAS_HUB_API_KEY" \
+  http://127.0.0.1:8765/v1/health
 ```
 
 ## Quay Admin UI access

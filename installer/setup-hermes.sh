@@ -329,9 +329,16 @@ VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
 
 ATLAS_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.version 2>/dev/null || true)"
 ATLAS_ENABLED=0
+ATLAS_HUB_ENABLED=0
 ATLAS_SOURCE_SYNC_ENABLED=0
 if [[ -n "$ATLAS_VERSION" ]]; then
   ATLAS_ENABLED=1
+fi
+ATLAS_HUB_ENABLED_RAW="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.enabled 2>/dev/null || true)"
+if [[ "$ATLAS_HUB_ENABLED_RAW" == "true" ]]; then
+  ATLAS_HUB_ENABLED=1
+fi
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   ATLAS_SOURCE_SYNC_ENABLED_RAW="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.enabled 2>/dev/null || true)"
   if [[ "$ATLAS_SOURCE_SYNC_ENABLED_RAW" == "true" ]]; then
     ATLAS_SOURCE_SYNC_ENABLED=1
@@ -346,6 +353,10 @@ fi
 
 if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
   echo "FAIL: atlas.source_sync.enabled=true requires atlas.version to be set." >&2
+  exit 2
+fi
+if [[ "$ATLAS_HUB_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
+  echo "FAIL: atlas.hub.enabled=true requires atlas.version to be set." >&2
   exit 2
 fi
 
@@ -718,6 +729,8 @@ GH_APP_ENV="$AUTH_DIR/github-app.env"
 ATLAS_APP_KEY_DST="$AUTH_DIR/atlas-manager.pem"
 ATLAS_APP_ENV="$AUTH_DIR/atlas-manager.env"
 ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"
+ATLAS_HUB_AUTH_FILE="$AUTH_DIR/atlas-hub-auth.json"
+ATLAS_HUB_CLIENT_API_KEY_FILE="$AUTH_DIR/atlas-hub-client-api-key"
 ATLAS_SOURCE_READER_APP_KEY_DST="$AUTH_DIR/atlas-source-reader.pem"
 ATLAS_SOURCE_READER_APP_ENV="$AUTH_DIR/atlas-source-reader.env"
 GATEWAY_RUNTIME_ENV="$AUTH_DIR/gateway-runtime.env"
@@ -1207,6 +1220,10 @@ done
 # the general Hermes worker/reviewer Apps.
 ATLAS_KB_ROOT=""
 ATLAS_CONFIG=""
+ATLAS_HUB_HOST=""
+ATLAS_HUB_PORT=""
+ATLAS_HUB_DATA_DIR=""
+ATLAS_HUB_QUERY_CONCURRENCY=""
 ATLAS_CODEX_BIN=""
 ATLAS_CODEX_TIMEOUT_MS=""
 ATLAS_SYNC_SOURCE_NAMES=""
@@ -1275,6 +1292,28 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   ATLAS_AI_MODE="${ATLAS_AI_MODE:-codex-exec}"
   ATLAS_CONFIG="$TARGET_DIR/config/atlas.yaml"
   ATLAS_CACHE_DIR="$TARGET_DIR/cache/atlas"
+  if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
+    ATLAS_HUB_HOST="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.host 2>/dev/null || true)"
+    ATLAS_HUB_HOST="${ATLAS_HUB_HOST:-127.0.0.1}"
+    if [[ "$ATLAS_HUB_HOST" != "127.0.0.1" && "$ATLAS_HUB_HOST" != "localhost" ]]; then
+      echo "FAIL: atlas.hub.host must be 127.0.0.1 or localhost (got: $ATLAS_HUB_HOST)" >&2
+      exit 1
+    fi
+    ATLAS_HUB_PORT="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.port 2>/dev/null || true)"
+    ATLAS_HUB_PORT="${ATLAS_HUB_PORT:-8765}"
+    [[ "$ATLAS_HUB_PORT" =~ ^[1-9][0-9]*$ && "$ATLAS_HUB_PORT" -le 65535 ]] \
+      || { echo "FAIL: atlas.hub.port must be an integer 1-65535 (got: $ATLAS_HUB_PORT)" >&2; exit 1; }
+    ATLAS_HUB_DATA_DIR="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.data_dir 2>/dev/null || true)"
+    if [[ -z "$ATLAS_HUB_DATA_DIR" ]]; then
+      ATLAS_HUB_DATA_DIR="$TARGET_DIR/atlas-hub"
+    elif [[ "$ATLAS_HUB_DATA_DIR" != /* ]]; then
+      ATLAS_HUB_DATA_DIR="$TARGET_DIR/$ATLAS_HUB_DATA_DIR"
+    fi
+    ATLAS_HUB_QUERY_CONCURRENCY="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.query_concurrency 2>/dev/null || true)"
+    ATLAS_HUB_QUERY_CONCURRENCY="${ATLAS_HUB_QUERY_CONCURRENCY:-4}"
+    [[ "$ATLAS_HUB_QUERY_CONCURRENCY" =~ ^[1-9][0-9]*$ ]] \
+      || { echo "FAIL: atlas.hub.query_concurrency must be a positive integer (got: $ATLAS_HUB_QUERY_CONCURRENCY)" >&2; exit 1; }
+  fi
   ATLAS_SYNC_SOURCE_NAMES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_names --sep "," 2>/dev/null || true)"
   if [[ -z "$ATLAS_SYNC_SOURCE_NAMES" ]]; then
     ATLAS_SYNC_SOURCE_NAMES="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.source_name 2>/dev/null || true)"
@@ -1297,6 +1336,40 @@ EOF
   chmod 0640 "$ATLAS_SECRET_ENV"
 
   install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config" "$ATLAS_CACHE_DIR"
+  if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$ATLAS_HUB_DATA_DIR"
+    if [[ -f "$ATLAS_HUB_AUTH_FILE" && -f "$ATLAS_HUB_CLIENT_API_KEY_FILE" ]]; then
+      echo "==> Atlas Hub auth material already present (preserving)"
+    elif [[ -f "$ATLAS_HUB_AUTH_FILE" || -f "$ATLAS_HUB_CLIENT_API_KEY_FILE" ]]; then
+      echo "FAIL: Atlas Hub auth material is incomplete." >&2
+      echo "      Expected both $ATLAS_HUB_AUTH_FILE and $ATLAS_HUB_CLIENT_API_KEY_FILE." >&2
+      echo "      Restore the missing file, or remove both files to rotate the Hub API key." >&2
+      exit 1
+    else
+      echo "==> generating Atlas Hub API key and server auth file"
+      ATLAS_HUB_KEY_JSON="$(mktemp)"
+      "$ATLAS_BIN_DST" hub keygen --scope v1:* > "$ATLAS_HUB_KEY_JSON"
+      python3 - "$ATLAS_HUB_KEY_JSON" "$ATLAS_HUB_AUTH_FILE" "$ATLAS_HUB_CLIENT_API_KEY_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+key_json, auth_file, client_key_file = map(Path, sys.argv[1:4])
+payload = json.loads(key_json.read_text(encoding="utf-8"))
+raw_key = payload.get("raw_key")
+entry = payload.get("entry")
+if not isinstance(raw_key, str) or not raw_key:
+    raise SystemExit("atlas hub keygen did not emit raw_key")
+if not isinstance(entry, dict):
+    raise SystemExit("atlas hub keygen did not emit entry")
+auth_file.write_text(json.dumps({"keys": [entry]}, indent=2) + "\n", encoding="utf-8")
+client_key_file.write_text(raw_key + "\n", encoding="utf-8")
+PY
+      rm -f "$ATLAS_HUB_KEY_JSON"
+    fi
+    chown root:"$AGENT_USER" "$ATLAS_HUB_AUTH_FILE" "$ATLAS_HUB_CLIENT_API_KEY_FILE"
+    chmod 0640 "$ATLAS_HUB_AUTH_FILE" "$ATLAS_HUB_CLIENT_API_KEY_FILE"
+  fi
   echo "==> rendering Atlas runtime config at $ATLAS_CONFIG"
   {
     printf '# Generated by setup-hermes.sh from deploy.values.yaml. Do not hand-edit.\n'
@@ -1308,6 +1381,12 @@ EOF
     printf '  mode: "%s"\n' "$ATLAS_AI_MODE"
     printf '  codex_bin: "%s"\n' "$ATLAS_CODEX_BIN"
     printf '  timeout_ms: %s\n' "$ATLAS_CODEX_TIMEOUT_MS"
+    if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
+      printf 'hub:\n'
+      printf '  auth_file: "%s"\n' "$ATLAS_HUB_AUTH_FILE"
+      printf '  data_dir: "%s"\n' "$ATLAS_HUB_DATA_DIR"
+      printf '  query_concurrency: %s\n' "$ATLAS_HUB_QUERY_CONCURRENCY"
+    fi
     if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
       printf 'sources:\n'
       IFS=',' read -r -a atlas_source_names <<<"$ATLAS_SYNC_SOURCE_NAMES"
@@ -1834,6 +1913,77 @@ python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
 # launchd path tracks under the existing macOS TODO at the top of this file.
 
 OPS_DIR="$FORK_DIR/ops"
+
+# ---------- Atlas Hub ----------
+# Long-running localhost Atlas Hub API service. The listener stays loopback-only;
+# operators expose it through a TLS reverse proxy or an SSH tunnel.
+ATLAS_HUB_SRC="$OPS_DIR/atlas-hub.service"
+
+if [[ "$ATLAS_HUB_ENABLED" -eq 1 && -f "$ATLAS_HUB_SRC" ]]; then
+  install -d -o root -g root -m 0755 /etc/default
+  if [[ -f /etc/default/atlas-hub ]]; then
+    echo "==> /etc/default/atlas-hub already present (preserving)"
+  else
+    echo "==> seeding /etc/default/atlas-hub"
+    cat >/etc/default/atlas-hub <<'EOF'
+# Generated by setup-hermes.sh — overrides for atlas-hub.service.
+# Edits here survive re-runs of the installer. Do not place raw Hub API keys
+# here; setup-hermes.sh manages them under <HERMES_HOME>/auth/.
+EOF
+    chown root:root /etc/default/atlas-hub
+    chmod 0644 /etc/default/atlas-hub
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing systemd service for atlas-hub (user=$AGENT_USER, bind=$ATLAS_HUB_HOST:$ATLAS_HUB_PORT)"
+    atlas_hub_was_active=0
+    systemctl is-active atlas-hub.service >/dev/null 2>&1 && atlas_hub_was_active=1
+    PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+      render-systemd-unit \
+      --template "$ATLAS_HUB_SRC" \
+      --out /etc/systemd/system/atlas-hub.service \
+      --set "AGENT_USER=$AGENT_USER" \
+      --set "TARGET_DIR=$TARGET_DIR" \
+      --set "ATLAS_CONFIG=$ATLAS_CONFIG" \
+      --set "ATLAS_KB_ROOT=$ATLAS_KB_ROOT" \
+      --set "ATLAS_AI_MODE=$ATLAS_AI_MODE" \
+      --set "ATLAS_CODEX_BIN=$ATLAS_CODEX_BIN" \
+      --set "ATLAS_CODEX_TIMEOUT_MS=$ATLAS_CODEX_TIMEOUT_MS" \
+      --set "ATLAS_HUB_HOST=$ATLAS_HUB_HOST" \
+      --set "ATLAS_HUB_PORT=$ATLAS_HUB_PORT"
+    systemctl daemon-reload
+    systemctl enable --now atlas-hub.service
+    if (( atlas_hub_was_active )); then
+      echo "==> restarting atlas-hub.service to pick up the installed Atlas binary/config"
+      systemctl try-restart atlas-hub.service
+    fi
+    atlas_hub_ready=0
+    for _ in {1..20}; do
+      if systemctl is-active --quiet atlas-hub.service; then
+        atlas_hub_key="$(tr -d '\r\n' < "$ATLAS_HUB_CLIENT_API_KEY_FILE")"
+        atlas_hub_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+          --config - "http://$ATLAS_HUB_HOST:$ATLAS_HUB_PORT/v1/health" \
+          <<<"header = \"Authorization: Bearer $atlas_hub_key\"" 2>/dev/null || true)"
+        unset atlas_hub_key
+        if [[ "$atlas_hub_code" == "200" ]]; then
+          atlas_hub_ready=1
+          break
+        fi
+      fi
+      sleep 1
+    done
+    if [[ "$atlas_hub_ready" -ne 1 ]]; then
+      echo "FAIL: atlas-hub.service did not return HTTP 200 at http://$ATLAS_HUB_HOST:$ATLAS_HUB_PORT/v1/health" >&2
+      systemctl --no-pager --lines=80 status atlas-hub.service >&2 || true
+      journalctl -u atlas-hub.service -n 100 --no-pager >&2 || true
+      exit 1
+    fi
+  else
+    echo "==> systemctl not present; skipping atlas-hub service enable" >&2
+  fi
+elif [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
+  echo "==> WARNING: $ATLAS_HUB_SRC missing; skipping atlas-hub install" >&2
+fi
 
 # ---------- Atlas source sync ----------
 # Hourly scheduled sync of configured external Markdown sources. The runner
@@ -2445,6 +2595,16 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     config credential.https://github.com.helper 2>/dev/null || true)"
   [[ "$atlas_helper" == "$ATLAS_GIT_CRED_HELPER" ]] \
     || { echo "FAIL: Atlas KB credential helper not configured (got: $atlas_helper)" >&2; exit 1; }
+fi
+if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
+  [[ -f "$ATLAS_HUB_AUTH_FILE" ]] \
+    || { echo "FAIL: Atlas Hub auth file missing at $ATLAS_HUB_AUTH_FILE" >&2; exit 1; }
+  [[ -f "$ATLAS_HUB_CLIENT_API_KEY_FILE" ]] \
+    || { echo "FAIL: Atlas Hub client API key file missing at $ATLAS_HUB_CLIENT_API_KEY_FILE" >&2; exit 1; }
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet atlas-hub.service \
+      || { echo "FAIL: atlas-hub.service is not active" >&2; exit 1; }
+  fi
 fi
 if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 ]]; then
   [[ -x /usr/local/sbin/atlas-source-sync-runner ]] \
