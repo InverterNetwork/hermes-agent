@@ -1049,6 +1049,7 @@ def atlas_install(install: dict) -> dict:
         "    enabled: true\n"
         "    host: 127.0.0.1\n"
         "    port: 8765\n"
+        "    public_base_url: https://atlas.example.test\n"
         "    data_dir: \"\"\n"
         "    query_concurrency: 4\n"
         "  github_app:\n"
@@ -1139,6 +1140,21 @@ def atlas_install(install: dict) -> dict:
         encoding="utf-8",
     )
 
+    caddyfile = install["tmp"] / "Caddyfile"
+    caddyfile.write_text(
+        "atlas.example.test {\n"
+        "\t# BEGIN HERMES MANAGED ATLAS HUB ROUTE\n"
+        "\thandle /v1/* {\n"
+        "\t\treverse_proxy 127.0.0.1:8765\n"
+        "\t}\n"
+        "\t# END HERMES MANAGED ATLAS HUB ROUTE\n"
+        "\thandle {\n"
+        "\t\treverse_proxy localhost:3100\n"
+        "\t}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
     _write_curl_status_stub(bin_dir / "curl")
 
     # Some git/filesystem operations in the extended fixture can clear the
@@ -1150,6 +1166,7 @@ def atlas_install(install: dict) -> dict:
     install["atlas_wrapper"] = atlas_wrapper
     install["atlas_profile"] = atlas_profile
     install["atlas_kb_root"] = kb_root
+    install["caddyfile"] = caddyfile
     return install
 
 
@@ -1158,6 +1175,7 @@ def _atlas_env(install: dict) -> dict[str, str]:
         "HERMES_VERIFY_ATLAS_BIN": str(install["atlas_bin"]),
         "HERMES_VERIFY_ATLAS_WRAPPER": str(install["atlas_wrapper"]),
         "HERMES_VERIFY_ATLAS_PROFILE": str(install["atlas_profile"]),
+        "HERMES_VERIFY_CADDYFILE": str(install["caddyfile"]),
     }
 
 
@@ -1207,6 +1225,8 @@ class TestAtlasVerify:
         assert "[OK] atlas-hub.service loopback bind: 127.0.0.1:8765" in result.stdout
         assert "[OK] atlas-hub.service port: 8765" in result.stdout
         assert "[OK] Atlas Hub local health: HTTP 200" in result.stdout
+        assert "[OK] Atlas Hub public Caddy route: https://atlas.example.test/v1/* -> 127.0.0.1:8765" in result.stdout
+        assert "[OK] Atlas Hub public health: HTTP 200" in result.stdout
         assert "[DRIFT]" not in result.stderr
 
     def test_missing_atlas_binary_is_drift(self, atlas_install):
@@ -1268,6 +1288,21 @@ class TestAtlasVerify:
 
         assert result.returncode == 1
         assert "[DRIFT] Atlas Hub client API key" in result.stderr
+
+    def test_atlas_hub_missing_public_caddy_route_is_drift(self, atlas_install):
+        atlas_install["caddyfile"].write_text(
+            "atlas.example.test {\n"
+            "\thandle {\n"
+            "\t\treverse_proxy localhost:3100\n"
+            "\t}\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        result = _run_verify_atlas(atlas_install)
+
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas Hub public Caddy route" in result.stderr
 
 
 @pytest.fixture

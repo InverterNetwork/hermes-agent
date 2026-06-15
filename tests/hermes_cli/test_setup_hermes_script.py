@@ -372,6 +372,7 @@ def test_atlas_hub_service_is_loopback_and_key_protected():
     assert "enabled: true" in values
     assert "host: 127.0.0.1" in values
     assert "port: 8765" in values
+    assert "public_base_url: https://didier.brix.fyi" in values
     assert "query_concurrency: 4" in values
 
     assert "ExecStart=/usr/local/bin/atlas --config __ATLAS_CONFIG__ serve --host __ATLAS_HUB_HOST__ --port __ATLAS_HUB_PORT__" in service
@@ -388,6 +389,9 @@ def test_atlas_hub_service_is_loopback_and_key_protected():
     assert "systemctl enable --now atlas-hub.service" in installer
     assert "systemctl try-restart atlas-hub.service" in installer
     assert "http://$ATLAS_HUB_HOST:$ATLAS_HUB_PORT/v1/health" in installer
+    assert "ensure-caddy-atlas-hub-route" in installer
+    assert "caddy validate --config /etc/caddy/Caddyfile" in installer
+    assert "$ATLAS_HUB_PUBLIC_BASE_URL/v1/health" in installer
     assert "Authorization: Bearer $atlas_hub_key" in installer
 
 
