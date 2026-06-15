@@ -205,7 +205,9 @@ jobs:
           # GitHub App plus real release assets. This smoke job exercises the
           # non-auth local-fixture installer path, so disable Atlas here and
           # leave production deploy.values.yaml unchanged.
-          data.setdefault("atlas", {})["version"] = ""
+          atlas = data.setdefault("atlas", {})
+          atlas["version"] = ""
+          atlas.setdefault("hub", {})["enabled"] = False
           data["repos"].append({
               "id": "code-only-fixture",
               "url": f"file://{code_fixture}",
