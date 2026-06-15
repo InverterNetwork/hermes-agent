@@ -50,8 +50,9 @@ Nine units live here:
 * **`atlas-hub`** — localhost-only Atlas Hub API service. Installed only
   when `atlas.hub.enabled=true`; binds to `127.0.0.1:8765`, uses
   `<HERMES_HOME>/config/atlas.yaml`, and authenticates with the
-  installer-managed key material under `<HERMES_HOME>/auth/`. Public
-  access belongs behind a TLS reverse proxy or an operator SSH tunnel.
+  installer-managed key material under `<HERMES_HOME>/auth/`. When
+  `atlas.hub.public_base_url` is set, the installer manages a Caddy
+  `/v1/*` route from that public origin to the loopback Hub service.
 
 ## Files
 
@@ -825,6 +826,18 @@ sudo systemctl status atlas-hub.service
 ATLAS_HUB_API_KEY="$(sudo tr -d '\r\n' < ~hermes/.hermes/auth/atlas-hub-client-api-key)"
 curl -fsS -H "Authorization: Bearer $ATLAS_HUB_API_KEY" \
   http://127.0.0.1:8765/v1/health
+```
+
+For the krustentier deployment, `atlas.hub.public_base_url` is
+`https://didier.brix.fyi`, so setup manages the public Caddy route for
+Atlas CLI clients:
+
+```sh
+curl -fsS -H "Authorization: Bearer $ATLAS_HUB_API_KEY" \
+  https://didier.brix.fyi/v1/health
+atlas hub use https://didier.brix.fyi
+atlas hub login --api-key "$ATLAS_HUB_API_KEY"
+atlas hub status --check
 ```
 
 ## Quay Admin UI access
