@@ -706,7 +706,7 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.9"
+  version: "v0.1.10"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
