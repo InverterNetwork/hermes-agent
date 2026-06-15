@@ -719,11 +719,14 @@ atlas:
     codex_timeout_ms: 120000
   # Atlas Hub is served as a loopback-only API. Public access must terminate
   # TLS in a reverse proxy that forwards to this listener, or operators can
-  # use an SSH tunnel for local CLI access.
+  # use an SSH tunnel for local CLI access. public_base_url must be an origin,
+  # because the Atlas CLI stores Hub targets as origins and appends /v1/* API
+  # paths itself.
   hub:
     enabled: true
     host: 127.0.0.1
     port: 8765
+    public_base_url: https://didier.brix.fyi
     # Empty means "$HERMES_HOME/atlas-hub". Auth files are installer-managed
     # under "$HERMES_HOME/auth/" so raw API keys never enter values.yaml.
     data_dir: ""

@@ -338,6 +338,8 @@ ATLAS_HUB_ENABLED_RAW="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get at
 if [[ "$ATLAS_HUB_ENABLED_RAW" == "true" ]]; then
   ATLAS_HUB_ENABLED=1
 fi
+ATLAS_HUB_PUBLIC_BASE_URL="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.public_base_url 2>/dev/null || true)"
+ATLAS_HUB_PUBLIC_BASE_URL="${ATLAS_HUB_PUBLIC_BASE_URL%/}"
 if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   ATLAS_SOURCE_SYNC_ENABLED_RAW="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.source_sync.enabled 2>/dev/null || true)"
   if [[ "$ATLAS_SOURCE_SYNC_ENABLED_RAW" == "true" ]]; then
@@ -357,6 +359,10 @@ if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
 fi
 if [[ "$ATLAS_HUB_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
   echo "FAIL: atlas.hub.enabled=true requires atlas.version to be set." >&2
+  exit 2
+fi
+if [[ -n "$ATLAS_HUB_PUBLIC_BASE_URL" && "$ATLAS_HUB_ENABLED" -ne 1 ]]; then
+  echo "FAIL: atlas.hub.public_base_url requires atlas.hub.enabled=true." >&2
   exit 2
 fi
 
@@ -1977,6 +1983,42 @@ EOF
       systemctl --no-pager --lines=80 status atlas-hub.service >&2 || true
       journalctl -u atlas-hub.service -n 100 --no-pager >&2 || true
       exit 1
+    fi
+
+    if [[ -n "$ATLAS_HUB_PUBLIC_BASE_URL" ]]; then
+      command -v caddy >/dev/null 2>&1 \
+        || { echo "FAIL: atlas.hub.public_base_url is set but caddy is not on PATH" >&2; exit 1; }
+      echo "==> installing Caddy route for Atlas Hub ($ATLAS_HUB_PUBLIC_BASE_URL/v1/* -> $ATLAS_HUB_HOST:$ATLAS_HUB_PORT)"
+      PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+        ensure-caddy-atlas-hub-route \
+        --caddyfile /etc/caddy/Caddyfile \
+        --public-base-url "$ATLAS_HUB_PUBLIC_BASE_URL" \
+        --hub-host "$ATLAS_HUB_HOST" \
+        --hub-port "$ATLAS_HUB_PORT"
+      caddy fmt --overwrite /etc/caddy/Caddyfile
+      caddy validate --config /etc/caddy/Caddyfile
+      systemctl reload caddy.service || systemctl restart caddy.service
+
+      atlas_hub_public_ready=0
+      for _ in {1..20}; do
+        atlas_hub_key="$(tr -d '\r\n' < "$ATLAS_HUB_CLIENT_API_KEY_FILE")"
+        atlas_hub_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+          "$ATLAS_HUB_PUBLIC_BASE_URL/v1/health" \
+          --config - \
+          <<<"header = \"Authorization: Bearer $atlas_hub_key\"" 2>/dev/null || true)"
+        unset atlas_hub_key
+        if [[ "$atlas_hub_code" == "200" ]]; then
+          atlas_hub_public_ready=1
+          break
+        fi
+        sleep 1
+      done
+      if [[ "$atlas_hub_public_ready" -ne 1 ]]; then
+        echo "FAIL: Atlas Hub public route did not return HTTP 200 at $ATLAS_HUB_PUBLIC_BASE_URL/v1/health" >&2
+        systemctl --no-pager --lines=80 status caddy.service >&2 || true
+        journalctl -u caddy.service -n 100 --no-pager >&2 || true
+        exit 1
+      fi
     fi
   else
     echo "==> systemctl not present; skipping atlas-hub service enable" >&2

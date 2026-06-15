@@ -30,6 +30,9 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
+from urllib.parse import urlparse
+
+from .caddy import caddyfile_has_atlas_hub_route
 
 
 _REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
@@ -72,6 +75,7 @@ class _State:
     upstream_sync_env: str
     reviewer_env: str
     reviewer_key: str
+    caddyfile: str
     values_file: Path
     values_helper: Path
     quay_version: str
@@ -1299,6 +1303,11 @@ def _check_atlas_hub_service(s: _State) -> None:
 
     host = _values_get(s.values_file, s.values_helper, "atlas.hub.host") or "127.0.0.1"
     port = _values_get(s.values_file, s.values_helper, "atlas.hub.port") or "8765"
+    public_base_url = (
+        _values_get(s.values_file, s.values_helper, "atlas.hub.public_base_url")
+        .strip()
+        .rstrip("/")
+    )
     data_dir_raw = _values_get(s.values_file, s.values_helper, "atlas.hub.data_dir")
     data_dir = (
         s.args.target / data_dir_raw
@@ -1400,6 +1409,80 @@ def _check_atlas_hub_service(s: _State) -> None:
             s.v_ok(f"Atlas Hub local health: HTTP {code}")
         else:
             s.v_drift("Atlas Hub local health", f"{health_url} returned HTTP {code}")
+
+    if public_base_url:
+        _check_atlas_hub_public_route(
+            s,
+            public_base_url=public_base_url,
+            hub_host=host,
+            hub_port=str(port),
+            client_key=client_key,
+        )
+
+
+def _check_atlas_hub_public_route(
+    s: _State,
+    *,
+    public_base_url: str,
+    hub_host: str,
+    hub_port: str,
+    client_key: str,
+) -> None:
+    parsed = urlparse(public_base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        s.v_drift(
+            "Atlas Hub public base URL",
+            "atlas.hub.public_base_url must be an http(s) origin without path, "
+            "query, fragment, or credentials",
+        )
+        return
+
+    caddyfile = Path(s.caddyfile)
+    try:
+        caddy_text = caddyfile.read_text(encoding="utf-8")
+    except OSError as exc:
+        s.v_drift("Atlas Hub public Caddy route", f"cannot read {caddyfile}: {exc}")
+    else:
+        try:
+            ok = caddyfile_has_atlas_hub_route(
+                caddy_text,
+                public_base_url=public_base_url,
+                hub_host=hub_host,
+                hub_port=hub_port,
+            )
+        except ValueError as exc:
+            s.v_drift("Atlas Hub public Caddy route", str(exc))
+        else:
+            if ok:
+                s.v_ok(
+                    "Atlas Hub public Caddy route: "
+                    f"{public_base_url}/v1/* -> {hub_host}:{hub_port}"
+                )
+            else:
+                s.v_drift(
+                    "Atlas Hub public Caddy route",
+                    f"missing managed /v1/* reverse_proxy to {hub_host}:{hub_port}",
+                )
+
+    if client_key:
+        health_url = (
+            os.environ.get("HERMES_VERIFY_ATLAS_HUB_PUBLIC_HEALTH_URL")
+            or f"{public_base_url}/v1/health"
+        )
+        code = _bearer_http_code(health_url, client_key)
+        if code == "200":
+            s.v_ok(f"Atlas Hub public health: HTTP {code}")
+        else:
+            s.v_drift("Atlas Hub public health", f"{health_url} returned HTTP {code}")
 
 
 def _check_codex_prereqs(s: _State) -> None:
@@ -2583,6 +2666,7 @@ def run(
         upstream_sync_env=os.environ.get("HERMES_VERIFY_UPSTREAM_SYNC_ENV") or "/etc/default/hermes-upstream-sync",
         reviewer_env=os.environ.get("HERMES_VERIFY_REVIEWER_ENV") or "/etc/hermes/reviewer.env",
         reviewer_key=os.environ.get("HERMES_VERIFY_REVIEWER_KEY") or "/etc/hermes/reviewer.pem",
+        caddyfile=os.environ.get("HERMES_VERIFY_CADDYFILE") or "/etc/caddy/Caddyfile",
         values_file=values_file,
         values_helper=values_helper,
         quay_version=quay_version,
