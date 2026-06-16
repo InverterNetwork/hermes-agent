@@ -196,4 +196,3 @@ describe('applyBackendUpdate recovery', () => {
     expect($backendUpdateApply.get().stage).toBe('error')
   })
 })
-
