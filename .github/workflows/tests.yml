@@ -30,11 +30,7 @@ jobs:
         slice: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Checkout code
-<<<<<<< HEAD
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-=======
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
->>>>>>> upstream/main
 
       - name: Restore duration cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -62,10 +58,7 @@ jobs:
           rg --version
 
       - name: Install uv
-<<<<<<< HEAD
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
-=======
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
@@ -76,7 +69,6 @@ jobs:
           cache-dependency-glob: |
             pyproject.toml
             uv.lock
->>>>>>> upstream/main
 
       - name: Set up Python 3.11
         run: uv python install 3.11
@@ -171,11 +163,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout code
-<<<<<<< HEAD
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-=======
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
->>>>>>> upstream/main
 
       - name: Install ripgrep (prebuilt binary)
         run: |
@@ -192,10 +180,7 @@ jobs:
           rg --version
 
       - name: Install uv
-<<<<<<< HEAD
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
-=======
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           # Persist uv's download/wheel cache (~/.cache/uv) across runs.
           # Keyed on the dependency manifests, so the cache is reused until
@@ -206,7 +191,6 @@ jobs:
           cache-dependency-glob: |
             pyproject.toml
             uv.lock
->>>>>>> upstream/main
 
       - name: Set up Python 3.11
         run: uv python install 3.11

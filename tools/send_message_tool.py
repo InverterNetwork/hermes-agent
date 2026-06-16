@@ -148,14 +148,11 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-<<<<<<< HEAD
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') for a file under a Hermes media cache or HERMES_MEDIA_ALLOW_DIRS — the platform will deliver it as a native media attachment."
             },
             "thread_ts": {
                 "type": "string",
                 "description": "Slack-only. If set, posts as a threaded reply under the given message_ts (e.g. '1715420800.123456'). Ignored on other platforms."
-=======
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
             },
             "emoji": {
                 "type": "string",
@@ -164,7 +161,6 @@ SEND_MESSAGE_SCHEMA = {
             "message_id": {
                 "type": "string",
                 "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
->>>>>>> upstream/main
             }
         },
         "required": []
@@ -925,16 +921,12 @@ async def _send_to_platform(
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-<<<<<<< HEAD
             result = await _send_slack(
                 pconfig.token,
                 chat_id,
                 chunk,
                 **_slack_kwargs,
             )
-=======
-            result = await _send_slack(pconfig.token, chat_id, chunk, thread_ts=thread_id)
->>>>>>> upstream/main
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -1222,7 +1214,6 @@ def _derive_forum_thread_name(message: str) -> str:
         first_line = "New Post"
     return first_line[:100]
 
-<<<<<<< HEAD
 
 # Process-local cache for Discord channel-type probes.  Avoids re-probing the
 # same channel on every send when the directory cache has no entry (e.g. fresh
@@ -1440,10 +1431,6 @@ async def _send_slack(token, chat_id, message, *, thread_ts=None):
 
     thread_ts: optional Slack message_ts to thread under.
     """
-=======
-async def _send_slack(token, chat_id, message, thread_ts=None):
-    """Send via Slack Web API."""
->>>>>>> upstream/main
     try:
         import aiohttp
     except ImportError:

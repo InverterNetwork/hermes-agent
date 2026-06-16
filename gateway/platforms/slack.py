@@ -62,11 +62,8 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     safe_url_for_log,
     cache_document_from_bytes,
-<<<<<<< HEAD
     cache_image_from_url,
-=======
     cache_video_from_bytes,
->>>>>>> upstream/main
 )
 
 
@@ -2544,7 +2541,6 @@ class SlackAdapter(BasePlatformAdapter):
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
 
-<<<<<<< HEAD
     def _extract_slack_text_payload(self, event: dict) -> str:
         """Merge ``event["text"]`` with rich-text quotes, blocks, and link unfurls.
 
@@ -2732,6 +2728,36 @@ class SlackAdapter(BasePlatformAdapter):
                         logger.warning(
                             "[Slack] Failed to cache audio from %s: %s",
                             url, e, exc_info=True,
+                        )
+            elif mimetype.startswith("video/") and url:
+                try:
+                    original_filename = f.get("name", "")
+                    _, ext = os.path.splitext(original_filename)
+                    ext = ext.lower()
+                    if ext not in SUPPORTED_VIDEO_TYPES:
+                        mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
+                        ext = mime_to_ext.get(
+                            mimetype.split(";", 1)[0].lower(), ".mp4"
+                        )
+
+                    raw_bytes = await self._download_slack_file_bytes(
+                        url, team_id=team_id
+                    )
+                    cached_path = cache_video_from_bytes(raw_bytes, ext=ext)
+                    media_urls.append(cached_path)
+                    media_types.append(SUPPORTED_VIDEO_TYPES.get(ext, mimetype))
+                    logger.debug("[Slack] Cached user video: %s", cached_path)
+                except Exception as e:  # pragma: no cover - defensive logging
+                    detail = self._describe_slack_download_failure(e, file_obj=f)
+                    if detail:
+                        attachment_notices.append(detail)
+                        logger.warning("[Slack] %s", detail)
+                    else:
+                        logger.warning(
+                            "[Slack] Failed to cache video from %s: %s",
+                            url,
+                            e,
+                            exc_info=True,
                         )
             elif url:
                 try:
@@ -3064,7 +3090,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id, trigger.skill, message_ts, STATUS_FINISHED, duration_ms,
         )
         return True
-=======
+
     async def _handle_slack_file_shared(self, event: dict) -> None:
         """Fallback for Slack file shares that do not arrive as message.files.
 
@@ -3142,7 +3168,6 @@ class SlackAdapter(BasePlatformAdapter):
         if thread_ts and thread_ts != ts:
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
->>>>>>> upstream/main
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
@@ -3426,7 +3451,6 @@ class SlackAdapter(BasePlatformAdapter):
             msg_type = MessageType.COMMAND
 
         # Handle file attachments
-<<<<<<< HEAD
         media_urls, media_types, attachment_notices, inline_text = (
             await self._extract_slack_media(
                 event, channel_id=channel_id, team_id=team_id,
@@ -3434,214 +3458,6 @@ class SlackAdapter(BasePlatformAdapter):
         )
         if inline_text:
             text = f"{inline_text}\n\n{text}".strip() if text else inline_text
-=======
-        media_urls = []
-        media_types = []
-        attachment_notices: List[str] = []
-        files = event.get("files", [])
-        for f in files:
-            # Slack Connect channels return stub file objects with
-            # file_access="check_file_info" and no URL fields. We must
-            # call files.info to retrieve the full object (including url_private_download)
-            # before we can download it.
-            # https://docs.slack.dev/reference/objects/file-object/#slack_connect_files
-            if f.get("file_access") == "check_file_info":
-                file_id = f.get("id")
-                if not file_id:
-                    continue
-                try:
-                    info_resp = await self._get_client(channel_id).files_info(
-                        file=file_id
-                    )
-                    if info_resp.get("ok"):
-                        f = info_resp["file"]
-                    else:
-                        detail = self._describe_slack_api_error(info_resp, file_obj=f)
-                        if detail:
-                            attachment_notices.append(detail)
-                            logger.warning("[Slack] %s", detail)
-                        else:
-                            logger.warning(
-                                "[Slack] files.info failed for %s: %s",
-                                file_id,
-                                info_resp.get("error"),
-                            )
-                        continue
-                except Exception as e:
-                    response = getattr(e, "response", None)
-                    detail = self._describe_slack_api_error(response, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning(
-                            "[Slack] files.info error for %s: %s",
-                            file_id,
-                            e,
-                            exc_info=True,
-                        )
-                    continue
-
-            mimetype = f.get("mimetype", "unknown")
-            url = f.get("url_private_download") or f.get("url_private", "")
-            if mimetype.startswith("image/") and url:
-                try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-                        ext = ".jpg"
-                    # Slack private URLs require the bot token as auth header
-                    cached = await self._download_slack_file(url, ext, team_id=team_id)
-                    media_urls.append(cached)
-                    media_types.append(mimetype)
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning(
-                            "[Slack] Failed to cache image from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
-                        )
-            elif mimetype.startswith("audio/") and url:
-                try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
-                        ext = ".ogg"
-                    cached = await self._download_slack_file(
-                        url, ext, audio=True, team_id=team_id
-                    )
-                    media_urls.append(cached)
-                    media_types.append(mimetype)
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning(
-                            "[Slack] Failed to cache audio from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
-                        )
-            elif mimetype.startswith("video/") and url:
-                try:
-                    original_filename = f.get("name", "")
-                    _, ext = os.path.splitext(original_filename)
-                    ext = ext.lower()
-                    if ext not in SUPPORTED_VIDEO_TYPES:
-                        mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
-                        ext = mime_to_ext.get(
-                            mimetype.split(";", 1)[0].lower(), ".mp4"
-                        )
-
-                    raw_bytes = await self._download_slack_file_bytes(
-                        url, team_id=team_id
-                    )
-                    cached_path = cache_video_from_bytes(raw_bytes, ext=ext)
-                    media_urls.append(cached_path)
-                    media_types.append(SUPPORTED_VIDEO_TYPES.get(ext, mimetype))
-                    logger.debug("[Slack] Cached user video: %s", cached_path)
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning(
-                            "[Slack] Failed to cache video from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
-                        )
-            elif url:
-                # Try to handle as a document attachment
-                try:
-                    original_filename = f.get("name", "")
-                    ext = ""
-                    if original_filename:
-                        _, ext = os.path.splitext(original_filename)
-                        ext = ext.lower()
-
-                    # Fallback: reverse-lookup from MIME type
-                    if not ext and mimetype:
-                        mime_to_ext = {
-                            v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()
-                        }
-                        ext = mime_to_ext.get(mimetype, "")
-
-                    if ext not in SUPPORTED_DOCUMENT_TYPES:
-                        continue  # Skip unsupported file types silently
-
-                    # Check file size (Slack limit: 20 MB for bots)
-                    file_size = f.get("size", 0)
-                    MAX_DOC_BYTES = 20 * 1024 * 1024
-                    if not file_size or file_size > MAX_DOC_BYTES:
-                        logger.warning(
-                            "[Slack] Document too large or unknown size: %s", file_size
-                        )
-                        continue
-
-                    # Download and cache
-                    raw_bytes = await self._download_slack_file_bytes(
-                        url, team_id=team_id
-                    )
-                    cached_path = cache_document_from_bytes(
-                        raw_bytes, original_filename or f"document{ext}"
-                    )
-                    doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
-                    media_urls.append(cached_path)
-                    media_types.append(doc_mime)
-                    logger.debug("[Slack] Cached user document: %s", cached_path)
-
-                    # Inject small text-ish files directly into the prompt so
-                    # snippets like JSON/YAML/configs are actually visible to the agent.
-                    MAX_TEXT_INJECT_BYTES = 100 * 1024
-                    TEXT_INJECT_EXTENSIONS = {
-                        ".md",
-                        ".txt",
-                        ".csv",
-                        ".log",
-                        ".json",
-                        ".xml",
-                        ".yaml",
-                        ".yml",
-                        ".toml",
-                        ".ini",
-                        ".cfg",
-                    }
-                    if (
-                        ext in TEXT_INJECT_EXTENSIONS
-                        and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES
-                    ):
-                        try:
-                            text_content = raw_bytes.decode("utf-8")
-                            display_name = original_filename or f"document{ext}"
-                            display_name = re.sub(r"[^\w.\- ]", "_", display_name)
-                            injection = f"[Content of {display_name}]:\n{text_content}"
-                            if text:
-                                text = f"{injection}\n\n{text}"
-                            else:
-                                text = injection
-                        except UnicodeDecodeError:
-                            pass  # Binary content, skip injection
-
-                except Exception as e:  # pragma: no cover - defensive logging
-                    detail = self._describe_slack_download_failure(e, file_obj=f)
-                    if detail:
-                        attachment_notices.append(detail)
-                        logger.warning("[Slack] %s", detail)
-                    else:
-                        logger.warning(
-                            "[Slack] Failed to cache document from %s: %s",
-                            url,
-                            e,
-                            exc_info=True,
-                        )
->>>>>>> upstream/main
 
         if attachment_notices:
             notice_block = "[Slack attachment notice]\n" + "\n".join(

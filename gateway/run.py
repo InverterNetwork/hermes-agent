@@ -40,11 +40,8 @@ import logging
 import os
 import re
 import shlex
-<<<<<<< HEAD
-=======
 import site
 import sys
->>>>>>> upstream/main
 import signal
 import tempfile
 import threading
@@ -385,7 +382,6 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
-<<<<<<< HEAD
 def _status_callback_mode_allows(mode: Any, event_type: str) -> bool:
     """Return whether a configured status-callback mode permits an event."""
     normalized = str("all" if mode is None else mode).strip().lower().replace("-", "_")
@@ -394,7 +390,7 @@ def _status_callback_mode_allows(mode: Any, event_type: str) -> bool:
     if normalized in {"warn", "warning", "warnings", "warn_only", "warnings_only"}:
         return str(event_type or "").strip().lower() == "warn"
     return True
-=======
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -408,7 +404,6 @@ def render_notice_line(notice) -> str:
     degrades to "" rather than raising on the agent's callback path.
     """
     return str(getattr(notice, "text", "") or "").strip()
->>>>>>> upstream/main
 
 
 async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
