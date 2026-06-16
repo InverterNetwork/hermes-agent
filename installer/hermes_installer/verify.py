@@ -30,6 +30,9 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
+from urllib.parse import urlparse
+
+from .caddy import caddyfile_has_atlas_hub_route
 
 
 _REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
@@ -72,11 +75,13 @@ class _State:
     upstream_sync_env: str
     reviewer_env: str
     reviewer_key: str
+    caddyfile: str
     values_file: Path
     values_helper: Path
     quay_version: str
     atlas_version: str
     atlas_ai_mode: str
+    atlas_hub_enabled: bool = False
     codex_required: bool = False
     quay_tags_supported: bool = False
     quay_serve_supported: bool = False
@@ -1259,6 +1264,227 @@ def _check_atlas_artefacts(s: _State, *, app_auth_expected: bool) -> None:
     _check_atlas_manager_token(s)
 
 
+def _check_atlas_hub_service(s: _State) -> None:
+    auth_file = s.args.target / "auth" / "atlas-hub-auth.json"
+    auth_info = _stat_info(auth_file)
+    if auth_info is None:
+        s.v_drift("Atlas Hub auth file", f"missing: {auth_file}")
+    else:
+        _check_mode_owner(s, "Atlas Hub auth file", auth_info, "640", s.rails_owner)
+        try:
+            auth_payload = json.loads(auth_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            s.v_drift("Atlas Hub auth file", f"unreadable or invalid JSON: {exc}")
+        else:
+            keys = auth_payload.get("keys") if isinstance(auth_payload, dict) else None
+            if isinstance(keys, list) and keys:
+                s.v_ok("Atlas Hub auth file keys present")
+            else:
+                s.v_drift("Atlas Hub auth file keys", "missing non-empty keys list")
+
+    client_key_file = s.args.target / "auth" / "atlas-hub-client-api-key"
+    client_key_info = _stat_info(client_key_file)
+    if client_key_info is None:
+        s.v_drift("Atlas Hub client API key", f"missing: {client_key_file}")
+        client_key = ""
+    else:
+        _check_mode_owner(
+            s, "Atlas Hub client API key", client_key_info, "640", s.rails_owner,
+        )
+        try:
+            client_key = client_key_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            s.v_drift("Atlas Hub client API key", f"unreadable: {exc}")
+            client_key = ""
+        if client_key.startswith("atlas_hub_sk_"):
+            s.v_ok("Atlas Hub client API key present")
+        else:
+            s.v_drift("Atlas Hub client API key", "missing atlas_hub_sk_ value")
+
+    host = _values_get(s.values_file, s.values_helper, "atlas.hub.host") or "127.0.0.1"
+    port = _values_get(s.values_file, s.values_helper, "atlas.hub.port") or "8765"
+    public_base_url = (
+        _values_get(s.values_file, s.values_helper, "atlas.hub.public_base_url")
+        .strip()
+        .rstrip("/")
+    )
+    data_dir_raw = _values_get(s.values_file, s.values_helper, "atlas.hub.data_dir")
+    data_dir = (
+        s.args.target / data_dir_raw
+        if data_dir_raw and not data_dir_raw.startswith("/")
+        else Path(data_dir_raw or (s.args.target / "atlas-hub"))
+    )
+    query_concurrency = (
+        _values_get(s.values_file, s.values_helper, "atlas.hub.query_concurrency")
+        or "4"
+    )
+    atlas_config = s.args.target / "config" / "atlas.yaml"
+    config_info = _stat_info(atlas_config)
+    if config_info is None:
+        s.v_drift("Atlas runtime config", f"missing: {atlas_config}")
+    else:
+        try:
+            config_text = atlas_config.read_text(encoding="utf-8")
+        except OSError as exc:
+            s.v_drift("Atlas runtime config", f"unreadable: {exc}")
+            config_text = ""
+        expectations = {
+            "hub auth_file": f'auth_file: "{auth_file}"',
+            "hub data_dir": f'data_dir: "{data_dir}"',
+            "hub query_concurrency": f"query_concurrency: {query_concurrency}",
+        }
+        for label, needle in expectations.items():
+            if config_text and needle in config_text:
+                s.v_ok(f"Atlas runtime config {label}")
+            elif config_text:
+                s.v_drift(f"Atlas runtime config {label}", f"missing {needle}")
+
+    if not shutil.which("systemctl"):
+        return
+
+    unit = "atlas-hub.service"
+    active, load, unitfile = _systemd_unit_state(s, unit)
+    if active == "active" and load == "loaded" and unitfile == "enabled":
+        s.v_ok(f"{unit}: active loaded enabled")
+    else:
+        s.v_drift(
+            unit,
+            f"active={active or '?'} load={load or '?'} unitfile={unitfile or '?'}",
+        )
+
+    unit_file = Path(s.systemd_dir) / unit
+    if not unit_file.is_file():
+        s.v_drift(unit, f"missing unit file: {unit_file}")
+        return
+    _check_mode_owner(s, unit, _stat_info(unit_file), "644", s.rails_owner)
+    try:
+        text = unit_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        s.v_drift(unit, f"unreadable: {exc}")
+        return
+
+    expected_config = f"Environment=ATLAS_CONFIG={atlas_config}"
+    if expected_config in text:
+        s.v_ok("atlas-hub.service ATLAS_CONFIG")
+    else:
+        s.v_drift("atlas-hub.service ATLAS_CONFIG", f"missing {expected_config}")
+
+    expected_kb_root = f"Environment=ATLAS_KB_ROOT={_atlas_kb_root(s)}"
+    if expected_kb_root in text:
+        s.v_ok("atlas-hub.service ATLAS_KB_ROOT")
+    else:
+        s.v_drift("atlas-hub.service ATLAS_KB_ROOT", f"missing {expected_kb_root}")
+
+    auth_env = f"EnvironmentFile=-{s.args.target / 'auth' / 'atlas.env'}"
+    if auth_env in text:
+        s.v_ok("atlas-hub.service secrets env")
+    else:
+        s.v_drift("atlas-hub.service secrets env", f"missing {auth_env}")
+
+    if re.search(r"ExecStart=.*\batlas\s+--config\s+\S+\s+serve\b", text):
+        s.v_ok("atlas-hub.service ExecStart uses atlas serve")
+    else:
+        s.v_drift("atlas-hub.service ExecStart", "missing `atlas --config ... serve`")
+
+    if re.search(r"ExecStart=.*--host\s+(127\.0\.0\.1|localhost)\b", text):
+        s.v_ok(f"atlas-hub.service loopback bind: {host}:{port}")
+    else:
+        s.v_drift(
+            "atlas-hub.service bind address",
+            "expected ExecStart to include --host 127.0.0.1 or localhost",
+        )
+
+    if re.search(rf"ExecStart=.*--port\s+{re.escape(str(port))}\b", text):
+        s.v_ok(f"atlas-hub.service port: {port}")
+    else:
+        s.v_drift("atlas-hub.service port", f"expected --port {port}")
+
+    if client_key:
+        health_url = (
+            os.environ.get("HERMES_VERIFY_ATLAS_HUB_HEALTH_URL")
+            or f"http://{host}:{port}/v1/health"
+        )
+        code = _bearer_http_code(health_url, client_key)
+        if code == "200":
+            s.v_ok(f"Atlas Hub local health: HTTP {code}")
+        else:
+            s.v_drift("Atlas Hub local health", f"{health_url} returned HTTP {code}")
+
+    if public_base_url:
+        _check_atlas_hub_public_route(
+            s,
+            public_base_url=public_base_url,
+            hub_host=host,
+            hub_port=str(port),
+            client_key=client_key,
+        )
+
+
+def _check_atlas_hub_public_route(
+    s: _State,
+    *,
+    public_base_url: str,
+    hub_host: str,
+    hub_port: str,
+    client_key: str,
+) -> None:
+    parsed = urlparse(public_base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        s.v_drift(
+            "Atlas Hub public base URL",
+            "atlas.hub.public_base_url must be an http(s) origin without path, "
+            "query, fragment, or credentials",
+        )
+        return
+
+    caddyfile = Path(s.caddyfile)
+    try:
+        caddy_text = caddyfile.read_text(encoding="utf-8")
+    except OSError as exc:
+        s.v_drift("Atlas Hub public Caddy route", f"cannot read {caddyfile}: {exc}")
+    else:
+        try:
+            ok = caddyfile_has_atlas_hub_route(
+                caddy_text,
+                public_base_url=public_base_url,
+                hub_host=hub_host,
+                hub_port=hub_port,
+            )
+        except ValueError as exc:
+            s.v_drift("Atlas Hub public Caddy route", str(exc))
+        else:
+            if ok:
+                s.v_ok(
+                    "Atlas Hub public Caddy route: "
+                    f"{public_base_url}/v1/* -> {hub_host}:{hub_port}"
+                )
+            else:
+                s.v_drift(
+                    "Atlas Hub public Caddy route",
+                    f"missing managed /v1/* reverse_proxy to {hub_host}:{hub_port}",
+                )
+
+    if client_key:
+        health_url = (
+            os.environ.get("HERMES_VERIFY_ATLAS_HUB_PUBLIC_HEALTH_URL")
+            or f"{public_base_url}/v1/health"
+        )
+        code = _bearer_http_code(health_url, client_key)
+        if code == "200":
+            s.v_ok(f"Atlas Hub public health: HTTP {code}")
+        else:
+            s.v_drift("Atlas Hub public health", f"{health_url} returned HTTP {code}")
+
+
 def _check_codex_prereqs(s: _State) -> None:
     """Codex CLI host-prep checks — fire only when the active quay agent
     invocation path references `codex`. setup-hermes.sh provisions the binary
@@ -2382,6 +2608,13 @@ def run(
             atlas_ai_mode = atlas_ai_mode or "codex-exec"
             if atlas_ai_mode == "codex-exec":
                 codex_required = True
+            atlas_hub_enabled = (
+                _values_get(values_file, values_helper, "atlas.hub.enabled") == "true"
+            )
+        else:
+            atlas_hub_enabled = False
+    else:
+        atlas_hub_enabled = False
 
     quay_bin = os.environ.get("HERMES_VERIFY_QUAY_BIN") or "/usr/local/bin/quay"
 
@@ -2433,11 +2666,13 @@ def run(
         upstream_sync_env=os.environ.get("HERMES_VERIFY_UPSTREAM_SYNC_ENV") or "/etc/default/hermes-upstream-sync",
         reviewer_env=os.environ.get("HERMES_VERIFY_REVIEWER_ENV") or "/etc/hermes/reviewer.env",
         reviewer_key=os.environ.get("HERMES_VERIFY_REVIEWER_KEY") or "/etc/hermes/reviewer.pem",
+        caddyfile=os.environ.get("HERMES_VERIFY_CADDYFILE") or "/etc/caddy/Caddyfile",
         values_file=values_file,
         values_helper=values_helper,
         quay_version=quay_version,
         atlas_version=atlas_version,
         atlas_ai_mode=atlas_ai_mode,
+        atlas_hub_enabled=atlas_hub_enabled,
         codex_required=codex_required,
         quay_tags_supported=quay_tags_supported,
         quay_serve_supported=quay_serve_supported,
@@ -2480,6 +2715,8 @@ def run(
             _check_quay_reference_repos(s, repos_tsv)
     if atlas_version:
         _check_atlas_artefacts(s, app_auth_expected=app_auth_expected)
+        if s.atlas_hub_enabled:
+            _check_atlas_hub_service(s)
     if s.codex_required:
         _check_codex_prereqs(s)
     _check_per_entry_repos(s, repos_tsv, app_auth_expected=app_auth_expected)

@@ -6,6 +6,8 @@
   ``--skip-root-check`` is passed (tests only).
 * ``ensure-codex`` — provision the pinned Codex CLI as a root-managed
   binary when Atlas or the caller say Codex is required.
+* ``ensure-caddy-atlas-hub-route`` — install the public Caddy route that
+  forwards Atlas CLI traffic to the loopback-only Hub service.
 * ``seed-systemd-default-env`` — create a preserved /etc/default override
   file for an installer-managed service.
 * ``render-systemd-unit`` — render a systemd unit template with explicit
@@ -115,6 +117,25 @@ def main(argv: list[str] | None = None) -> int:
         help="bypass the euid==0 assertion (tests only)",
     )
 
+    car = sub.add_parser(
+        "ensure-caddy-atlas-hub-route",
+        help="install the Caddy route that exposes Atlas Hub through HTTPS",
+    )
+    car.add_argument(
+        "--caddyfile",
+        type=Path,
+        default=Path("/etc/caddy/Caddyfile"),
+        help="Caddyfile path to update (default: /etc/caddy/Caddyfile)",
+    )
+    car.add_argument("--public-base-url", required=True, help="public Hub origin")
+    car.add_argument("--hub-host", required=True, help="loopback Atlas Hub host")
+    car.add_argument("--hub-port", required=True, help="loopback Atlas Hub port")
+    car.add_argument(
+        "--skip-root-check",
+        action="store_true",
+        help="bypass the euid==0 assertion (tests only)",
+    )
+
     vr = sub.add_parser("verify", help="read-only health check of a rendered install")
     vr.add_argument("--fork", required=True, type=Path, help="fork repo path")
     vr.add_argument(
@@ -194,6 +215,27 @@ def main(argv: list[str] | None = None) -> int:
             replacements,
             chown_root=not args.skip_root_check,
         )
+        return 0
+
+    if args.cmd == "ensure-caddy-atlas-hub-route":
+        from .caddy import ensure_atlas_hub_route
+
+        if not args.skip_root_check:
+            require_root()
+        try:
+            changed = ensure_atlas_hub_route(
+                args.caddyfile,
+                public_base_url=args.public_base_url,
+                hub_host=args.hub_host,
+                hub_port=args.hub_port,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if changed:
+            print(f"updated {args.caddyfile}")
+        else:
+            print(f"{args.caddyfile} already had the Atlas Hub route")
         return 0
 
     if args.cmd == "verify":
