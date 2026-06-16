@@ -49,7 +49,7 @@ from hermes_installer.verify import VerifyArgs, run as run_verify  # noqa: E402
 def _minimal_quay_values(path: Path) -> None:
     path.write_text(
         "quay:\n"
-        "  version: \"v0.3.34\"\n"
+        "  version: \"v0.3.37\"\n"
         "  adapters:\n"
         "    slack:\n"
         "      enabled: false\n",
