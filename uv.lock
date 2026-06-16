@@ -1435,7 +1435,6 @@ all = [
     { name = "mcp" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
-    { name = "pytest-timeout" },
     { name = "ruff" },
     { name = "setuptools" },
     { name = "simple-term-menu" },
