@@ -391,10 +391,23 @@ _is_legacy_state_repo_fixture() {
     && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]]
 }
 
+_use_local_state_repo_source_for_quay() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]] || return 1
+  if [[ "$AUTH_METHOD" == "none" ]]; then
+    return 0
+  fi
+  [[ -z "$STATE_ORIGIN_URL" \
+    || ! "$STATE_ORIGIN_URL" =~ ^(https?://|ssh://|git://|git@) ]]
+}
+
 _effective_repo_url() {
   local repo_id="$1"
   local repo_url="$2"
-  if _is_legacy_state_repo_fixture "$repo_id" "$repo_url"; then
+  if _use_local_state_repo_source_for_quay "$repo_id" "$repo_url"; then
     printf 'file://%s\n' "$STATE_DIR"
   else
     printf '%s\n' "$repo_url"
@@ -404,9 +417,7 @@ _effective_repo_url() {
 _alternate_clone_origin_urls() {
   local repo_id="$1"
   local repo_url="$2"
-  [[ -n "$STATE_DIR" \
-    && "$repo_id" == "hermes-state" \
-    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]] || return 0
+  _use_local_state_repo_source_for_quay "$repo_id" "$repo_url" || return 0
   printf '%s\n' "$STATE_DIR"
   printf 'file://%s\n' "$STATE_DIR"
 }
