@@ -51,6 +51,7 @@ class VerifyArgs:
     auth_method: str = "none"
     quiet: bool = False
     values: Path | None = None
+    state: Path | None = None
     gh_api_base: str | None = None
 
 
@@ -778,6 +779,26 @@ def _parse_repos_tsv(tsv: str) -> list[tuple[str, str, str, str, str]]:
         parts += [""] * (5 - len(parts))
         rows.append(tuple(parts[:5]))  # type: ignore[arg-type]
     return rows
+
+
+def _is_legacy_state_repo_fixture(
+    args: VerifyArgs, repo_id: str, repo_url: str,
+) -> bool:
+    return (
+        args.auth_method == "none"
+        and args.state is not None
+        and repo_id == "hermes-state"
+        and repo_url == "https://github.com/InverterNetwork/hermes-state"
+    )
+
+
+def _effective_repos_tsv(args: VerifyArgs, repos_tsv: str) -> str:
+    rows = []
+    for repo_id, repo_url, repo_base, repo_pkg, repo_install in _parse_repos_tsv(repos_tsv):
+        if _is_legacy_state_repo_fixture(args, repo_id, repo_url):
+            repo_url = f"file://{args.state}"
+        rows.append("\t".join((repo_id, repo_url, repo_base, repo_pkg, repo_install)))
+    return "\n".join(rows)
 
 
 def _parse_quay_version(value: str) -> tuple[int, int, int] | None:
@@ -2708,6 +2729,7 @@ def run(
             "repos[] schema",
             "values_helper.py list-repos exited non-zero (run it manually for details)",
         )
+    repos_tsv = _effective_repos_tsv(args, repos_tsv)
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
         _check_quay_github_app_gitconfig(s, required=app_auth_expected)

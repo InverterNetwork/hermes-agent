@@ -229,6 +229,7 @@ if [[ "$VERIFY" -eq 1 ]]; then
   )
   [[ "$QUIET" -eq 1 ]]      && verify_args+=( --quiet )
   [[ -n "$VALUES_FILE" ]]   && verify_args+=( --values "$VALUES_FILE" )
+  [[ -n "$STATE_DIR" ]]     && verify_args+=( --state "$STATE_DIR" )
   [[ -n "$GH_API_BASE" ]]   && verify_args+=( --gh-api-base "$GH_API_BASE" )
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   exec env "PYTHONPATH=$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
@@ -370,9 +371,36 @@ fi
 # clone/push; SSH deploy-key rewrites are skipped for those entries. Fail fast
 # before any provisioning so the operator doesn't half-install with an auth
 # model that can't push.
+_is_legacy_state_repo_fixture() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ "$AUTH_METHOD" == "none" \
+    && -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]]
+}
+
+_effective_repo_url() {
+  local repo_id="$1"
+  local repo_url="$2"
+  if _is_legacy_state_repo_fixture "$repo_id" "$repo_url"; then
+    printf 'file://%s\n' "$STATE_DIR"
+  else
+    printf '%s\n' "$repo_url"
+  fi
+}
+
+_repo_config_with_effective_url() {
+  local repo_config_json="$1"
+  local repo_url="$2"
+  python3 -c 'import json, sys; p=json.loads(sys.argv[1]); p["repo_url"]=sys.argv[2]; print(json.dumps(p, separators=(",", ":")))' \
+    "$repo_config_json" "$repo_url"
+}
+
 _quay_gh_ids=()
 while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
   [[ -z "$repo_id" || -z "$repo_pkg" ]] && continue
+  _is_legacy_state_repo_fixture "$repo_id" "$repo_url" && continue
   [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]] || continue
   _quay_gh_ids+=("$repo_id")
 done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos 2>/dev/null || true)
@@ -1710,6 +1738,8 @@ fi
 if [[ -n "$ALL_REPOS_TSV" ]]; then
   while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
     [[ -z "$repo_id" ]] && continue
+    repo_values_url="$repo_url"
+    repo_url="$(_effective_repo_url "$repo_id" "$repo_url")"
 
     # ---- per-repo url.insteadOf rewrite (code-only github.com entries) ----
     # quay-managed github.com entries skip the SSH rewrite and use the App
@@ -1840,6 +1870,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
               get-repo-config "$repo_id" --mode update
           )"
+          if _is_legacy_state_repo_fixture "$repo_id" "$repo_values_url"; then
+            repo_config_json="$(_repo_config_with_effective_url "$repo_config_json" "$repo_url")"
+          fi
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo update \
               --id "$repo_id" \
@@ -1850,6 +1883,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
               get-repo-config "$repo_id" --mode add
           )"
+          if _is_legacy_state_repo_fixture "$repo_id" "$repo_values_url"; then
+            repo_config_json="$(_repo_config_with_effective_url "$repo_config_json" "$repo_url")"
+          fi
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
               --input "$repo_config_json" >/dev/null
