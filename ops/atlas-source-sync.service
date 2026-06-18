@@ -11,6 +11,7 @@ Environment=HERMES_HOME=__TARGET_DIR__
 Environment=ATLAS_CONFIG=__ATLAS_CONFIG__
 Environment=ATLAS_SYNC_SOURCE_NAMES=__ATLAS_SYNC_SOURCE_NAMES__
 Environment=HERMES_ATLAS_SOURCE_READER_GH_CONFIG=__TARGET_DIR__/auth/atlas-source-reader.env
+EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env
 EnvironmentFile=-__TARGET_DIR__/auth/atlas.env
 EnvironmentFile=-/etc/default/atlas-source-sync
 ExecStart=/usr/local/sbin/atlas-source-sync-runner

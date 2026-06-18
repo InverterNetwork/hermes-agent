@@ -338,7 +338,9 @@ def test_atlas_gitbook_source_sync_is_configured():
     wrapper = (OPS_DIR / "atlas-as-hermes").read_text(encoding="utf-8")
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
-    assert 'version: "v0.1.10"' in values
+    assert 'version: "v0.1.11"' in values
+    assert "google_docs:" in values
+    assert "service_account_file: auth/otto-google-sa.json" in values
     assert "source_names:" in values
     assert "- emusd-docs" in values
     assert "- brix-product-docs" in values
@@ -353,13 +355,18 @@ def test_atlas_gitbook_source_sync_is_configured():
     assert "atlas.sources.$atlas_source_name.space_id" in installer
     assert "atlas.sources.$atlas_source_name.token_env" in installer
     assert 'ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"' in installer
+    assert 'ATLAS_RUNTIME_ENV="$AUTH_DIR/atlas-runtime.env"' in installer
+    assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" in installer
 
     assert "Environment=ATLAS_SYNC_SOURCE_NAMES=__ATLAS_SYNC_SOURCE_NAMES__" in service
+    assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env" in service
     assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas.env" in service
     assert "ATLAS_SYNC_SOURCE_NAMES" in runner
     assert 'for source_name in "${source_names[@]}"' in runner
     assert 'sync source "$source_name"' in runner
+    assert "__TARGET_DIR__/auth/atlas-runtime.env" in wrapper
     assert "__TARGET_DIR__/auth/atlas.env" in wrapper
+    assert "__TARGET_DIR__/auth/atlas-runtime.env" in profile
     assert "__TARGET_DIR__/auth/atlas.env" in profile
 
 
@@ -379,6 +386,7 @@ def test_atlas_hub_service_is_loopback_and_key_protected():
     assert "Environment=ATLAS_CONFIG=__ATLAS_CONFIG__" in service
     assert "Environment=ATLAS_KB_ROOT=__ATLAS_KB_ROOT__" in service
     assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas.env" in service
+    assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env" in service
     assert "EnvironmentFile=-/etc/default/atlas-hub" in service
 
     assert 'ATLAS_HUB_AUTH_FILE="$AUTH_DIR/atlas-hub-auth.json"' in installer
