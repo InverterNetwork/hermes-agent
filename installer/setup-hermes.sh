@@ -203,8 +203,19 @@ _git_as_owner() {
 # preserve check.
 _check_clone_origin_or_die() {
   local kind="$1" dir="$2" expected_url="$3"
+  shift 3
   local actual_url
   actual_url="$(_git_as_owner "$dir" config --get remote.origin.url 2>/dev/null || true)"
+  if [[ "$actual_url" == "$expected_url" ]]; then
+    return 0
+  fi
+  local alternate_url
+  for alternate_url in "$@"; do
+    [[ -n "$alternate_url" ]] || continue
+    if [[ "$actual_url" == "$alternate_url" ]]; then
+      return 0
+    fi
+  done
   if [[ "$actual_url" != "$expected_url" ]]; then
     echo "FAIL: $dir origin=$actual_url, expected $expected_url" >&2
     echo "      refusing to silently re-point an existing $kind." >&2
@@ -388,6 +399,16 @@ _effective_repo_url() {
   else
     printf '%s\n' "$repo_url"
   fi
+}
+
+_alternate_clone_origin_urls() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]] || return 0
+  printf '%s\n' "$STATE_DIR"
+  printf 'file://%s\n' "$STATE_DIR"
 }
 
 _repo_config_with_effective_url() {
@@ -1812,8 +1833,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
 
     # ---- code mirror at $TARGET/code/<id>/ ----
     code_dir="$CODE_ROOT/$repo_id"
+    mapfile -t alternate_clone_origins < <(_alternate_clone_origin_urls "$repo_id" "$repo_values_url")
     if [[ -d "$code_dir/.git" ]]; then
-      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url"
+      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url" "${alternate_clone_origins[@]}"
       echo "==> code mirror $repo_id present at $code_dir (preserving)"
     else
       echo "==> cloning $repo_url into $code_dir"
@@ -1842,7 +1864,7 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
       else
         bare="$TARGET_DIR/quay/repos/${repo_id}.git"
         if [[ -d "$bare" ]]; then
-          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url"
+          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url" "${alternate_clone_origins[@]}"
           echo "==> quay bare clone $repo_id present (preserving)"
         else
           echo "==> cloning $repo_url into $bare"

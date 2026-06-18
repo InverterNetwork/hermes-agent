@@ -466,6 +466,9 @@ def test_installer_supports_local_hermes_state_quay_fixture():
     ).read_text(encoding="utf-8")
 
     assert "_is_legacy_state_repo_fixture" in installer
+    assert "_alternate_clone_origin_urls" in installer
+    assert 'mapfile -t alternate_clone_origins' in installer
+    assert '"${alternate_clone_origins[@]}"' in installer
     assert '"$repo_id" == "hermes-state"' in installer
     assert '"$repo_url" == "https://github.com/InverterNetwork/hermes-state"' in installer
     assert 'verify_args+=( --state "$STATE_DIR" )' in installer
