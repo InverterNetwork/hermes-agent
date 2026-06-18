@@ -1,0 +1,31 @@
+[Unit]
+Description=Atlas Hub API server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User/Group and target-dir-derived paths are substituted by setup-hermes.sh
+# at install time so non-default --user / --target values stay coherent.
+User=__AGENT_USER__
+Group=__AGENT_USER__
+Environment=HERMES_HOME=__TARGET_DIR__
+Environment=ATLAS_CONFIG=__ATLAS_CONFIG__
+Environment=ATLAS_KB_ROOT=__ATLAS_KB_ROOT__
+Environment=ATLAS_AI_MODE=__ATLAS_AI_MODE__
+Environment=ATLAS_CODEX_BIN=__ATLAS_CODEX_BIN__
+Environment=ATLAS_CODEX_TIMEOUT_MS=__ATLAS_CODEX_TIMEOUT_MS__
+# Atlas source secrets such as GITBOOK_API_TOKEN live here when configured.
+EnvironmentFile=-__TARGET_DIR__/auth/atlas.env
+# Optional operator-only extra env. Keep Hub API keys in <HERMES_HOME>/auth/.
+EnvironmentFile=-/etc/default/atlas-hub
+WorkingDirectory=__ATLAS_KB_ROOT__
+# Bind loopback only. Network clients must reach this through a TLS-terminating
+# reverse proxy or an SSH tunnel, never by widening the Atlas listener.
+ExecStart=/usr/local/bin/atlas --config __ATLAS_CONFIG__ serve --host __ATLAS_HUB_HOST__ --port __ATLAS_HUB_PORT__
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

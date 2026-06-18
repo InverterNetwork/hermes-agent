@@ -338,7 +338,7 @@ def test_atlas_gitbook_source_sync_is_configured():
     wrapper = (OPS_DIR / "atlas-as-hermes").read_text(encoding="utf-8")
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
-    assert 'version: "v0.1.6"' in values
+    assert 'version: "v0.1.10"' in values
     assert "source_names:" in values
     assert "- emusd-docs" in values
     assert "- brix-product-docs" in values
@@ -361,6 +361,38 @@ def test_atlas_gitbook_source_sync_is_configured():
     assert 'sync source "$source_name"' in runner
     assert "__TARGET_DIR__/auth/atlas.env" in wrapper
     assert "__TARGET_DIR__/auth/atlas.env" in profile
+
+
+def test_atlas_hub_service_is_loopback_and_key_protected():
+    values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    service = (OPS_DIR / "atlas-hub.service").read_text(encoding="utf-8")
+
+    assert "hub:" in values
+    assert "enabled: true" in values
+    assert "host: 127.0.0.1" in values
+    assert "port: 8765" in values
+    assert "public_base_url: https://didier.brix.fyi" in values
+    assert "query_concurrency: 4" in values
+
+    assert "ExecStart=/usr/local/bin/atlas --config __ATLAS_CONFIG__ serve --host __ATLAS_HUB_HOST__ --port __ATLAS_HUB_PORT__" in service
+    assert "Environment=ATLAS_CONFIG=__ATLAS_CONFIG__" in service
+    assert "Environment=ATLAS_KB_ROOT=__ATLAS_KB_ROOT__" in service
+    assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas.env" in service
+    assert "EnvironmentFile=-/etc/default/atlas-hub" in service
+
+    assert 'ATLAS_HUB_AUTH_FILE="$AUTH_DIR/atlas-hub-auth.json"' in installer
+    assert 'ATLAS_HUB_CLIENT_API_KEY_FILE="$AUTH_DIR/atlas-hub-client-api-key"' in installer
+    assert '"$ATLAS_BIN_DST" hub keygen --scope v1:*' in installer
+    assert "atlas.hub.host must be 127.0.0.1 or localhost" in installer
+    assert "atlas-hub.service" in installer
+    assert "systemctl enable --now atlas-hub.service" in installer
+    assert "systemctl try-restart atlas-hub.service" in installer
+    assert "http://$ATLAS_HUB_HOST:$ATLAS_HUB_PORT/v1/health" in installer
+    assert "ensure-caddy-atlas-hub-route" in installer
+    assert "caddy validate --config /etc/caddy/Caddyfile" in installer
+    assert "$ATLAS_HUB_PUBLIC_BASE_URL/v1/health" in installer
+    assert "Authorization: Bearer $atlas_hub_key" in installer
 
 
 def test_quay_tick_service_carries_reviewer_token_minting_env():

@@ -550,6 +550,15 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+  - id: itry-liquidation-bot
+    url: https://github.com/InverterNetwork/itry-liquidation-bot
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: itry
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
   - id: brix-indexer
     url: https://github.com/InverterNetwork/brix-indexer
     # GH default branch is `dev` (not `main`). The code-sync timer
@@ -697,7 +706,7 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.6"
+  version: "v0.1.11"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
@@ -708,6 +717,20 @@ atlas:
     mode: codex-exec
     codex_binary: /usr/local/bin/codex
     codex_timeout_ms: 120000
+  # Atlas Hub is served as a loopback-only API. Public access must terminate
+  # TLS in a reverse proxy that forwards to this listener, or operators can
+  # use an SSH tunnel for local CLI access. public_base_url must be an origin,
+  # because the Atlas CLI stores Hub targets as origins and appends /v1/* API
+  # paths itself.
+  hub:
+    enabled: true
+    host: 127.0.0.1
+    port: 8765
+    public_base_url: https://didier.brix.fyi
+    # Empty means "$HERMES_HOME/atlas-hub". Auth files are installer-managed
+    # under "$HERMES_HOME/auth/" so raw API keys never enter values.yaml.
+    data_dir: ""
+    query_concurrency: 4
   github_app:
     id: "3925386"
     installation_id: "137066070"
