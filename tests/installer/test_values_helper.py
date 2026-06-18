@@ -1646,6 +1646,14 @@ class TestListRepos:
             "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
         ]
 
+    def test_deployment_registers_hermes_state_for_quay(self):
+        r = _run(REPO_ROOT / "deploy.values.yaml", "list-repos", "--quay")
+        assert r.returncode == 0, r.stderr
+        assert (
+            "hermes-state\thttps://github.com/InverterNetwork/hermes-state\tmain\tbun\ttrue"
+            in r.stdout.splitlines()
+        )
+
     def test_get_repo_config_add_emits_quay_payload_with_optional_fields(
         self, tmp_path: Path
     ):

@@ -1,6 +1,6 @@
 # BRIX-1410: Quay Repo Registration
 
-Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all 11 are quay-managed):
+Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all 12 are quay-managed):
 
 | repo id | remote | base branch | package manager | install cmd |
 | --- | --- | --- | --- | --- |
@@ -14,6 +14,7 @@ Source of truth is [`deploy.values.yaml`](../deploy.values.yaml) `repos:` (all 1
 | `iTry-contracts` | `https://github.com/InverterNetwork/iTry-contracts` | `main` | `bun` | `true` |
 | `quay` | `https://github.com/InverterNetwork/quay` | `dev` | `bun` | `bun install` |
 | `hermes-agent` | `https://github.com/InverterNetwork/hermes-agent` | `main` | `bun` | `bun install` |
+| `hermes-state` | `https://github.com/InverterNetwork/hermes-state` | `main` | `bun` | `true` |
 | `atlas` | `https://github.com/InverterNetwork/atlas` | `dev` | `bun` | `bun install` |
 
 ## Verification commands
@@ -31,7 +32,7 @@ Deployed host (post-deploy):
 sudo /usr/local/bin/quay-as-hermes repo list
 ```
 
-Expected: all 11 repo ids above are present.
+Expected: all 12 repo ids above are present, including `hermes-state`.
 
 ## Enqueue verification / dry-run equivalent
 
@@ -41,3 +42,4 @@ If no suitable issue exists for a repo yet, record the dry-run equivalent as:
 
 1. `quay-as-hermes repo list` shows the repo id.
 2. `installer/hermes_installer/verify.py --verify` reports the repo as registered (no `[DRIFT] quay repo <id>`).
+3. For `hermes-state`, a real `quay-as-hermes enqueue --linear-issue <ISSUE>` using an issue whose repo is `hermes-state` succeeds; this proves routing and local materialization, not just registration.
