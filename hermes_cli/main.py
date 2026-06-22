@@ -538,6 +538,16 @@ try:
     if _cfg_path.exists():
         with open(_cfg_path, encoding="utf-8") as _f:
             _early_cfg_raw = _yaml_early.safe_load(_f) or {}
+        # Managed scope: overlay administrator-pinned values so a managed
+        # security.redact_secrets / network.force_ipv4 wins here too. This early
+        # bridge reads config.yaml directly (before load_config is usable), so
+        # without the overlay a managed redact_secrets toggle would be ignored.
+        # Fail-open via the shared helper.
+        try:
+            from hermes_cli import managed_scope
+            _early_cfg_raw = managed_scope.apply_managed_overlay(_early_cfg_raw)
+        except Exception:
+            pass
         if "HERMES_REDACT_SECRETS" not in os.environ:
             _early_sec_cfg = _early_cfg_raw.get("security", {})
             if isinstance(_early_sec_cfg, dict):
@@ -599,7 +609,6 @@ from hermes_cli.model_setup_flows import (
     _model_flow_xai_oauth,
     _model_flow_qwen_oauth,
     _model_flow_minimax_oauth,
-    _model_flow_google_gemini_cli,
     _model_flow_custom,
     _model_flow_azure_foundry,
     _model_flow_named_custom,
@@ -1647,6 +1656,64 @@ def _find_bundled_tui(hermes_cli_dir: Path | None = None) -> Path | None:
     return bundled if bundled.is_file() else None
 
 
+def _restore_tui_workspace(tui_dir: Path) -> bool:
+    """Try to restore a missing ``ui-tui/`` from git, returning True on success.
+
+    On Windows an antivirus / NTFS filter driver can leave tracked ``ui-tui/``
+    files deleted in the working tree after ``hermes update`` (HEAD stays
+    intact; the files just vanish — see issue #49145). Those files are tracked,
+    so ``git restore`` puts them back deterministically. Best-effort: returns
+    False (rather than raising) when git is unavailable, this isn't a checkout,
+    or the restore leaves the directory still missing — the caller then prints
+    the manual-recovery message.
+    """
+    git = shutil.which("git")
+    if not git or not (tui_dir.parent / ".git").exists():
+        return False
+    try:
+        subprocess.run(
+            [git, "restore", "--", tui_dir.name],
+            cwd=str(tui_dir.parent),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return tui_dir.is_dir()
+
+
+def _ensure_tui_workspace(tui_dir: Path) -> None:
+    """Ensure ``ui-tui/`` exists before any npm/node subprocess uses it as cwd.
+
+    Without this, a missing workspace falls through to ``subprocess.run(...,
+    cwd=<missing ui-tui>)``, which crashes with ``NotADirectoryError``
+    (``WinError 267`` on Windows) instead of a usable message (#49145). We
+    first try to self-heal via ``git restore``; only if that can't recover the
+    directory do we abort with concrete manual-recovery steps.
+    """
+    if tui_dir.is_dir():
+        return
+
+    if _restore_tui_workspace(tui_dir):
+        if not os.environ.get("HERMES_QUIET"):
+            print(f"Restored missing TUI workspace: {tui_dir}")
+        return
+
+    print(
+        "Error: the TUI workspace is missing from this Hermes checkout.\n"
+        f"Expected directory: {tui_dir}\n"
+        "This usually means `hermes update` left tracked ui-tui files deleted.\n"
+        "Recovery:\n"
+        "  1. From the Hermes checkout, run `git restore -- ui-tui`\n"
+        "  2. Run `npm install --silent --no-fund --no-audit --progress=false`\n"
+        "  3. Retry `hermes --tui`\n"
+        "If the checkout is still inconsistent, run `hermes update --force`.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
@@ -1679,6 +1746,9 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    if not ext_dir:
+        _ensure_tui_workspace(tui_dir)
 
     # 1. Prebuilt bundle (nix / packaged release): just run it.
     if not tui_dev:
@@ -2360,6 +2430,7 @@ def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
     from hermes_cli.config import get_env_value, save_env_value
+    from hermes_constants import find_node_executable, with_hermes_node_path
 
     print()
     print("⚕ WhatsApp Setup")
@@ -2462,8 +2533,8 @@ def cmd_whatsapp(args):
             print("  ⚠ No allowlist — the agent will respond to ALL incoming messages")
 
     # ── Step 4: Install bridge dependencies ──────────────────────────────
-    project_root = Path(__file__).resolve().parents[1]
-    bridge_dir = project_root / "scripts" / "whatsapp-bridge"
+    from gateway.platforms.whatsapp_common import resolve_whatsapp_bridge_dir
+    bridge_dir = resolve_whatsapp_bridge_dir()
     bridge_script = bridge_dir / "bridge.js"
 
     if not bridge_script.exists():
@@ -2474,7 +2545,7 @@ def cmd_whatsapp(args):
         print(
             "\n→ Installing WhatsApp bridge dependencies (this can take a few minutes)..."
         )
-        npm = shutil.which("npm")
+        npm = find_node_executable("npm")
         if not npm:
             print("  ✗ npm not found on PATH — install Node.js first")
             return
@@ -2487,6 +2558,7 @@ def cmd_whatsapp(args):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=with_hermes_node_path(),
             )
         except KeyboardInterrupt:
             print("\n  ✗ Install cancelled")
@@ -2543,8 +2615,15 @@ def cmd_whatsapp(args):
 
     try:
         subprocess.run(
-            ["node", str(bridge_script), "--pair-only", "--session", str(session_dir)],
+            [
+                find_node_executable("node") or "node",
+                str(bridge_script),
+                "--pair-only",
+                "--session",
+                str(session_dir),
+            ],
             cwd=str(bridge_dir),
+            env=with_hermes_node_path(),
         )
     except KeyboardInterrupt:
         pass
@@ -2999,8 +3078,6 @@ def select_provider_and_model(args=None):
         _model_flow_qwen_oauth(config, current_model)
     elif selected_provider == "minimax-oauth":
         _model_flow_minimax_oauth(config, current_model, args=args)
-    elif selected_provider == "google-gemini-cli":
-        _model_flow_google_gemini_cli(config, current_model)
     elif selected_provider == "copilot-acp":
         _model_flow_copilot_acp(config, current_model)
     elif selected_provider == "copilot":
@@ -3528,14 +3605,6 @@ _DEFAULT_QWEN_PORTAL_MODELS = [
     "qwen3-coder-plus",
     "qwen3-coder",
 ]
-
-
-
-
-
-
-
-
 
 
 def _prompt_custom_api_mode_selection(base_url: str, current_api_mode: str = "") -> Optional[str]:
@@ -4532,6 +4601,7 @@ def _run_with_idle_timeout(
     *,
     idle_timeout_seconds: int = 180,
     indent: str = "    ",
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess that streams output, with an idle-output timeout.
 
@@ -4566,6 +4636,7 @@ def _run_with_idle_timeout(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
     except OSError as exc:
         # E.g. npm not on PATH between the which() check and now.
@@ -4757,12 +4828,15 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             encoding = getattr(sys.stdout, "encoding", None) or "ascii"
             print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
-    npm = shutil.which("npm")
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    npm = find_node_executable("npm")
     if not npm:
         if fatal:
             _say("Web UI frontend not built and npm is not available.")
             _say("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
+    build_env = with_hermes_node_path()
     _say("→ Building web UI...")
 
     def _relay(result: "subprocess.CompletedProcess") -> None:
@@ -4794,6 +4868,7 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         npm,
         npm_cwd,
         extra_args=(*npm_workspace_args, "--silent"),
+        env=build_env,
     )
     if r1.returncode != 0:
         _say(
@@ -4809,13 +4884,13 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # users react by rebooting, which leaves the editable install in a
     # half-state. Streaming + idle-kill makes failures observable AND
     # recoverable (the stale-dist fallback below handles the kill path).
-    r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir)
+    r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
     if r2.returncode != 0:
         # Retry once after a short delay — covers boot-time races on Windows
         # (antivirus scanning Node.js binaries, npm cache not ready, transient
         # I/O when launched via Scheduled Task at logon). See issue #23817.
         _time.sleep(3)
-        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir)
+        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
 
     if r2.returncode != 0:
         # _run_with_idle_timeout merges stderr into stdout; older callers
@@ -5117,6 +5192,115 @@ def _purge_electron_build_cache(desktop_dir: Path) -> list[Path]:
     return removed
 
 
+# Last-resort Electron mirror after GitHub download fails (#47266). Only used
+# when the user hasn't pinned ELECTRON_MIRROR.
+_ELECTRON_FALLBACK_MIRROR = "https://npmmirror.com/mirrors/electron/"
+
+
+def _electron_dir(project_root: Path) -> Path:
+    """Return the Electron package directory the desktop workspace installs.
+
+    npm may keep workspace-only dev dependencies under
+    ``apps/desktop/node_modules`` instead of hoisting them to the repo root.
+    Which layout you get depends on the npm version and what else is installed,
+    so a build path that assumes one or the other breaks intermittently across
+    machines. ``apps/desktop/package.json`` points electron-builder's
+    ``electronDist`` at ``node_modules/electron/dist`` relative to the desktop
+    project, so prefer the workspace-local package and fall back to the root
+    hoist when that's where npm landed it.
+    """
+    desktop_local = project_root / "apps" / "desktop" / "node_modules" / "electron"
+    if desktop_local.exists():
+        return desktop_local
+    return project_root / "node_modules" / "electron"
+
+
+def _electron_dist_binary(project_root: Path) -> Path:
+    """Return the path to the Electron main binary inside the installed package.
+
+    electron-builder reads the binary from ``build.electronDist`` since #38673,
+    so this is the exact file whose absence makes a pack fail with "The
+    specified electronDist does not exist". The basename differs per OS (the
+    platform Electron is named for the host the build runs on).
+    """
+    dist = _electron_dir(project_root) / "dist"
+    if sys.platform == "darwin":
+        return dist / "Electron.app" / "Contents" / "MacOS" / "Electron"
+    if sys.platform == "win32":
+        return dist / "electron.exe"
+    return dist / "electron"
+
+
+def _electron_dist_ok(project_root: Path) -> bool:
+    """True when ``node_modules/electron/dist`` holds a usable Electron binary.
+
+    A directory that exists but is missing the binary (a partial extraction from
+    a corrupt cached zip, or an interrupted postinstall) counts as NOT ok, since
+    that is exactly the shape that makes electron-builder throw on the pinned
+    electronDist.
+    """
+    try:
+        return _electron_dist_binary(project_root).exists()
+    except OSError:
+        return False
+
+
+def _electron_pkg_staged_missing_dist(project_root: Path) -> bool:
+    """electron staged (package.json + install.js) but dist missing — blocked postinstall."""
+    electron_dir = _electron_dir(project_root)
+    return (
+        (electron_dir / "package.json").is_file()
+        and (electron_dir / "install.js").is_file()
+        and not _electron_dist_ok(project_root)
+    )
+
+
+def _redownload_electron_dist(
+    project_root: Path,
+    env: dict,
+    *,
+    mirror: Optional[str] = None,
+) -> bool:
+    """Best-effort: run electron's install.js to populate dist/ (optional mirror)."""
+    if _electron_dist_ok(project_root):
+        return True
+
+    electron_dir = _electron_dir(project_root)
+    installer = electron_dir / "install.js"
+    if not installer.is_file():
+        return False
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    node = find_node_executable("node")
+    if not node:
+        return False
+
+    dist_dir = electron_dir / "dist"
+    shutil.rmtree(dist_dir, ignore_errors=True)
+    try:
+        (electron_dir / "path.txt").unlink()
+    except OSError:
+        pass
+
+    dl_env = with_hermes_node_path(env)
+    if mirror:
+        dl_env["ELECTRON_MIRROR"] = mirror
+    try:
+        subprocess.run([node, str(installer)], cwd=str(electron_dir), env=dl_env, check=False)
+    except OSError:
+        return False
+    return _electron_dist_ok(project_root)
+
+
+def _try_redownload_electron_dist(project_root: Path, env: dict) -> bool:
+    """Canonical download, then fallback mirror unless the user pinned one."""
+    if _redownload_electron_dist(project_root, env):
+        return True
+    if env.get("ELECTRON_MIRROR"):
+        return False
+    return _redownload_electron_dist(project_root, env, mirror=_ELECTRON_FALLBACK_MIRROR)
+
+
 def _stop_desktop_processes_locking_build(desktop_dir: Path) -> list[int]:
     """Terminate any running desktop app executing from this build's ``release``
     dir so a rebuild can replace its (otherwise locked) executable.
@@ -5278,7 +5462,10 @@ def cmd_gui(args: argparse.Namespace):
     except Exception:
         pass
 
-    env = os.environ.copy()
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    # with_hermes_node_path() copies os.environ when called with no arg.
+    env = with_hermes_node_path()
     if getattr(args, "fake_boot", False):
         env["HERMES_DESKTOP_BOOT_FAKE"] = "1"
     if getattr(args, "ignore_existing", False):
@@ -5295,7 +5482,7 @@ def cmd_gui(args: argparse.Namespace):
     packaged_executable = _desktop_packaged_executable(desktop_dir)
 
     if source_mode or not skip_build:
-        npm = shutil.which("npm")
+        npm = find_node_executable("npm")
         if not npm:
             print("Desktop GUI requires Node.js/npm, but npm was not found on PATH.")
             print("Install Node.js, then run:  hermes gui")
@@ -5310,8 +5497,8 @@ def cmd_gui(args: argparse.Namespace):
                 print("  Pre-build first:  cd apps/desktop && npm run build")
                 print("  Or drop --skip-build to install dependencies and build automatically.")
                 sys.exit(1)
-            if not (PROJECT_ROOT / "node_modules" / "electron" / "package.json").exists():
-                print("✗ --skip-build --source requires existing workspace dependencies.")
+            if not (_electron_dir(PROJECT_ROOT) / "package.json").exists():
+                print("✗ --skip-build --source requires existing desktop workspace dependencies.")
                 print(f"  Install first:  cd {PROJECT_ROOT} && npm ci")
                 print("  Or drop --skip-build to install dependencies and build automatically.")
                 sys.exit(1)
@@ -5339,9 +5526,18 @@ def cmd_gui(args: argparse.Namespace):
             nixos_env = _nixos_build_env()
             install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
             if install_result.returncode != 0:
-                print("✗ Desktop dependency install failed")
-                print(f"  Run manually:  cd {PROJECT_ROOT} && npm ci")
-                sys.exit(install_result.returncode or 1)
+                if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
+                    print("✗ Desktop dependency install failed")
+                    print(f"  Run manually:  cd {PROJECT_ROOT} && npm ci")
+                    sys.exit(install_result.returncode or 1)
+                repaired = _try_redownload_electron_dist(PROJECT_ROOT, env)
+                if repaired:
+                    print("  ⚠ Dependency install failed with a missing Electron dist; "
+                          "repopulated it and continuing.")
+                else:
+                    print("  ⚠ Dependency install failed with a missing Electron dist; "
+                          "continuing to the build so electron-builder can attempt "
+                          "the Electron fetch itself.")
 
             build_label = "source build" if source_mode else "packaged app"
             print(f"→ Building desktop {build_label}...")
@@ -5357,22 +5553,16 @@ def cmd_gui(args: argparse.Namespace):
                     print(f"  ⚠ Stopped running desktop app to free the build output (pid {', '.join(map(str, stopped))})")
             build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
             if build_result.returncode != 0 and not source_mode:
-                # A corrupt cached Electron zip makes `pack` fail with an ENOENT
-                # on the final `electron` -> `Hermes` rename: unpack-electron
-                # extracted a partial tree (missing the 193 MB binary) from the
-                # bad zip. We do NOT try to prove the zip is corrupt ourselves —
-                # stdlib zipfile silently tolerates the prepended/concatenated
-                # junk that is the most common corruption (a partial download
-                # resumed into the same file), so a `testzip()` gate would pass
-                # and never self-heal. Instead, on any packaged-build failure we
-                # purge the version's cached zip + the half-written unpacked dir
-                # and retry once: @electron/get re-downloads with its own SHASUM
-                # verification, which is the real source of truth. If the
-                # failure was something else, the clean re-download is harmless
-                # and the retry fails the same way.
-                purged = _purge_electron_build_cache(desktop_dir)
-                if purged:
-                    print("  ⚠ Desktop build failed; cleared cached Electron download and retrying once...")
+                # Corrupt cached Electron zip → partial unpack → ENOENT on rename.
+                # stdlib zipfile won't catch the common concat-junk case, so purge
+                # and retry once; @electron/get SHASUM is the real gate.
+                purged: list[Path] = []
+                restored = False
+                if not _electron_dist_ok(PROJECT_ROOT):
+                    purged = _purge_electron_build_cache(desktop_dir)
+                    restored = _redownload_electron_dist(PROJECT_ROOT, env)
+                if restored:
+                    print("  ⚠ Desktop build failed; refreshed the Electron download and retrying once...")
                     for p in purged:
                         print(f"    - {p}")
                     # The purge can't remove a win-unpacked tree whose Hermes.exe
@@ -5380,20 +5570,14 @@ def cmd_gui(args: argparse.Namespace):
                     _stop_desktop_processes_locking_build(desktop_dir)
                     build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
             if build_result.returncode != 0 and not source_mode and not env.get("ELECTRON_MIRROR"):
-                # Still failing and the user hasn't pinned a mirror: GitHub's
-                # Electron release host is likely blocked/throttled (the repeating
-                # "retrying" download log). Retry once via npmmirror.com — the
-                # de-facto Electron community mirror (Alibaba). @electron/get
-                # SHASUM-checks the download, but the SHASUMS come from the same
-                # mirror, so that guards against a corrupt/partial download, NOT
-                # a compromised mirror: reaching for it is an explicit trust
-                # trade-off we only make AFTER the canonical GitHub download has
-                # failed, and we never override a user-pinned ELECTRON_MIRROR.
                 print("  ⚠ Desktop build still failing; the Electron download from "
-                      "GitHub looks blocked. Retrying once via a public mirror "
+                      "GitHub looks blocked. Re-downloading via a public mirror "
                       "(npmmirror.com)... (set ELECTRON_MIRROR to use another mirror)")
+                mirror = _ELECTRON_FALLBACK_MIRROR
                 mirror_env = dict(env)
-                mirror_env["ELECTRON_MIRROR"] = "https://npmmirror.com/mirrors/electron/"
+                mirror_env["ELECTRON_MIRROR"] = mirror
+                if not _electron_dist_ok(PROJECT_ROOT):
+                    _redownload_electron_dist(PROJECT_ROOT, env, mirror=mirror)
                 _stop_desktop_processes_locking_build(desktop_dir)
                 build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=mirror_env, check=False)
             if build_result.returncode != 0:
@@ -5811,6 +5995,43 @@ def _kill_stale_dashboard_processes(
 _warn_stale_dashboard_processes = _kill_stale_dashboard_processes
 
 
+def _atomic_replace_dir(src: str, dst: str) -> None:
+    """Replace directory *dst* with *src* without leaving *dst* half-deleted.
+
+    The naive ``rmtree(dst); copytree(src, dst)`` has a destructive window: if
+    the copy fails partway (common on the Windows ZIP-update path, which only
+    runs because file I/O is already flaky on that machine), the old directory
+    is already gone and nothing replaced it — the install is left with a
+    deleted tree (issue #49145, where ``ui-tui/`` vanished and broke the TUI).
+
+    Instead, stage the new copy into a sibling temp dir first; only once that
+    fully succeeds do we swap it in. A failure during staging raises with the
+    original *dst* still intact.
+    """
+    staging = f"{dst}.hermes-update-staging"
+    backup = f"{dst}.hermes-update-old"
+    # Clear any leftovers from a previously-interrupted update.
+    for leftover in (staging, backup):
+        if os.path.exists(leftover):
+            shutil.rmtree(leftover, ignore_errors=True)
+
+    # 1. Stage the new copy. If this fails, dst is untouched.
+    shutil.copytree(src, staging)
+    # 2. Swap: move the live dir aside, move staging into place. Both moves are
+    #    same-filesystem renames; if the second fails we restore the backup.
+    if os.path.exists(dst):
+        os.rename(dst, backup)
+    try:
+        os.rename(staging, dst)
+    except OSError:
+        if os.path.exists(backup) and not os.path.exists(dst):
+            os.rename(backup, dst)  # roll back to the original
+        raise
+    # 3. New dir is in place; drop the old one (best-effort — never fatal).
+    if os.path.exists(backup):
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -5896,9 +6117,9 @@ def _update_via_zip(args):
             src = os.path.join(extracted, item)
             dst = os.path.join(str(PROJECT_ROOT), item)
             if os.path.isdir(src):
-                if os.path.exists(dst):
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
+                # Atomic-ish replace: never leave dst half-deleted if the copy
+                # fails partway (the failure mode behind #49145 on Windows).
+                _atomic_replace_dir(src, dst)
             else:
                 shutil.copy2(src, dst)
             update_count += 1
@@ -5976,6 +6197,10 @@ def _update_via_zip(args):
             )
         if result.get("user_modified"):
             print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+            print(
+                "    → see them: hermes skills list-modified  "
+                "(diff/reset to resume updates)"
+            )
         if result.get("cleaned"):
             print(f"  − {len(result['cleaned'])} removed from manifest")
         if not result["copied"] and not result.get("updated"):
@@ -7526,7 +7751,9 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
 
 
 def _update_node_dependencies() -> None:
-    npm = shutil.which("npm")
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    npm = find_node_executable("npm")
     if not npm:
         return
 
@@ -7543,7 +7770,7 @@ def _update_node_dependencies() -> None:
     print("→ Updating Node.js dependencies...")
     extra_args = ["--no-fund", "--no-audit", "--progress=false"]
 
-    nixos_env = _nixos_build_env()
+    nixos_env = with_hermes_node_path(_nixos_build_env())
 
     # Step 1: root install (no workspace recursion).
     root_args = [*extra_args, "--workspaces=false"]
@@ -8017,7 +8244,13 @@ def _run_pre_update_backup(args) -> None:
         cfg = {}
 
     updates_cfg = cfg.get("updates", {}) if isinstance(cfg, dict) else {}
-    enabled = updates_cfg.get("pre_update_backup", False)
+    # The default config ships with ``pre_update_backup: true`` (see
+    # ``hermes_cli/config.py``). Fall back to true if the key is missing
+    # (e.g. a user has an older custom config without the field). The
+    # ``False`` default from before #48200 caused silent data loss when
+    # an update step computed a wrong path — the cost of a few minutes
+    # of zip time per update is negligible compared to the alternative.
+    enabled = updates_cfg.get("pre_update_backup", True)
     keep = updates_cfg.get("backup_keep", 5)
 
     if not enabled and not force_backup:
@@ -8154,6 +8387,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
     try:
         from gateway.status import terminate_pid
         from hermes_cli.gateway import (
+            _capture_gateway_argv,
             _get_restart_drain_timeout,
             find_gateway_pids,
             find_profile_gateway_processes,
@@ -8199,6 +8433,21 @@ def _pause_windows_gateways_for_update() -> dict | None:
     )
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes]
 
+    # Snapshot each unmapped gateway's command line *before* we force-kill it,
+    # so ``_resume_windows_gateways_after_update`` can respawn it by replaying
+    # its own argv. Unmapped gateways are ones with no profile→PID-file mapping
+    # — e.g. a Windows Scheduled Task running ``pythonw.exe -m hermes_cli.main
+    # gateway run``. Without this snapshot they were force-killed and never
+    # restarted (the "Restart manually after update" dead-end from #50090).
+    unmapped: list[dict] = []
+    for pid in unmapped_pids:
+        argv = None
+        try:
+            argv = _capture_gateway_argv(int(pid))
+        except Exception as exc:
+            logger.debug("Could not capture argv for unmapped gateway %s: %s", pid, exc)
+        unmapped.append({"pid": int(pid), "argv": argv})
+
     force_killed = []
     for pid in sorted(set(survivors).union(unmapped_pids)):
         try:
@@ -8213,15 +8462,20 @@ def _pause_windows_gateways_for_update() -> dict | None:
         print(f"  → Force-stopped {len(force_killed)} gateway process(es)")
 
     if unmapped_pids:
+        respawnable = sum(1 for u in unmapped if u.get("argv"))
         print(
             f"  → Stopped {len(unmapped_pids)} gateway process(es) without profile mapping"
         )
-        print("    Restart manually after update: hermes gateway run")
+        if respawnable < len(unmapped_pids):
+            # Some had no recoverable command line (psutil missing, access
+            # denied, already gone): those still need a manual restart.
+            print("    Restart manually after update: hermes gateway run")
 
     return {
         "resume_needed": True,
         "profiles": profiles,
         "unmapped_pids": unmapped_pids,
+        "unmapped": unmapped,
     }
 
 
@@ -8234,11 +8488,15 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         return
 
     profiles = token.get("profiles") or {}
-    if not profiles:
+    unmapped = token.get("unmapped") or []
+    if not profiles and not any(u.get("argv") for u in unmapped):
         return
 
     try:
-        from hermes_cli.gateway import launch_detached_profile_gateway_restart
+        from hermes_cli.gateway import (
+            launch_detached_gateway_restart_by_cmdline,
+            launch_detached_profile_gateway_restart,
+        )
     except Exception as exc:
         logger.debug("Could not load Windows gateway restart helper: %s", exc)
         return
@@ -8255,9 +8513,33 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
                 exc,
             )
 
+    # Respawn unmapped gateways (no profile→PID-file mapping, e.g. a Scheduled
+    # Task) by replaying the argv we snapshotted before force-killing them.
+    unmapped_relaunched = 0
+    for entry in unmapped:
+        argv = entry.get("argv")
+        old_pid = entry.get("pid")
+        if not argv or not old_pid:
+            continue
+        try:
+            if launch_detached_gateway_restart_by_cmdline(int(old_pid), list(argv)):
+                unmapped_relaunched += 1
+        except Exception as exc:
+            logger.debug(
+                "Could not restart unmapped Windows gateway (pid %s) after update: %s",
+                old_pid,
+                exc,
+            )
+
     if relaunched:
         print()
         print(f"  ✓ Restarting Windows gateway profile(s): {', '.join(relaunched)}")
+    if unmapped_relaunched:
+        if not relaunched:
+            print()
+        print(
+            f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
+        )
 
 
 def _discard_lockfile_churn(git_cmd, repo_root):
@@ -8277,10 +8559,16 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         )
         if diff.returncode != 0:
             return
+        dirty_package_dirs = {
+            Path(line.strip()).parent
+            for line in diff.stdout.splitlines()
+            if line.strip().endswith("package.json")
+        }
         dirty = [
             line.strip()
             for line in diff.stdout.splitlines()
             if line.strip().endswith("package-lock.json")
+            and Path(line.strip()).parent not in dirty_package_dirs
         ]
         if not dirty:
             return
@@ -8899,7 +9187,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Electron build by ``hermes update``.
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
         has_desktop_app = _desktop_packaged_executable(desktop_dir) is not None or _desktop_dist_exists(desktop_dir)
-        if (desktop_dir / "package.json").exists() and shutil.which("npm") and has_desktop_app:
+        from hermes_constants import find_node_executable
+
+        if (desktop_dir / "package.json").exists() and find_node_executable("npm") and has_desktop_app:
             print("→ Checking if desktop app needs rebuilding...")
             _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
             # Stream the build output live (long Electron builds otherwise
@@ -8958,6 +9248,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
             if result.get("user_modified"):
                 print(f"  ~ {len(result['user_modified'])} user-modified (kept)")
+                print(
+                    "    → see them: hermes skills list-modified  "
+                    "(diff/reset to resume updates)"
+                )
             if result.get("cleaned"):
                 print(f"  − {len(result['cleaned'])} removed from manifest")
             if not result["copied"] and not result.get("updated"):
@@ -10694,6 +10988,147 @@ def _dashboard_listening(host: str, port: int) -> bool:
         return False
 
 
+def _maybe_setup_dashboard_auth_interactively(args) -> None:
+    """Offer to configure dashboard auth when a non-loopback bind has none.
+
+    Called from ``cmd_dashboard`` just before ``start_server``. The auth
+    gate engages on every non-loopback bind (``--insecure`` is a no-op since
+    the June 2026 hardening), and ``start_server`` fails closed when no
+    ``DashboardAuthProvider`` is registered. Rather than greet an interactive
+    operator with that hard error, prompt them to set up the bundled
+    username/password provider on the spot — or point them at
+    ``hermes dashboard register`` for OAuth.
+
+    No-ops (so the existing fail-closed ``SystemExit`` remains the backstop)
+    when:
+      * the bind is loopback (gate never engages), or
+      * a provider is already registered, or
+      * stdin/stdout isn't a TTY (Docker/s6, CI, piped ``--no-open`` runs).
+    """
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+
+    try:
+        from hermes_cli.web_server import should_require_auth
+        if not should_require_auth(host):
+            return  # loopback bind — gate never engages
+    except Exception:
+        return  # if we can't tell, defer to start_server's own gate
+
+    try:
+        from hermes_cli.dashboard_auth import list_providers
+        if list_providers():
+            return  # a provider is already configured/registered
+    except Exception:
+        return
+
+    # Only prompt an interactive operator. Non-TTY callers fall through to
+    # start_server's fail-closed SystemExit (with the corrected fix hint).
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+
+    print()
+    print(
+        f"⚠ The dashboard is binding to a non-loopback address ({host}) and "
+        f"needs an auth provider."
+    )
+    print(
+        "  Non-loopback binds always require authentication "
+        "(--insecure no longer bypasses this)."
+    )
+    print()
+    print("  How do you want to authenticate the dashboard?")
+    print("    [1] Username & password (quickest; for a trusted LAN / VPN)")
+    print("    [2] OAuth via Nous Portal (run `hermes dashboard register`)")
+    print("    [3] Cancel")
+    print()
+
+    try:
+        choice = input("  Choice [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+
+    if choice == "2":
+        print()
+        print(
+            "  Run this on the host where the dashboard lives, then start "
+            "the dashboard again:\n"
+            "    hermes dashboard register\n"
+            "  It provisions a Nous Portal OAuth client and writes "
+            "HERMES_DASHBOARD_OAUTH_CLIENT_ID into ~/.hermes/.env for you.\n"
+            "  Docs: https://hermes-agent.nousresearch.com/docs/"
+            "user-guide/features/web-dashboard#authentication-gated-mode"
+        )
+        sys.exit(0)
+
+    if choice not in ("1",):
+        print("  Cancelled.")
+        sys.exit(1)
+
+    # ── Username/password setup ──────────────────────────────────────────
+    import getpass
+    import secrets
+
+    print()
+    try:
+        username = input("  Username [admin]: ").strip() or "admin"
+        password = getpass.getpass("  Password: ")
+        confirm = getpass.getpass("  Confirm password: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+
+    if not password:
+        print("  ✗ Empty password — aborting.")
+        sys.exit(1)
+    if password != confirm:
+        print("  ✗ Passwords don't match — aborting.")
+        sys.exit(1)
+
+    try:
+        from plugins.dashboard_auth.basic import hash_password
+    except Exception as exc:
+        print(f"  ✗ Could not load the password provider: {exc}")
+        sys.exit(1)
+
+    password_hash = hash_password(password)
+    # A stable token-signing secret so sessions survive a dashboard restart.
+    secret = secrets.token_urlsafe(32)
+
+    try:
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        dash = cfg.setdefault("dashboard", {})
+        basic = dash.setdefault("basic_auth", {})
+        basic["username"] = username
+        basic["password_hash"] = password_hash
+        # Never persist plaintext: clear any stale plaintext password key.
+        basic["password"] = ""
+        if not str(basic.get("secret", "") or "").strip():
+            basic["secret"] = secret
+        save_config(cfg)
+    except Exception as exc:
+        print(f"  ✗ Failed to write config.yaml: {exc}")
+        sys.exit(1)
+
+    # Re-run plugin discovery so the basic provider registers from the
+    # just-written config before start_server's gate check runs.
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins(force=True)
+    except Exception as exc:
+        print(f"  ⚠ Plugin re-discovery failed ({exc}); the gate may still "
+              "fail closed. Set the password again or restart the dashboard.")
+
+    print()
+    print(f"  ✓ Username/password auth configured (user: {username}).")
+    print("    Saved to config.yaml under dashboard.basic_auth.")
+    print("    Sign in at the dashboard with these credentials.")
+    print()
+
+
 def cmd_dashboard(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
@@ -10885,6 +11320,13 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
+    # Interactive auth setup: if this bind will engage the auth gate but no
+    # provider is registered yet, offer to configure one here (TTY only)
+    # instead of hard-failing inside start_server. Non-interactive callers
+    # (Docker/s6, CI, --no-open pipelines) fall through to start_server's
+    # fail-closed SystemExit unchanged.
+    _maybe_setup_dashboard_auth_interactively(args)
+
     # The in-browser Chat tab (the embedded TUI over PTY/WebSocket) is always
     # available — the desktop app and the dashboard's own Chat tab both rely on
     # the `/api/ws` + `/api/pty` sockets, so there is no reason to gate them.
@@ -10900,6 +11342,13 @@ def cmd_dashboard(args):
 def cmd_dashboard_register(args):
     """Register a self-hosted dashboard OAuth client with Nous Portal."""
     from hermes_cli.dashboard_register import cmd_dashboard_register as _impl
+
+    _impl(args)
+
+
+def cmd_gateway_enroll(args):
+    """Enroll a self-hosted gateway with a relay connector."""
+    from hermes_cli.gateway_enroll import cmd_gateway_enroll as _impl
 
     _impl(args)
 
@@ -10943,6 +11392,24 @@ def cmd_logs(args):
         since=getattr(args, "since", None),
         component=getattr(args, "component", None),
     )
+
+
+def _build_provider_choices() -> list[str]:
+    """Build the --provider choices list from CANONICAL_PROVIDERS + 'auto'."""
+    try:
+        from hermes_cli.models import CANONICAL_PROVIDERS as _cp
+        return ["auto"] + [p.slug for p in _cp]
+    except Exception:
+        # Fallback: static list guarantees the CLI always works
+        return [
+            "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
+            "anthropic", "gemini", "xai", "bedrock", "azure-foundry",
+            "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
+            "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
+            "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
+        ]
+
+
 # Top-level subcommands that argparse knows about WITHOUT running plugin
 # discovery.  Used to short-circuit eager plugin imports (which can take
 # 500ms+ pulling in google.cloud.pubsub_v1, aiohttp, grpc, etc.) when the
@@ -11596,7 +12063,9 @@ def main():
     # =========================================================================
     # gateway + proxy commands  (parsers built in hermes_cli/subcommands/gateway.py)
     # =========================================================================
-    build_gateway_parser(subparsers, cmd_gateway=cmd_gateway, cmd_proxy=cmd_proxy)
+    build_gateway_parser(
+        subparsers, cmd_gateway=cmd_gateway, cmd_proxy=cmd_proxy, cmd_gateway_enroll=cmd_gateway_enroll
+    )
 
     # =========================================================================
     # lsp command

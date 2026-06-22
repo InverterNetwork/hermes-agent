@@ -452,6 +452,7 @@ class TestCleanupProgress:
             assert resolve_display_setting(config, "telegram", "cleanup_progress") is True, val
 
 
+<<<<<<< HEAD
 # ---------------------------------------------------------------------------
 # status_callbacks — lifecycle/warning status bubble controls
 # ---------------------------------------------------------------------------
@@ -471,10 +472,35 @@ class TestStatusCallbacks:
         assert resolve_display_setting({}, "slack", "status_callbacks") == "warn"
 
     def test_per_platform_override_wins(self):
+=======
+class TestToolProgressGrouping:
+    """resolve_display_setting() for the tool_progress_grouping knob."""
+
+    def test_default_is_accumulate(self):
+        """No config anywhere → global default 'accumulate'."""
+        from gateway.display_config import resolve_display_setting
+
+        assert (
+            resolve_display_setting({}, "telegram", "tool_progress_grouping")
+            == "accumulate"
+        )
+
+    def test_global_separate(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"tool_progress_grouping": "separate"}}
+        assert (
+            resolve_display_setting(config, "discord", "tool_progress_grouping")
+            == "separate"
+        )
+
+    def test_platform_override_wins(self):
+>>>>>>> upstream/main
         from gateway.display_config import resolve_display_setting
 
         config = {
             "display": {
+<<<<<<< HEAD
                 "status_callbacks": "all",
                 "platforms": {
                     "slack": {"status_callbacks": "off"},
@@ -504,3 +530,37 @@ class TestStatusCallbacks:
         for value in ("warn", "warning", "warnings", "warn-only", "warnings_only"):
             config = {"display": {"status_callbacks": value}}
             assert resolve_display_setting(config, "telegram", "status_callbacks") == "warn"
+=======
+                "tool_progress_grouping": "accumulate",
+                "platforms": {"discord": {"tool_progress_grouping": "separate"}},
+            }
+        }
+        assert (
+            resolve_display_setting(config, "discord", "tool_progress_grouping")
+            == "separate"
+        )
+        # Other platforms still get the global value.
+        assert (
+            resolve_display_setting(config, "telegram", "tool_progress_grouping")
+            == "accumulate"
+        )
+
+    def test_invalid_value_falls_back_to_accumulate(self):
+        """_normalise rejects anything outside accumulate|separate."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"tool_progress_grouping": "bogus"}}
+        assert (
+            resolve_display_setting(config, "telegram", "tool_progress_grouping")
+            == "accumulate"
+        )
+
+    def test_case_insensitive(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"tool_progress_grouping": "SEPARATE"}}
+        assert (
+            resolve_display_setting(config, "telegram", "tool_progress_grouping")
+            == "separate"
+        )
+>>>>>>> upstream/main
