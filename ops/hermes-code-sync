@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # hermes-code-sync — periodic refresh of the agent's code mirrors.
 #
-# For each entry in deploy.values.yaml's repos[], fetch origin and hard-
-# reset the working tree to origin/<base_branch>. base_branch is read
-# directly from values.yaml every tick — NOT from origin/HEAD, because
+# For each entry in deploy.values.yaml's repos[], fetch origin, hard-
+# reset the working tree to origin/<base_branch>, and switch the local
+# checkout onto <base_branch>. base_branch is read directly from
+# values.yaml every tick — NOT from origin/HEAD, because
 # `git clone --branch <ref>` does NOT update origin/HEAD (only the local
 # checkout), so any entry whose base_branch differs from the GitHub
 # default branch would otherwise be silently snapped to the wrong branch
@@ -67,6 +68,11 @@ while IFS=$'\t' read -r repo_id _repo_url repo_base _repo_pkg _repo_install; do
   fi
   if ! git -C "$repo" reset --hard "origin/$repo_base" --quiet 2>/dev/null; then
     warn "$repo_id: git reset --hard origin/$repo_base failed"
+    failed=$((failed + 1))
+    continue
+  fi
+  if ! git -C "$repo" checkout --quiet -B "$repo_base" "origin/$repo_base" 2>/dev/null; then
+    warn "$repo_id: git checkout -B $repo_base origin/$repo_base failed"
     failed=$((failed + 1))
     continue
   fi
