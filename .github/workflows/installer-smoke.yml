@@ -94,6 +94,7 @@ jobs:
         #   * quay                — quay-managed, base_branch: dev
         #   * hermes-agent        — quay-managed, base_branch: main
         #   * brix-prototypes     — quay-managed, base_branch: main
+        #   * brix-prototyping-sandbox — quay-managed, base_branch: main
         #   * atlas               — quay-managed, base_branch: dev
         #   * code-only-fixture   — code-only, base_branch: main; exercises
         #                           the "code mirror only" branch of the
@@ -119,6 +120,7 @@ jobs:
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/quay
           HERMES_AGENT_FIXTURE=/srv/hermes/repos/quay-fixtures/hermes-agent
           BRIX_PROTOTYPES_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-prototypes
+          BRIX_PROTOTYPING_SANDBOX_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-prototyping-sandbox
           ATLAS_FIXTURE=/srv/hermes/repos/quay-fixtures/atlas
           CODE_FIXTURE=/srv/hermes/repos/code-fixtures/code-only-fixture
           DEV_FIXTURE=/srv/hermes/repos/code-fixtures/non-default-branch-fixture
@@ -144,6 +146,7 @@ jobs:
           init_fixture "$QUAY_FIXTURE" "init fixture" dev
           init_fixture "$HERMES_AGENT_FIXTURE" "init fixture"
           init_fixture "$BRIX_PROTOTYPES_FIXTURE" "init fixture"
+          init_fixture "$BRIX_PROTOTYPING_SANDBOX_FIXTURE" "init fixture"
           init_fixture "$ATLAS_FIXTURE" "init fixture" dev
           init_fixture "$CODE_FIXTURE" "init fixture"
           # HEAD on main (so origin/HEAD points at main after clone), then
@@ -165,7 +168,7 @@ jobs:
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$ITRY_LIQUIDATION_BOT_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$HERMES_AGENT_FIXTURE" "$BRIX_PROTOTYPES_FIXTURE" "$ATLAS_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$ITRY_LIQUIDATION_BOT_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$HERMES_AGENT_FIXTURE" "$BRIX_PROTOTYPES_FIXTURE" "$BRIX_PROTOTYPING_SANDBOX_FIXTURE" "$ATLAS_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
           (
               brix_landing_fixture,
@@ -178,10 +181,11 @@ jobs:
               quay_fixture,
               hermes_agent_fixture,
               brix_prototypes_fixture,
+              brix_prototyping_sandbox_fixture,
               atlas_fixture,
               code_fixture,
               dev_fixture,
-          ) = sys.argv[1:14]
+          ) = sys.argv[1:15]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
@@ -196,6 +200,7 @@ jobs:
               "quay": quay_fixture,
               "hermes-agent": hermes_agent_fixture,
               "brix-prototypes": brix_prototypes_fixture,
+              "brix-prototyping-sandbox": brix_prototyping_sandbox_fixture,
               "atlas": atlas_fixture,
           }
           for entry in data.get("repos", []):
