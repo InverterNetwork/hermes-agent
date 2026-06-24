@@ -531,6 +531,18 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "cd looping/backend && bun install && cd ../frontend && bun install"
+  - id: brix-prototyping-sandbox
+    url: https://github.com/InverterNetwork/brix-prototyping-sandbox
+    # Sandbox repo used for prototype glue / review intake. Keep bootstrap as a
+    # no-op until the repo grows a stable install surface we actually want Quay
+    # workers to rely on.
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "true"
   - id: iTRY-frontends
     url: https://github.com/InverterNetwork/iTRY-frontends
     # GH default branch is `master` (not `main`).
