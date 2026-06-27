@@ -494,6 +494,7 @@ slack:
       - C094LCV1X36  # test-devops (private)
       - C0B5ZUS7WRG  # requested 2026-06-01
       - C0B79CZLM50  # requested 2026-06-01
+      - C0AHDA8S3M1  # requested 2026-06-27
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: "C0B3WAWLL0L"
