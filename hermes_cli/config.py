@@ -2250,8 +2250,14 @@ DEFAULT_CONFIG = {
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels
+        "strict_mention": True,        # Require @mention in Slack channel threads too
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
+        # Channel response policy used only when strict_mention is false:
+        #   mention_to_wake_quiet_thread — require @mention to wake in channels,
+        #       then keep channel-thread replies silent unless they also @mention Hermes
+        #   thread_followup — legacy: any reply in an engaged thread wakes Hermes
+        "response_policy": "mention_to_wake_quiet_thread",
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
@@ -2332,19 +2338,6 @@ DEFAULT_CONFIG = {
             "rich_messages": False,     # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.
             "rich_drafts": False,       # Experimental Bot API 10.1 rich draft previews during Telegram DM streaming. Default off because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws.
         },
-    },
-
-    # Slack platform settings (gateway mode)
-    "slack": {
-        # Channel response policy:
-        #   mention_to_wake_quiet_thread — require @mention to wake in channels,
-        #       then keep channel-thread replies silent unless they also @mention
-        #       Hermes (default)
-        #   thread_followup — legacy: any reply in an engaged thread wakes Hermes
-        # Set slack.strict_mention=false to allow legacy actionable thread follow-ups
-        # without making every engaged-thread reply wake Hermes.
-        "response_policy": "mention_to_wake_quiet_thread",
-        "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
     # Mattermost platform settings (gateway mode)
