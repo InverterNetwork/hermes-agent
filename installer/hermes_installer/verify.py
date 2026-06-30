@@ -1071,6 +1071,24 @@ def _atlas_kb_root(s: _State) -> Path:
     return s.args.target / path
 
 
+def _atlas_google_service_account_file(s: _State) -> Path | None:
+    raw = _values_get(
+        s.values_file,
+        s.values_helper,
+        "atlas.google_docs.service_account_file",
+    )
+    if not raw:
+        return None
+    if raw.startswith("${HERMES_HOME}/"):
+        raw = raw.removeprefix("${HERMES_HOME}/")
+    elif raw.startswith("$HERMES_HOME/"):
+        raw = raw.removeprefix("$HERMES_HOME/")
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return s.args.target / path
+
+
 def _atlas_expected_credential_helper(s: _State) -> str:
     target = s.args.target
     rails = target / "hermes-agent"
@@ -1231,6 +1249,39 @@ def _check_atlas_artefacts(s: _State, *, app_auth_expected: bool) -> None:
             "644", s.rails_owner,
         )
 
+    runtime_env = s.args.target / "auth" / "atlas-runtime.env"
+    runtime_env_info = _stat_info(runtime_env)
+    if runtime_env_info is None:
+        s.v_drift("Atlas runtime env", f"missing: {runtime_env}")
+        runtime_env_text = ""
+    else:
+        _check_mode_owner(s, "Atlas runtime env", runtime_env_info, "640", s.rails_owner)
+        try:
+            runtime_env_text = runtime_env.read_text(encoding="utf-8")
+        except OSError as exc:
+            s.v_drift("Atlas runtime env", f"unreadable: {exc}")
+            runtime_env_text = ""
+
+    google_sa_file = _atlas_google_service_account_file(s)
+    if google_sa_file is not None:
+        expected_line = f"ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE={google_sa_file}"
+        if expected_line in runtime_env_text:
+            s.v_ok("Atlas Google Docs service account env")
+        elif runtime_env_text:
+            s.v_drift("Atlas Google Docs service account env", f"missing {expected_line}")
+
+        google_sa_info = _stat_info(google_sa_file)
+        if google_sa_info is None:
+            s.v_drift("Atlas Google Docs service account file", f"missing: {google_sa_file}")
+        else:
+            _check_mode_owner(
+                s,
+                "Atlas Google Docs service account file",
+                google_sa_info,
+                "640",
+                s.rails_owner,
+            )
+
     kb_root = _atlas_kb_root(s)
     kb_repo = _values_get(s.values_file, s.values_helper, "atlas.kb_repo")
     kb_repo = kb_repo or "https://github.com/InverterNetwork/atlas-kb"
@@ -1380,6 +1431,12 @@ def _check_atlas_hub_service(s: _State) -> None:
         s.v_ok("atlas-hub.service secrets env")
     else:
         s.v_drift("atlas-hub.service secrets env", f"missing {auth_env}")
+
+    runtime_env = f"EnvironmentFile=-{s.args.target / 'auth' / 'atlas-runtime.env'}"
+    if runtime_env in text:
+        s.v_ok("atlas-hub.service runtime env")
+    else:
+        s.v_drift("atlas-hub.service runtime env", f"missing {runtime_env}")
 
     if re.search(r"ExecStart=.*\batlas\s+--config\s+\S+\s+serve\b", text):
         s.v_ok("atlas-hub.service ExecStart uses atlas serve")

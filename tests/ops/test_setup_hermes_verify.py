@@ -1045,6 +1045,8 @@ def atlas_install(install: dict) -> dict:
         "  kb_root: \"\"\n"
         "  ai:\n"
         "    mode: api\n"
+        "  google_docs:\n"
+        "    service_account_file: auth/otto-google-sa.json\n"
         "  hub:\n"
         "    enabled: true\n"
         "    host: 127.0.0.1\n"
@@ -1079,6 +1081,13 @@ def atlas_install(install: dict) -> dict:
         encoding="utf-8",
     )
     (auth / "atlas-manager.env").chmod(0o640)
+    (auth / "otto-google-sa.json").write_text('{"type":"service_account"}\n', encoding="utf-8")
+    (auth / "otto-google-sa.json").chmod(0o640)
+    (auth / "atlas-runtime.env").write_text(
+        f"ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE={auth / 'otto-google-sa.json'}\n",
+        encoding="utf-8",
+    )
+    (auth / "atlas-runtime.env").chmod(0o640)
     (auth / "atlas.env").write_text("GITBOOK_API_TOKEN=test-token\n", encoding="utf-8")
     (auth / "atlas.env").chmod(0o640)
     (auth / "atlas-hub-auth.json").write_text(
@@ -1134,6 +1143,7 @@ def atlas_install(install: dict) -> dict:
         "[Service]\n"
         f"Environment=ATLAS_CONFIG={atlas_config_dir / 'atlas.yaml'}\n"
         f"Environment=ATLAS_KB_ROOT={kb_root}\n"
+        f"EnvironmentFile=-{auth / 'atlas-runtime.env'}\n"
         f"EnvironmentFile=-{auth / 'atlas.env'}\n"
         "ExecStart=/usr/local/bin/atlas --config "
         f"{atlas_config_dir / 'atlas.yaml'} serve --host 127.0.0.1 --port 8765\n",
@@ -1205,6 +1215,9 @@ class TestAtlasVerify:
         assert "[OK] atlas binary version:" in result.stdout
         assert "[OK] atlas-as-hermes wrapper:" in result.stdout
         assert "[OK] atlas profile.d drop-in:" in result.stdout
+        assert "[OK] Atlas runtime env:" in result.stdout
+        assert "[OK] Atlas Google Docs service account env" in result.stdout
+        assert "[OK] Atlas Google Docs service account file:" in result.stdout
         assert "[OK] Atlas KB ownership:" in result.stdout
         assert "[OK] Atlas KB credential helper configured" in result.stdout
         assert "[OK] Atlas manager token helper check passes" in result.stdout
@@ -1221,6 +1234,7 @@ class TestAtlasVerify:
         assert "[OK] atlas-hub.service ATLAS_CONFIG" in result.stdout
         assert "[OK] atlas-hub.service ATLAS_KB_ROOT" in result.stdout
         assert "[OK] atlas-hub.service secrets env" in result.stdout
+        assert "[OK] atlas-hub.service runtime env" in result.stdout
         assert "[OK] atlas-hub.service ExecStart uses atlas serve" in result.stdout
         assert "[OK] atlas-hub.service loopback bind: 127.0.0.1:8765" in result.stdout
         assert "[OK] atlas-hub.service port: 8765" in result.stdout

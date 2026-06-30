@@ -717,6 +717,10 @@ atlas:
     mode: codex-exec
     codex_binary: /usr/local/bin/codex
     codex_timeout_ms: 120000
+  google_docs:
+    # Relative paths are resolved under "$HERMES_HOME". The service-account
+    # JSON itself is staged out-of-band under auth/ and is not committed.
+    service_account_file: auth/otto-google-sa.json
   # Atlas Hub is served as a loopback-only API. Public access must terminate
   # TLS in a reverse proxy that forwards to this listener, or operators can
   # use an SSH tunnel for local CLI access. public_base_url must be an origin,

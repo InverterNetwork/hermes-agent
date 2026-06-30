@@ -11,6 +11,11 @@ if [ "$(id -un)" = "__AGENT_USER__" ]; then
   export ATLAS_CODEX_BIN="__ATLAS_CODEX_BIN__"
   export ATLAS_CODEX_TIMEOUT_MS="__ATLAS_CODEX_TIMEOUT_MS__"
   export ATLAS_SESSION_ID="${ATLAS_SESSION_ID:-hermes-agent}"
+  if [ -r "__TARGET_DIR__/auth/atlas-runtime.env" ]; then
+    set -a
+    . "__TARGET_DIR__/auth/atlas-runtime.env"
+    set +a
+  fi
   if [ -r "__TARGET_DIR__/auth/atlas.env" ]; then
     set -a
     . "__TARGET_DIR__/auth/atlas.env"
