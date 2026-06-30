@@ -5,8 +5,9 @@ Follows the same pattern as test_whatsapp_group_gating.py.
 """
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from gateway.config import Platform, PlatformConfig
 
 
@@ -145,10 +146,10 @@ def test_require_mention_env_var_default_true(monkeypatch):
 # Tests: _slack_strict_mention
 # ---------------------------------------------------------------------------
 
-def test_strict_mention_defaults_to_false(monkeypatch):
+def test_strict_mention_defaults_to_true(monkeypatch):
     monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
     adapter = _make_adapter()
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_true():
@@ -171,10 +172,10 @@ def test_strict_mention_string_off():
     assert adapter._slack_strict_mention() is False
 
 
-def test_strict_mention_malformed_stays_false():
-    """Unrecognised values keep strict mode OFF (fail-open to legacy behavior)."""
+def test_strict_mention_malformed_stays_true():
+    """Unrecognised values keep strict mode ON (safe mention-gated behavior)."""
     adapter = _make_adapter(strict_mention="maybe")
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_env_var_fallback(monkeypatch):
@@ -257,7 +258,7 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         or adapter._slack_message_matches_mention_patterns(text)
     )
 
-    if not is_dm and bot_uid:
+    if not is_dm:
         # allowed_channels check (whitelist — must pass before other gating)
         allowed = adapter._slack_allowed_channels()
         if allowed and channel_id not in allowed:
@@ -267,6 +268,10 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
             return True
         elif not adapter._slack_require_mention():
             return True
+        elif not bot_uid:
+            return False
+        elif adapter._slack_strict_mention() and not is_mentioned:
+            return False
         elif not is_mentioned:
             if thread_reply and active_session:
                 return True
@@ -311,8 +316,16 @@ def test_mentioned_message_always_processed():
     assert _would_process(adapter, mentioned=True, text="what's up") is True
 
 
-def test_thread_reply_with_active_session_processed():
+def test_thread_reply_with_active_session_requires_mention_by_default():
     adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="followup",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_thread_reply_with_active_session_processed_when_strict_disabled():
+    adapter = _make_adapter(require_mention=True, strict_mention=False)
     assert _would_process(
         adapter, text="followup",
         thread_reply=True, active_session=True,
@@ -327,29 +340,75 @@ def test_thread_reply_without_active_session_ignored():
     ) is False
 
 
-def test_bot_uid_none_processes_channel_message():
-    """When bot_uid is None (before auth_test), channel messages pass through.
-
-    This preserves the old behavior: the gating block is skipped entirely
-    when bot_uid is falsy, so messages are not silently dropped during
-    startup or for new workspaces.
-    """
+def test_bot_uid_none_ignores_channel_message_when_mentions_required():
     adapter = _make_adapter(require_mention=True)
     adapter._bot_user_id = None
     adapter._team_bot_user_ids = {}
 
-    # With bot_uid=None, the `if not is_dm and bot_uid:` condition is False,
-    # so the gating block is skipped — message passes through.
-    bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
-    assert bot_uid is None
+    assert _would_process(adapter, text="hello everyone") is False
 
-    # Simulate: gating block not entered when bot_uid is falsy
-    is_dm = False
-    if not is_dm and bot_uid:
-        result = False  # would enter gating
-    else:
-        result = True  # gating skipped, message processed
-    assert result is True
+
+def _make_runtime_adapter(
+    *,
+    require_mention=True,
+    strict_mention=None,
+    active_session=False,
+):
+    extra = {
+        "allowed_channels": "",
+        "require_mention": require_mention,
+    }
+    if strict_mention is not None:
+        extra["strict_mention"] = strict_mention
+
+    adapter = SlackAdapter(
+        PlatformConfig(enabled=True, token="xoxb-fake", extra=extra)
+    )
+    adapter._app = MagicMock()
+    adapter._app.client = AsyncMock()
+    adapter._bot_user_id = BOT_USER_ID
+    adapter._team_bot_user_ids = {"T1": BOT_USER_ID}
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Alice")
+    adapter._extract_slack_media = AsyncMock(return_value=([], [], [], ""))
+    adapter._fetch_thread_context = AsyncMock(return_value="")
+    adapter._fetch_thread_parent_attachment_context = AsyncMock(return_value="")
+    adapter._fetch_thread_parent_text = AsyncMock(return_value="")
+    adapter._has_active_session_for_thread = MagicMock(return_value=active_session)
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_runtime_default_strict_ignores_unmentioned_active_thread_reply():
+    adapter = _make_runtime_adapter(active_session=True)
+
+    await adapter._handle_slack_message({
+        "channel": CHANNEL_ID,
+        "ts": "171234.000200",
+        "thread_ts": "171234.000100",
+        "user": "U_ALICE",
+        "text": "can you check the logs?",
+        "team": "T1",
+    })
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_strict_disabled_processes_unmentioned_active_thread_reply():
+    adapter = _make_runtime_adapter(strict_mention=False, active_session=True)
+
+    await adapter._handle_slack_message({
+        "channel": CHANNEL_ID,
+        "ts": "171234.000300",
+        "thread_ts": "171234.000100",
+        "user": "U_ALICE",
+        "text": "can you check the logs?",
+        "team": "T1",
+    })
+
+    adapter.handle_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

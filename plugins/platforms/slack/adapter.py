@@ -2633,7 +2633,7 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
-        if not is_dm and bot_uid:
+        if not is_dm:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -2646,6 +2646,12 @@ class SlackAdapter(BasePlatformAdapter):
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
+            elif not bot_uid:
+                logger.debug(
+                    "[Slack] Ignoring channel message before bot user id was resolved: %s",
+                    channel_id,
+                )
+                return
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
@@ -3941,18 +3947,18 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_strict_mention(self) -> bool:
         """When true, channel threads require an explicit @-mention on every
         message. Disables all auto-triggers (mentioned-thread memory,
-        bot-message follow-up, session-presence). Defaults to False.
+        bot-message follow-up, session-presence). Defaults to True.
         """
         configured = self.config.extra.get("strict_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
+                return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {
-            "true",
-            "1",
-            "yes",
-            "on",
+        return os.getenv("SLACK_STRICT_MENTION", "true").lower() not in {
+            "false",
+            "0",
+            "no",
+            "off",
         }
 
     def _slack_free_response_channels(self) -> set:
