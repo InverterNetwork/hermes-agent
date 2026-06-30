@@ -628,6 +628,17 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+  - id: hermes-state
+    url: https://github.com/InverterNetwork/hermes-state
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      # State/config repo; workers do not need a package bootstrap before
+      # editing skills, memories, cron jobs, or deployment state.
+      install_cmd: "true"
   - id: atlas
     url: https://github.com/InverterNetwork/atlas
     base_branch: dev

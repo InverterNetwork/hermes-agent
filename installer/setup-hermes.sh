@@ -203,8 +203,19 @@ _git_as_owner() {
 # preserve check.
 _check_clone_origin_or_die() {
   local kind="$1" dir="$2" expected_url="$3"
+  shift 3
   local actual_url
   actual_url="$(_git_as_owner "$dir" config --get remote.origin.url 2>/dev/null || true)"
+  if [[ "$actual_url" == "$expected_url" ]]; then
+    return 0
+  fi
+  local alternate_url
+  for alternate_url in "$@"; do
+    [[ -n "$alternate_url" ]] || continue
+    if [[ "$actual_url" == "$alternate_url" ]]; then
+      return 0
+    fi
+  done
   if [[ "$actual_url" != "$expected_url" ]]; then
     echo "FAIL: $dir origin=$actual_url, expected $expected_url" >&2
     echo "      refusing to silently re-point an existing $kind." >&2
@@ -229,6 +240,7 @@ if [[ "$VERIFY" -eq 1 ]]; then
   )
   [[ "$QUIET" -eq 1 ]]      && verify_args+=( --quiet )
   [[ -n "$VALUES_FILE" ]]   && verify_args+=( --values "$VALUES_FILE" )
+  [[ -n "$STATE_DIR" ]]     && verify_args+=( --state "$STATE_DIR" )
   [[ -n "$GH_API_BASE" ]]   && verify_args+=( --gh-api-base "$GH_API_BASE" )
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   exec env "PYTHONPATH=$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
@@ -370,9 +382,57 @@ fi
 # clone/push; SSH deploy-key rewrites are skipped for those entries. Fail fast
 # before any provisioning so the operator doesn't half-install with an auth
 # model that can't push.
+_is_legacy_state_repo_fixture() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ "$AUTH_METHOD" == "none" \
+    && -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]]
+}
+
+_use_local_state_repo_source_for_quay() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]] || return 1
+  if [[ "$AUTH_METHOD" == "none" ]]; then
+    return 0
+  fi
+  [[ -z "$STATE_ORIGIN_URL" \
+    || ! "$STATE_ORIGIN_URL" =~ ^(https?://|ssh://|git://|git@) ]]
+}
+
+_effective_repo_url() {
+  local repo_id="$1"
+  local repo_url="$2"
+  if _use_local_state_repo_source_for_quay "$repo_id" "$repo_url"; then
+    printf 'file://%s\n' "$STATE_DIR"
+  else
+    printf '%s\n' "$repo_url"
+  fi
+}
+
+_alternate_clone_origin_urls() {
+  local repo_id="$1"
+  local repo_url="$2"
+  _use_local_state_repo_source_for_quay "$repo_id" "$repo_url" || return 0
+  printf '%s\n' "$STATE_DIR"
+  printf 'file://%s\n' "$STATE_DIR"
+}
+
+_repo_config_with_effective_url() {
+  local repo_config_json="$1"
+  local repo_url="$2"
+  python3 -c 'import json, sys; p=json.loads(sys.argv[1]); p["repo_url"]=sys.argv[2]; print(json.dumps(p, separators=(",", ":")))' \
+    "$repo_config_json" "$repo_url"
+}
+
 _quay_gh_ids=()
 while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
   [[ -z "$repo_id" || -z "$repo_pkg" ]] && continue
+  _is_legacy_state_repo_fixture "$repo_id" "$repo_url" && continue
   [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]] || continue
   _quay_gh_ids+=("$repo_id")
 done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos 2>/dev/null || true)
@@ -1710,6 +1770,8 @@ fi
 if [[ -n "$ALL_REPOS_TSV" ]]; then
   while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
     [[ -z "$repo_id" ]] && continue
+    repo_values_url="$repo_url"
+    repo_url="$(_effective_repo_url "$repo_id" "$repo_url")"
 
     # ---- per-repo url.insteadOf rewrite (code-only github.com entries) ----
     # quay-managed github.com entries skip the SSH rewrite and use the App
@@ -1782,8 +1844,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
 
     # ---- code mirror at $TARGET/code/<id>/ ----
     code_dir="$CODE_ROOT/$repo_id"
+    mapfile -t alternate_clone_origins < <(_alternate_clone_origin_urls "$repo_id" "$repo_values_url")
     if [[ -d "$code_dir/.git" ]]; then
-      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url"
+      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url" "${alternate_clone_origins[@]}"
       echo "==> code mirror $repo_id present at $code_dir (preserving)"
     else
       echo "==> cloning $repo_url into $code_dir"
@@ -1812,7 +1875,7 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
       else
         bare="$TARGET_DIR/quay/repos/${repo_id}.git"
         if [[ -d "$bare" ]]; then
-          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url"
+          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url" "${alternate_clone_origins[@]}"
           echo "==> quay bare clone $repo_id present (preserving)"
         else
           echo "==> cloning $repo_url into $bare"
@@ -1840,6 +1903,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
               get-repo-config "$repo_id" --mode update
           )"
+          if _is_legacy_state_repo_fixture "$repo_id" "$repo_values_url"; then
+            repo_config_json="$(_repo_config_with_effective_url "$repo_config_json" "$repo_url")"
+          fi
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo update \
               --id "$repo_id" \
@@ -1850,6 +1916,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
               get-repo-config "$repo_id" --mode add
           )"
+          if _is_legacy_state_repo_fixture "$repo_id" "$repo_values_url"; then
+            repo_config_json="$(_repo_config_with_effective_url "$repo_config_json" "$repo_url")"
+          fi
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
               --input "$repo_config_json" >/dev/null

@@ -453,3 +453,29 @@ def test_installer_stale_insteadof_values_cover_suffixes_and_ssh_shapes():
     assert '"git@github.com:${org}/${repo_short}.git"' in content
     assert '"ssh://git@github.com/${org}/${repo_short}"' in content
     assert '"ssh://git@github.com/${org}/${repo_short}.git"' in content
+
+
+def test_installer_supports_local_hermes_state_quay_fixture():
+    """CI uses --state without GitHub App auth for the hermes-state fixture."""
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    verify = (REPO_ROOT / "installer" / "hermes_installer" / "verify.py").read_text(
+        encoding="utf-8"
+    )
+    verify_cli = (
+        REPO_ROOT / "installer" / "hermes_installer" / "__main__.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_is_legacy_state_repo_fixture" in installer
+    assert "_use_local_state_repo_source_for_quay" in installer
+    assert "STATE_ORIGIN_URL" in installer
+    assert "_alternate_clone_origin_urls" in installer
+    assert 'if _use_local_state_repo_source_for_quay "$repo_id" "$repo_url"; then' in installer
+    assert 'mapfile -t alternate_clone_origins' in installer
+    assert '"${alternate_clone_origins[@]}"' in installer
+    assert '"$repo_id" == "hermes-state"' in installer
+    assert '"$repo_url" == "https://github.com/InverterNetwork/hermes-state"' in installer
+    assert 'verify_args+=( --state "$STATE_DIR" )' in installer
+    assert "_effective_repos_tsv(args, repos_tsv)" in verify
+    assert 'repo_id == "hermes-state"' in verify
+    assert 'repo_url == "https://github.com/InverterNetwork/hermes-state"' in verify
+    assert '"--state"' in verify_cli
