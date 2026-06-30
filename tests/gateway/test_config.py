@@ -138,26 +138,31 @@ class TestGetConnectedPlatforms:
 
 class TestSessionResetPolicy:
     def test_roundtrip(self):
-        policy = SessionResetPolicy(mode="idle", at_hour=6, idle_minutes=120)
+        policy = SessionResetPolicy(mode="idle", at_hour=6, idle_minutes=120,
+                                    bg_process_max_age_hours=48)
         d = policy.to_dict()
         restored = SessionResetPolicy.from_dict(d)
         assert restored.mode == "idle"
         assert restored.at_hour == 6
         assert restored.idle_minutes == 120
+        assert restored.bg_process_max_age_hours == 48
 
     def test_defaults(self):
         policy = SessionResetPolicy()
         assert policy.mode == "both"
         assert policy.at_hour == 4
         assert policy.idle_minutes == 1440
+        assert policy.bg_process_max_age_hours == 24
 
     def test_from_dict_treats_null_values_as_defaults(self):
         restored = SessionResetPolicy.from_dict(
-            {"mode": None, "at_hour": None, "idle_minutes": None}
+            {"mode": None, "at_hour": None, "idle_minutes": None,
+             "bg_process_max_age_hours": None}
         )
         assert restored.mode == "both"
         assert restored.at_hour == 4
         assert restored.idle_minutes == 1440
+        assert restored.bg_process_max_age_hours == 24
 
     def test_from_dict_coerces_quoted_false_notify(self):
         restored = SessionResetPolicy.from_dict({"notify": "false"})
@@ -803,113 +808,6 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
-    def test_bridges_slack_allowed_channels_list_from_config_yaml_to_env(
-        self, tmp_path, monkeypatch
-    ):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n"
-            "  allowed_channels:\n"
-            "    - C_ALLOW1\n"
-            "    - C_ALLOW2\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
-
-        load_gateway_config()
-
-        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == "C_ALLOW1,C_ALLOW2"
-
-    def test_bridges_slack_allowed_channels_csv_from_config_yaml_to_env(
-        self, tmp_path, monkeypatch
-    ):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n  allowed_channels: 'C_ALLOW1,C_ALLOW2'\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
-
-        load_gateway_config()
-
-        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == "C_ALLOW1,C_ALLOW2"
-
-    def test_bridges_slack_allowed_channels_empty_list_disables_gate(
-        self, tmp_path, monkeypatch
-    ):
-        """``allowed_channels: []`` should set SLACK_ALLOWED_CHANNELS to '',
-        which the slack runtime maps to an empty allowlist (no gate)."""
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n  allowed_channels: []\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
-
-        load_gateway_config()
-
-        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == ""
-
-    def test_bridges_slack_home_channel_from_config_yaml_to_env(
-        self, tmp_path, monkeypatch
-    ):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n  home_channel: C_HOME\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.delenv("SLACK_HOME_CHANNEL", raising=False)
-
-        load_gateway_config()
-
-        assert os.environ.get("SLACK_HOME_CHANNEL") == "C_HOME"
-
-    def test_slack_home_channel_env_takes_precedence_over_config_yaml(
-        self, tmp_path, monkeypatch
-    ):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n  home_channel: C_FROM_YAML\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("SLACK_HOME_CHANNEL", "C_FROM_ENV")
-
-        load_gateway_config()
-
-        assert os.environ.get("SLACK_HOME_CHANNEL") == "C_FROM_ENV"
-
-    def test_slack_allowed_channels_env_takes_precedence_over_config_yaml(
-        self, tmp_path, monkeypatch
-    ):
-        hermes_home = tmp_path / ".hermes"
-        hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text(
-            "slack:\n  allowed_channels: [C_FROM_YAML]\n",
-            encoding="utf-8",
-        )
-
-        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_FROM_ENV")
-
-        load_gateway_config()
-
-        assert os.environ.get("SLACK_ALLOWED_CHANNELS") == "C_FROM_ENV"
-
     def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -941,6 +839,38 @@ class TestLoadGatewayConfig:
         load_gateway_config()
 
         assert os.environ.get("FEISHU_ALLOW_BOTS") == "none"
+
+    def test_bridges_telegram_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n  allow_bots: mentions\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TELEGRAM_ALLOW_BOTS", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "mentions"
+
+    def test_telegram_allow_bots_env_takes_precedence_over_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n  allow_bots: all\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "none")
+
+        load_gateway_config()
+
+        assert os.environ.get("TELEGRAM_ALLOW_BOTS") == "none"
 
     def test_invalid_quick_commands_in_config_yaml_are_ignored(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
@@ -1007,6 +937,25 @@ class TestLoadGatewayConfig:
 
         assert config.platforms[Platform.TELEGRAM].extra["rich_messages"] is False
 
+    def test_loads_telegram_rich_drafts_from_gateway_platform_extra(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      extra:\n"
+            "        rich_drafts: true\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].extra["rich_drafts"] is True
+
     def test_load_config_default_keeps_telegram_rich_messages_opt_in(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -1018,6 +967,7 @@ class TestLoadGatewayConfig:
         config = load_config()
 
         assert config["telegram"]["extra"]["rich_messages"] is False
+        assert config["telegram"]["extra"]["rich_drafts"] is False
 
     def test_bridges_telegram_extra_base_url_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
