@@ -9,7 +9,8 @@ Nine units live here:
 * **`hermes-code-sync`** — frequent (5-min) refresh of the agent's
   read-only code mirrors at `~/.hermes/code/<id>/`. Each `repos[]` entry
   in `deploy.values.yaml` produces one mirror; the timer fetches origin
-  and hard-resets to `origin/<base_branch>` on every tick, so the
+  hard-resets to `origin/<base_branch>`, and checks out the local
+  `<base_branch>` branch on every tick, so the
   gateway can grep/read up-to-date source when answering codebase
   questions in Slack.
 * **`hermes-upstream-sync`** — weekly proposer that detects upstream
@@ -1208,7 +1209,8 @@ quote rather than a hallucinated function name.
 
 The mirrors are read-only from the gateway's perspective: any local
 divergence is wiped by the next `hermes-code-sync` tick, which hard-
-resets each mirror to `origin/<base_branch>`.
+resets each mirror to `origin/<base_branch>` and switches the checkout
+back to the configured `<base_branch>` branch.
 
 ## Schema
 
@@ -1243,7 +1245,8 @@ Field invariants:
   key. Non-github URLs (e.g. CI's `file://` fixtures) flow through
   unchanged.
 * `base_branch` is required for every entry. The mirror is hard-reset
-  to `origin/<base_branch>` on every sync tick.
+  to `origin/<base_branch>` and checked out on `<base_branch>` on every
+  sync tick.
 * `quay:` is optional. Block-present-vs-absent IS the signal — there is
   no separate `quay.enabled` flag. When present, must carry
   `package_manager` and `install_cmd`. Optional Quay repo metadata is
