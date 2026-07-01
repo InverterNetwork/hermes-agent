@@ -948,17 +948,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            # Slack migrated to a bundled plugin (#41112); delivery flows
-            # through the registry's standalone_sender_fn, which applies
-            # mrkdwn formatting and posts via the Slack Web API.
-            from gateway.platform_registry import platform_registry
-            _slack_entry = platform_registry.get("slack")
-            if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
-                result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
-            else:
-                result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id
+            if thread_id:
+                result = await _send_slack(
+                    pconfig.token, chat_id, chunk, thread_ts=thread_id
                 )
+            else:
+                result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
@@ -1244,8 +1239,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-# _send_slack moved to the slack plugin as _standalone_send
-# (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
+async def _send_slack(token, chat_id, message, *, thread_ts=None):
+    """Compatibility shim for the pre-plugin Slack sender signature."""
+    from types import SimpleNamespace
+
+    pconfig = SimpleNamespace(token=token, extra={})
+    return await _registry_standalone_send(
+        "slack", pconfig, chat_id, message, thread_id=thread_ts
+    )
 
 
 async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):

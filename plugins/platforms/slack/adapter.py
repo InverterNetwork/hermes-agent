@@ -50,6 +50,7 @@ from gateway.platforms.base import (
     is_host_excluded_by_no_proxy,
     resolve_proxy_url,
     safe_url_for_log,
+    cache_image_from_url,
     cache_document_from_bytes,
     cache_video_from_bytes,
 )
@@ -473,6 +474,18 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        self._trigger_router = None
+        triggers = self.config.extra.get("triggers") if self.config.extra else None
+        if triggers:
+            try:
+                from gateway.slack_triggers import SlackTriggerRouter, parse_triggers
+
+                self._trigger_router = SlackTriggerRouter(
+                    parse_triggers(triggers),
+                    bot_user_id=self._bot_user_id,
+                )
+            except Exception as exc:
+                logger.warning("[Slack] Ignoring invalid slack triggers: %s", exc)
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -1072,6 +1085,15 @@ class SlackAdapter(BasePlatformAdapter):
             import re as _re
 
             _slash_names = [name for name, _d, _h in slack_native_slashes()]
+            try:
+                from agent.skill_commands import get_skill_commands
+
+                for skill_name in get_skill_commands():
+                    normalized = str(skill_name).lstrip("/")
+                    if normalized:
+                        _slash_names.append(normalized)
+            except Exception:
+                logger.debug("[Slack] Failed to load skill slash commands", exc_info=True)
             if _slash_names:
                 _slash_pattern = _re.compile(
                     r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
@@ -2456,6 +2478,9 @@ class SlackAdapter(BasePlatformAdapter):
                 pass
 
         text = original_text
+        media_urls = []
+        media_types = []
+        attachment_notices: List[str] = []
 
         # Extract quoted/forwarded content from Slack blocks.
         # Slack's modern composer embeds forwarded messages in the ``blocks``
@@ -2481,6 +2506,30 @@ class SlackAdapter(BasePlatformAdapter):
             if blocks_payload:
                 text = (text.strip() + "\n\n" + blocks_payload).strip()
 
+            for block in blocks:
+                image_url = (block or {}).get("image_url", "")
+                if not image_url or ".gif" not in image_url.lower():
+                    continue
+                title = ((block or {}).get("title") or {}).get("text") or (block or {}).get("alt_text") or ""
+                try:
+                    cached = await cache_image_from_url(image_url, ext=".gif")
+                    media_urls.append(cached)
+                    media_types.append("image/gif")
+                except Exception as exc:
+                    attachment_notices.append(
+                        f"Slack GIF preview could not be cached: {exc}"
+                    )
+                gif_context = [
+                    "[Slack GIF]",
+                    f"Title/alt: {title}" if title else "",
+                    f"Media: {image_url}",
+                ]
+                text = (
+                    text.strip()
+                    + "\n\n"
+                    + "\n".join(part for part in gif_context if part)
+                ).strip()
+
         # Extract link unfurls / rich attachments (e.g. Notion previews).
         # Slack places unfurled link previews in the ``attachments`` array with
         # fields like title, title_link/from_url, text, footer, and fallback.
@@ -2494,6 +2543,67 @@ class SlackAdapter(BasePlatformAdapter):
                 att_text = att.get("text", "")
                 att_footer = att.get("footer", "")
                 att_fallback = att.get("fallback", "")
+                service_name = att.get("service_name", "")
+                image_url = att.get("image_url") or att.get("thumb_url") or ""
+                private_url = att.get("url_private_download") or att.get("url_private", "")
+                looks_like_gif = any(
+                    value and "gif" in str(value).lower()
+                    for value in (
+                        att_fallback,
+                        att_title,
+                        att_url,
+                        service_name,
+                        image_url,
+                        private_url,
+                    )
+                )
+
+                if looks_like_gif:
+                    media_note = ""
+                    if private_url and private_url.startswith("https://files.slack.com/"):
+                        try:
+                            gif_team_id = event.get("team") or event.get("team_id") or ""
+                            cached = await self._download_slack_file(
+                                private_url,
+                                ".gif",
+                                team_id=gif_team_id,
+                            )
+                            media_urls.append(cached)
+                            media_types.append("image/gif")
+                            media_note = "Media: private Slack file cached when downloadable."
+                        except Exception as exc:
+                            attachment_notices.append(
+                                f"Slack GIF private file could not be cached: {exc}"
+                            )
+                    elif image_url or private_url:
+                        public_url = image_url or private_url
+                        try:
+                            cached = await cache_image_from_url(public_url, ext=".gif")
+                            media_urls.append(cached)
+                            media_types.append("image/gif")
+                        except Exception as exc:
+                            attachment_notices.append(
+                                f"Slack GIF preview could not be cached: {exc}"
+                            )
+                        media_note = f"Media: {public_url}"
+                    else:
+                        attachment_notices.append(
+                            "Slack GIF attachment did not include a downloadable media or preview URL"
+                        )
+
+                    gif_parts = [
+                        "[Slack GIF]",
+                        f"Title/alt: {att_title}" if att_title else "",
+                        f"Provider: {service_name}" if service_name else "",
+                        f"Source: {att_url}" if att_url else "",
+                        media_note,
+                        f"Fallback: {att_fallback}" if att_fallback else "",
+                    ]
+                    section = "\n".join(part for part in gif_parts if part)
+                    if section in text:
+                        continue
+                    att_parts.append(section)
+                    continue
 
                 # Skip message-type attachments (e.g. Slack bot messages with
                 # is_msg_unfurl) to avoid echoing our own content.
@@ -2633,6 +2743,9 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
+        if not is_dm and await self._maybe_dispatch_slack_trigger(event, text=text):
+            return
+
         if not is_dm:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
@@ -2712,9 +2825,6 @@ class SlackAdapter(BasePlatformAdapter):
             msg_type = MessageType.COMMAND
 
         # Handle file attachments
-        media_urls = []
-        media_types = []
-        attachment_notices: List[str] = []
         files = event.get("files", [])
         for f in files:
             # Slack Connect channels return stub file objects with
@@ -3035,6 +3145,138 @@ class SlackAdapter(BasePlatformAdapter):
             self._reacting_message_ids.add(ts)
 
         await self.handle_message(msg_event)
+
+    async def _maybe_dispatch_slack_trigger(
+        self,
+        event: dict,
+        *,
+        text: Optional[str] = None,
+    ) -> bool:
+        """Dispatch configured top-level Slack channel triggers."""
+        router = self._trigger_router
+        if router is None:
+            return False
+
+        channel_id = event.get("channel", "")
+        ts = event.get("ts", "")
+        thread_ts = event.get("thread_ts")
+        user_id = event.get("user", "")
+        bot_id = event.get("bot_id")
+        subtype = event.get("subtype")
+        team_id = event.get("team") or event.get("team_id") or ""
+        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+
+        router.set_bot_user_id(bot_uid)
+
+        from gateway.slack_triggers import (
+            STATUS_RATE_LIMITED,
+            STATUS_SKIPPED_BOT,
+            STATUS_SKIPPED_DUPLICATE,
+            STATUS_SKIPPED_NOT_TOP_LEVEL,
+            STATUS_SKIPPED_SELF,
+            build_envelope,
+            is_bot_message,
+        )
+
+        raw_text = event.get("text", "")
+        if (
+            thread_ts
+            and thread_ts != ts
+            and bot_uid
+            and f"<@{bot_uid}>" in raw_text
+            and not is_bot_message(bot_id=bot_id, subtype=subtype)
+        ):
+            return False
+
+        trigger, status = router.evaluate(
+            channel_id=channel_id,
+            message_ts=ts,
+            thread_ts=thread_ts,
+            bot_id=bot_id,
+            user_id=user_id,
+            subtype=subtype,
+        )
+        if trigger is None:
+            if status == STATUS_SKIPPED_NOT_TOP_LEVEL:
+                return False
+            return status in {
+                STATUS_RATE_LIMITED,
+                STATUS_SKIPPED_BOT,
+                STATUS_SKIPPED_DUPLICATE,
+                STATUS_SKIPPED_SELF,
+            }
+
+        body = text if text is not None else raw_text
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        for file_obj in event.get("files") or []:
+            mimetype = file_obj.get("mimetype", "")
+            url = file_obj.get("url_private_download") or file_obj.get("url_private", "")
+            if not (mimetype.startswith("image/") and url):
+                continue
+            ext = "." + mimetype.split("/")[-1].split(";")[0]
+            if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                ext = ".jpg"
+            try:
+                media_urls.append(
+                    await self._download_slack_file(url, ext, team_id=team_id)
+                )
+                media_types.append(mimetype)
+            except Exception as exc:
+                logger.warning("[Slack] Trigger image cache failed: %s", exc)
+
+        permalink = ""
+        try:
+            if self._app is not None:
+                resp = await self._app.client.chat_getPermalink(
+                    channel=channel_id,
+                    message_ts=ts,
+                )
+                permalink = resp.get("permalink", "") if isinstance(resp, dict) else ""
+        except Exception as exc:
+            logger.warning("[Slack] Trigger permalink lookup failed: %s", exc)
+
+        author_name = await self._resolve_user_name(user_id, chat_id=channel_id)
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=channel_id,
+            chat_type="group",
+            user_id=user_id,
+            user_name=author_name,
+            thread_id=ts,
+        )
+        msg_type = MessageType.TEXT
+        if media_types:
+            if any(m.startswith("image/") for m in media_types):
+                msg_type = MessageType.PHOTO
+            elif any(m.startswith("video/") for m in media_types):
+                msg_type = MessageType.VIDEO
+            elif any(m.startswith("audio/") for m in media_types):
+                msg_type = MessageType.VOICE
+            else:
+                msg_type = MessageType.DOCUMENT
+
+        await self.handle_message(
+            MessageEvent(
+                text=build_envelope(
+                    trigger=trigger,
+                    permalink=permalink,
+                    message_ts=ts,
+                    author_name=author_name,
+                    author_slack_id=user_id,
+                    message_text=body or "",
+                ),
+                message_type=msg_type,
+                source=source,
+                raw_message=event,
+                message_id=ts,
+                media_urls=media_urls,
+                media_types=media_types,
+                auto_skill=trigger.skill,
+                internal=False,
+            )
+        )
+        return True
 
     # ----- Approval button support (Block Kit) -----
 
@@ -3587,7 +3829,13 @@ class SlackAdapter(BasePlatformAdapter):
                     continue
 
                 msg_text = msg.get("text", "").strip()
-                if not msg_text:
+                attachment_context = ""
+                if is_parent:
+                    attachment_context = await self._thread_attachment_context_from_message(
+                        msg,
+                        team_id=team_id,
+                    )
+                if not msg_text and not attachment_context:
                     continue
 
                 # Strip bot mentions from context messages
@@ -3600,7 +3848,10 @@ class SlackAdapter(BasePlatformAdapter):
                 if is_bot and not display_user:
                     display_user = msg.get("username") or "bot"
                 name = await self._resolve_user_name(display_user, chat_id=channel_id)
-                context_parts.append(f"{prefix}{name}: {msg_text}")
+                line = f"{prefix}{name}: {msg_text}" if msg_text else f"{prefix}{name}:"
+                if attachment_context:
+                    line = f"{line}\n{attachment_context}"
+                context_parts.append(line)
                 if is_parent:
                     parent_text = msg_text
 
@@ -3623,6 +3874,64 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to fetch thread context: %s", e)
             return ""
+
+    async def _thread_attachment_context_from_message(
+        self,
+        msg: dict,
+        *,
+        team_id: str = "",
+    ) -> str:
+        parts: list[str] = []
+        for file_obj in msg.get("files") or []:
+            mimetype = file_obj.get("mimetype", "")
+            name = file_obj.get("name") or file_obj.get("title") or "attachment.txt"
+            url = file_obj.get("url_private_download") or file_obj.get("url_private", "")
+            _, ext = os.path.splitext(name)
+            is_text = (
+                (mimetype or "").startswith("text/")
+                or ext.lower() in _TEXT_INJECT_EXTENSIONS
+            )
+            if not (url and is_text):
+                continue
+            size = int(file_obj.get("size") or 0)
+            if size and size > 100 * 1024:
+                continue
+            try:
+                raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
+                cache_document_from_bytes(raw_bytes, name)
+                text_content = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:
+                logger.warning("[Slack] Failed to cache thread attachment: %s", exc)
+                continue
+            display_name = re.sub(r"[^\w.\- ]", "_", name)
+            parts.append(f"[Content of {display_name}]:\n{text_content}")
+        return "\n\n".join(parts)
+
+    async def _fetch_thread_parent_attachment_context(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        team_id: str = "",
+    ) -> str:
+        try:
+            client = self._get_client(channel_id)
+            result = await client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=1,
+                inclusive=True,
+            )
+            for msg in result.get("messages", []):
+                if msg.get("ts") == thread_ts:
+                    return await self._thread_attachment_context_from_message(
+                        msg,
+                        team_id=team_id,
+                    )
+        except Exception as exc:
+            logger.warning("[Slack] Failed to fetch thread parent attachments: %s", exc)
+        return ""
 
     async def _fetch_thread_parent_text(
         self,
@@ -3692,6 +4001,15 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._channel_team[channel_id] = team_id
 
+        if channel_id and not channel_id.startswith("D"):
+            allowed_channels = self._slack_allowed_channels()
+            if allowed_channels and channel_id not in allowed_channels:
+                return
+
+        if slash_name == "quay-admin":
+            await self._handle_quay_admin_slash_command(command)
+            return
+
         if slash_name in {"hermes", ""}:
             # Legacy /hermes <subcommand> [args] routing + free-form questions.
             # Empty slash_name falls into this branch for backward compat
@@ -3760,6 +4078,102 @@ class SlackAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         finally:
             _slash_user_id.reset(_slash_user_id_token)
+
+    async def _respond_to_slash_command(self, command: dict, text: str) -> None:
+        """Reply to a Slack slash invocation without leaking into a channel."""
+        response_url = command.get("response_url", "")
+        if response_url:
+            try:
+                async with aiohttp.ClientSession(trust_env=True) as session:
+                    await session.post(
+                        response_url,
+                        json={
+                            "response_type": "ephemeral",
+                            "replace_original": True,
+                            "text": text,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    )
+                return
+            except Exception as exc:
+                logger.warning("[Slack] slash response_url failed: %s", exc)
+
+        channel_id = command.get("channel_id", "")
+        if channel_id:
+            await self.send(channel_id, text)
+
+    async def _handle_quay_admin_slash_command(self, command: dict) -> None:
+        """Send an allowlisted Slack user a one-time Quay Admin login link."""
+        user_id = command.get("user_id", "")
+        channel_id = command.get("channel_id", "")
+        team_id = command.get("team_id", "")
+
+        from hermes_cli import quay_admin_auth
+
+        if not quay_admin_auth.is_slack_user_allowed(user_id):
+            await self._respond_to_slash_command(
+                command,
+                "You are not allowed to request Quay Admin access.",
+            )
+            return
+
+        client = self._team_clients.get(team_id)
+        if client is None and channel_id:
+            try:
+                client = self._get_client(channel_id)
+            except Exception:
+                client = None
+
+        if client is None:
+            await self._respond_to_slash_command(
+                command,
+                "Quay Admin access is allowed, but Slack DM delivery is unavailable.",
+            )
+            return
+
+        display_name = ""
+        try:
+            user_resp = await client.users_info(user=user_id)
+            profile = (user_resp.get("user") or {}).get("profile") or {}
+            display_name = (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or (user_resp.get("user") or {}).get("real_name")
+                or ""
+            )
+        except Exception:
+            display_name = ""
+
+        token, _record = quay_admin_auth.create_login_token(
+            user_id,
+            display_name=display_name,
+        )
+        login_url = quay_admin_auth.build_login_url(token)
+        try:
+            dm_resp = await client.conversations_open(users=user_id)
+            dm_channel = (dm_resp.get("channel") or {}).get("id")
+            if not dm_channel:
+                raise RuntimeError("Slack did not return a DM channel")
+            await client.chat_postMessage(
+                channel=dm_channel,
+                text=(
+                    "Quay Admin login link:\n"
+                    f"{login_url}\n\n"
+                    "This one-time link expires shortly."
+                ),
+            )
+        except Exception as exc:
+            logger.warning("[Slack] Quay Admin DM failed: %s", exc)
+            await self._respond_to_slash_command(
+                command,
+                "You are allowed for Quay Admin, but I could not DM the login link.",
+            )
+            return
+
+        await self._respond_to_slash_command(
+            command,
+            "I sent you a DM with a one-time Quay Admin login link.",
+        )
 
     def _has_active_session_for_thread(
         self,
@@ -3990,9 +4404,11 @@ class SlackAdapter(BasePlatformAdapter):
         if raw is None:
             raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
         if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
+            values = {str(part).strip() for part in raw if str(part).strip()}
+            return set() if "*" in values else values
         if isinstance(raw, str) and raw.strip():
-            return {part.strip() for part in raw.split(",") if part.strip()}
+            values = {part.strip() for part in raw.split(",") if part.strip()}
+            return set() if "*" in values else values
         return set()
 
     def _slack_mention_patterns(self) -> List["re.Pattern"]:

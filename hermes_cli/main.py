@@ -42,15 +42,6 @@ Usage:
 
     hermes claw migrate --dry-run  # Preview migration without changes
 """
-
-import sys
-
-# Skip writing .pyc files. The render-target install lives at
-# ~/.hermes/hermes-agent/ which is root-owned read-only for the agent user, so
-# Python can't create __pycache__/ alongside source modules. Set this before
-# any other import so transitive imports inherit the flag.
-sys.dont_write_bytecode = True
-
 # IMPORTANT: hermes_bootstrap must be the very first import — it sets up
 # UTF-8 stdio on Windows so print()/subprocess children don't hit
 # UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
@@ -68,6 +59,13 @@ try:
     import hermes_bootstrap  # noqa: F401
 except ModuleNotFoundError:
     pass
+
+import sys
+
+# Skip writing .pyc files. The render-target install lives at
+# ~/.hermes/hermes-agent/ which is root-owned read-only for the agent user, so
+# Python can't create __pycache__/ alongside source modules.
+sys.dont_write_bytecode = True
 
 import os
 
