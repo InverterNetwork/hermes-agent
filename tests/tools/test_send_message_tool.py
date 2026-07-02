@@ -163,6 +163,8 @@ class _patch_slack_standalone_sender:
             except Exception:
                 pass
         token = getattr(pconfig, "token", None)
+        if thread_id is None:
+            return await self._mock(token, chat_id, formatted)
         return await self._mock(token, chat_id, formatted, thread_ts=thread_id)
 
     def __enter__(self):

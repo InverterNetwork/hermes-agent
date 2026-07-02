@@ -1272,6 +1272,8 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
+    if thread_id is None:
+        return await entry.standalone_sender_fn(pconfig, chat_id, message)
     return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
 
 
