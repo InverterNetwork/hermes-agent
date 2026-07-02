@@ -94,7 +94,7 @@ if [ ! -r "$DEV_NAV_PUBLISH_PASSWORD_FILE" ]; then
 fi
 signer_args+=(--password-file "$DEV_NAV_PUBLISH_PASSWORD_FILE")
 
-if [ -n "${DEV_NAV_PUBLISH_PRIVATE_KEY:-}${NAV_PUBLISH_PRIVATE_KEY:-}" ]; then
+if [ -n "${DEV_NAV_PUBLISH_PRIVATE_KEY+x}${NAV_PUBLISH_PRIVATE_KEY+x}" ]; then
   echo "dev-nav-publish failed: raw private-key env vars are not accepted; use a Foundry keystore account" >&2
   exit 1
 fi
