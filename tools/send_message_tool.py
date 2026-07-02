@@ -720,7 +720,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    slack_thread_ts=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -948,9 +957,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            if thread_id:
+            slack_thread_id = slack_thread_ts or thread_id
+            if slack_thread_id:
                 result = await _send_slack(
-                    pconfig.token, chat_id, chunk, thread_ts=thread_id
+                    pconfig.token, chat_id, chunk, thread_ts=slack_thread_id
                 )
             else:
                 result = await _send_slack(pconfig.token, chat_id, chunk)
