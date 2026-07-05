@@ -12,15 +12,6 @@ Usage:
     # Or from CLI
     python cli.py --gateway
 """
-
-import sys
-
-# Skip writing .pyc files. The render-target install lives at
-# ~/.hermes/hermes-agent/ which is root-owned read-only for the agent user, so
-# Python can't create __pycache__/ alongside source modules. Set this before
-# any other import so transitive imports inherit the flag.
-sys.dont_write_bytecode = True
-
 # IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
 # on Windows.  No-op on POSIX.  See hermes_bootstrap.py for full rationale.
 try:
@@ -43,6 +34,11 @@ import re
 import shlex
 import site
 import sys
+
+# Skip writing .pyc files. The render-target install lives at
+# ~/.hermes/hermes-agent/ which is root-owned read-only for the agent user, so
+# Python can't create __pycache__/ alongside source modules.
+sys.dont_write_bytecode = True
 import signal
 import tempfile
 import threading
