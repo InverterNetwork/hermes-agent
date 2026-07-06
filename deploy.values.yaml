@@ -654,7 +654,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.38"
+  version: "v0.3.39"
   # Public org-owned release repo for unauthenticated installer downloads.
   release_repo: InverterNetwork/quay
   # Quay Agent panel backend. All values here are non-secret and are loaded by
@@ -741,6 +741,10 @@ atlas:
     mode: codex-exec
     codex_binary: /usr/local/bin/codex
     codex_timeout_ms: 120000
+  google_docs:
+    # Relative paths are resolved under "$HERMES_HOME". The service-account
+    # JSON itself is staged out-of-band under auth/ and is not committed.
+    service_account_file: auth/otto-google-sa.json
   # Atlas Hub is served as a loopback-only API. Public access must terminate
   # TLS in a reverse proxy that forwards to this listener, or operators can
   # use an SSH tunnel for local CLI access. public_base_url must be an origin,
