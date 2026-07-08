@@ -206,6 +206,8 @@ import requests, json
 # Print summary to stdout — agent analyzes and reports
 ```
 
+On managed installs, `~/.hermes/scripts` is a symlink to `~/.hermes/state/scripts`, so cron helper scripts are part of the writable state repo alongside skills, memories, and cron jobs.
+
 The script timeout defaults to 120 seconds. `_get_script_timeout()` resolves the limit through a three-layer chain:
 
 1. **Module-level override** — `_SCRIPT_TIMEOUT` (for tests/monkeypatching). Only used when it differs from the default.

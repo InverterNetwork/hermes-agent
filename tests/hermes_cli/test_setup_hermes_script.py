@@ -26,6 +26,16 @@ def test_installer_gateway_install_is_noninteractive():
     assert "--no-start-now --no-start-on-login" in content
 
 
+def test_installer_manages_scripts_as_state_symlink():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "==> wiring state symlinks (skills, memories, cron, scripts)" in content
+    assert "for d in skills memories cron scripts; do" in content
+    assert 'if [[ ! -e "$STATE_TARGET/$d" ]]; then' in content
+    assert 'install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$STATE_TARGET/$d"' in content
+    assert 'Move its contents into $STATE_TARGET/$d/ and retry' in content
+
+
 def test_setup_hermes_script_has_termux_path():
     content = SETUP_SCRIPT.read_text(encoding="utf-8")
 
