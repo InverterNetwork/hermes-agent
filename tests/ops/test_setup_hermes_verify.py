@@ -228,7 +228,7 @@ def install(tmp_path: Path) -> dict:
 
     # Symlinks at render-target root pointing into state/ (matches the
     # installer's wiring).
-    for d in ("skills", "memories", "cron", "scripts"):
+    for d in ("skills", "memories", "cron"):
         (state / d).mkdir(exist_ok=True)
         os.symlink(f"state/{d}", target / d)
 
@@ -541,22 +541,6 @@ class TestSetupHermesVerify:
         result = _run_verify(install)
         assert result.returncode == 1
         assert "[DRIFT] symlink skills" in result.stderr
-
-    def test_scripts_symlink_is_required(self, install):
-        link = install["target"] / "scripts"
-        link.unlink()
-        link.mkdir()
-        result = _run_verify(install)
-        assert result.returncode == 1
-        assert "[DRIFT] symlink scripts" in result.stderr
-
-    def test_state_scripts_dir_is_required(self, install):
-        (install["target"] / "scripts").unlink()
-        shutil.rmtree(install["state"] / "scripts")
-        os.symlink("state/scripts", install["target"] / "scripts")
-        result = _run_verify(install)
-        assert result.returncode == 1
-        assert "[DRIFT] state/scripts" in result.stderr
 
     def test_missing_sessions_dir_is_drift(self, install):
         shutil.rmtree(install["target"] / "sessions")

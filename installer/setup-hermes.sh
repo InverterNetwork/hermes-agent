@@ -1132,8 +1132,8 @@ EOF
 fi
 
 # ---------- state (agent-owned, writable) ----------
-# state/ is a clone of the private hermes-state repo. skills/memories/cron/scripts
-# at the render-target root are symlinks into state/, so the agent's writes show
+# state/ is a clone of the private hermes-state repo. skills/memories/cron at
+# the render-target root are symlinks into state/, so the agent's writes show
 # up as git changes that the auto-commit pipeline (future work) can ship.
 #
 # Re-run policy: if state/ already has a .git, leave it alone — destroying it
@@ -1982,18 +1982,11 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
 fi
 
 # Symlinks at render-target root so the agent's existing paths
-# ($TARGET/skills, $TARGET/memories, $TARGET/cron, $TARGET/scripts) keep working
-# but writes land inside the git repo. ln -snf is idempotent: replaces existing
-# symlinks in place and refuses to descend into a real directory (we error below
-# if so).
-echo "==> wiring state symlinks (skills, memories, cron, scripts)"
-for d in skills memories cron scripts; do
-  if [[ ! -e "$STATE_TARGET/$d" ]]; then
-    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$STATE_TARGET/$d"
-  elif [[ ! -d "$STATE_TARGET/$d" ]]; then
-    echo "FAIL: $STATE_TARGET/$d exists but is not a directory." >&2
-    exit 1
-  fi
+# ($TARGET/skills, $TARGET/memories, $TARGET/cron) keep working but writes
+# land inside the git repo. ln -snf is idempotent: replaces existing symlinks
+# in place and refuses to descend into a real directory (we error below if so).
+echo "==> wiring state symlinks (skills, memories, cron)"
+for d in skills memories cron; do
   link="$TARGET_DIR/$d"
   # Pre-clean: if a previous v0 install left real dirs here, they need to go.
   # Safe-to-remove check: no regular files / symlinks / sockets anywhere in
@@ -2777,7 +2770,7 @@ fi
 state_git_owner="$(stat -c '%U' "$STATE_TARGET/.git")"
 [[ "$state_git_owner" == "$AGENT_USER" ]] \
   || { echo "FAIL: $STATE_TARGET/.git owned by $state_git_owner, expected $AGENT_USER" >&2; exit 1; }
-for d in skills memories cron scripts; do
+for d in skills memories cron; do
   [[ -L "$TARGET_DIR/$d" ]] \
     || { echo "FAIL: $TARGET_DIR/$d is not a symlink" >&2; exit 1; }
   resolved="$(readlink "$TARGET_DIR/$d")"
@@ -2842,7 +2835,7 @@ fi
 # symlinks after the initial state clone chown; restore the ownership invariant
 # before the installer returns so future `git add .` from the agent cannot
 # trip on root-owned files.
-for d in skills memories cron scripts; do
+for d in skills memories cron; do
   [[ -e "$STATE_TARGET/$d" ]] && chown -R "$AGENT_USER:$AGENT_USER" "$STATE_TARGET/$d"
 done
 
