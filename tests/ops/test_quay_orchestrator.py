@@ -81,6 +81,10 @@ class FakeQuayClient:
         self.recorded_reply = (handoff, reply, thread_ref)
 
     def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+        # Match production: reject any reason quay's CLI would reject, so the
+        # fake can't mask an invalid-reason regression (e.g. the auto-remediated
+        # path once passed a non-existent "blocker_auto_remediated").
+        quay._validate_submit_reason(reason)
         if self.state != "claimed":
             raise RuntimeError(f"wrong_state: cannot submit brief from {self.state}")
         self.state = "queued"
@@ -2982,7 +2986,7 @@ def test_drain_remediation_happy_submits_and_posts_fyi():
     result = drainer.drain_one()
     assert result.status == "submitted_remediated"
     assert quay_client.submitted == [
-        (handoff, outcome.brief, "blocker_auto_remediated")
+        (handoff, outcome.brief, "blocker_resolved")
     ]
     assert quay_client.completed == [handoff]
     assert len(slack.questions) == 1  # FYI posted to fallback channel
@@ -3028,10 +3032,22 @@ def test_drain_remediation_end_to_end_with_real_remediator():
     result = drainer.drain_one()
     assert result.status == "submitted_remediated"
     assert quay_client.submitted[0][1].startswith("Remove the unused import")
-    assert quay_client.submitted[0][2] == "blocker_auto_remediated"
+    assert quay_client.submitted[0][2] == "blocker_resolved"
     assert len(slack.questions) == 1
     # Friction was filed to Linear (find + create).
     assert any("issueCreate" in c[0] for c in linear.calls)
+
+
+def test_submit_reason_guard_matches_quay_cli_enum():
+    # Quay's `submit-brief --help` accepts only these two reasons; the guard must
+    # reject anything else (regression fence for the old "blocker_auto_remediated").
+    assert quay._QUAY_SUBMIT_REASONS == frozenset(
+        {"blocker_resolved", "advice_answered"}
+    )
+    assert quay._validate_submit_reason("blocker_resolved") == "blocker_resolved"
+    assert quay._validate_submit_reason("advice_answered") == "advice_answered"
+    with pytest.raises(ValueError):
+        quay._validate_submit_reason("blocker_auto_remediated")
 
 
 # -- config plumbing ---------------------------------------------------------

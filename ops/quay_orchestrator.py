@@ -502,6 +502,24 @@ class QuayCommandError(RuntimeError):
         super().__init__(f"quay command failed{suffix}: {' '.join(argv)}")
 
 
+# Quay's `submit-brief --reason` accepts ONLY these two values (verified via
+# `quay submit-brief --help`). Any other value fails at the CLI mid-drain, so we
+# validate at the call site to fail loudly instead. In particular the agentic
+# remediation path resolves a blocker, so it reuses `blocker_resolved` — the
+# auto-vs-human distinction lives in the `brief_submitted_remediated` log event
+# and the Slack FYI, not in this enum.
+_QUAY_SUBMIT_REASONS: frozenset[str] = frozenset({"blocker_resolved", "advice_answered"})
+
+
+def _validate_submit_reason(reason: str) -> str:
+    if reason not in _QUAY_SUBMIT_REASONS:
+        raise ValueError(
+            f"invalid submit-brief reason {reason!r}; "
+            f"quay accepts only {sorted(_QUAY_SUBMIT_REASONS)}"
+        )
+    return reason
+
+
 class QuayCliClient:
     """Adapter for Quay's shared outbox and legacy handoff CLI contracts."""
 
@@ -796,6 +814,7 @@ class QuayCliClient:
         *,
         reason: str,
     ) -> None:
+        _validate_submit_reason(reason)
         claim_id = self._claim_id(handoff)
         with _temp_text_file(brief) as path:
             self._run_json(
@@ -2682,7 +2701,10 @@ class HandoffDrainer:
                 )
         if brief and remediated:
             outcome = self.remediator.last_outcome
-            self.quay.submit_brief(handoff, brief, reason="blocker_auto_remediated")
+            # Resolving a blocker -> the only Quay-valid resume reason for this
+            # handoff kind. The "auto-remediated" distinction is recorded in the
+            # log event and FYI below, not the reason enum.
+            self.quay.submit_brief(handoff, brief, reason="blocker_resolved")
             self.quay.complete_claim(handoff)
             self.metrics.agent_briefs_submitted += 1
             log_event(
