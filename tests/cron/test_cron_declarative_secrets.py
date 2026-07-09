@@ -249,6 +249,22 @@ class TestBuildCronSecretInjection:
         assert build_cron_secret_injection(None, {"SLACK_BOT_TOKEN"}) == ({}, [])
         assert build_cron_secret_injection([], {"SLACK_BOT_TOKEN"}) == ({}, [])
 
+    def test_case_variance_cannot_evade_hard_floor(self):
+        """The hard-floor test is case-insensitive: a miscased spelling of a
+        floor secret (matters on case-insensitive Windows env vars) must still
+        be refused, even when allowlisted with the same miscased spelling and a
+        value is present under either casing."""
+        from tools.environments.local import build_cron_secret_injection
+
+        for spelling in ("gh_token", "Gh_Token", "gH_tOkEn"):
+            extra, warns = build_cron_secret_injection(
+                [spelling],
+                {spelling},  # operator (mis)spells it the same way in the allowlist
+                source_env={spelling: "ghp-evil", "GH_TOKEN": "ghp-evil"},
+            )
+            assert extra == {}, f"{spelling!r} evaded the hard floor"
+            assert len(warns) == 1 and "hard floor" in warns[0]
+
 
 class TestHardFloor:
     def test_slack_bot_token_is_eligible(self):
@@ -318,6 +334,24 @@ class TestAllowlistConfigReader:
             raise RuntimeError("config broken")
 
         monkeypatch.setattr(sched, "load_config", _boom)
+        assert sched._cron_injectable_secrets_allowlist() == frozenset()
+
+    def test_dict_config_fails_closed(self, monkeypatch):
+        """A mistyped mapping value must NOT have its keys treated as an
+        allowlist — it fails closed to an empty set."""
+        import cron.scheduler as sched
+
+        monkeypatch.setattr(
+            sched,
+            "load_config",
+            lambda: {"cron": {"injectable_secrets": {"SLACK_BOT_TOKEN": True}}},
+        )
+        assert sched._cron_injectable_secrets_allowlist() == frozenset()
+
+    def test_int_config_fails_closed(self, monkeypatch):
+        import cron.scheduler as sched
+
+        monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"injectable_secrets": 123}})
         assert sched._cron_injectable_secrets_allowlist() == frozenset()
 
 
@@ -399,6 +433,51 @@ class TestRunJobScriptInjection:
         assert ok is True
         assert output == "ABSENT"
         assert "hard floor" in caplog.text
+
+    def test_case_variance_floor_evasion_still_stripped(self, cron_env, monkeypatch, caplog):
+        """Adversarial: declare + allowlist a floor secret under a lowercase
+        spelling with the real UPPERCASE value in env → still stripped."""
+        import logging
+        import cron.scheduler as sched
+
+        monkeypatch.setenv("GH_TOKEN", "ghp-live")
+        monkeypatch.setattr(
+            sched, "_cron_injectable_secrets_allowlist", lambda: frozenset({"gh_token"})
+        )
+        _write_probe(cron_env / "scripts", "GH_TOKEN")
+
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            ok, output = sched._run_job_script("probe.py", secrets=["gh_token"])
+        assert ok is True
+        assert output == "ABSENT"
+        assert "hard floor" in caplog.text
+
+    def test_preset_force_key_in_base_env_is_dropped(self, cron_env, monkeypatch):
+        """Adversarial: a _HERMES_FORCE_<floorkey> already present in the base
+        os.environ must NOT be turned into the bare key in the child — only the
+        vetted extra_env may force-inject. Neither the FORCE key nor the real
+        floor key reaches the subprocess."""
+        import cron.scheduler as sched
+
+        monkeypatch.setenv("_HERMES_FORCE_GH_TOKEN", "ghp-evil")
+        monkeypatch.setenv("GH_TOKEN", "ghp-evil")
+        # No secrets declared at all — pure base-env smuggling attempt.
+        monkeypatch.setattr(sched, "_cron_injectable_secrets_allowlist", lambda: frozenset())
+
+        script = cron_env / "scripts" / "smuggle_probe.py"
+        script.write_text(
+            textwrap.dedent(
+                """\
+                import os
+                leaked = os.environ.get("GH_TOKEN") or os.environ.get("_HERMES_FORCE_GH_TOKEN")
+                print("LEAKED" if leaked else "CLEAN")
+                """
+            )
+        )
+
+        ok, output = sched._run_job_script("smuggle_probe.py")
+        assert ok is True
+        assert output == "CLEAN"
 
     def test_custom_secret_injected_end_to_end(self, cron_env, monkeypatch):
         """A non-blocklisted custom secret still flows through the two gates."""

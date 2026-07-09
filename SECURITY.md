@@ -163,6 +163,19 @@ the containment story above: an authorized secret is exposed to the
 same arbitrary third-party dependencies the script already runs, so
 operators authorize only what a reviewed script legitimately needs.
 
+The residual assumption is deliberate and bounded. `no_agent` cron
+jobs and their scripts are a **reviewed managed-state surface** — the
+scripts live in the versioned scripts directory and the jobs in the
+versioned cron store, so a `secrets:` declaration lands through the
+same review as any other state change. The agent can author a cron
+job and add a `secrets:` declaration, but it **cannot self-grant**: a
+declaration only requests a name, and injection still requires an
+operator to have allowlisted it in host config the agent cannot
+write. The operator allowlist is the ceiling and the hard floor is
+the floor — the agent can, at most, route an *already-authorized*
+secret to a script it is allowed to run, and can never widen the set
+of injectable secrets or reach a hard-floor credential.
+
 ### 2.4 In-Process Heuristics
 
 The following components screen or warn about LLM behavior. They

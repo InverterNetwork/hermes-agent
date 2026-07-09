@@ -1566,9 +1566,20 @@ def _cron_injectable_secrets_allowlist() -> frozenset[str]:
     try:
         cfg = load_config() or {}
         cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
-        raw = cron_cfg.get("injectable_secrets") or []
+        raw = cron_cfg.get("injectable_secrets")
         if isinstance(raw, str):
             raw = [raw]
+        elif not isinstance(raw, (list, tuple)):
+            # A mistyped config value (dict, int, None, …) must fail CLOSED — an
+            # empty allowlist injects nothing — rather than, say, iterating a
+            # dict's keys and silently treating them as authorized names.
+            if raw is not None:
+                logger.warning(
+                    "cron.injectable_secrets must be a list of names, got %s; "
+                    "ignoring (no secrets will be injectable)",
+                    type(raw).__name__,
+                )
+            raw = []
         return frozenset(str(name).strip() for name in raw if str(name).strip())
     except Exception as exc:
         logger.debug("Failed to load cron.injectable_secrets allowlist: %s", exc)

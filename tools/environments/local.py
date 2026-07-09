@@ -356,6 +356,13 @@ def build_cron_secret_injection(
       2. not in the operator allowlist → refuse (declared but unauthorized)
       3. no value in ``source_env``    → refuse (authorized but not provisioned)
       4. otherwise                     → inject
+
+    The hard-floor membership test is CASE-INSENSITIVE: the floor frozenset holds
+    canonical UPPERCASE env-var names, but env vars are case-insensitive on
+    Windows, so a miscased spelling (``gh_token``, ``Gh_Token``) must not be able
+    to slip a floor secret past the check. Only the floor comparison is
+    canonicalized — the env lookup and the injected key keep the declared
+    spelling.
     """
     warnings: list[str] = []
     extra_env: dict[str, str] = {}
@@ -366,7 +373,9 @@ def build_cron_secret_injection(
 
     allow = {str(n).strip() for n in (allowlist or []) if str(n).strip()}
     env = os.environ if source_env is None else source_env
-    hard_floor = cron_never_injectable_keys()
+    # Canonicalize the floor to uppercase once so the membership test below can
+    # be case-insensitive (defends the Windows case-folding footgun).
+    hard_floor = {n.upper() for n in cron_never_injectable_keys()}
 
     seen: set[str] = set()
     for name in names:
@@ -374,7 +383,7 @@ def build_cron_secret_injection(
             continue
         seen.add(name)
 
-        if name in hard_floor:
+        if name.upper() in hard_floor:
             warnings.append(
                 f"declared secret {name!r} is on the never-injectable hard floor "
                 f"and cannot be granted to a cron script even if allowlisted — skipped"
