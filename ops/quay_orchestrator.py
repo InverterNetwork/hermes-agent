@@ -597,6 +597,17 @@ class QuayCliClient:
             outbox_item_id = str(row.get("outbox_item_id") or row.get("id") or "")
             if not outbox_item_id:
                 continue
+            terminal_reason = _terminal_outbox_row_reason(row)
+            if terminal_reason:
+                log_event(
+                    self._logger,
+                    "outbox_claim_skipped",
+                    worker_id=worker_id,
+                    outbox_item_id=outbox_item_id,
+                    task_id=str(row.get("task_id") or ""),
+                    reason=terminal_reason,
+                )
+                continue
             try:
                 claim = self._run_json(["outbox", "claim", outbox_item_id])
             except QuayCommandError as exc:
@@ -1405,16 +1416,28 @@ class HandoffDrainer:
         return result
 
     def _handle_claimed_delivery_item(self, item: OutboxItem) -> DrainResult:
+        # A single poisoned row must never crash the drain or block the rows
+        # behind it: any Slack error is classified, and any other unexpected
+        # exception is retried within a bounded budget and then quarantined —
+        # nothing here re-raises.
+        try:
+            return self._deliver_claimed_item(item)
+        except SlackApiError as exc:
+            return self._fail_delivery_slack_error(item, exc)
+        except Exception as exc:  # noqa: BLE001 - one bad row must not crash drain
+            return self._fail_delivery_unexpected(item, exc)
+
+    def _deliver_claimed_item(self, item: OutboxItem) -> DrainResult:
         task = self.quay.get_task_context(item.task_id)
         handoff = item.as_handoff(task)
         route = resolve_slack_route(handoff, task, self.config)
         if route is None:
             reason = "missing_default_slack_channel"
-            self.quay.fail_outbox_item(item, reason)
+            self._fail_terminal_delivery_item(item, reason)
             self.metrics.claims_released += 1
             log_event(
                 self.logger,
-                "outbox_item_failed",
+                "outbox_item_quarantined",
                 outbox_item_id=item.outbox_item_id,
                 task_id=item.task_id,
                 reason=reason,
@@ -1427,43 +1450,13 @@ class HandoffDrainer:
             )
 
         message = delivery_message_from_outbox(item, task)
-        try:
-            post_ref = self._post_delivery_message(
-                item=item,
-                handoff=handoff,
-                task=task,
-                route=route,
-                message=message,
-            )
-        except SlackApiError as exc:
-            self.metrics.errors += 1
-            reason = f"slack_api_error:{exc.method}:{exc.error}"
-            self.quay.fail_outbox_item(item, reason)
-            self.metrics.claims_released += 1
-            log_event(
-                self.logger,
-                "outbox_item_failed",
-                outbox_item_id=item.outbox_item_id,
-                task_id=item.task_id,
-                reason=reason,
-                slack_method=exc.method,
-                slack_error=exc.error,
-            )
-            return DrainResult(
-                status="slack_api_error",
-                handoff_id=handoff.handoff_id,
-                task_id=item.task_id,
-                metrics=self.metrics.as_dict(),
-            )
-        except Exception as exc:
-            self.metrics.errors += 1
-            reason = f"runner_error: {type(exc).__name__}: {exc}"
-            try:
-                self.quay.fail_outbox_item(item, reason)
-                self.metrics.claims_released += 1
-            except Exception:
-                self.logger.exception("failed to mark delivery outbox item failed")
-            raise
+        post_ref = self._post_delivery_message(
+            item=item,
+            handoff=handoff,
+            task=task,
+            route=route,
+            message=message,
+        )
 
         # Slack delivery is at-least-once: if the post succeeds but marking the
         # outbox item complete fails, a later retry may post the same message.
@@ -1485,6 +1478,124 @@ class HandoffDrainer:
             task_id=item.task_id,
             metrics=self.metrics.as_dict(),
         )
+
+    def _fail_delivery_slack_error(
+        self, item: OutboxItem, exc: SlackApiError
+    ) -> DrainResult:
+        self.metrics.errors += 1
+        reason = f"slack_api_error:{exc.method}:{exc.error}"
+        disposition = _delivery_slack_error_disposition(exc)
+        if disposition == "terminal":
+            self._fail_terminal_delivery_item(item, reason)
+            self.metrics.claims_released += 1
+            log_event(
+                self.logger,
+                "outbox_item_quarantined",
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
+                slack_method=exc.method,
+                slack_error=exc.error,
+            )
+            return DrainResult(
+                status="slack_api_error",
+                handoff_id=f"outbox:{item.outbox_item_id}",
+                task_id=item.task_id,
+                metrics=self.metrics.as_dict(),
+            )
+        if disposition == "operator":
+            # Human-recoverable (invite the bot / unarchive). Never silently
+            # dropped: alert loudly and retry within the budget so a quick fix
+            # auto-delivers before the row is quarantined.
+            log_event(
+                self.logger,
+                "outbox_item_operator_action_required",
+                level=logging.ERROR,
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
+                slack_method=exc.method,
+                slack_error=exc.error,
+                remediation="invite the Slack bot to the channel or unarchive it, then requeue",
+            )
+        return self._retry_or_quarantine_delivery_item(
+            item,
+            reason,
+            status="slack_api_error",
+            slack_method=exc.method,
+            slack_error=exc.error,
+        )
+
+    def _fail_delivery_unexpected(self, item: OutboxItem, exc: Exception) -> DrainResult:
+        self.metrics.errors += 1
+        detail = str(exc).replace("\n", " ").strip()
+        reason = f"runner_error:{type(exc).__name__}:{detail}"
+        self.logger.exception(
+            "unexpected error delivering outbox item %s", item.outbox_item_id
+        )
+        return self._retry_or_quarantine_delivery_item(
+            item, reason, status="runner_error"
+        )
+
+    def _retry_or_quarantine_delivery_item(
+        self,
+        item: OutboxItem,
+        reason: str,
+        *,
+        status: str,
+        slack_method: str | None = None,
+        slack_error: str | None = None,
+    ) -> DrainResult:
+        attempts = _delivery_attempt_count(item) + 1
+        if attempts >= MAX_DELIVERY_ATTEMPTS:
+            terminal_reason = f"exhausted_retries:attempt={attempts}:{reason}"
+            try:
+                self._fail_terminal_delivery_item(item, terminal_reason)
+                self.metrics.claims_released += 1
+            except Exception:
+                self.logger.exception(
+                    "failed to quarantine exhausted delivery outbox item"
+                )
+            log_event(
+                self.logger,
+                "outbox_item_quarantined",
+                level=logging.ERROR,
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=terminal_reason,
+                attempts=attempts,
+                slack_method=slack_method,
+                slack_error=slack_error,
+            )
+        else:
+            retry_reason = f"{_DELIVERY_ATTEMPT_MARKER}{attempts}:{reason}"
+            try:
+                self.quay.fail_outbox_item(item, retry_reason)
+                self.metrics.claims_released += 1
+            except Exception:
+                self.logger.exception(
+                    "failed to mark delivery outbox item for retry"
+                )
+            log_event(
+                self.logger,
+                "outbox_item_failed",
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=retry_reason,
+                attempts=attempts,
+                slack_method=slack_method,
+                slack_error=slack_error,
+            )
+        return DrainResult(
+            status=status,
+            handoff_id=f"outbox:{item.outbox_item_id}",
+            task_id=item.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _fail_terminal_delivery_item(self, item: OutboxItem, reason: str) -> None:
+        terminal_reason = f"terminal:{reason}"
+        self.quay.fail_outbox_item(item, terminal_reason)
 
     def _post_delivery_message(
         self,
@@ -2585,14 +2696,211 @@ def _coerce_slack_route(value: Any, *, source: str) -> SlackRoute | None:
 
 
 def _parse_slack_thread_ref(value: str) -> tuple[str, str] | None:
-    left, sep, right = value.strip().partition(":")
-    if not sep:
+    parts = [part.strip() for part in value.strip().split(":")]
+    if parts and parts[0].lower() == "slack":
+        # A `slack:` prefix is only valid in the full `slack:CHANNEL:THREAD_TS`
+        # shape. Reject anything else (e.g. a truncated `slack:CHANNEL`) rather
+        # than mis-reading "slack" as the channel id.
+        if len(parts) != 3:
+            return None
+        channel_id, thread_ts = parts[1], parts[2]
+    elif len(parts) == 2:
+        channel_id, thread_ts = parts
+    else:
         return None
-    channel_id = left.strip()
-    thread_ts = right.strip()
     if not channel_id or not thread_ts:
         return None
     return channel_id, thread_ts
+
+
+# --- Delivery outbox quarantine contract ------------------------------------
+#
+# One deterministically-bad delivery row must never starve the rows behind it.
+# The orchestrator marks such rows with a `terminal:` error prefix and skips
+# them on later drains. This only works if `quay outbox list --status pending`
+# faithfully round-trips what `quay outbox fail --error <reason>` wrote, i.e.:
+#
+#   * a failed row is re-listed under `--status pending` (retryable), OR is
+#     dropped from the pending list entirely once it is dead-lettered — either
+#     way it stops being re-claimed; and
+#   * the `--error` string survives on the row under one of `last_error`,
+#     `error`, or `last_error_message`, with our `terminal:` marker intact
+#     (optionally behind a Quay wrapper prefix such as "... : terminal:...").
+#
+# `MAX_DELIVERY_ATTEMPTS` also bounds retries for genuinely transient failures
+# and for unexpected (non-Slack) exceptions, so even if Quay exposes no native
+# attempt counter the row is quarantined after a few ticks. The fallback
+# counter is carried in the `delivery_attempt=<n>` marker embedded in the
+# retryable failure reason (read back via the same last_error round-trip).
+MAX_DELIVERY_ATTEMPTS = 5
+
+_DELIVERY_ATTEMPT_MARKER = "delivery_attempt="
+
+# Slack Web API `error` values (and the synthetic `transport_error:` prefix
+# used for network / 5xx / 429 failures) that are genuinely transient: the same
+# payload and route can succeed on a later tick, so these are retried within the
+# attempt budget rather than quarantined immediately.
+_RETRYABLE_SLACK_ERRORS = frozenset(
+    {
+        "ratelimited",
+        "rate_limited",
+        "service_unavailable",
+        "internal_error",
+        "fatal_error",
+        "backend_error",
+        "request_timeout",
+        "timeout",
+        "gateway_timeout",
+        "connection_error",
+    }
+)
+
+# Deterministic Slack errors a human can still clear by fixing the destination
+# channel (invite the bot / unarchive). Retried within the attempt budget so a
+# quick fix auto-delivers, and surfaced loudly (see the operator alert) so the
+# message is never silently dropped.
+_OPERATOR_RECOVERABLE_SLACK_ERRORS = frozenset(
+    {
+        "not_in_channel",
+        "is_archived",
+    }
+)
+
+
+def _delivery_slack_error_disposition(exc: SlackApiError) -> str:
+    """Classify a Slack delivery failure.
+
+    Returns ``retryable`` (transient — retry within the attempt budget),
+    ``operator`` (channel-level, human-recoverable — retry within budget *and*
+    alert), or ``terminal`` (deterministic bad payload/route — quarantine
+    immediately so it cannot starve the outbox).
+    """
+    error = (exc.error or "").strip().lower()
+    if error.startswith("transport_error:") or error in _RETRYABLE_SLACK_ERRORS:
+        return "retryable"
+    if error in _OPERATOR_RECOVERABLE_SLACK_ERRORS:
+        return "operator"
+    return "terminal"
+
+
+def _delivery_attempt_count(item: OutboxItem) -> int:
+    """Best-effort count of prior delivery attempts for a claimed row.
+
+    Prefers a native counter on the raw Quay outbox row; otherwise falls back
+    to the ``delivery_attempt=<n>`` marker this orchestrator embeds in the
+    retryable failure reason, so bounded retry still works when Quay exposes no
+    attempt counter.
+    """
+    raw = item.metadata.get("quay_outbox")
+    if not isinstance(raw, Mapping):
+        return 0
+    for key in ("delivery_attempts", "attempt_count", "attempts", "retry_count"):
+        value = raw.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return _attempt_from_marker(_row_error(raw))
+
+
+def _row_error(row: Mapping[str, Any]) -> str:
+    return str(
+        row.get("last_error")
+        or row.get("error")
+        or row.get("last_error_message")
+        or ""
+    )
+
+
+def _attempt_from_marker(reason: str) -> int:
+    marker_at = reason.find(_DELIVERY_ATTEMPT_MARKER)
+    if marker_at < 0:
+        return 0
+    tail = reason[marker_at + len(_DELIVERY_ATTEMPT_MARKER) :]
+    digits = ""
+    for ch in tail:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else 0
+
+
+# Reason tokens that legitimately follow a `terminal:` / `quarantine:` marker.
+# Wrapper-tolerance only fires when the marker is followed by one of these, so
+# arbitrary error free-text that merely contains the word "terminal" (e.g.
+# "connection terminal: reset by peer") is never misread as a terminal row.
+_TERMINAL_REASON_TOKENS = frozenset(
+    {
+        "missing_default_slack_channel",
+        "slack_api_error",
+        "exhausted_retries",
+        "channel_not_found",
+        "thread_not_found",
+        "not_in_channel",
+        "is_archived",
+        "msg_too_long",
+        "invalid_blocks",
+        "invalid_arguments",
+        "restricted_action",
+        "quarantined",
+    }
+)
+
+
+def _leading_reason_token(text: str) -> str:
+    token = ""
+    for ch in text:
+        if ch == ":" or ch.isspace():
+            break
+        token += ch
+    return token
+
+
+def _wrapped_terminal_reason(lowered: str) -> bool:
+    """True only if a `terminal:`/`quarantine:` marker sits behind a wrapper
+    boundary AND is immediately followed by a recognized terminal reason token.
+    """
+    for marker in ("terminal:", "quarantine:"):
+        for sep in (" " + marker, ":" + marker):
+            idx = lowered.find(sep)
+            while idx >= 0:
+                after = lowered[idx + len(sep) :]
+                if _leading_reason_token(after) in _TERMINAL_REASON_TOKENS:
+                    return True
+                idx = lowered.find(sep, idx + 1)
+    return False
+
+
+def _terminal_outbox_row_reason(row: Mapping[str, Any]) -> str | None:
+    status = str(row.get("status") or row.get("state") or "").strip().lower()
+    if status in {
+        "terminal",
+        "quarantined",
+        "quarantine",
+        "failed_terminal",
+        "dead",
+        "dead_letter",
+    }:
+        return f"terminal_status:{status}"
+    last_error = _row_error(row).strip()
+    if not last_error:
+        return None
+    lowered = last_error.lower()
+    # Canonical marker the orchestrator itself writes — always authoritative.
+    if lowered.startswith("terminal:") or lowered.startswith("quarantine:"):
+        return last_error
+    # A row still carrying a delivery_attempt= retry marker is retryable-in-flight:
+    # never let wrapper-tolerance misread free text inside its reason as terminal.
+    if _DELIVERY_ATTEMPT_MARKER in lowered:
+        return None
+    # Tolerate a Quay wrapper prefix, e.g. "quay-wrapper: terminal:exhausted_retries",
+    # but only when the marker is followed by a recognized terminal reason token.
+    if _wrapped_terminal_reason(lowered):
+        return last_error
+    return None
 
 
 def load_config(path: Path | None) -> OrchestratorConfig:
@@ -2632,9 +2940,15 @@ def build_quay_client(config: OrchestratorConfig) -> QuayClient:
     return QuayCliClient(command=config.quay_command, logger=LOGGER)
 
 
-def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
+def log_event(
+    logger: logging.Logger,
+    event: str,
+    *,
+    level: int = logging.INFO,
+    **fields: Any,
+) -> None:
     record = {"event": event, **fields}
-    logger.info(json.dumps(record, sort_keys=True))
+    logger.log(level, json.dumps(record, sort_keys=True))
 
 
 def run_drain_one(args: argparse.Namespace) -> int:
