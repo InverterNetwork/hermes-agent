@@ -283,6 +283,123 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
+# ---------------------------------------------------------------------------
+# Declarative cron secret injection (BRIX-1870).
+#
+# ``no_agent`` cron scripts are spawned through ``_sanitize_subprocess_env``,
+# which strips every Hermes-managed secret from the child (SECURITY.md §2.3) —
+# a script runs arbitrary third-party deps, so ambient secrets are one poisoned
+# dep away from full exfiltration. This helper implements a NARROW, TWO-GATE
+# opt-in that lets a script receive back exactly the secrets it declares AND the
+# operator has authorized — nothing else:
+#
+#   Gate 1 (job / hermes-state):  the job's ``secrets: [...]`` list. Dev-editable,
+#                                 PR-reviewed. Declares what the script WANTS.
+#   Gate 2 (host / operator):     ``cron.injectable_secrets`` in the HOST
+#                                 config.yaml. Operator-controlled allowlist,
+#                                 NOT in hermes-state. Declares what the platform
+#                                 ALLOWS.
+#
+# Injection is the INTERSECTION: a name is granted only if it is in BOTH gates,
+# has a value in the source environment, and is NOT on the hard floor below.
+#
+# Hard floor — the allowlist can NEVER grant these, even if an operator lists
+# them and a job declares them. It is the union of the Tier-1 always-strip keys
+# and the full provider/tool blocklist, minus a single blessed exception
+# (``SLACK_BOT_TOKEN``, the motivating case). So GitHub auth, the Slack APP token
+# and signing secret, every provider/model API key, dashboard/session tokens,
+# other-platform bot tokens, and remote-compute secrets are structurally
+# un-injectable through this path.
+_CRON_INJECTABLE_EXCEPTIONS: frozenset[str] = frozenset({
+    "SLACK_BOT_TOKEN",
+})
+
+
+def cron_never_injectable_keys() -> frozenset[str]:
+    """Return the hard-floor set the cron secret allowlist can never grant.
+
+    Union of the Tier-1 always-strip keys (:data:`_ALWAYS_STRIP_KEYS`) and the
+    full provider/tool blocklist (:data:`_HERMES_PROVIDER_ENV_BLOCKLIST`), minus
+    the explicitly-blessed exceptions (:data:`_CRON_INJECTABLE_EXCEPTIONS`).
+
+    Computed at call time so it tracks the provider registry that the blocklist
+    is derived from — the floor can never silently drift below the strip policy
+    it mirrors. An operator who lists any of these names in
+    ``cron.injectable_secrets`` is ignored (loudly, at the call site).
+    """
+    return frozenset(_ALWAYS_STRIP_KEYS | _HERMES_PROVIDER_ENV_BLOCKLIST) - _CRON_INJECTABLE_EXCEPTIONS
+
+
+def build_cron_secret_injection(
+    declared: "list[str] | None",
+    allowlist: "set[str] | frozenset[str] | list[str] | None",
+    *,
+    source_env: "dict | None" = None,
+) -> "tuple[dict[str, str], list[str]]":
+    """Compute the declarative-secret injection for a ``no_agent`` cron script.
+
+    Returns ``(extra_env, warnings)``:
+
+    * ``extra_env`` maps ``_HERMES_FORCE_<NAME> -> value`` for each declared
+      name that clears BOTH gates, is off the hard floor, and has a value in
+      ``source_env``. The ``_HERMES_FORCE_`` prefix makes
+      :func:`_sanitize_subprocess_env` re-inject the bare name POST-strip, so an
+      allowlisted secret (e.g. ``SLACK_BOT_TOKEN``, otherwise removed by the
+      blocklist) reaches the script while everything else stays stripped. Feed
+      this dict straight to ``_sanitize_subprocess_env(base, extra_env)``.
+    * ``warnings`` is a human-readable string per declared name that was NOT
+      injected, so the caller can log LOUDLY on any mismatch — a script must
+      never silently run without a credential it expects.
+
+    Gate order per declared name (first decisive check wins):
+      1. on the hard floor            → refuse (never injectable)
+      2. not in the operator allowlist → refuse (declared but unauthorized)
+      3. no value in ``source_env``    → refuse (authorized but not provisioned)
+      4. otherwise                     → inject
+    """
+    warnings: list[str] = []
+    extra_env: dict[str, str] = {}
+
+    names = [str(n).strip() for n in (declared or []) if str(n).strip()]
+    if not names:
+        return extra_env, warnings
+
+    allow = {str(n).strip() for n in (allowlist or []) if str(n).strip()}
+    env = os.environ if source_env is None else source_env
+    hard_floor = cron_never_injectable_keys()
+
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+
+        if name in hard_floor:
+            warnings.append(
+                f"declared secret {name!r} is on the never-injectable hard floor "
+                f"and cannot be granted to a cron script even if allowlisted — skipped"
+            )
+            continue
+        if name not in allow:
+            warnings.append(
+                f"declared secret {name!r} is not in the operator "
+                f"cron.injectable_secrets allowlist — skipped (ask an operator to "
+                f"allowlist it in config.yaml)"
+            )
+            continue
+        value = env.get(name)
+        if value is None or value == "":
+            warnings.append(
+                f"declared secret {name!r} is allowlisted but has no value in the "
+                f"host environment — skipped (provision it in an auth/*.env or "
+                f"~/.hermes/.env sourced by the gateway)"
+            )
+            continue
+        extra_env[f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}{name}"] = value
+
+    return extra_env, warnings
+
+
 def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
     """Build a sanitized environment dict for a spawned subprocess.
 

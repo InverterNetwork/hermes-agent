@@ -1545,7 +1545,37 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _cron_injectable_secrets_allowlist() -> frozenset[str]:
+    """Operator-controlled allowlist of secret names injectable into cron scripts.
+
+    This is the PLATFORM authorization gate for declarative cron secrets
+    (BRIX-1870). It is sourced from ``cron.injectable_secrets`` in the HOST
+    ``config.yaml`` — deliberately NOT from hermes-state (jobs.json / the
+    version-controlled state surface), so a dev PR can declare that a job WANTS
+    a secret but only an operator editing host config can AUTHORIZE it.
+
+    The secret VALUES themselves come from the existing Hermes secret plumbing:
+    the gateway process environment, populated by the staged ``auth/*.env`` /
+    ``~/.hermes/.env`` files. "Provision once, reuse freely" — an operator stages
+    a secret (e.g. ``SLACK_BOT_TOKEN``, already required for the Slack gateway)
+    exactly once and simply adds its name here to authorize cron injection.
+
+    Returns an empty set on any error or absent config so the feature fails
+    CLOSED (nothing injected), never open.
+    """
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        raw = cron_cfg.get("injectable_secrets") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        return frozenset(str(name).strip() for name in raw if str(name).strip())
+    except Exception as exc:
+        logger.debug("Failed to load cron.injectable_secrets allowlist: %s", exc)
+        return frozenset()
+
+
+def _run_job_script(script_path: str, *, secrets: Optional[List[str]] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1567,10 +1597,21 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     provider credentials and other Hermes-managed secrets are not inherited
     (SECURITY.md §2.3), matching terminal and MCP child processes.
 
+    Declarative secret injection (BRIX-1870): when ``secrets`` is provided (the
+    job's ``secrets: [...]`` list), each name that is BOTH declared here AND in
+    the operator ``cron.injectable_secrets`` allowlist — and not on the hard
+    floor — is force-injected back into the otherwise-stripped environment via
+    ``_sanitize_subprocess_env``'s ``extra_env`` param. Any declared name that
+    fails a gate is logged loudly and simply not injected (the script still
+    runs). See :func:`build_cron_secret_injection`.
+
     Args:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        secrets: Optional list of secret env-var names the job declared it
+            needs. Only the intersection with the operator allowlist (minus the
+            hard floor) is injected; everything else stays stripped.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -1628,7 +1669,32 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         argv = [sys.executable, str(path)]
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
+        from tools.environments.local import (
+            _HERMES_PROVIDER_ENV_FORCE_PREFIX,
+            _sanitize_subprocess_env,
+            build_cron_secret_injection,
+        )
+
+        # Declarative secret injection (BRIX-1870): re-grant ONLY the secrets
+        # that are both declared on the job AND authorized by the operator
+        # allowlist, minus the never-injectable hard floor. Everything else
+        # stays stripped by _sanitize_subprocess_env.
+        extra_env: Optional[dict] = None
+        if secrets:
+            extra_env, _secret_warnings = build_cron_secret_injection(
+                secrets, _cron_injectable_secrets_allowlist()
+            )
+            for _w in _secret_warnings:
+                logger.warning("Cron script %s: declarative secret %s", path.name, _w)
+            if extra_env:
+                _injected = sorted(
+                    k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):] for k in extra_env
+                )
+                logger.info(
+                    "Cron script %s: injecting operator-allowlisted secrets %s",
+                    path.name,
+                    _injected,
+                )
 
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
@@ -1637,7 +1703,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_sanitize_subprocess_env(os.environ.copy(), extra_env),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
@@ -1720,7 +1786,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, secrets=job.get("secrets"))
         if success:
             if script_output:
                 prompt = (
@@ -2014,7 +2080,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, secrets=job.get("secrets"))
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2103,7 +2169,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, secrets=job.get("secrets"))
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
