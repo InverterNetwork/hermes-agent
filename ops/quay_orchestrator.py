@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -261,6 +262,12 @@ class OrchestratorConfig:
     remediation_max_tokens: int = 4000
     remediation_max_attempts: int = 2
     remediation_friction_enabled: bool = False
+    # Model-authored human-facing escalation message (BRIX-1878). Decoupled from
+    # ``remediation_enabled``: this flag only lets the (already bounded) turn
+    # author the Slack escalation text on the escalate path. It NEVER enables an
+    # auto-resume — a gate-cleared resume is still only submitted under
+    # ``remediation_enabled``. Default OFF: fully inert until explicitly enabled.
+    remediation_escalation_message_enabled: bool = False
     remediation_linear_team_id: str = DEFAULT_REMEDIATION_LINEAR_TEAM_ID
 
     @classmethod
@@ -291,6 +298,9 @@ class OrchestratorConfig:
             ),
             remediation_friction_enabled=_as_bool(
                 raw.get("remediation_friction_enabled"), default=False
+            ),
+            remediation_escalation_message_enabled=_as_bool(
+                raw.get("remediation_escalation_message_enabled"), default=False
             ),
             remediation_linear_team_id=str(
                 raw.get("remediation_linear_team_id")
@@ -346,6 +356,17 @@ class OrchestratorConfig:
             remediation_friction_enabled = _as_bool(
                 remediation_friction_env, default=remediation_friction_enabled
             )
+        remediation_escalation_message_enabled = (
+            self.remediation_escalation_message_enabled
+        )
+        remediation_escalation_message_env = os.getenv(
+            "QUAY_ORCHESTRATOR_REMEDIATION_ESCALATION_MESSAGE_ENABLED"
+        )
+        if remediation_escalation_message_env is not None:
+            remediation_escalation_message_enabled = _as_bool(
+                remediation_escalation_message_env,
+                default=remediation_escalation_message_enabled,
+            )
         return dataclasses.replace(
             self,
             enabled=enabled,
@@ -372,6 +393,9 @@ class OrchestratorConfig:
                 default=self.remediation_max_attempts,
             ),
             remediation_friction_enabled=remediation_friction_enabled,
+            remediation_escalation_message_enabled=(
+                remediation_escalation_message_enabled
+            ),
             remediation_linear_team_id=(
                 os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID")
                 or self.remediation_linear_team_id
@@ -1418,6 +1442,10 @@ REMEDIATION_GUARDRAIL_SYSTEM = (
 _MAX_REMEDIATION_RESPONSE_CHARS = 20000
 _MAX_REMEDIATION_BRIEF_CHARS = 6000
 _MAX_FRICTION_FIELD_CHARS = 4000
+# The optional model-authored escalation message is human-facing prose; cap it so
+# a single blocked worker cannot flood a Slack thread. Applied both when parsing
+# and when sanitizing (defence in depth).
+_MAX_ESCALATION_MESSAGE_CHARS = 800
 
 
 @dataclass(frozen=True)
@@ -1426,6 +1454,10 @@ class RemediationOutcome:
     category: str
     rationale: str = ""
     friction: Mapping[str, str] | None = None
+    # Optional model-authored human-facing escalation message, carried ONLY for
+    # the escalate path. NEVER read by any gate / allowlist / loop-guard / resume
+    # decision — the renderer reads it after the decision has been made.
+    message: str | None = None
     tokens: int = 0
 
 
@@ -1501,6 +1533,24 @@ def _parse_friction(value: Any) -> dict[str, str] | None:
     return fields
 
 
+def _coerce_escalation_message(value: Any) -> str | None:
+    """Defensively coerce a raw escalate ``message`` into a capped string.
+
+    Returns ``None`` (message treated as absent) unless ``value`` is a non-empty
+    string. The message is optional: escalate is valid with or without it, and a
+    missing / blank / non-string / oversized value must never block the escalate.
+    Oversized text is truncated with an ellipsis rather than rejected.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > _MAX_ESCALATION_MESSAGE_CHARS:
+        text = text[: _MAX_ESCALATION_MESSAGE_CHARS - 1].rstrip() + "…"
+    return text
+
+
 def parse_remediation_response(text: str) -> dict[str, Any] | None:
     """Strictly parse the remediation turn's JSON.
 
@@ -1535,6 +1585,11 @@ def parse_remediation_response(text: str) -> dict[str, Any] | None:
         # Otto cannot self-resolve. Invalid/oversized friction is dropped (we
         # still escalate); a bad friction never blocks the escalation.
         escalation: dict[str, Any] = {"action": "escalate"}
+        # Optional human-facing escalation message. Carried ONLY on the escalate
+        # path; it does not (and must not) influence the resume/gate logic below.
+        message = _coerce_escalation_message(data.get("message"))
+        if message is not None:
+            escalation["message"] = message
         if data.get("friction") is not None:
             parsed_friction = _parse_friction(data.get("friction"))
             if parsed_friction is not None:
@@ -1748,14 +1803,23 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
                 # still supplied a valid friction object, surface it via
                 # ``last_outcome`` so the orchestrator can record it (code-only,
                 # behind ``remediation_friction_enabled``) while still escalating.
+                # BRIX-1878: likewise carry any model-authored escalation message
+                # so the orchestrator can render it in place of the deterministic
+                # template (gated by ``remediation_escalation_message_enabled``).
+                # Both are escalate-path-only and read AFTER this decision — they
+                # never affect the gate/allowlist/loop-guard logic above.
                 friction = (
                     parsed.get("friction") if isinstance(parsed, Mapping) else None
                 )
-                if friction:
+                message = (
+                    parsed.get("message") if isinstance(parsed, Mapping) else None
+                )
+                if friction or message:
                     self.last_outcome = RemediationOutcome(
                         brief="",
                         category="",
                         friction=friction,
+                        message=message,
                         tokens=tokens,
                     )
                 log_event(
@@ -2684,13 +2748,34 @@ class HandoffDrainer:
 
         brief = choose_direct_brief(handoff)
         remediated = False
-        if brief is None and self.config.remediation_enabled:
+        # Run the (bounded, guardrailed) remediation turn when EITHER auto-resume
+        # OR the escalation-message feature is enabled. The two flags are
+        # independent: the message flag lets the turn run purely to author a
+        # human-facing escalation, and NEVER authorizes an auto-resume.
+        if brief is None and (
+            self.config.remediation_enabled
+            or self.config.remediation_escalation_message_enabled
+        ):
             brief = self.remediator.remediate(
                 handoff=handoff, task=task, artifact=artifact
             )
-            if brief is not None:
+            # A gate-cleared resume is submitted ONLY under remediation_enabled.
+            # In message-only mode a proposed resume is deliberately dropped
+            # (brief -> None) so we fall through to escalate; the message flag
+            # must never enable an auto-resume.
+            if brief is not None and self.config.remediation_enabled:
                 remediated = True
             else:
+                if brief is not None:
+                    # Message-only mode: the model proposed a gate-cleared resume
+                    # but auto-resume is disabled, so we escalate instead.
+                    log_event(
+                        self.logger,
+                        "remediation_resume_suppressed_message_only",
+                        handoff_id=handoff.handoff_id,
+                        task_id=handoff.task_id,
+                    )
+                    brief = None
                 self.metrics.remediation_escalated += 1
                 # F4: even when Otto escalates, still capture any recurring
                 # Quay-CLI friction the model surfaced. Code-only and gated by
@@ -2761,7 +2846,17 @@ class HandoffDrainer:
                 metrics=self.metrics.as_dict(),
             )
 
-        question = build_human_question(handoff, task, artifact)
+        # Use a model-authored escalation body ONLY when the message feature is
+        # enabled AND the remediation turn actually supplied one; otherwise the
+        # renderer falls back to the deterministic build_human_question. Read
+        # after the decision, this can never affect any gate or the resume path.
+        model_message = None
+        if (
+            self.config.remediation_escalation_message_enabled
+            and self.remediator.last_outcome is not None
+        ):
+            model_message = self.remediator.last_outcome.message
+        question = build_escalation_message(handoff, task, artifact, model_message)
         if handoff_is_waiting_for_human(handoff):
             return self._poll_waiting_human_handoff(
                 handoff=handoff,
@@ -3721,6 +3816,110 @@ def build_human_question(
             lines.append("Context:")
             lines.extend(f"• {line}" for line in context_lines)
 
+    lines.append(_HUMAN_QUESTION_FOOTER)
+    return "\n".join(lines)
+
+
+# A zero-width space wedged into a mention token breaks the exact-substring that
+# Slack (and a human's eye) reads as a ping, while keeping the text legible.
+_MENTION_NEUTRALIZER = "\u200b"
+
+# Slack broadcast tokens and raw mention tokens. The model message is authored
+# from attacker-influenceable blocker text, so it must never be able to @-ping a
+# channel or a person. Each pattern is de-fanged so the visible text survives but
+# cannot broadcast.
+_BROADCAST_TOKEN_RE = re.compile(r"<!(channel|here|everyone)>", re.IGNORECASE)
+_SUBTEAM_TOKEN_RE = re.compile(r"<!subteam\^[^>]*>", re.IGNORECASE)
+_RAW_USER_MENTION_RE = re.compile(r"<@([^>]*)>")
+_BARE_BROADCAST_RE = re.compile(r"@(channel|here|everyone)\b", re.IGNORECASE)
+
+
+def _defang_raw_user_mention(match: "re.Match[str]") -> str:
+    inner = match.group(1).strip()
+    label = inner.split("|", 1)[-1].strip() or inner.split("|", 1)[0].strip()
+    return "@" + _MENTION_NEUTRALIZER + (label or "user")
+
+
+def _sanitize_escalation_message(text: str) -> str:
+    """Neutralize broadcast/mention injection in a model-authored message.
+
+    The message is composed from attacker-influenceable blocker text, so before
+    it can reach Slack we defang every token that could ping: ``@channel`` /
+    ``@here`` / ``@everyone``, the Slack broadcast tokens ``<!channel>`` /
+    ``<!here>`` / ``<!everyone>``, user-group ``<!subteam^...>`` tokens, and raw
+    ``<@Uxxxx>`` user mentions. Each is rewritten so the visible text is
+    preserved but the exact ping substring no longer exists. Also collapses
+    whitespace and caps the length. Pure and side-effect free.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = text
+    # Slack broadcast tokens -> visible but inert (no literal ``<!channel>`` and
+    # no literal ``@channel`` left behind).
+    cleaned = _BROADCAST_TOKEN_RE.sub(
+        lambda m: "@" + _MENTION_NEUTRALIZER + m.group(1).lower(), cleaned
+    )
+    # User-group pings.
+    cleaned = _SUBTEAM_TOKEN_RE.sub("@" + _MENTION_NEUTRALIZER + "group", cleaned)
+    # Raw user mentions <@Uxxxx> / <@Uxxxx|name>.
+    cleaned = _RAW_USER_MENTION_RE.sub(_defang_raw_user_mention, cleaned)
+    # Bare @channel / @here / @everyone (both the originals and none of the
+    # already-neutralized forms above, which carry a zero-width space).
+    cleaned = _BARE_BROADCAST_RE.sub(
+        lambda m: "@" + _MENTION_NEUTRALIZER + m.group(1).lower(), cleaned
+    )
+    # Collapse to a compact single block and cap the size.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > _MAX_ESCALATION_MESSAGE_CHARS:
+        cleaned = cleaned[: _MAX_ESCALATION_MESSAGE_CHARS - 1].rstrip() + "…"
+    return cleaned
+
+
+def build_escalation_message(
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+    model_message: str | None,
+) -> str:
+    """Render the human escalation, optionally using a model-authored body.
+
+    When ``model_message`` sanitizes to a non-empty string, it becomes the BODY
+    of the escalation, wrapped in the SAME deterministic routing scaffolding
+    :func:`build_human_question` uses (reason-specific header + identifier·repo,
+    a ``Contributor:`` mention, and the shared footer). When it is ``None`` /
+    blank, this falls back to :func:`build_human_question` unchanged. An explicit
+    worker/operator ``human_question`` still wins verbatim (highest priority).
+    """
+    # Highest priority: an explicit worker/operator question is authoritative and
+    # must win over any model-authored message (mirrors build_human_question).
+    if handoff.human_question and handoff.human_question.strip():
+        return handoff.human_question.strip()
+    meta_question = handoff.metadata.get("human_question")
+    if isinstance(meta_question, str) and meta_question.strip():
+        return meta_question.strip()
+
+    body = _sanitize_escalation_message(model_message or "")
+    if not body:
+        # No usable model message -> byte-identical to today's escalation.
+        return build_human_question(handoff, task, artifact)
+
+    artifact_lines = _clean_handoff_lines(artifact.text if artifact else "")
+    summary_lines = _clean_handoff_lines(handoff.summary)
+    combined_lines = list(dict.fromkeys(artifact_lines + summary_lines))
+    kind = _handoff_reason_kind(handoff, "\n".join(combined_lines))
+
+    identifier = task.issue or task.task_id
+    repo = task.repo_id or handoff.repo_id
+    header = _handoff_header(kind)
+    header_suffix = " · ".join(part for part in (identifier, repo) if part)
+    if header_suffix:
+        header = f"{header} — {header_suffix}"
+
+    lines = [header]
+    author_mention = resolve_author_mention(handoff, task)
+    if author_mention:
+        lines.append(f"Contributor: {author_mention}")
+    lines.append(body)
     lines.append(_HUMAN_QUESTION_FOOTER)
     return "\n".join(lines)
 
