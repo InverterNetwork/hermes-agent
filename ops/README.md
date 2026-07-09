@@ -235,8 +235,13 @@ Re-run touches:
 
 ```ini
 [Timer]
-OnUnitActiveSec=2min
+OnCalendar=*:0/2
 ```
+
+`OnCalendar` (a wall-clock schedule) rather than `OnUnitActiveSec` so the
+timer always has a next elapse and re-arms after any stop or
+restart-past-boot — a monotonic-only schedule can silently deadlock with no
+next trigger (BRIX-1874).
 
 To retune without editing the shipped unit, drop a systemd override:
 
@@ -244,8 +249,8 @@ To retune without editing the shipped unit, drop a systemd override:
 sudo systemctl edit hermes-sync.timer
 # In the editor, add:
 # [Timer]
-# OnUnitActiveSec=
-# OnUnitActiveSec=5min
+# OnCalendar=
+# OnCalendar=*:0/5
 sudo systemctl daemon-reload
 ```
 
@@ -625,8 +630,13 @@ GitHub, not in this codebase.
 
 ```ini
 [Timer]
-OnUnitActiveSec=1min
+OnCalendar=minutely
 ```
+
+`OnCalendar` (a wall-clock schedule) rather than `OnUnitActiveSec` so the
+timer always has a next elapse and re-arms after any stop or
+restart-past-boot — a monotonic-only schedule can silently deadlock with no
+next trigger (BRIX-1874).
 
 Retune the same way as hermes-sync:
 
@@ -1329,8 +1339,13 @@ keys), either rotate first or keep it out of `repos[]` until you have.
 
 ```ini
 [Timer]
-OnUnitActiveSec=5min
+OnCalendar=*:0/5
 ```
+
+`OnCalendar` (a wall-clock schedule) rather than `OnUnitActiveSec` so the
+timer always has a next elapse and re-arms after any stop or
+restart-past-boot — a monotonic-only schedule can silently deadlock with no
+next trigger (BRIX-1874).
 
 Override the same way as the other timers:
 
