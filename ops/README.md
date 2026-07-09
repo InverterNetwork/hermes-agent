@@ -744,10 +744,38 @@ effective Quay config and env:
 
 The orchestrator accepts both stored thread ref shapes,
 `CHANNEL:THREAD_TS` and `slack:CHANNEL:THREAD_TS`, and normalizes to the
-unprefixed form before Slack API calls. Deterministic delivery routing
-failures are marked with a `terminal:` outbox error and logged as
-`outbox_item_quarantined`; rows that later appear with terminal/quarantine
-status or error markers are skipped so later pending delivery rows can drain.
+unprefixed form before Slack API calls. A `slack:` prefix is only accepted in
+the full three-part shape — a truncated `slack:CHANNEL` is rejected rather than
+read as channel `slack`.
+
+Delivery failures are classified so one bad row cannot starve the outbox:
+
+- **Deterministic** failures (missing route, `msg_too_long`, `invalid_blocks`,
+  `invalid_arguments`, `restricted_action`, `channel_not_found`,
+  `thread_not_found`, and any Slack error not on the retryable/operator lists)
+  are marked with a `terminal:` outbox error, logged as
+  `outbox_item_quarantined`, and skipped on later drains.
+- **Transient** failures (`ratelimited`, `service_unavailable`,
+  `internal_error`, `request_timeout`, network/5xx `transport_error:` …) and
+  unexpected non-Slack exceptions are retried up to `MAX_DELIVERY_ATTEMPTS`
+  (5), then quarantined with `terminal:exhausted_retries:…`. A single bad row
+  therefore blocks the rows behind it for at most a few one-minute ticks, and
+  an exception in one row never crashes the whole drain.
+- **Operator-recoverable** failures (`not_in_channel`, `is_archived`) are
+  retried within the same budget *and* surfaced as an ERROR-level
+  `outbox_item_operator_action_required` alert (invite the bot / unarchive,
+  then requeue) so a fixable channel is never silently dropped.
+
+Outbox contract this depends on (Quay side): `quay outbox fail --error <reason>`
+must round-trip through `quay outbox list --status pending` such that either the
+row is re-listed as pending carrying `<reason>` under one of `last_error`,
+`error`, or `last_error_message` (with the `terminal:`/`quarantine:` marker
+intact, optionally behind a wrapper prefix), or the row is dropped from the
+pending list once dead-lettered. Where Quay exposes no native attempt counter,
+the orchestrator carries its own `delivery_attempt=<n>` counter inside the
+retryable failure reason via the same round-trip. If Quay stops surfacing the
+error string on pending rows, quarantine detection degrades — see the contract
+comment above `MAX_DELIVERY_ATTEMPTS` in `ops/quay_orchestrator.py`.
 
 ```sh
 sudo -u hermes env QUAY_DATA_DIR=/home/hermes/.hermes/quay python3 - <<'PY'

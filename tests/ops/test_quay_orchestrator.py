@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import logging
 import sys
 import threading
 from pathlib import Path
@@ -165,6 +166,89 @@ class FakeOutboxQuayClient:
             raise RuntimeError(f"wrong_state: cannot fail outbox from {self.state}")
         self.state = "pending"
         self.failed.append((item, reason))
+
+
+class ReclaimingOutboxQuayClient:
+    """Round-trips fail_outbox_item reasons back as the row's ``last_error`` on
+    the next claim, and honors terminal markers by refusing to re-claim.
+
+    This mirrors the exact Quay outbox contract the quarantine logic depends
+    on (documented at ops/quay_orchestrator.py), so bounded retry and the
+    terminal-skip can be exercised across successive drains instead of being
+    faked with a hard-coded ``last_error``.
+    """
+
+    def __init__(self, raw, *, task=None) -> None:
+        self._raw = dict(raw)
+        self.task = task or quay.TaskContext(
+            task_id=str(raw.get("task_id") or ""),
+            title="Review approved PR",
+            issue="BRIX-1447",
+            repo_id="hermes-agent",
+        )
+        self.completed: list[object] = []
+        self.failed: list[tuple[object, str]] = []
+        self.claims = 0
+
+    def claim_work(self, worker_id: str):
+        if quay._terminal_outbox_row_reason(self._raw):
+            return None
+        self.claims += 1
+        return quay.OutboxItem.from_mapping(self._raw)
+
+    def claim_handoff(self, worker_id: str):
+        return None
+
+    def get_task_context(self, task_id: str):
+        return self.task
+
+    def complete_outbox_item(self, item) -> None:
+        self._raw["status"] = "completed"
+        self.completed.append(item)
+
+    def fail_outbox_item(self, item, reason: str) -> None:
+        self._raw["last_error"] = reason
+        self._raw["status"] = "pending"
+        self.failed.append((item, reason))
+
+
+def delivery_raw(*, route_hint=None, payload=None, **extra):
+    raw = {
+        "outbox_item_id": 31,
+        "task_id": "task-delivery",
+        "kind": "slack.pr_ready_approved",
+        "handler_class": "delivery",
+        "claim_id": "outbox-claim-31",
+        "payload_json": json.dumps(
+            payload or {"message": "PR #44 is approved and ready."}
+        ),
+        "route_hint_json": json.dumps(
+            route_hint if route_hint is not None else {"channel_id": "CDELIVERY"}
+        ),
+        "status": "pending",
+        "last_error": None,
+    }
+    raw.update(extra)
+    return raw
+
+
+class _CapturingLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _capturing_logger(name: str) -> tuple[logging.Logger, _CapturingLogHandler]:
+    logger = logging.getLogger(name)
+    logger.handlers.clear()
+    handler = _CapturingLogHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    return logger, handler
 
 
 class FakeSlackClient:
@@ -719,6 +803,118 @@ def test_drain_one_delivery_terminal_slack_failure_marks_item_terminal():
     ]
 
 
+def test_drain_one_delivery_msg_too_long_quarantines_immediately():
+    item = delivery_item(route_hint={"channel_id": "CDELIVERY"})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "msg_too_long")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    # msg_too_long is a deterministic bad payload: quarantined on the first
+    # failure so it cannot starve the rows behind it.
+    assert result.status == "slack_api_error"
+    assert quay_client.completed == []
+    assert quay_client.failed == [
+        (item, "terminal:slack_api_error:chat.postMessage:msg_too_long")
+    ]
+
+
+def test_drain_one_delivery_transient_slack_error_retries_then_quarantines():
+    quay_client = ReclaimingOutboxQuayClient(delivery_raw())
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "ratelimited")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    statuses = [
+        drainer.drain_one().status
+        for _ in range(quay.MAX_DELIVERY_ATTEMPTS + 2)
+    ]
+    reasons = [reason for _, reason in quay_client.failed]
+
+    # ratelimited is transient: retried with an incrementing marker for the
+    # first MAX-1 attempts, then quarantined once the budget is exhausted.
+    retryable = [r for r in reasons if r.startswith(quay._DELIVERY_ATTEMPT_MARKER)]
+    assert len(retryable) == quay.MAX_DELIVERY_ATTEMPTS - 1
+    assert reasons[0].startswith("delivery_attempt=1:")
+    assert reasons[-1].startswith("terminal:exhausted_retries:")
+    assert "ratelimited" in reasons[-1]
+    # Once quarantined the row is no longer re-claimed, so later drains find
+    # no work rather than re-poisoning the outbox forever.
+    assert statuses[-1] == "no_handoff"
+    assert quay_client.completed == []
+
+
+def test_drain_one_delivery_unexpected_error_is_bounded_and_never_crashes_drain():
+    quay_client = ReclaimingOutboxQuayClient(delivery_raw())
+    slack = FakeSlackClient(post_error=ValueError("deterministic render bug"))
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    statuses = []
+    for _ in range(quay.MAX_DELIVERY_ATTEMPTS + 1):
+        # A deterministic non-Slack exception must not propagate out of the
+        # drain (previously it re-raised and crashed the tick every time).
+        statuses.append(drainer.drain_one().status)
+
+    reasons = [reason for _, reason in quay_client.failed]
+    assert all(status in {"runner_error", "no_handoff"} for status in statuses)
+    assert reasons[0].startswith("delivery_attempt=1:runner_error:ValueError:")
+    assert reasons[-1].startswith("terminal:exhausted_retries:")
+    assert "ValueError" in reasons[-1]
+    assert statuses[-1] == "no_handoff"
+    assert quay_client.completed == []
+
+
+def test_drain_one_delivery_not_in_channel_alerts_and_retries_not_silently_dropped():
+    logger, handler = _capturing_logger("test.operator-alert")
+    quay_client = ReclaimingOutboxQuayClient(delivery_raw())
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "not_in_channel")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+        logger=logger,
+    )
+
+    result = drainer.drain_one()
+
+    # not_in_channel is human-recoverable: NOT silently quarantined on the
+    # first failure (retried within the budget so a quick channel fix
+    # auto-delivers) and surfaced as a loud ERROR-level operator alert.
+    assert result.status == "slack_api_error"
+    first_reason = quay_client.failed[0][1]
+    assert first_reason.startswith("delivery_attempt=1:")
+    assert "not_in_channel" in first_reason
+    alerts = [
+        rec
+        for rec in handler.records
+        if "outbox_item_operator_action_required" in rec.getMessage()
+    ]
+    assert alerts, "expected a loud operator-action alert"
+    assert alerts[0].levelno == logging.ERROR
+
+
 def test_cli_quay_adapter_claims_delivery_outbox_and_leaves_workflow_for_handoff():
     runner = RecordingDeliveryOutboxRunner()
     quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
@@ -786,6 +982,69 @@ def test_cli_quay_adapter_skips_terminal_outbox_row_and_claims_later_ready_item(
         "task get task-ready",
         "outbox complete 23 --claim-id delivery-claim-23",
     ]
+
+
+def test_parse_slack_thread_ref_accepts_both_shapes_and_rejects_truncated_prefix():
+    assert quay._parse_slack_thread_ref("C123:1000.0") == ("C123", "1000.0")
+    assert quay._parse_slack_thread_ref("slack:C123:1000.0") == ("C123", "1000.0")
+    assert quay._parse_slack_thread_ref("SLACK:C123:1000.0") == ("C123", "1000.0")
+    # Truncated legacy prefix must be rejected, not read as channel="slack".
+    assert quay._parse_slack_thread_ref("slack:C123") is None
+    assert quay._parse_slack_thread_ref("slack:") is None
+    assert quay._parse_slack_thread_ref("slack") is None
+    assert quay._parse_slack_thread_ref("slack:slack:C123:1000.0") is None
+    assert quay._parse_slack_thread_ref("C123") is None
+    assert quay._parse_slack_thread_ref("C123:") is None
+    assert quay._parse_slack_thread_ref("") is None
+
+
+def test_delivery_slack_error_disposition_splits_transient_operator_terminal():
+    def disp(error: str) -> str:
+        return quay._delivery_slack_error_disposition(
+            quay.SlackApiError("chat.postMessage", error)
+        )
+
+    # Transient -> retryable within the attempt budget.
+    assert disp("ratelimited") == "retryable"
+    assert disp("service_unavailable") == "retryable"
+    assert disp("internal_error") == "retryable"
+    assert disp("transport_error:<urlopen error timed out>") == "retryable"
+    assert disp("transport_error:HTTP Error 503: Service Unavailable") == "retryable"
+    # Human-recoverable channel state -> operator alert (still retried).
+    assert disp("not_in_channel") == "operator"
+    assert disp("is_archived") == "operator"
+    # Deterministic bad payload/route -> quarantine immediately.
+    assert disp("msg_too_long") == "terminal"
+    assert disp("invalid_blocks") == "terminal"
+    assert disp("channel_not_found") == "terminal"
+    assert disp("thread_not_found") == "terminal"
+
+
+def test_terminal_outbox_row_reason_tolerates_field_and_wrapper_variance():
+    # Marker under each accepted error-field name.
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "terminal:missing_default_slack_channel"}
+    )
+    assert quay._terminal_outbox_row_reason({"error": "quarantine:bad"})
+    assert quay._terminal_outbox_row_reason(
+        {"last_error_message": "terminal:slack_api_error"}
+    )
+    # Terminal status name variants.
+    assert quay._terminal_outbox_row_reason({"status": "dead_letter"})
+    assert quay._terminal_outbox_row_reason({"state": "quarantined"})
+    # A Quay wrapper prefix before our marker is still detected.
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "delivery handler failed: terminal:msg_too_long"}
+    )
+    # Retryable rows (attempt marker / plain transient) are NOT skipped.
+    assert (
+        quay._terminal_outbox_row_reason(
+            {"last_error": "delivery_attempt=2:slack_api_error:chat.postMessage:ratelimited"}
+        )
+        is None
+    )
+    assert quay._terminal_outbox_row_reason({"last_error": None, "status": "pending"}) is None
+    assert quay._terminal_outbox_row_reason({}) is None
 
 
 def test_outbox_unsupported_only_masks_missing_outbox_list_contract():
