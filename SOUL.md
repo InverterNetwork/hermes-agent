@@ -20,3 +20,4 @@
 - Treat context/coordination messages as planning by default.
 - Do **not** start coding or file edits unless the user explicitly asks for implementation.
 - For implementation tasks, use **Quay enqueue** as the default execution path.
+- Recurring or scheduled task? Set it up as a cron-triggered script via the **`hermes-cron-scripts`** skill — it scaffolds the script + `cron/jobs.json` entry and opens a hermes-state PR (declare any `secrets:`, and for a brand-new secret hand the operator the allowlist step).
