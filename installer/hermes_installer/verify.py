@@ -36,6 +36,7 @@ from .caddy import caddyfile_has_atlas_hub_route
 
 
 _REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
+_STATE_MANAGED_DIRS = ("skills", "memories", "cron", "scripts")
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +651,7 @@ def _check_gateway_org_defaults(s: _State) -> None:
 
 def _check_state_symlinks(s: _State) -> None:
     target = s.args.target
-    for d in ("skills", "memories", "cron"):
+    for d in _STATE_MANAGED_DIRS:
         link = target / d
         if link.is_symlink():
             tgt = os.readlink(link)
@@ -672,6 +673,26 @@ def _check_state_repo(s: _State, app_auth_expected: bool) -> None:
         s.v_ok(f"state .git ownership: {sown}")
     else:
         s.v_drift("state ownership", f"expected {s.agent_owner}, got {sown}")
+    for d in _STATE_MANAGED_DIRS:
+        path = state / d
+        info = _stat_info(path)
+        if not path.is_dir() or info is None:
+            s.v_drift(f"state/{d}", f"missing or not a directory: {path}")
+            continue
+        mode, owner, _group_name = info
+        try:
+            st_mode = path.stat().st_mode
+            writable = bool(st_mode & stat.S_IWUSR)
+            searchable = bool(st_mode & stat.S_IXUSR)
+        except OSError:
+            writable = searchable = False
+        if owner == s.agent_owner and writable and searchable:
+            s.v_ok(f"state/{d}: {mode} {owner}")
+        else:
+            s.v_drift(
+                f"state/{d}",
+                f"mode={mode} owner={owner} (expected {s.agent_owner}-writable directory)",
+            )
     for k in ("user.name", "user.email"):
         # `--local` so we only read this repo's own config — accepting global
         # values would mask drift after a `git config --unset`.

@@ -141,7 +141,7 @@ Under `$TARGET` (default: `~hermes/.hermes/`):
 | `hooks/` | `root:root` | 755 | rails overlay slot |
 | `state/` | `hermes:hermes` | 755 | clone of `hermes-state`; `.git/` agent-owned |
 | `atlas-kb/` | `hermes:hermes` | 755 | Atlas knowledge-base checkout. Only provisioned when `atlas.version` is set; default path can be overridden by `atlas.kb_root`. |
-| `skills`, `memories`, `cron` | `hermes:hermes` (symlink) | — | resolve to `state/<name>` |
+| `skills`, `memories`, `cron`, `scripts` | `hermes:hermes` (symlink) | — | resolve to `state/<name>` |
 | `sessions/`, `logs/`, `cache/` | `hermes:hermes` | 755 | local-only (gitignored content) |
 | `code/` | `hermes:hermes` | 755 | code mirrors root. One subdir per `repos[]` entry, each a working-tree clone refreshed by `hermes-code-sync` (5-min cadence). Read by the gateway when answering codebase questions in Slack. |
 | `quay/` | `hermes:hermes` | 755 | quay data dir (sqlite, worktrees, bare clones, logs); seeded `config.toml` lives inside, preserved across re-runs. Only present when `quay.version` is set in `deploy.values.yaml` |
@@ -161,7 +161,7 @@ The installer is idempotent and **never destroys agent work in `state/` by defau
 
 | Flag | Effect |
 |---|---|
-| _(default)_ | Preserve existing `state/`. Refuse to drop a populated `skills/memories/cron` real dir from a v0 install (operator must move data into `state/<name>/` first). |
+| _(default)_ | Preserve existing `state/`. Refuse to drop a populated `skills/memories/cron/scripts` real dir from a v0 install (operator must move data into `state/<name>/` first). |
 | `--force-state` | **Destructive.** Remove `state/` and re-clone from `--state`. Wipes all uncommitted agent work and any commits not yet pushed back to the source. |
 
 ### Git identity
