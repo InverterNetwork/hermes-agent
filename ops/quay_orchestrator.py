@@ -2446,13 +2446,26 @@ _HANDOFF_FILLER_LINES = frozenset(
     }
 )
 
-# Openers / verbs that mark a line as a question or a concrete ask we can
-# promote into the ``Need:`` field.
-_HANDOFF_ACTION_PREFIXES = (
-    "should", "shall", "can we", "can i", "could we", "could i", "would",
-    "do we", "does", "did", "which", "what", "how", "when", "where", "who",
-    "is it", "are we", "may i", "please", "need ", "needs ", "confirm",
-    "decide", "approve", "clarify", "provide", "let me know", "advise",
+# A line WITHOUT a trailing ``?`` only counts as the ask when it opens with a
+# clear imperative / request. Ambiguous interrogative leads (does/what/how/…)
+# are deliberately excluded here so declaratives like "Does not compile after
+# the refactor." are not mistaken for the ask; a real question keeps its ``?``.
+_HANDOFF_IMPERATIVE_PREFIXES = (
+    "please", "confirm", "decide", "approve", "clarify", "provide",
+    "advise", "let me know", "need to", "needs to",
+    "should we", "should i", "shall we", "shall i",
+)
+
+# Softer signals used only as a fallback: when no strong ask is found and the
+# generic default would otherwise fire, a leftover line opening with one of
+# these (an uncertainty or a request) is promoted into ``Need:`` instead of
+# being left to overflow into ``Context:``. Kept conservative on purpose.
+_HANDOFF_SOFT_ASK_PREFIXES = (
+    "unsure", "not sure", "unclear", "uncertain", "wondering", "wonder ",
+    "should", "shall", "which", "whether", "need ", "needs ", "please",
+    "can we", "can i", "could we", "could i", "would we", "would it",
+    "let me know", "confirm", "decide", "clarify", "advise",
+    "want to know", "requesting", "request ",
 )
 
 
@@ -2477,13 +2490,19 @@ def _clean_handoff_lines(text: str) -> list[str]:
 
 
 def _is_action_line(line: str) -> bool:
-    """True when ``line`` reads as a question or a concrete ask."""
+    """True when ``line`` clearly reads as a question or a concrete ask.
+
+    A trailing ``?`` always qualifies. Without one, only a clear imperative /
+    request does — ambiguous interrogative leads are left to the softer,
+    fallback-only :func:`_promote_soft_ask` so plain declaratives are not
+    mislabelled as the ask.
+    """
     lowered = line.strip().lower()
     if not lowered:
         return False
     if lowered.endswith("?"):
         return True
-    return any(lowered.startswith(prefix) for prefix in _HANDOFF_ACTION_PREFIXES)
+    return lowered.startswith(_HANDOFF_IMPERATIVE_PREFIXES)
 
 
 def _first_blocker_line(lines: list[str]) -> str:
@@ -2498,6 +2517,19 @@ def _promote_action_line(lines: list[str]) -> str:
     """The first question/ask line, promotable into ``Need:`` (else empty)."""
     for line in lines:
         if _is_action_line(line):
+            return line
+    return ""
+
+
+def _promote_soft_ask(lines: list[str]) -> str:
+    """A leftover line that reads like an uncertainty/request (else empty).
+
+    Fallback used only when no strong ask was promoted, so a real ask phrased
+    without a ``?`` (e.g. "Unsure whether we should roll back or push forward")
+    still reaches the human as ``Need:`` rather than the generic default.
+    """
+    for line in lines:
+        if line.strip().lower().startswith(_HANDOFF_SOFT_ASK_PREFIXES):
             return line
     return ""
 
@@ -2565,7 +2597,13 @@ def build_human_question(
     kind = _handoff_reason_kind(handoff, "\n".join(combined_lines))
 
     promoted = _promote_action_line(combined_lines)
-    need_line = promoted if promoted and promoted != reason_line else _handoff_default_need(kind)
+    if promoted and promoted != reason_line:
+        need_line = promoted
+    else:
+        # No strong ask: try to rescue a softly-phrased ask from the leftover
+        # before falling back to the reason-specific default.
+        leftover_for_ask = [line for line in combined_lines if line != reason_line]
+        need_line = _promote_soft_ask(leftover_for_ask) or _handoff_default_need(kind)
 
     identifier = task.issue or task.task_id
     repo = task.repo_id or handoff.repo_id
@@ -2590,12 +2628,18 @@ def build_human_question(
     if need_line:
         lines.append(f"Need: {need_line}")
 
-    # Context: a distinct summary statement we have not already surfaced as the
-    # Reason or Need — only when it adds signal.
-    for candidate in summary_lines:
-        if candidate not in {reason_line, need_line} and not _is_action_line(candidate):
-            lines.append(f"Context: {candidate}")
-            break
+    # Context: every non-filler blocker/summary line we have not already
+    # surfaced as Reason or Need. This guarantees no artifact signal — a second
+    # question, a soft ask, or diagnostic detail — is ever silently dropped,
+    # while staying empty for the common single-statement + single-question case.
+    used = {reason_line, need_line}
+    context_lines = [line for line in combined_lines if line not in used]
+    if context_lines:
+        if len(context_lines) == 1:
+            lines.append(f"Context: {context_lines[0]}")
+        else:
+            lines.append("Context:")
+            lines.extend(f"• {line}" for line in context_lines)
 
     lines.append(_HUMAN_QUESTION_FOOTER)
     return "\n".join(lines)

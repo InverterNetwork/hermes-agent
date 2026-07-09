@@ -1898,6 +1898,110 @@ def test_human_question_returns_metadata_question_verbatim():
     assert question == "Which region should the worker target?"
 
 
+def _blocker_handoff(task_id: str) -> "quay.Handoff":
+    return quay.Handoff(
+        handoff_id=f"handoff-{task_id}",
+        task_id=task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+
+
+def test_human_question_single_question_stays_compact_with_no_context():
+    task = quay.TaskContext(
+        task_id="task-compact", title="Wire it up", issue="BRIX-7001", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the importer schema changed and two endpoints now exist.\n"
+            "Should we keep the old endpoint or migrate to the new one?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the importer schema changed and two endpoints now exist." in lines
+    assert "Need: Should we keep the old endpoint or migrate to the new one?" in lines
+    # The common single-statement + single-question case must not sprout Context.
+    assert "Context:" not in question
+
+
+def test_human_question_second_question_overflows_into_context():
+    task = quay.TaskContext(
+        task_id="task-2q", title="Migrate", issue="BRIX-7002", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the migration keeps failing on the users table.\n"
+            "Should we roll back or push forward?\n"
+            "Do we also need to notify the on-call engineer?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the migration keeps failing on the users table." in lines
+    assert "Need: Should we roll back or push forward?" in lines
+    # The second question is never dropped — it overflows into Context. A single
+    # leftover renders inline (no bullet) to stay compact.
+    assert "Context: Do we also need to notify the on-call engineer?" in lines
+
+
+def test_human_question_non_question_ask_reaches_human_as_need():
+    task = quay.TaskContext(
+        task_id="task-softask", title="Refactor", issue="BRIX-7003", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "The refactor left two importer paths in place.\n"
+            "Unsure whether we should roll back or push forward"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: The refactor left two importer paths in place." in lines
+    # A real ask phrased without a "?" is promoted to Need, not dropped.
+    assert "Need: Unsure whether we should roll back or push forward" in lines
+    assert "Context:" not in question
+
+
+def test_human_question_diagnostic_detail_overflows_into_context_not_need():
+    task = quay.TaskContext(
+        task_id="task-detail", title="Fix build", issue="BRIX-7004", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the build fails after the refactor.\n"
+            "Does not compile after the refactor.\n"
+            "The types module now imports itself."
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the build fails after the refactor." in lines
+    # The declarative "Does not compile..." must not be mistaken for the ask.
+    assert "Need: Does not compile after the refactor." not in lines
+    assert "Need: advise how the worker should proceed." in lines
+    # Diagnostic detail lines survive verbatim in Context.
+    assert "Context:" in lines
+    assert "• Does not compile after the refactor." in lines
+    assert "• The types module now imports itself." in lines
+
+
 def test_stale_metadata_route_falls_back_and_records_fallback_thread():
     handoff = quay.Handoff(handoff_id="handoff-stale", task_id="task-stale")
     task = quay.TaskContext(
