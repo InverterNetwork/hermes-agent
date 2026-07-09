@@ -914,6 +914,29 @@ class QuayCliClient:
         return metadata
 
 
+def _assert_agent_tool_less(agent: Any) -> None:
+    """Guarantee an orchestrator agent resolved to ZERO tools.
+
+    The orchestrator's ``AIAgent`` instances (Slack decider + blocker
+    remediator) must never hold a tool: the model is a pure reasoner and every
+    state change is performed by orchestrator code. ``enabled_toolsets=[]``
+    alone is NOT sufficient because ``model_tools`` force-appends the ``kanban``
+    toolset whenever ``HERMES_KANBAN_TASK`` is set in the ambient env. This
+    check fails loudly if any tool survives, so the agent can never silently
+    gain a capability from the environment.
+    """
+    tools = getattr(agent, "tools", None)
+    if tools:
+        try:
+            names = sorted(t["function"]["name"] for t in tools)
+        except (TypeError, KeyError, AttributeError):
+            names = [str(t) for t in tools]
+        raise RuntimeError(
+            "orchestrator agent must be tool-less but resolved tools: "
+            + ", ".join(names)
+        )
+
+
 class _OrchestratorAgentBuilder:
     """Shared bounded-``AIAgent`` runtime/model resolution for the orchestrator.
 
@@ -950,7 +973,9 @@ class _OrchestratorAgentBuilder:
         max_tokens: int | None = None,
     ) -> Any:
         if self._agent_factory is not None:
-            return self._agent_factory()
+            agent = self._agent_factory()
+            _assert_agent_tool_less(agent)
+            return agent
         runtime = self._resolve_runtime()
         agent_class = self._agent_class
         if agent_class is None:
@@ -969,7 +994,15 @@ class _OrchestratorAgentBuilder:
             credential_pool=runtime.get("credential_pool"),
             max_iterations=max_iterations,
             quiet_mode=True,
+            # Tool-less by construction. An empty ``enabled_toolsets`` is not
+            # enough: ``model_tools`` force-appends the ``kanban`` toolset
+            # whenever ``HERMES_KANBAN_TASK`` is set in the ambient env.
+            # Explicitly disabling ``kanban`` overrides that force-append so the
+            # orchestrator agent resolves to ZERO tools regardless of env — an
+            # explicit API rather than mutating global ``os.environ``. The
+            # post-build ``_assert_agent_tool_less`` check is the backstop.
             enabled_toolsets=[],
+            disabled_toolsets=["kanban"],
             skip_context_files=True,
             skip_memory=True,
             platform="quay-orchestrator",
@@ -977,7 +1010,9 @@ class _OrchestratorAgentBuilder:
         )
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        return agent_class(**kwargs)
+        agent = agent_class(**kwargs)
+        _assert_agent_tool_less(agent)
+        return agent
 
     def _resolve_runtime(self) -> Mapping[str, Any]:
         resolver = self._runtime_resolver
@@ -1302,6 +1337,36 @@ _NEVER_AUTO_CATEGORY_TOKENS: tuple[str, ...] = (
     "escalate",
 )
 
+# Canonical auto-answerable categories (companion skill hermes-state #32). This
+# allowlist is the ENFORCEABLE FLOOR for auto-resume: a model resume is accepted
+# only when its category normalizes to one of these five. Everything else — a
+# novel label, a relabeled danger, an empty/miscased/non-string value —
+# escalates. The keyword denylist above (`_never_auto_reason` /
+# `_is_never_auto_category`) is kept as defense-in-depth over the brief text; it
+# does NOT replace this floor.
+_AUTO_ANSWERABLE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "prerequisite-baseline",
+        "stale-baseline",
+        "missing-invocation",
+        "transient-retry",
+        "scoped-known-fix",
+    }
+)
+
+
+def _normalize_category(category: Any) -> str:
+    """Strip + lowercase a model-proposed category; non-strings normalize to ''."""
+    if not isinstance(category, str):
+        return ""
+    return category.strip().lower()
+
+
+def _is_auto_answerable_category(category: Any) -> bool:
+    """True only when ``category`` is a member of the canonical allowlist."""
+    return _normalize_category(category) in _AUTO_ANSWERABLE_CATEGORIES
+
+
 REMEDIATION_GUARDRAIL_SYSTEM = (
     "You are the Quay orchestrator's blocker-remediation guardrail. A worker is "
     "blocked and you decide whether the orchestrator may auto-resume it WITHOUT a "
@@ -1446,7 +1511,16 @@ def parse_remediation_response(text: str) -> dict[str, Any] | None:
 
     action = str(data.get("action") or "").strip().lower()
     if action == "escalate":
-        return {"action": "escalate"}
+        # F4: preserve a valid friction object on the escalate path so the
+        # orchestrator can still capture a recurring Quay-CLI friction even when
+        # Otto cannot self-resolve. Invalid/oversized friction is dropped (we
+        # still escalate); a bad friction never blocks the escalation.
+        escalation: dict[str, Any] = {"action": "escalate"}
+        if data.get("friction") is not None:
+            parsed_friction = _parse_friction(data.get("friction"))
+            if parsed_friction is not None:
+                escalation["friction"] = parsed_friction
+        return escalation
     if action != "resume":
         return None
 
@@ -1613,8 +1687,21 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
                 )
                 return None
 
-            # Consume one attempt now: we are about to invoke the model.
-            self._bump_attempts(handoff.task_id)
+            # Consume one attempt now: we are about to invoke the model. Fail
+            # CLOSED — if we cannot durably record the attempt we treat
+            # ourselves as OVER-BUDGET and escalate WITHOUT calling the model
+            # ("if I can't prove I'm under budget, I don't spend an attempt").
+            try:
+                self._bump_attempts(handoff.task_id)
+            except OSError:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="loop_guard_write_failed",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                )
+                return None
 
             agent = self._build_agent(
                 handoff,
@@ -1638,6 +1725,20 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
 
             parsed = parse_remediation_response(text)
             if parsed is None or parsed.get("action") != "resume":
+                # F4: the model escalated (or its output was rejected). If it
+                # still supplied a valid friction object, surface it via
+                # ``last_outcome`` so the orchestrator can record it (code-only,
+                # behind ``remediation_friction_enabled``) while still escalating.
+                friction = (
+                    parsed.get("friction") if isinstance(parsed, Mapping) else None
+                )
+                if friction:
+                    self.last_outcome = RemediationOutcome(
+                        brief="",
+                        category="",
+                        friction=friction,
+                        tokens=tokens,
+                    )
                 log_event(
                     self._logger,
                     "remediation_attempt",
@@ -1651,11 +1752,20 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
             brief = str(parsed.get("brief") or "").strip()
             category = str(parsed.get("category") or "").strip()
 
-            # Gate #2 (post-model): re-run the never-auto classifier with the
-            # model's own category/brief, and independently reject a never-auto
-            # category. Only a brief clearing BOTH gates is ever returned.
+            # Gate #2 (post-model): a resume is accepted ONLY IF BOTH hold:
+            #   (a) the model's category is a member of the canonical
+            #       auto-answerable allowlist (the ENFORCEABLE FLOOR), AND
+            #   (b) the deterministic never-auto keyword scan over the model's
+            #       own category+brief finds nothing.
+            # The allowlist is the primary, enforceable gate; the keyword scan
+            # (`_never_auto_reason` / `_is_never_auto_category`) is kept as
+            # defense-in-depth. Both are layers among several: LLM judgment, a
+            # narrow allowlist, worker-sandbox limits, and an FYI-with-undo. Any
+            # category that is novel, empty, relabeled, miscased, or non-string
+            # fails (a) and escalates.
             if not brief:
                 return None
+            allowlisted = _is_auto_answerable_category(category)
             gate2 = _never_auto_reason(
                 handoff,
                 task,
@@ -1663,15 +1773,24 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
                 proposed_category=category,
                 proposed_brief=brief,
             )
-            if gate2 is not None or _is_never_auto_category(category):
+            if not allowlisted or gate2 is not None or _is_never_auto_category(category):
+                if not allowlisted:
+                    reason = (
+                        "category_not_allowlisted:"
+                        + (_normalize_category(category) or "<empty>")
+                    )
+                elif gate2 is not None:
+                    reason = gate2
+                else:
+                    reason = f"never_auto_category:{category.lower()}"
                 log_event(
                     self._logger,
                     "remediation_gate_blocked",
-                    gate="post_model_never_auto",
+                    gate="post_model_allowlist",
                     task_id=handoff.task_id,
                     handoff_id=handoff.handoff_id,
                     category=category,
-                    reason=gate2 or f"never_auto_category:{category.lower()}",
+                    reason=reason,
                     tokens=tokens,
                 )
                 return None
@@ -1789,13 +1908,14 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
             return 0
 
     def _bump_attempts(self, task_id: str) -> int:
+        # Fail CLOSED: a failure to durably record the attempt MUST propagate so
+        # the caller treats it as over-budget and escalates. Swallowing the
+        # error here (fail-open) would let a read-only/full filesystem re-invoke
+        # the model every tick without ever advancing the counter — unbounded.
         path = self._attempts_path(task_id)
         nxt = self._read_attempts(task_id) + 1
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(str(nxt), encoding="utf-8")
-        except OSError:
-            self._logger.exception("failed to persist remediation attempt counter")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(nxt), encoding="utf-8")
         return nxt
 
     # -- friction markers --------------------------------------------------
@@ -2553,6 +2673,13 @@ class HandoffDrainer:
                 remediated = True
             else:
                 self.metrics.remediation_escalated += 1
+                # F4: even when Otto escalates, still capture any recurring
+                # Quay-CLI friction the model surfaced. Code-only and gated by
+                # remediation_friction_enabled inside record_friction; a no-op
+                # when there is no friction to file.
+                self.remediator.record_friction(
+                    outcome=self.remediator.last_outcome, task=task
+                )
         if brief and remediated:
             outcome = self.remediator.last_outcome
             self.quay.submit_brief(handoff, brief, reason="blocker_auto_remediated")

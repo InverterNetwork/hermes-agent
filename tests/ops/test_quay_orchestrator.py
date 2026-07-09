@@ -2758,7 +2758,7 @@ def test_remediator_happy_resume_returns_brief_and_bumps_counter():
         {
             "action": "resume",
             "brief": "Remove the unused import in foo.py and rerun ruff.",
-            "category": "lint_fix",
+            "category": "scoped-known-fix",
             "rationale": "Removing an unused import is safe and reversible.",
         }
     )
@@ -2768,7 +2768,7 @@ def test_remediator_happy_resume_returns_brief_and_bumps_counter():
     )
     assert brief == "Remove the unused import in foo.py and rerun ruff."
     assert rem.last_outcome is not None
-    assert rem.last_outcome.category == "lint_fix"
+    assert rem.last_outcome.category == "scoped-known-fix"
     assert rem.last_outcome.tokens == 123
     # Durable loop guard advanced to 1 on disk.
     assert rem._attempts_path("task-rem").read_text(encoding="utf-8") == "1"
@@ -2793,11 +2793,13 @@ def test_remediator_gate2_blocks_never_auto_category():
 
 
 def test_remediator_gate2_blocks_danger_brief_text():
+    # Category is allowlisted (passes gate (a)); the danger lives only in the
+    # brief text, so the keyword backstop (gate (b)) is what must block it.
     response = json.dumps(
         {
             "action": "resume",
             "brief": "Drop the production database table to unblock.",
-            "category": "cleanup",
+            "category": "scoped-known-fix",
             "rationale": "safe",
         }
     )
@@ -2822,7 +2824,7 @@ def test_remediator_reads_skill_from_disk():
         {
             "action": "resume",
             "brief": "Remove the unused import and rerun ruff.",
-            "category": "lint",
+            "category": "scoped-known-fix",
             "rationale": "safe",
         }
     )
@@ -2998,7 +3000,7 @@ def test_drain_remediation_end_to_end_with_real_remediator():
         {
             "action": "resume",
             "brief": "Remove the unused import in foo.py and rerun ruff.",
-            "category": "lint_fix",
+            "category": "scoped-known-fix",
             "rationale": "Removing an unused import is safe and reversible.",
             "friction": {
                 "title": "quay lint output truncated",
@@ -3077,3 +3079,247 @@ def test_config_env_overrides_remediation(monkeypatch):
     assert cfg.remediation_max_attempts == 5
     assert cfg.remediation_friction_enabled is True
     assert cfg.remediation_linear_team_id == "team-env"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review hardening: F1 allowlist, F2 tool-less, F3 fail-closed
+# loop guard, F4 friction-on-escalate (BRIX-1878).
+# ---------------------------------------------------------------------------
+
+
+# -- F1: allowlist as the enforceable floor ----------------------------------
+
+
+def test_auto_answerable_category_allowlist_membership():
+    for good in (
+        "prerequisite-baseline",
+        "stale-baseline",
+        "missing-invocation",
+        "transient-retry",
+        "scoped-known-fix",
+        "  Scoped-Known-Fix  ",  # normalized (strip + lowercase)
+    ):
+        assert quay._is_auto_answerable_category(good), good
+    for bad in ("lint_fix", "housekeeping", "", "escalate", "product", None, 123):
+        assert not quay._is_auto_answerable_category(bad), bad
+
+
+def test_drain_real_remediator_escalates_paraphrased_danger_briefs():
+    # Benign, allowlisted category (clears gate (a)) but a PARAPHRASED dangerous
+    # brief: the keyword backstop (gate (b)) over the model's own brief must
+    # catch it. Otto escalates and never submits a brief.
+    dangerous_briefs = [
+        "Apply the pending migration to the live production cluster.",
+        "Force-push to overwrite remote history so the branch matches local.",
+    ]
+    for brief_text in dangerous_briefs:
+        response = json.dumps(
+            {
+                "action": "resume",
+                "category": "scoped-known-fix",
+                "brief": brief_text,
+                "rationale": "quick and safe",
+            }
+        )
+        remediator = make_remediator(
+            response=response,
+            config=remediation_config(default_slack_channel=""),
+        )
+        handoff = safe_handoff()
+        quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+        drainer = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=FakeSlackClient(),
+            config=remediation_config(default_slack_channel=""),
+            worker_id="test-worker",
+            remediator=remediator,
+        )
+        result = drainer.drain_one()
+        assert quay_client.submitted == [], brief_text
+        assert result.metrics["remediation_escalated"] == 1, brief_text
+        # Model ran; its resume was rejected post-hoc by the gate.
+        assert len(remediator.agent_calls) == 1, brief_text
+
+
+def test_drain_real_remediator_escalates_novel_category():
+    # A safe brief but a NOVEL/unknown category (not one of the 5 canonical
+    # auto-answerable categories) must escalate: the allowlist is the floor.
+    # Under the old denylist this label carried no banned token and would have
+    # leaked through to an auto-resume.
+    response = json.dumps(
+        {
+            "action": "resume",
+            "category": "housekeeping",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "rationale": "safe and reversible",
+        }
+    )
+    remediator = make_remediator(
+        response=response,
+        config=remediation_config(default_slack_channel=""),
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(default_slack_channel=""),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []
+    assert result.metrics["remediation_escalated"] == 1
+    assert len(remediator.agent_calls) == 1
+
+
+# -- F2: tool-less guarantee regardless of ambient env -----------------------
+
+
+class ToolResolvingAgent:
+    """Agent stub whose ``.tools`` are computed by the REAL model_tools
+    resolver, exactly like ``agent_init.init_agent`` does. This exercises the
+    tool-less guarantee end-to-end rather than stubbing it out."""
+
+    instances: list = []
+
+    def __init__(self, **kwargs) -> None:
+        import model_tools
+
+        self.kwargs = kwargs
+        self.tools = model_tools.get_tool_definitions(
+            enabled_toolsets=kwargs.get("enabled_toolsets"),
+            disabled_toolsets=kwargs.get("disabled_toolsets"),
+            quiet_mode=True,
+        )
+        ToolResolvingAgent.instances.append(self)
+
+
+def test_remediation_agent_is_tool_less_even_with_kanban_env(monkeypatch):
+    # model_tools force-appends the `kanban` toolset when HERMES_KANBAN_TASK is
+    # set. The orchestrator agent must still resolve to ZERO tools.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "kanban-task-42")
+    ToolResolvingAgent.instances = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=ToolResolvingAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    agent = rem._build_agent(safe_handoff(), max_iterations=3, max_tokens=100)
+    assert agent.kwargs["enabled_toolsets"] == []
+    assert agent.kwargs["disabled_toolsets"] == ["kanban"]
+    # Force-append neutralized: the remediation agent holds no tools at all.
+    assert agent.tools == []
+
+
+# -- F3: loop guard fails CLOSED on a durable-write failure ------------------
+
+
+def test_remediator_loop_guard_write_failure_escalates_without_model(monkeypatch):
+    rem = make_remediator(
+        response='{"action":"resume","brief":"x","category":"scoped-known-fix","rationale":"ok"}'
+    )
+    real_write = Path.write_text
+
+    def failing_write(self, *args, **kwargs):
+        if "remediation-attempts" in str(self):
+            raise OSError("read-only file system")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(quay.Path, "write_text", failing_write)
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None  # cannot prove under-budget -> escalate
+    assert rem.agent_calls == []  # model NOT invoked (fail-closed before build)
+    assert rem.last_outcome is None
+
+
+# -- F4: friction captured on the escalate path too --------------------------
+
+
+def test_parse_remediation_response_escalate_carries_valid_friction():
+    parsed = quay.parse_remediation_response(
+        json.dumps(
+            {
+                "action": "escalate",
+                "friction": {"title": "t", "detail": "d", "signature": "sig"},
+            }
+        )
+    )
+    assert parsed == {
+        "action": "escalate",
+        "friction": {"title": "t", "detail": "d", "signature": "sig"},
+    }
+    # Invalid friction is dropped but the response still escalates.
+    parsed_bad = quay.parse_remediation_response(
+        json.dumps({"action": "escalate", "friction": {"title": "only-title"}})
+    )
+    assert parsed_bad == {"action": "escalate"}
+
+
+def _escalate_with_friction_response(signature: str) -> str:
+    return json.dumps(
+        {
+            "action": "escalate",
+            "friction": {
+                "title": "quay CLI cannot pass multiline briefs",
+                "detail": "the submit-brief flag rejects newlines",
+                "signature": signature,
+            },
+        }
+    )
+
+
+def test_drain_escalate_with_friction_records_but_still_escalates():
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=_escalate_with_friction_response("sig-escalate-1"),
+        config=remediation_config(
+            remediation_friction_enabled=True, default_slack_channel=""
+        ),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(
+            remediation_friction_enabled=True, default_slack_channel=""
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []  # escalated, not resumed
+    assert result.metrics["remediation_escalated"] == 1
+    assert any("issueCreate" in c[0] for c in linear.calls)  # friction filed
+
+
+def test_drain_escalate_with_friction_noop_when_flag_off():
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=_escalate_with_friction_response("sig-escalate-2"),
+        config=remediation_config(
+            remediation_friction_enabled=False, default_slack_channel=""
+        ),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(
+            remediation_friction_enabled=False, default_slack_channel=""
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []  # still escalates
+    assert result.metrics["remediation_escalated"] == 1
+    assert linear.calls == []  # friction NOT filed while the flag is off
