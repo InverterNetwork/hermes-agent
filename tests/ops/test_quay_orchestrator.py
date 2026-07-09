@@ -2794,6 +2794,32 @@ def test_sanitize_escalation_message_collapses_whitespace_and_caps():
     assert capped.endswith("…")
 
 
+def test_sanitize_escalation_message_neutralizes_labeled_and_link_tokens():
+    # Regression: Slack parses the LABELED broadcast `<!channel|urgent>` as the
+    # same @channel ping as `<!channel>` — an anchored regex missed it. Also
+    # defang disguised hyperlinks and channel refs.
+    cases = [
+        "<!channel|urgent> deploy now",
+        "<!here|team ping>",
+        "<!everyone|all hands>",
+        "<!channel > trailing space",
+        "<!subteam^S1|marketing>",
+        "<@U123|admin> please look",
+        "@channel now",
+        "<https://evil.example|Approve here>",
+        "<#C0001|general>",
+    ]
+    for raw in cases:
+        out = quay._sanitize_escalation_message(raw).lower()
+        # No live broadcast/mention/entity token survives as a literal substring.
+        for banned in ("<!channel", "<!here", "<!everyone", "<!subteam",
+                       "<@", "<#", "<http",
+                       "@channel", "@here", "@everyone"):
+            assert banned not in out, f"{banned!r} survived in {out!r} from {raw!r}"
+    # Ordinary comparisons and emails are left intact.
+    assert quay._sanitize_escalation_message("a < b and x@y.com") == "a < b and x@y.com"
+
+
 # -- HandoffRemediator gates -------------------------------------------------
 
 

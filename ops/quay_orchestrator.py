@@ -3828,10 +3828,18 @@ _MENTION_NEUTRALIZER = "\u200b"
 # from attacker-influenceable blocker text, so it must never be able to @-ping a
 # channel or a person. Each pattern is de-fanged so the visible text survives but
 # cannot broadcast.
-_BROADCAST_TOKEN_RE = re.compile(r"<!(channel|here|everyone)>", re.IGNORECASE)
+# NOTE: consume the optional label — Slack parses `<!channel|urgent>` as the same
+# broadcast as `<!channel>`, so `\b[^>]*>` (mirroring the subteam pattern) is
+# required; an anchored `...)>` regex misses the labeled/spaced form and it pings.
+_BROADCAST_TOKEN_RE = re.compile(r"<!(channel|here|everyone)\b[^>]*>", re.IGNORECASE)
 _SUBTEAM_TOKEN_RE = re.compile(r"<!subteam\^[^>]*>", re.IGNORECASE)
 _RAW_USER_MENTION_RE = re.compile(r"<@([^>]*)>")
 _BARE_BROADCAST_RE = re.compile(r"@(channel|here|everyone)\b", re.IGNORECASE)
+# Backstop for every other Slack angle-bracket entity: channel refs `<#C..>`,
+# disguised hyperlinks `<https://..|label>`, or any `<!..>`/`<@..>` form the
+# passes above didn't fully consume. The lookahead requires a Slack sigil or URL
+# scheme right after `<`, so ordinary text like "a < b" is left untouched.
+_SLACK_ENTITY_OPEN_RE = re.compile(r"<(?=[@#!]|https?://|mailto:|tel:)", re.IGNORECASE)
 
 
 def _defang_raw_user_mention(match: "re.Match[str]") -> str:
@@ -3846,10 +3854,12 @@ def _sanitize_escalation_message(text: str) -> str:
     The message is composed from attacker-influenceable blocker text, so before
     it can reach Slack we defang every token that could ping: ``@channel`` /
     ``@here`` / ``@everyone``, the Slack broadcast tokens ``<!channel>`` /
-    ``<!here>`` / ``<!everyone>``, user-group ``<!subteam^...>`` tokens, and raw
-    ``<@Uxxxx>`` user mentions. Each is rewritten so the visible text is
-    preserved but the exact ping substring no longer exists. Also collapses
-    whitespace and caps the length. Pure and side-effect free.
+    ``<!here>`` / ``<!everyone>`` (including their labeled ``<!channel|label>``
+    forms), user-group ``<!subteam^...>`` tokens, raw ``<@Uxxxx>`` user mentions,
+    and any other Slack angle-bracket entity (channel refs, disguised
+    hyperlinks). Each is rewritten so the visible text is preserved but the exact
+    ping/link substring no longer exists. Also collapses whitespace and caps the
+    length. Pure and side-effect free.
     """
     if not isinstance(text, str):
         return ""
@@ -3868,6 +3878,11 @@ def _sanitize_escalation_message(text: str) -> str:
     cleaned = _BARE_BROADCAST_RE.sub(
         lambda m: "@" + _MENTION_NEUTRALIZER + m.group(1).lower(), cleaned
     )
+    # Break any remaining Slack angle-bracket entity (disguised hyperlink,
+    # channel ref, or a mention/broadcast form missed above) by wedging a
+    # zero-width space after the opening `<`, so Slack renders it as inert
+    # literal text instead of a live link/ref/ping.
+    cleaned = _SLACK_ENTITY_OPEN_RE.sub("<" + _MENTION_NEUTRALIZER, cleaned)
     # Collapse to a compact single block and cap the size.
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > _MAX_ESCALATION_MESSAGE_CHARS:
