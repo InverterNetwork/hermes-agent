@@ -215,6 +215,17 @@ The script timeout defaults to 120 seconds. `_get_script_timeout()` resolves the
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 120 seconds
 
+### Script Environment & Declarative Secret Injection
+
+`_run_job_script()` builds the subprocess environment through `_sanitize_subprocess_env(os.environ.copy(), extra_env)` (`tools/environments/local.py`), so every Hermes-managed secret is stripped by default — the same policy as terminal and MCP children (SECURITY.md §2.3).
+
+A job may opt a narrow subset back in via its `secrets: [...]` field, gated by two independent trust domains:
+
+1. **Declaration gate (hermes-state):** the job's `secrets` list, PR-reviewed in `jobs.json`. `_run_job_script(..., secrets=job.get("secrets"))` passes it in.
+2. **Authorization gate (host config):** `_cron_injectable_secrets_allowlist()` reads `cron.injectable_secrets` from the host `config.yaml` (never from state).
+
+`build_cron_secret_injection(declared, allowlist)` computes the **intersection** and returns `extra_env` keyed with the `_HERMES_FORCE_<NAME>` prefix, which makes `_sanitize_subprocess_env` re-inject each blessed name *after* the strip. A **hard floor** — `cron_never_injectable_keys()`, the union of `_ALWAYS_STRIP_KEYS` and the provider blocklist minus `SLACK_BOT_TOKEN` — can never be granted even if allowlisted. Any declared name that fails a gate (unauthorized, hard-floor, or unprovisioned) is logged at WARNING and skipped; the script still runs, just without that secret. Values are sourced from the gateway process environment (staged `auth/*.env` / `~/.hermes/.env`), so "provision once, reuse freely" holds — see [FORK.md → Cron script secrets](https://github.com/InverterNetwork/hermes-agent/blob/main/FORK.md).
+
 ### Provider Recovery
 
 `run_job()` passes the user's configured fallback providers and credential pool into the `AIAgent` instance:

@@ -163,6 +163,51 @@ Interpreter choice is by file extension:
 
 We intentionally do NOT honour `#!/...` shebangs — keeping the interpreter set explicit and small reduces the surface the scheduler trusts.
 
+## Giving a Script a Secret
+
+Script-only jobs run with **every Hermes-managed secret stripped** from their environment — provider API keys, GitHub tokens, gateway bot tokens, the lot (see [Credential Scoping](/security#23-credential-scoping)). A script runs arbitrary third-party dependencies, so ambient secrets are one poisoned dep away from exfiltration. Strip-by-default is the safe posture.
+
+But sometimes the script legitimately needs one — a watchdog that posts directly to Slack needs `SLACK_BOT_TOKEN`. You opt that one secret in through **two gates that must both agree**:
+
+1. **You declare it** on the job with `secrets: [...]` — the names your script needs.
+2. **An operator allowlists it** in the host `config.yaml` under `cron.injectable_secrets`.
+
+Only the intersection is injected. Declaring a name the operator hasn't allowlisted (or that's on the never-injectable hard floor) does nothing except log a warning — the script still runs, just without that secret.
+
+```python
+# You declare what the script needs:
+cronjob(
+    action="create",
+    schedule="every 5m",
+    script="slack-heartbeat.sh",
+    no_agent=True,
+    deliver="local",
+    secrets=["SLACK_BOT_TOKEN"],   # the declaration gate
+)
+```
+
+```yaml
+# An operator authorizes it once in ~/.hermes/config.yaml:
+cron:
+  injectable_secrets:
+    - SLACK_BOT_TOKEN
+```
+
+The secret's value comes from the environment the gateway already has (staged `auth/*.env` / `~/.hermes/.env`), so a token like `SLACK_BOT_TOKEN` that's already configured for the gateway is **provisioned once and reused freely** — the operator just adds its name to the allowlist, and any job can then declare it.
+
+Inside the script the secret is a normal env var:
+
+```bash
+#!/usr/bin/env bash
+# slack-heartbeat.sh — posts a heartbeat using the injected token.
+curl -sS -X POST https://slack.com/api/chat.postMessage \
+  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+  -H "Content-type: application/json" \
+  -d '{"channel":"#ops","text":"host alive"}' > /dev/null
+```
+
+**Never injectable, even if allowlisted:** GitHub tokens, provider/model API keys, the Slack **app** token and signing secret, dashboard/session tokens, and other-platform bot tokens. `SLACK_BOT_TOKEN` is the one always-stripped secret that's eligible; everything on that hard floor is refused (with a warning) no matter what the config says. Declare only the names your script actually uses.
+
 ## Schedule Syntax
 
 Same as all other cron jobs:

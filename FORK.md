@@ -188,3 +188,36 @@ Some pieces are deliberately deferred:
 
 - **launchd unit installation.** systemd timers ship today; the macOS launchd path is tracked under the existing macOS TODO at the top of `installer/setup-hermes.sh`.
 - **macOS branch.** v0 is Linux-only.
+
+## Cron script secrets (declarative injection)
+
+`no_agent` cron scripts run as a sandboxed subprocess with every Hermes-managed secret stripped (SECURITY.md §2.3). To let a specific script receive a secret it needs — e.g. a watchdog that posts to Slack with `SLACK_BOT_TOKEN` — declare it on the job and authorize it on the host. Both gates must agree; neither alone grants anything. This replaces the old friction of staging a per-script out-of-band env file on the host.
+
+**Dev side — declare (`secrets:`, in hermes-state, PR-reviewed).** The cron job carries a `secrets` list of env-var names. Via the tool:
+
+```python
+cronjob(action="create", schedule="every 5m", script="slack-alert.sh",
+        no_agent=True, deliver="local", secrets=["SLACK_BOT_TOKEN"])
+```
+
+or by hand in `state/cron/jobs.json`:
+
+```json
+{ "id": "…", "script": "slack-alert.sh", "no_agent": true, "secrets": ["SLACK_BOT_TOKEN"] }
+```
+
+Because `cron/` (and `scripts/`) are versioned managed-state surfaces, this declaration is reviewed like any other state change. It says only what the script *wants*.
+
+**Operator side — authorize (`cron.injectable_secrets`, in host config, NOT state).** Add the allowlisted names to `config.yaml` in `HERMES_HOME` (host/deployment config, outside hermes-state):
+
+```yaml
+cron:
+  injectable_secrets:
+    - SLACK_BOT_TOKEN
+```
+
+The secret **value** is sourced from the existing Hermes secret plumbing — the gateway process environment, populated by the staged `auth/*.env` (and `~/.hermes/.env`). So `SLACK_BOT_TOKEN`, already staged in `auth/slack.env` for the Slack gateway, is **provisioned once and reused freely**: an operator only adds its name to the allowlist to authorize cron injection; devs then declare `secrets: [SLACK_BOT_TOKEN]` on any job. A secret a script needs that the gateway doesn't already hold is staged into any gateway-sourced `auth/*.env` on the host, then allowlisted the same way.
+
+**What is injected:** exactly the *intersection* — a name that is both declared on the job and in `cron.injectable_secrets`, holds a value in the host env, and is not on the hard floor. Everything else stays stripped.
+
+**Hard floor (never injectable, even if allowlisted):** GitHub tokens, provider/model API keys, the Slack **app** token and signing secret, dashboard/session tokens, other-platform bot tokens, and remote-compute secrets. Only `SLACK_BOT_TOKEN` is blessed as allowlist-eligible among the always-strip secrets. A declared name that is unauthorized, on the hard floor, or unprovisioned is **logged loudly and skipped** — the script still runs, but without that secret, so a misconfiguration surfaces in the logs rather than silently.
