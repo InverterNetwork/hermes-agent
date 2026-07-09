@@ -681,8 +681,9 @@ def _check_state_repo(s: _State, app_auth_expected: bool) -> None:
             continue
         mode, owner, _group_name = info
         try:
-            writable = bool(path.stat().st_mode & stat.S_IWUSR)
-            searchable = bool(path.stat().st_mode & stat.S_IXUSR)
+            st_mode = path.stat().st_mode
+            writable = bool(st_mode & stat.S_IWUSR)
+            searchable = bool(st_mode & stat.S_IXUSR)
         except OSError:
             writable = searchable = False
         if owner == s.agent_owner and writable and searchable:
