@@ -2828,6 +2828,52 @@ def _attempt_from_marker(reason: str) -> int:
     return int(digits) if digits else 0
 
 
+# Reason tokens that legitimately follow a `terminal:` / `quarantine:` marker.
+# Wrapper-tolerance only fires when the marker is followed by one of these, so
+# arbitrary error free-text that merely contains the word "terminal" (e.g.
+# "connection terminal: reset by peer") is never misread as a terminal row.
+_TERMINAL_REASON_TOKENS = frozenset(
+    {
+        "missing_default_slack_channel",
+        "slack_api_error",
+        "exhausted_retries",
+        "channel_not_found",
+        "thread_not_found",
+        "not_in_channel",
+        "is_archived",
+        "msg_too_long",
+        "invalid_blocks",
+        "invalid_arguments",
+        "restricted_action",
+        "quarantined",
+    }
+)
+
+
+def _leading_reason_token(text: str) -> str:
+    token = ""
+    for ch in text:
+        if ch == ":" or ch.isspace():
+            break
+        token += ch
+    return token
+
+
+def _wrapped_terminal_reason(lowered: str) -> bool:
+    """True only if a `terminal:`/`quarantine:` marker sits behind a wrapper
+    boundary AND is immediately followed by a recognized terminal reason token.
+    """
+    for marker in ("terminal:", "quarantine:"):
+        for sep in (" " + marker, ":" + marker):
+            idx = lowered.find(sep)
+            while idx >= 0:
+                after = lowered[idx + len(sep) :]
+                if _leading_reason_token(after) in _TERMINAL_REASON_TOKENS:
+                    return True
+                idx = lowered.find(sep, idx + 1)
+    return False
+
+
 def _terminal_outbox_row_reason(row: Mapping[str, Any]) -> str | None:
     status = str(row.get("status") or row.get("state") or "").strip().lower()
     if status in {
@@ -2843,14 +2889,17 @@ def _terminal_outbox_row_reason(row: Mapping[str, Any]) -> str | None:
     if not last_error:
         return None
     lowered = last_error.lower()
+    # Canonical marker the orchestrator itself writes — always authoritative.
     if lowered.startswith("terminal:") or lowered.startswith("quarantine:"):
         return last_error
-    # Tolerate a Quay wrapper prefix, e.g. "delivery handler failed: terminal:…".
-    # Anchor on a boundary (space or colon) before the marker so arbitrary
-    # error text that merely contains the word is not misread as terminal.
-    for sep in (" terminal:", ":terminal:", " quarantine:", ":quarantine:"):
-        if sep in lowered:
-            return last_error
+    # A row still carrying a delivery_attempt= retry marker is retryable-in-flight:
+    # never let wrapper-tolerance misread free text inside its reason as terminal.
+    if _DELIVERY_ATTEMPT_MARKER in lowered:
+        return None
+    # Tolerate a Quay wrapper prefix, e.g. "quay-wrapper: terminal:exhausted_retries",
+    # but only when the marker is followed by a recognized terminal reason token.
+    if _wrapped_terminal_reason(lowered):
+        return last_error
     return None
 
 

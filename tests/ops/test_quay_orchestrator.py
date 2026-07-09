@@ -1047,6 +1047,37 @@ def test_terminal_outbox_row_reason_tolerates_field_and_wrapper_variance():
     assert quay._terminal_outbox_row_reason({}) is None
 
 
+def test_terminal_outbox_row_reason_rejects_free_text_terminal_false_positive():
+    # A RETRYABLE-in-flight row whose embedded exception text merely CONTAINS
+    # " terminal:" as free text must NOT be misdetected as terminal (would be a
+    # silent early skip / drop).
+    retryable_free_text = {
+        "last_error": (
+            "delivery_attempt=1:runner_error:RuntimeError: "
+            "connection terminal: reset by peer"
+        )
+    }
+    assert quay._terminal_outbox_row_reason(retryable_free_text) is None
+
+    # Even without a delivery_attempt= marker, free text after the marker that
+    # isn't a recognized terminal reason token stays non-terminal.
+    assert (
+        quay._terminal_outbox_row_reason(
+            {"last_error": "socket read: terminal: reset by peer"}
+        )
+        is None
+    )
+
+    # Genuine terminal writes are still detected: the orchestrator's own
+    # canonical prefix, and a Quay wrapper in front of a recognized token.
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "terminal:channel_not_found"}
+    )
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "quay-wrapper: terminal:exhausted_retries:attempt=5:runner_error"}
+    )
+
+
 def test_outbox_unsupported_only_masks_missing_outbox_list_contract():
     assert quay._outbox_unsupported(
         quay.QuayCommandError(
