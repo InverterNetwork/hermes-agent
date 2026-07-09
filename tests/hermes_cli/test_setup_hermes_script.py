@@ -406,11 +406,22 @@ def test_atlas_hub_service_is_loopback_and_key_protected():
 def test_quay_tick_service_carries_reviewer_token_minting_env():
     service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
     runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
 
     assert "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env" in service
     assert "RuntimeDirectory=hermes" in service
     assert "QUAY_REVIEWER_GH_TOKEN" in runner
     assert "/etc/hermes/reviewer.env" in runner
+    assert "QUAY_GITHUB_AUTH_SRC=\"$OPS_DIR/quay-github-auth\"" in installer
+    assert "install -o \"$AGENT_USER\" -g \"$AGENT_USER\" -m 0755 \"$QUAY_GITHUB_AUTH_SRC\" \"$QUAY_GITHUB_AUTH_DST\"" in installer
+
+
+def test_quay_orchestrator_runner_prepares_github_auth_before_parked_polls():
+    runner = (OPS_DIR / "quay-orchestrator-runner").read_text(encoding="utf-8")
+
+    assert "quay-github-auth" in runner
+    assert "quay_prepare_worker_github_auth" in runner
+    assert "--park-human-waits" in runner
 
 
 def test_quay_serve_service_is_localhost_and_token_protected():

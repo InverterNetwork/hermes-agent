@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Shared GitHub auth preflight for Quay runtime wrappers.
+#
+# Source this file, then call quay_prepare_worker_github_auth before invoking
+# quay paths that may resume workers or waiting_human handoffs.
+
+quay_auth_log_prefix="${quay_auth_log_prefix:-quay-github-auth}"
+
+quay_auth_warn() {
+  printf '[%s] WARN: %s\n' "$quay_auth_log_prefix" "$*" >&2
+}
+
+quay_auth_die() {
+  printf '[%s] ERROR: %s\n' "$quay_auth_log_prefix" "$*" >&2
+  exit "${2:-70}"
+}
+
+quay_auth_fail_or_return() {
+  local mode="$1"
+  local message="$2"
+  local code="${3:-70}"
+  if [[ "$mode" == "optional" ]]; then
+    quay_auth_warn "$message; continuing without worker GitHub token"
+    unset QUAY_WORKER_GH_TOKEN GH_TOKEN GITHUB_TOKEN
+    return "$code"
+  fi
+  quay_auth_die "$message" "$code"
+}
+
+quay_auth_export_worker_token() {
+  local token="$1"
+  export QUAY_WORKER_GH_TOKEN="$token"
+  export GH_TOKEN="$token"
+  export GITHUB_TOKEN="$token"
+}
+
+quay_auth_validate_token() {
+  local token="$1"
+  local output
+  local rc
+
+  [[ -n "$token" ]] || return 10
+  if ! command -v gh >/dev/null 2>&1; then
+    quay_auth_warn "gh CLI not found while validating inherited GitHub token"
+    return 12
+  fi
+
+  output="$(
+    GH_TOKEN="$token" GITHUB_TOKEN="$token" gh api rate_limit 2>&1 >/dev/null
+  )"
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$output" =~ rate[[:space:]-]?limit|secondary[[:space:]-]?rate|429 ]]; then
+    quay_auth_warn "GitHub auth validation hit rate limiting: ${output//$'\n'/ }"
+    return 13
+  fi
+  if [[ "$output" =~ Bad[[:space:]]credentials|Requires[[:space:]]authentication|401|403 ]]; then
+    return 11
+  fi
+  quay_auth_warn "GitHub auth validation failed before token refresh: ${output//$'\n'/ }"
+  return 12
+}
+
+quay_auth_mint_worker_token() {
+  local home="${HERMES_HOME:-$HOME/.hermes}"
+  local helper="${HERMES_TOKEN_HELPER:-$home/hermes-agent/installer/hermes_github_token.py}"
+  local py="${HERMES_TOKEN_PYTHON:-$home/hermes-agent/venv/bin/python}"
+  local token
+
+  if [[ ! -x "$py" || ! -f "$helper" ]]; then
+    QUAY_AUTH_MINT_ERROR="missing GitHub worker token and token helper unavailable (python=$py helper=$helper); check HERMES_HOME and GitHub App staging"
+    return 64
+  fi
+
+  if ! token="$(timeout 30 env HERMES_HOME="$home" "$py" "$helper" mint 2>/dev/null)" \
+       || [[ -z "$token" ]]; then
+    QUAY_AUTH_MINT_ERROR="GitHub worker token mint failed; check auth/github-app.env, auth/github-app.pem, network access, and GitHub App installation/rate limits"
+    return 75
+  fi
+  QUAY_AUTH_MINTED_WORKER_TOKEN="$token"
+}
+
+quay_prepare_worker_github_auth() {
+  local mode="${1:-strict}"
+  local existing="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+  local token
+  local validate_rc
+
+  if [[ -n "$existing" ]]; then
+    quay_auth_validate_token "$existing"
+    validate_rc=$?
+    case "$validate_rc" in
+      0)
+        quay_auth_export_worker_token "$existing"
+        return 0
+        ;;
+      11)
+        quay_auth_warn "inherited GitHub token is stale or unauthorized; minting replacement"
+        unset QUAY_WORKER_GH_TOKEN GH_TOKEN GITHUB_TOKEN
+        ;;
+      12|13)
+        quay_auth_fail_or_return "$mode" \
+          "cannot validate inherited GitHub token due to GitHub auth/rate-limit outage; refusing to run Quay with possibly stale GH_TOKEN/GITHUB_TOKEN" \
+          75 || return "$?"
+        ;;
+      *)
+        quay_auth_fail_or_return "$mode" "unexpected GitHub token validation result: $validate_rc" 70 || return "$?"
+        ;;
+    esac
+  fi
+
+  quay_auth_mint_worker_token
+  validate_rc=$?
+  if [[ "$validate_rc" -ne 0 ]]; then
+    quay_auth_fail_or_return "$mode" "${QUAY_AUTH_MINT_ERROR:-GitHub worker token mint failed}" "$validate_rc" || return "$?"
+  fi
+  token="$QUAY_AUTH_MINTED_WORKER_TOKEN"
+  quay_auth_export_worker_token "$token"
+}

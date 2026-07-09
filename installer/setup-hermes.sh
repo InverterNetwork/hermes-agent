@@ -2373,8 +2373,15 @@ fi
 QUAY_TICK_SRC="$OPS_DIR/quay-tick.service"
 QUAY_TICK_RUNNER_SRC="$OPS_DIR/quay-tick-runner"
 QUAY_TICK_RUNNER_DST="/usr/local/sbin/quay-tick-runner"
+QUAY_GITHUB_AUTH_SRC="$OPS_DIR/quay-github-auth"
+QUAY_GITHUB_AUTH_DST="$TARGET_DIR/hermes-agent/ops/quay-github-auth"
 
-if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" && -f "$QUAY_TICK_RUNNER_SRC" ]]; then
+if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" && -f "$QUAY_TICK_RUNNER_SRC" && -f "$QUAY_GITHUB_AUTH_SRC" ]]; then
+  if [[ "$(readlink -f "$QUAY_GITHUB_AUTH_SRC")" != "$(readlink -f "$QUAY_GITHUB_AUTH_DST" 2>/dev/null || printf '%s' "$QUAY_GITHUB_AUTH_DST")" ]]; then
+    echo "==> installing quay GitHub auth helper at $QUAY_GITHUB_AUTH_DST"
+    install -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$QUAY_GITHUB_AUTH_SRC" "$QUAY_GITHUB_AUTH_DST"
+  fi
+
   echo "==> installing quay-tick-runner at $QUAY_TICK_RUNNER_DST"
   install -o root -g root -m 0755 "$QUAY_TICK_RUNNER_SRC" "$QUAY_TICK_RUNNER_DST"
 
@@ -2526,6 +2533,13 @@ fi
 rm -f /usr/local/sbin/brix-orchestrator-runner
 
 if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_ORCHESTRATOR_ENABLED" -eq 1 && -f "$QUAY_ORCH_SERVICE_SRC" && -f "$QUAY_ORCH_TIMER_SRC" && -f "$QUAY_ORCH_RUNNER_SRC" ]]; then
+  if [[ -f "$QUAY_GITHUB_AUTH_SRC" ]]; then
+    if [[ "$(readlink -f "$QUAY_GITHUB_AUTH_SRC")" != "$(readlink -f "$QUAY_GITHUB_AUTH_DST" 2>/dev/null || printf '%s' "$QUAY_GITHUB_AUTH_DST")" ]]; then
+      echo "==> installing quay GitHub auth helper at $QUAY_GITHUB_AUTH_DST"
+      install -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$QUAY_GITHUB_AUTH_SRC" "$QUAY_GITHUB_AUTH_DST"
+    fi
+  fi
+
   echo "==> installing quay-orchestrator-runner at $QUAY_ORCH_RUNNER_DST"
   install -o root -g root -m 0755 "$QUAY_ORCH_RUNNER_SRC" "$QUAY_ORCH_RUNNER_DST"
 

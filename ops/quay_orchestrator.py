@@ -597,6 +597,17 @@ class QuayCliClient:
             outbox_item_id = str(row.get("outbox_item_id") or row.get("id") or "")
             if not outbox_item_id:
                 continue
+            terminal_reason = _terminal_outbox_row_reason(row)
+            if terminal_reason:
+                log_event(
+                    self._logger,
+                    "outbox_claim_skipped",
+                    worker_id=worker_id,
+                    outbox_item_id=outbox_item_id,
+                    task_id=str(row.get("task_id") or ""),
+                    reason=terminal_reason,
+                )
+                continue
             try:
                 claim = self._run_json(["outbox", "claim", outbox_item_id])
             except QuayCommandError as exc:
@@ -1410,11 +1421,11 @@ class HandoffDrainer:
         route = resolve_slack_route(handoff, task, self.config)
         if route is None:
             reason = "missing_default_slack_channel"
-            self.quay.fail_outbox_item(item, reason)
+            self._fail_terminal_delivery_item(item, reason)
             self.metrics.claims_released += 1
             log_event(
                 self.logger,
-                "outbox_item_failed",
+                "outbox_item_quarantined",
                 outbox_item_id=item.outbox_item_id,
                 task_id=item.task_id,
                 reason=reason,
@@ -1438,11 +1449,15 @@ class HandoffDrainer:
         except SlackApiError as exc:
             self.metrics.errors += 1
             reason = f"slack_api_error:{exc.method}:{exc.error}"
-            self.quay.fail_outbox_item(item, reason)
+            terminal = _is_terminal_delivery_slack_error(exc)
+            if terminal:
+                self._fail_terminal_delivery_item(item, reason)
+            else:
+                self.quay.fail_outbox_item(item, reason)
             self.metrics.claims_released += 1
             log_event(
                 self.logger,
-                "outbox_item_failed",
+                "outbox_item_quarantined" if terminal else "outbox_item_failed",
                 outbox_item_id=item.outbox_item_id,
                 task_id=item.task_id,
                 reason=reason,
@@ -1485,6 +1500,10 @@ class HandoffDrainer:
             task_id=item.task_id,
             metrics=self.metrics.as_dict(),
         )
+
+    def _fail_terminal_delivery_item(self, item: OutboxItem, reason: str) -> None:
+        terminal_reason = f"terminal:{reason}"
+        self.quay.fail_outbox_item(item, terminal_reason)
 
     def _post_delivery_message(
         self,
@@ -2585,14 +2604,35 @@ def _coerce_slack_route(value: Any, *, source: str) -> SlackRoute | None:
 
 
 def _parse_slack_thread_ref(value: str) -> tuple[str, str] | None:
-    left, sep, right = value.strip().partition(":")
-    if not sep:
+    parts = [part.strip() for part in value.strip().split(":")]
+    if len(parts) == 3 and parts[0].lower() == "slack":
+        channel_id, thread_ts = parts[1], parts[2]
+    elif len(parts) == 2:
+        channel_id, thread_ts = parts
+    else:
         return None
-    channel_id = left.strip()
-    thread_ts = right.strip()
     if not channel_id or not thread_ts:
         return None
     return channel_id, thread_ts
+
+
+def _terminal_outbox_row_reason(row: Mapping[str, Any]) -> str | None:
+    status = str(row.get("status") or row.get("state") or "").strip().lower()
+    if status in {"terminal", "quarantined", "quarantine", "failed_terminal"}:
+        return f"terminal_status:{status}"
+    last_error = str(row.get("last_error") or row.get("error") or "").strip()
+    if last_error.startswith("terminal:") or last_error.startswith("quarantine:"):
+        return last_error
+    return None
+
+
+def _is_terminal_delivery_slack_error(exc: SlackApiError) -> bool:
+    return exc.error in {
+        "channel_not_found",
+        "not_in_channel",
+        "is_archived",
+        "thread_not_found",
+    }
 
 
 def load_config(path: Path | None) -> OrchestratorConfig:
