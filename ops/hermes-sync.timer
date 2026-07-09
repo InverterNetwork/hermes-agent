@@ -2,11 +2,21 @@
 Description=Run hermes-sync every 2 minutes
 
 [Timer]
-# Initial delay after boot to let the network settle.
-OnBootSec=30s
-# Cadence: 2 minutes between ticks. Override in
-# /etc/systemd/system/hermes-sync.timer.d/override.conf to retune.
-OnUnitActiveSec=2min
+# Wall-clock cadence: every 2 minutes (BRIX-1874). Anchored on the wall clock
+# via OnCalendar rather than OnBootSec/OnUnitActiveSec, so the timer always has
+# a next elapse and always re-arms after any stop/restart. A monotonic-only
+# schedule (OnUnitActiveSec re-anchors off the *previous* service activation)
+# can compute NO next trigger if the service is stopped and the timer is later
+# started past boot with no prior activation to anchor on — it then sits active
+# with `Trigger: n/a` and silently never fires again.
+#
+# Retune with an override drop-in
+# (/etc/systemd/system/hermes-sync.timer.d/override.conf via
+# `sudo systemctl edit hermes-sync.timer`), resetting OnCalendar first:
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=*:0/5
+OnCalendar=*:0/2
 AccuracySec=15s
 Persistent=true
 Unit=hermes-sync.service

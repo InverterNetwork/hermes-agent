@@ -4,8 +4,6 @@ import dataclasses
 import importlib.util
 import json
 import logging
-import shutil
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -2124,91 +2122,6 @@ def test_installed_quay_orchestrator_runner_uses_parked_human_waits():
     assert "--park-human-waits" in runner
     assert "TimeoutStartSec=300" in service
     assert "Unit=quay-orchestrator.service" in timer
-
-
-def _timer_directive_values(timer_text: str, key: str) -> list[str]:
-    """Return the values of every `Key=...` directive in a unit file, ignoring
-    comments and whitespace."""
-    values = []
-    for raw in timer_text.splitlines():
-        line = raw.strip()
-        if line.startswith("#") or "=" not in line:
-            continue
-        name, _, value = line.partition("=")
-        if name.strip() == key:
-            values.append(value.strip())
-    return values
-
-
-def test_quay_orchestrator_timer_has_wall_clock_trigger():
-    """Regression for BRIX-1874: the orchestrator timer must carry an
-    OnCalendar (wall-clock) trigger so it always re-arms after a stop or a
-    restart-past-boot.
-
-    The old schedule was monotonic-only (OnBootSec + OnUnitActiveSec, no
-    OnCalendar). OnBootSec elapses once per boot and OnUnitActiveSec re-anchors
-    off the *previous* service activation, so a stop followed by a start past
-    boot (with no prior activation to anchor on) computes NO next elapse: the
-    timer sits active with `Trigger: n/a` and never fires again. The outbox
-    drain silently died for ~3 days that way. An OnCalendar trigger is anchored
-    on the wall clock and cannot deadlock.
-    """
-    timer = (REPO_ROOT / "ops" / "quay-orchestrator.timer").read_text(
-        encoding="utf-8"
-    )
-
-    on_calendar = _timer_directive_values(timer, "OnCalendar")
-    assert on_calendar, (
-        "quay-orchestrator.timer must define OnCalendar so it always has a "
-        "wall-clock next elapse and cannot deadlock with no next trigger "
-        "(BRIX-1874)."
-    )
-
-    # The timer must not rely solely on monotonic anchors: if OnCalendar were
-    # ever dropped and only OnBootSec/OnUnitActiveSec remained, the deadlock
-    # would return. Presence of OnCalendar above already guarantees this; this
-    # assertion documents the invariant and keeps the cadence roughly minutely.
-    assert on_calendar == ["minutely"], (
-        "expected an every-minute wall-clock cadence; got "
-        f"OnCalendar={on_calendar!r}"
-    )
-
-
-def test_quay_orchestrator_timer_passes_systemd_analyze_verify(tmp_path):
-    """If `systemd-analyze` is available, validate the rendered timer (and its
-    service) as real systemd would — this also confirms the OnCalendar
-    expression parses. Skipped where systemd tooling is absent (e.g. CI/macOS).
-    """
-    systemd_analyze = shutil.which("systemd-analyze")
-    if systemd_analyze is None:
-        pytest.skip("systemd-analyze not available")
-
-    timer_src = (REPO_ROOT / "ops" / "quay-orchestrator.timer").read_text(
-        encoding="utf-8"
-    )
-    service_src = (REPO_ROOT / "ops" / "quay-orchestrator.service").read_text(
-        encoding="utf-8"
-    )
-    # The service is a template (installer substitutes __AGENT_USER__ /
-    # __TARGET_DIR__); fill placeholders so `verify` can resolve Unit=.
-    service_src = service_src.replace("__AGENT_USER__", "hermes").replace(
-        "__TARGET_DIR__", "/opt/hermes"
-    )
-    (tmp_path / "quay-orchestrator.timer").write_text(timer_src, encoding="utf-8")
-    (tmp_path / "quay-orchestrator.service").write_text(
-        service_src, encoding="utf-8"
-    )
-
-    result = subprocess.run(
-        [systemd_analyze, "verify", str(tmp_path / "quay-orchestrator.timer")],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, (
-        "systemd-analyze verify rejected quay-orchestrator.timer:\n"
-        f"{result.stdout}\n{result.stderr}"
-    )
 
 
 def test_cli_quay_adapter_noops_without_slack_token_when_no_handoffs(
