@@ -225,6 +225,9 @@ class RunMetrics:
     no_handoff: int = 0
     lock_busy: int = 0
     errors: int = 0
+    agent_briefs_submitted: int = 0
+    agent_fyi_posted: int = 0
+    remediation_escalated: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return dataclasses.asdict(self)
@@ -238,6 +241,10 @@ class DrainResult:
     metrics: Mapping[str, int] = field(default_factory=dict)
 
 
+# Default Linear team for Otto's Quay-CLI friction tickets (BRIX-1878).
+DEFAULT_REMEDIATION_LINEAR_TEAM_ID = "28294e03-c1ce-4c2b-ba24-49e36179a321"
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     enabled: bool = False
@@ -247,6 +254,14 @@ class OrchestratorConfig:
     reply_timeout_seconds: float = 1800.0
     poll_interval_seconds: float = 15.0
     lock_path: Path | None = None
+    # Agentic blocker remediation (BRIX-1878). Default OFF: Otto never touches a
+    # live handoff unless every one of these flags is explicitly enabled.
+    remediation_enabled: bool = False
+    remediation_max_iterations: int = 3
+    remediation_max_tokens: int = 4000
+    remediation_max_attempts: int = 2
+    remediation_friction_enabled: bool = False
+    remediation_linear_team_id: str = DEFAULT_REMEDIATION_LINEAR_TEAM_ID
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "OrchestratorConfig":
@@ -262,6 +277,25 @@ class OrchestratorConfig:
                 raw.get("poll_interval_seconds"), default=15.0
             ),
             lock_path=Path(str(raw["lock_path"])) if raw.get("lock_path") else None,
+            remediation_enabled=_as_bool(
+                raw.get("remediation_enabled"), default=False
+            ),
+            remediation_max_iterations=_positive_int(
+                raw.get("remediation_max_iterations"), default=3
+            ),
+            remediation_max_tokens=_positive_int(
+                raw.get("remediation_max_tokens"), default=4000
+            ),
+            remediation_max_attempts=_positive_int(
+                raw.get("remediation_max_attempts"), default=2
+            ),
+            remediation_friction_enabled=_as_bool(
+                raw.get("remediation_friction_enabled"), default=False
+            ),
+            remediation_linear_team_id=str(
+                raw.get("remediation_linear_team_id")
+                or DEFAULT_REMEDIATION_LINEAR_TEAM_ID
+            ),
         )
 
     def with_env_overrides(self) -> "OrchestratorConfig":
@@ -298,6 +332,20 @@ class OrchestratorConfig:
             "QUAY_ORCHESTRATOR_LOCK",
             "BRIX_ORCHESTRATOR_LOCK",
         )
+        remediation_enabled = self.remediation_enabled
+        remediation_enabled_env = os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_ENABLED")
+        if remediation_enabled_env is not None:
+            remediation_enabled = _as_bool(
+                remediation_enabled_env, default=remediation_enabled
+            )
+        remediation_friction_enabled = self.remediation_friction_enabled
+        remediation_friction_env = os.getenv(
+            "QUAY_ORCHESTRATOR_REMEDIATION_FRICTION_ENABLED"
+        )
+        if remediation_friction_env is not None:
+            remediation_friction_enabled = _as_bool(
+                remediation_friction_env, default=remediation_friction_enabled
+            )
         return dataclasses.replace(
             self,
             enabled=enabled,
@@ -310,6 +358,24 @@ class OrchestratorConfig:
             reply_timeout_seconds=timeout,
             poll_interval_seconds=interval,
             lock_path=Path(lock_env) if lock_env else self.lock_path,
+            remediation_enabled=remediation_enabled,
+            remediation_max_iterations=_positive_int(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ITERATIONS"),
+                default=self.remediation_max_iterations,
+            ),
+            remediation_max_tokens=_positive_int(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_TOKENS"),
+                default=self.remediation_max_tokens,
+            ),
+            remediation_max_attempts=_positive_int(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ATTEMPTS"),
+                default=self.remediation_max_attempts,
+            ),
+            remediation_friction_enabled=remediation_friction_enabled,
+            remediation_linear_team_id=(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID")
+                or self.remediation_linear_team_id
+            ),
         )
 
 
@@ -848,12 +914,36 @@ class QuayCliClient:
         return metadata
 
 
-class HermesConversationDecider:
-    """LLM-backed Quay orchestrator decision step.
+def _assert_agent_tool_less(agent: Any) -> None:
+    """Guarantee an orchestrator agent resolved to ZERO tools.
 
-    Humans talk normally in Slack. This component decides whether that
-    discussion has enough information to resume the worker, or whether the
-    orchestrator should ask/confirm one more thing.
+    The orchestrator's ``AIAgent`` instances (Slack decider + blocker
+    remediator) must never hold a tool: the model is a pure reasoner and every
+    state change is performed by orchestrator code. ``enabled_toolsets=[]``
+    alone is NOT sufficient because ``model_tools`` force-appends the ``kanban``
+    toolset whenever ``HERMES_KANBAN_TASK`` is set in the ambient env. This
+    check fails loudly if any tool survives, so the agent can never silently
+    gain a capability from the environment.
+    """
+    tools = getattr(agent, "tools", None)
+    if tools:
+        try:
+            names = sorted(t["function"]["name"] for t in tools)
+        except (TypeError, KeyError, AttributeError):
+            names = [str(t) for t in tools]
+        raise RuntimeError(
+            "orchestrator agent must be tool-less but resolved tools: "
+            + ", ".join(names)
+        )
+
+
+class _OrchestratorAgentBuilder:
+    """Shared bounded-``AIAgent`` runtime/model resolution for the orchestrator.
+
+    Both the Slack conversation decider and the blocker remediator run a scoped,
+    tool-less ``AIAgent`` under the same provider/model resolution rules. This
+    base owns that plumbing so the two callers cannot drift apart; each supplies
+    its own iteration/token caps via ``_build_agent``.
     """
 
     def __init__(
@@ -875,52 +965,17 @@ class HermesConversationDecider:
         self._model_normalizer = model_normalizer
         self._agent_class = agent_class
 
-    def decide(
+    def _build_agent(
         self,
-        *,
         handoff: Handoff,
-        task: TaskContext,
-        artifact: Artifact | None,
-        question: str,
-        replies: list[SlackReply],
-        posted_messages: list[str],
-    ) -> ConversationDecision:
-        if not replies:
-            return ConversationDecision(action="wait")
-
-        agent = self._build_agent(handoff)
-        prompt = build_orchestrator_decision_prompt(
-            handoff=handoff,
-            task=task,
-            artifact=artifact,
-            question=question,
-            replies=replies,
-            posted_messages=posted_messages,
-        )
-        result = agent.run_conversation(
-            prompt,
-            system_message=ORCHESTRATOR_DECISION_SYSTEM,
-            conversation_history=[],
-            task_id=f"quay-orchestrator:{handoff.task_id}",
-        )
-        text = ""
-        if isinstance(result, Mapping):
-            text = str(result.get("final_response") or "")
-        else:
-            text = str(result or "")
-        decision = parse_decision_response(text)
-        log_event(
-            self._logger,
-            "orchestrator_conversation_decision",
-            handoff_id=handoff.handoff_id,
-            task_id=handoff.task_id,
-            action=decision.action,
-        )
-        return decision
-
-    def _build_agent(self, handoff: Handoff) -> Any:
+        *,
+        max_iterations: int,
+        max_tokens: int | None = None,
+    ) -> Any:
         if self._agent_factory is not None:
-            return self._agent_factory()
+            agent = self._agent_factory()
+            _assert_agent_tool_less(agent)
+            return agent
         runtime = self._resolve_runtime()
         agent_class = self._agent_class
         if agent_class is None:
@@ -928,7 +983,7 @@ class HermesConversationDecider:
 
             agent_class = AIAgent
 
-        return agent_class(
+        kwargs: dict[str, Any] = dict(
             model=self._resolve_model(runtime),
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -937,14 +992,27 @@ class HermesConversationDecider:
             acp_command=runtime.get("command"),
             acp_args=list(runtime.get("args") or []),
             credential_pool=runtime.get("credential_pool"),
-            max_iterations=2,
+            max_iterations=max_iterations,
             quiet_mode=True,
+            # Tool-less by construction. An empty ``enabled_toolsets`` is not
+            # enough: ``model_tools`` force-appends the ``kanban`` toolset
+            # whenever ``HERMES_KANBAN_TASK`` is set in the ambient env.
+            # Explicitly disabling ``kanban`` overrides that force-append so the
+            # orchestrator agent resolves to ZERO tools regardless of env — an
+            # explicit API rather than mutating global ``os.environ``. The
+            # post-build ``_assert_agent_tool_less`` check is the backstop.
             enabled_toolsets=[],
+            disabled_toolsets=["kanban"],
             skip_context_files=True,
             skip_memory=True,
             platform="quay-orchestrator",
             session_id=orchestrator_session_id(handoff),
         )
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        agent = agent_class(**kwargs)
+        _assert_agent_tool_less(agent)
+        return agent
 
     def _resolve_runtime(self) -> Mapping[str, Any]:
         resolver = self._runtime_resolver
@@ -1047,6 +1115,923 @@ class HermesConversationDecider:
             return str(resolver(provider) or "").strip()
         except Exception:
             return ""
+
+
+class HermesConversationDecider(_OrchestratorAgentBuilder):
+    """LLM-backed Quay orchestrator decision step.
+
+    Humans talk normally in Slack. This component decides whether that
+    discussion has enough information to resume the worker, or whether the
+    orchestrator should ask/confirm one more thing.
+    """
+
+    def decide(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        replies: list[SlackReply],
+        posted_messages: list[str],
+    ) -> ConversationDecision:
+        if not replies:
+            return ConversationDecision(action="wait")
+
+        agent = self._build_agent(handoff, max_iterations=2)
+        prompt = build_orchestrator_decision_prompt(
+            handoff=handoff,
+            task=task,
+            artifact=artifact,
+            question=question,
+            replies=replies,
+            posted_messages=posted_messages,
+        )
+        result = agent.run_conversation(
+            prompt,
+            system_message=ORCHESTRATOR_DECISION_SYSTEM,
+            conversation_history=[],
+            task_id=f"quay-orchestrator:{handoff.task_id}",
+        )
+        text = ""
+        if isinstance(result, Mapping):
+            text = str(result.get("final_response") or "")
+        else:
+            text = str(result or "")
+        decision = parse_decision_response(text)
+        log_event(
+            self._logger,
+            "orchestrator_conversation_decision",
+            handoff_id=handoff.handoff_id,
+            task_id=handoff.task_id,
+            action=decision.action,
+        )
+        return decision
+
+
+# ---------------------------------------------------------------------------
+# Agentic blocker remediation (BRIX-1878)
+#
+# SAFETY: Otto may auto-answer a blocked worker only when EVERY guardrail below
+# agrees. The model NEVER holds a tool; it only proposes JSON. All state
+# transitions (``submit_brief``, Linear writes) are performed by orchestrator
+# code AFTER the deterministic gates below. When anything is unclear the code
+# escalates to a human — the model's opinion cannot override that.
+# ---------------------------------------------------------------------------
+
+# Deterministic never-auto categories. If any substring here appears in the
+# blocker/handoff/model text, the handoff is escalated to a human, full stop.
+_NEVER_AUTO_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "product_or_requirements_decision": (
+        "product decision",
+        "product call",
+        "requirement",
+        "requirements",
+        "acceptance criteria",
+        "scope change",
+        "change scope",
+        "design decision",
+        "which approach",
+        "which option",
+        "which feature",
+        "business logic",
+        "business decision",
+        "should we",
+        "do we want",
+        "product owner",
+        "stakeholder",
+        "roadmap",
+    ),
+    "irreversible_or_production_change": (
+        "production",
+        "prod deploy",
+        "deploy to prod",
+        "irreversible",
+        "cannot be undone",
+        "can't be undone",
+        "not reversible",
+        "force push",
+        "force-push",
+        "rollback",
+        "mainnet",
+        "live environment",
+        "destructive",
+        "delete",
+        "drop table",
+        "tear down",
+        "teardown",
+        "release to production",
+    ),
+    "security": (
+        "security",
+        "vulnerability",
+        "vulnerabilities",
+        "cve-",
+        "exploit",
+        "auth bypass",
+        "authentication bypass",
+        "authorization",
+        "access control",
+        "privilege",
+        "rce",
+        "xss",
+        "csrf",
+        "sql injection",
+        "injection attack",
+        "malicious",
+    ),
+    "spend_or_budget": (
+        "budget",
+        "spend",
+        "overspend",
+        "invoice",
+        "billing",
+        "payment",
+        "purchase",
+        "procurement",
+        "pay for",
+        "pricing tier",
+        "upgrade plan",
+    ),
+    "credentials_or_secrets": (
+        "credential",
+        "secret",
+        "api key",
+        "api_key",
+        "apikey",
+        "password",
+        "private key",
+        "ssh key",
+        "access token",
+        "auth token",
+        "bearer token",
+        "mnemonic",
+        "seed phrase",
+        "wallet key",
+        "keystore",
+        ".env secret",
+    ),
+    "data_changes": (
+        "data migration",
+        "migrate data",
+        "database migration",
+        "schema migration",
+        "drop column",
+        "delete rows",
+        "delete records",
+        "truncate",
+        "alter table",
+        "wipe data",
+        "purge data",
+        "production data",
+        "customer data",
+        "user data",
+        "backfill",
+    ),
+    "ambiguous_intent": (
+        "unclear",
+        "ambiguous",
+        "not sure what",
+        "unsure",
+        "need clarification",
+        "needs clarification",
+        "please clarify",
+        "what did you mean",
+        "which one",
+        "don't know what",
+        "cannot determine",
+        "can't determine",
+        "undecided",
+    ),
+}
+
+# Category tokens that, if the model claims them, are treated as never-auto.
+_NEVER_AUTO_CATEGORY_TOKENS: tuple[str, ...] = (
+    "product",
+    "requirement",
+    "design",
+    "security",
+    "vuln",
+    "credential",
+    "secret",
+    "password",
+    "token",
+    "spend",
+    "budget",
+    "billing",
+    "payment",
+    "cost",
+    "data",
+    "migration",
+    "migrate",
+    "irreversible",
+    "prod",
+    "production",
+    "deploy",
+    "release",
+    "destructive",
+    "delete",
+    "ambiguous",
+    "unclear",
+    "unknown",
+    "escalate",
+)
+
+# Canonical auto-answerable categories (companion skill hermes-state #32). This
+# allowlist is the ENFORCEABLE FLOOR for auto-resume: a model resume is accepted
+# only when its category normalizes to one of these five. Everything else — a
+# novel label, a relabeled danger, an empty/miscased/non-string value —
+# escalates. The keyword denylist above (`_never_auto_reason` /
+# `_is_never_auto_category`) is kept as defense-in-depth over the brief text; it
+# does NOT replace this floor.
+_AUTO_ANSWERABLE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "prerequisite-baseline",
+        "stale-baseline",
+        "missing-invocation",
+        "transient-retry",
+        "scoped-known-fix",
+    }
+)
+
+
+def _normalize_category(category: Any) -> str:
+    """Strip + lowercase a model-proposed category; non-strings normalize to ''."""
+    if not isinstance(category, str):
+        return ""
+    return category.strip().lower()
+
+
+def _is_auto_answerable_category(category: Any) -> bool:
+    """True only when ``category`` is a member of the canonical allowlist."""
+    return _normalize_category(category) in _AUTO_ANSWERABLE_CATEGORIES
+
+
+REMEDIATION_GUARDRAIL_SYSTEM = (
+    "You are the Quay orchestrator's blocker-remediation guardrail. A worker is "
+    "blocked and you decide whether the orchestrator may auto-resume it WITHOUT a "
+    "human in the loop, running on a live orchestrator.\n"
+    "You have NO tools. You only emit ONE JSON object and nothing else.\n"
+    "NEVER auto-resume (always output {\"action\":\"escalate\"}) when the blocker "
+    "involves ANY of: a product or requirements decision; an irreversible or "
+    "production change; security; spend or budget; credentials or secrets; data "
+    "changes; or any ambiguous, unclear, or under-specified intent.\n"
+    "When you are unsure for ANY reason, output {\"action\":\"escalate\"}.\n"
+    "Only propose a resume when the fix is objectively safe, reversible, and fully "
+    "determined by the blocker context (for example a lint or formatting fix, a "
+    "trivial and obvious test correction, or a mechanical follow-up that the "
+    "worker already described).\n"
+    "You never perform actions; the orchestrator code, not you, decides whether to "
+    "act on your proposal and re-checks every guardrail first.\n"
+    "Output schema (JSON only, no prose, no code fence):\n"
+    "  {\"action\":\"escalate\"}\n"
+    "OR\n"
+    "  {\"action\":\"resume\",\"brief\":\"<resume guidance for the worker>\","
+    "\"category\":\"<auto-answerable category>\",\"rationale\":\"<why it is safe "
+    "and reversible>\",\"friction\":{\"title\":\"...\",\"detail\":\"...\","
+    "\"signature\":\"...\"}}\n"
+    "The friction object is optional; include it only to record a recurring "
+    "Quay-CLI friction the worker hit.\n"
+    "--- BEGIN SKILL ---\n"
+)
+
+# Hard caps: any response beyond these is treated as malformed -> escalate.
+_MAX_REMEDIATION_RESPONSE_CHARS = 20000
+_MAX_REMEDIATION_BRIEF_CHARS = 6000
+_MAX_FRICTION_FIELD_CHARS = 4000
+
+
+@dataclass(frozen=True)
+class RemediationOutcome:
+    brief: str
+    category: str
+    rationale: str = ""
+    friction: Mapping[str, str] | None = None
+    tokens: int = 0
+
+
+def _never_auto_reason(
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+    *,
+    proposed_category: str = "",
+    proposed_brief: str = "",
+) -> str | None:
+    """Deterministic (no-model) never-auto classifier.
+
+    Returns a human-readable reason string when the handoff must NOT be
+    auto-remediated (the caller escalates), or ``None`` when the deterministic
+    checks find no reason to block. Conservative by design: missing blocker
+    context is itself a reason to escalate.
+    """
+    blocker_text = artifact.text if artifact else ""
+    # Pre-model gate: with no blocker context we cannot reason safely.
+    if not proposed_category and not proposed_brief:
+        if not blocker_text or not blocker_text.strip():
+            return "no_blocker_context"
+
+    parts = [
+        handoff.reason or "",
+        handoff.summary or "",
+        blocker_text,
+        proposed_category or "",
+        proposed_brief or "",
+    ]
+    try:
+        parts.append(json.dumps(task.metadata, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        parts.append(str(task.metadata))
+    haystack = "\n".join(parts).lower()
+
+    for category, needles in _NEVER_AUTO_CATEGORIES.items():
+        for needle in needles:
+            if needle in haystack:
+                return f"{category}:{needle.strip()}"
+
+    if proposed_category:
+        category_lower = proposed_category.strip().lower()
+        for token in _NEVER_AUTO_CATEGORY_TOKENS:
+            if token in category_lower:
+                return f"never_auto_category:{category_lower}"
+
+    return None
+
+
+def _is_never_auto_category(category: str) -> bool:
+    category_lower = (category or "").strip().lower()
+    if not category_lower:
+        return True
+    return any(token in category_lower for token in _NEVER_AUTO_CATEGORY_TOKENS)
+
+
+def _parse_friction(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    title = value.get("title")
+    detail = value.get("detail")
+    signature = value.get("signature")
+    fields = {}
+    for key, raw in (("title", title), ("detail", detail), ("signature", signature)):
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        text = raw.strip()
+        if len(text) > _MAX_FRICTION_FIELD_CHARS:
+            return None
+        fields[key] = text
+    return fields
+
+
+def parse_remediation_response(text: str) -> dict[str, Any] | None:
+    """Strictly parse the remediation turn's JSON.
+
+    Accepts ONLY ``{"action":"escalate"}`` or a fully-formed resume object.
+    Anything malformed, missing a required field, or oversized returns ``None``
+    so the caller escalates to a human.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > _MAX_REMEDIATION_RESPONSE_CHARS:
+        return None
+    if raw.startswith("```"):
+        raw = _strip_json_fence(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+    if not isinstance(data, Mapping):
+        return None
+
+    action = str(data.get("action") or "").strip().lower()
+    if action == "escalate":
+        # F4: preserve a valid friction object on the escalate path so the
+        # orchestrator can still capture a recurring Quay-CLI friction even when
+        # Otto cannot self-resolve. Invalid/oversized friction is dropped (we
+        # still escalate); a bad friction never blocks the escalation.
+        escalation: dict[str, Any] = {"action": "escalate"}
+        if data.get("friction") is not None:
+            parsed_friction = _parse_friction(data.get("friction"))
+            if parsed_friction is not None:
+                escalation["friction"] = parsed_friction
+        return escalation
+    if action != "resume":
+        return None
+
+    brief = data.get("brief")
+    category = data.get("category")
+    rationale = data.get("rationale")
+    if not isinstance(brief, str) or not brief.strip():
+        return None
+    if not isinstance(category, str) or not category.strip():
+        return None
+    if not isinstance(rationale, str) or not rationale.strip():
+        return None
+    if len(brief) > _MAX_REMEDIATION_BRIEF_CHARS:
+        return None
+
+    result: dict[str, Any] = {
+        "action": "resume",
+        "brief": brief.strip(),
+        "category": category.strip(),
+        "rationale": rationale.strip(),
+    }
+    if "friction" in data and data.get("friction") is not None:
+        parsed_friction = _parse_friction(data.get("friction"))
+        if parsed_friction is None:
+            return None
+        result["friction"] = parsed_friction
+    return result
+
+
+def build_remediation_prompt(
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+) -> str:
+    payload = {
+        "task": {
+            "task_id": task.task_id,
+            "title": task.title,
+            "issue": task.issue,
+            "repo_id": task.repo_id or handoff.repo_id,
+            "metadata": task.metadata,
+        },
+        "handoff": {
+            "handoff_id": handoff.handoff_id,
+            "reason": handoff.reason,
+            "summary": handoff.summary,
+        },
+        "blocker": artifact.text if artifact else "",
+    }
+    return (
+        "A Quay worker is blocked. Decide whether it can be safely auto-resumed "
+        "without a human, following every rule in the system message.\n"
+        "Return only the JSON object described in the system message.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    )
+
+
+def build_remediation_fyi(
+    handoff: Handoff,
+    task: TaskContext,
+    outcome: RemediationOutcome,
+) -> str:
+    target = task.issue or task.title or task.task_id
+    blocker = ""
+    if handoff.summary and handoff.summary.strip():
+        blocker = handoff.summary.strip().splitlines()[0].strip()
+    preview = outcome.brief.strip()
+    if len(preview) > 400:
+        preview = preview[:397].rstrip() + "..."
+    lines = [f"Otto auto-resumed a blocked Quay worker for {target}."]
+    lines.append(f"Task: {task.task_id}")
+    if blocker:
+        lines.append(f"Blocker: {blocker}")
+    lines.append(f"Category: {outcome.category}")
+    lines.append(f"Brief: {preview}")
+    lines.append("Auto-resumed; reply here to override.")
+    return "\n".join(lines)
+
+
+class HandoffRemediator(_OrchestratorAgentBuilder):
+    """Bounded, guardrailed agentic remediation for blocked worker handoffs.
+
+    ``remediate`` returns a resume brief ONLY when both the pre-model and
+    post-model deterministic gates agree it is safe; any doubt, crash, or model
+    malfunction degrades to ``None`` (human escalation). The model is a pure
+    reasoner with no tools: the orchestrator, not the model, performs every
+    state change.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: OrchestratorConfig,
+        logger: logging.Logger | None = None,
+        agent_factory: Any | None = None,
+        runtime_resolver: Any | None = None,
+        default_model_resolver: Any | None = None,
+        model_catalog_resolver: Any | None = None,
+        model_normalizer: Any | None = None,
+        agent_class: Any | None = None,
+        skill_loader: Any | None = None,
+        linear_request: Any | None = None,
+    ) -> None:
+        super().__init__(
+            logger=logger,
+            agent_factory=agent_factory,
+            runtime_resolver=runtime_resolver,
+            default_model_resolver=default_model_resolver,
+            model_catalog_resolver=model_catalog_resolver,
+            model_normalizer=model_normalizer,
+            agent_class=agent_class,
+        )
+        self.config = config
+        self._skill_loader = skill_loader
+        self._linear_request = linear_request
+        self.last_outcome: RemediationOutcome | None = None
+
+    # -- public API --------------------------------------------------------
+
+    def remediate(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+    ) -> str | None:
+        self.last_outcome = None
+        try:
+            # Gate #1a (pre-model): deterministic never-auto classifier.
+            never = _never_auto_reason(handoff, task, artifact)
+            if never is not None:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="pre_model_never_auto",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    reason=never,
+                )
+                return None
+
+            # Gate #1b (pre-model): durable per-task loop guard.
+            attempts = self._read_attempts(handoff.task_id)
+            if attempts >= self.config.remediation_max_attempts:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="loop_guard",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    attempts=attempts,
+                    max_attempts=self.config.remediation_max_attempts,
+                )
+                return None
+
+            skill_body = self._load_skill()
+            if not skill_body:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="missing_skill",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                )
+                return None
+
+            # Consume one attempt now: we are about to invoke the model. Fail
+            # CLOSED — if we cannot durably record the attempt we treat
+            # ourselves as OVER-BUDGET and escalate WITHOUT calling the model
+            # ("if I can't prove I'm under budget, I don't spend an attempt").
+            try:
+                self._bump_attempts(handoff.task_id)
+            except OSError:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="loop_guard_write_failed",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                )
+                return None
+
+            agent = self._build_agent(
+                handoff,
+                max_iterations=self.config.remediation_max_iterations,
+                max_tokens=self.config.remediation_max_tokens,
+            )
+            system_message = REMEDIATION_GUARDRAIL_SYSTEM + skill_body
+            prompt = build_remediation_prompt(handoff, task, artifact)
+            result = agent.run_conversation(
+                prompt,
+                system_message=system_message,
+                conversation_history=[],
+                task_id=f"quay-orchestrator:{handoff.task_id}",
+            )
+            if isinstance(result, Mapping):
+                text = str(result.get("final_response") or "")
+                tokens = _safe_int(result.get("total_tokens"))
+            else:
+                text = str(result or "")
+                tokens = 0
+
+            parsed = parse_remediation_response(text)
+            if parsed is None or parsed.get("action") != "resume":
+                # F4: the model escalated (or its output was rejected). If it
+                # still supplied a valid friction object, surface it via
+                # ``last_outcome`` so the orchestrator can record it (code-only,
+                # behind ``remediation_friction_enabled``) while still escalating.
+                friction = (
+                    parsed.get("friction") if isinstance(parsed, Mapping) else None
+                )
+                if friction:
+                    self.last_outcome = RemediationOutcome(
+                        brief="",
+                        category="",
+                        friction=friction,
+                        tokens=tokens,
+                    )
+                log_event(
+                    self._logger,
+                    "remediation_attempt",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    decision="escalate",
+                    tokens=tokens,
+                )
+                return None
+
+            brief = str(parsed.get("brief") or "").strip()
+            category = str(parsed.get("category") or "").strip()
+
+            # Gate #2 (post-model): a resume is accepted ONLY IF BOTH hold:
+            #   (a) the model's category is a member of the canonical
+            #       auto-answerable allowlist (the ENFORCEABLE FLOOR), AND
+            #   (b) the deterministic never-auto keyword scan over the model's
+            #       own category+brief finds nothing.
+            # The allowlist is the primary, enforceable gate; the keyword scan
+            # (`_never_auto_reason` / `_is_never_auto_category`) is kept as
+            # defense-in-depth. Both are layers among several: LLM judgment, a
+            # narrow allowlist, worker-sandbox limits, and an FYI-with-undo. Any
+            # category that is novel, empty, relabeled, miscased, or non-string
+            # fails (a) and escalates.
+            if not brief:
+                return None
+            allowlisted = _is_auto_answerable_category(category)
+            gate2 = _never_auto_reason(
+                handoff,
+                task,
+                artifact,
+                proposed_category=category,
+                proposed_brief=brief,
+            )
+            if not allowlisted or gate2 is not None or _is_never_auto_category(category):
+                if not allowlisted:
+                    reason = (
+                        "category_not_allowlisted:"
+                        + (_normalize_category(category) or "<empty>")
+                    )
+                elif gate2 is not None:
+                    reason = gate2
+                else:
+                    reason = f"never_auto_category:{category.lower()}"
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="post_model_allowlist",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    category=category,
+                    reason=reason,
+                    tokens=tokens,
+                )
+                return None
+
+            outcome = RemediationOutcome(
+                brief=brief,
+                category=category,
+                rationale=str(parsed.get("rationale") or ""),
+                friction=parsed.get("friction"),
+                tokens=tokens,
+            )
+            self.last_outcome = outcome
+            log_event(
+                self._logger,
+                "remediation_attempt",
+                task_id=handoff.task_id,
+                handoff_id=handoff.handoff_id,
+                decision="resume",
+                category=category,
+                tokens=tokens,
+            )
+            return brief
+        except Exception:
+            # A crash must degrade to human escalation, never drop the handoff.
+            self._logger.exception("remediation crashed; escalating to human")
+            self.last_outcome = None
+            return None
+
+    def record_friction(
+        self,
+        *,
+        outcome: RemediationOutcome | None,
+        task: TaskContext,
+    ) -> None:
+        """Best-effort: file recurring Quay-CLI friction to Linear.
+
+        Never raises. Deduped both by a local per-signature marker (avoids
+        re-hitting Linear across ticks) and by a GraphQL title search.
+        """
+        if not self.config.remediation_friction_enabled:
+            return
+        if outcome is None or not outcome.friction:
+            return
+        friction = outcome.friction
+        signature = str(friction.get("signature") or "").strip()
+        if not signature:
+            return
+        try:
+            if self._friction_marker_exists(signature):
+                return
+            team_id = self.config.remediation_linear_team_id
+            existing = self._linear_find_friction(team_id, signature)
+            if existing:
+                log_event(
+                    self._logger,
+                    "remediation_friction_deduped",
+                    task_id=task.task_id,
+                    signature=signature,
+                    issue=existing,
+                )
+            else:
+                created = self._linear_create_friction(team_id, friction, signature)
+                log_event(
+                    self._logger,
+                    "remediation_friction_filed",
+                    task_id=task.task_id,
+                    signature=signature,
+                    issue=created,
+                )
+            self._write_friction_marker(signature)
+        except Exception:
+            self._logger.exception("friction recording failed; ignoring")
+
+    # -- skill loading -----------------------------------------------------
+
+    def _load_skill(self) -> str | None:
+        if self._skill_loader is not None:
+            try:
+                body = self._skill_loader()
+            except Exception:
+                self._logger.exception("remediation skill loader failed")
+                return None
+            body = (body or "").strip() if isinstance(body, str) else ""
+            return body or None
+        path = self._skill_path()
+        try:
+            if not path.is_file():
+                return None
+            body = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            self._logger.exception("failed to read remediation skill")
+            return None
+        return body or None
+
+    def _skill_path(self) -> Path:
+        return (
+            _hermes_home_dir()
+            / "skills"
+            / "quay"
+            / "quay-blocker-remediation"
+            / "SKILL.md"
+        )
+
+    # -- durable loop guard ------------------------------------------------
+
+    def _attempts_path(self, task_id: str) -> Path:
+        safe = _sanitize_state_key(task_id)
+        return _hermes_home_dir() / "quay" / "remediation-attempts" / safe
+
+    def _read_attempts(self, task_id: str) -> int:
+        path = self._attempts_path(task_id)
+        try:
+            return int((path.read_text(encoding="utf-8") or "0").strip() or "0")
+        except (OSError, ValueError):
+            return 0
+
+    def _bump_attempts(self, task_id: str) -> int:
+        # Fail CLOSED: a failure to durably record the attempt MUST propagate so
+        # the caller treats it as over-budget and escalates. Swallowing the
+        # error here (fail-open) would let a read-only/full filesystem re-invoke
+        # the model every tick without ever advancing the counter — unbounded.
+        path = self._attempts_path(task_id)
+        nxt = self._read_attempts(task_id) + 1
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(nxt), encoding="utf-8")
+        return nxt
+
+    # -- friction markers --------------------------------------------------
+
+    def _friction_marker_path(self, signature: str) -> Path:
+        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:32]
+        return _hermes_home_dir() / "quay" / "friction-markers" / digest
+
+    def _friction_marker_exists(self, signature: str) -> bool:
+        return self._friction_marker_path(signature).exists()
+
+    def _write_friction_marker(self, signature: str) -> None:
+        path = self._friction_marker_path(signature)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(signature, encoding="utf-8")
+        except OSError:
+            self._logger.exception("failed to persist friction marker")
+
+    # -- Linear (code-only, never an agent tool) ---------------------------
+
+    def _linear_find_friction(self, team_id: str, signature: str) -> str | None:
+        query = (
+            "query($team: ID!, $needle: String!) { "
+            "issues(filter: {team: {id: {eq: $team}}, "
+            "title: {containsIgnoreCase: $needle}}, first: 1) "
+            "{ nodes { id identifier url } } }"
+        )
+        data = self._linear_call(
+            query, {"team": team_id, "needle": signature}
+        )
+        nodes = (
+            ((data.get("data") or {}).get("issues") or {}).get("nodes")
+            if isinstance(data, Mapping)
+            else None
+        )
+        if isinstance(nodes, list) and nodes:
+            first = nodes[0]
+            if isinstance(first, Mapping):
+                return str(first.get("identifier") or first.get("id") or "")
+        return None
+
+    def _linear_create_friction(
+        self,
+        team_id: str,
+        friction: Mapping[str, str],
+        signature: str,
+    ) -> str | None:
+        title = f"{friction.get('title', '').strip()} [otto-friction:{signature}]"
+        detail = friction.get("detail", "").strip()
+        description = (
+            f"{detail}\n\n"
+            f"_Filed automatically by Otto (Quay-CLI friction capture)._\n"
+            f"Signature: `{signature}`\n"
+            f"Tag: `[otto-friction]`"
+        )
+        mutation = (
+            "mutation($input: IssueCreateInput!) { "
+            "issueCreate(input: $input) { success issue { id identifier url } } }"
+        )
+        data = self._linear_call(
+            mutation,
+            {"input": {"teamId": team_id, "title": title, "description": description}},
+        )
+        issue = (
+            ((data.get("data") or {}).get("issueCreate") or {}).get("issue")
+            if isinstance(data, Mapping)
+            else None
+        )
+        if isinstance(issue, Mapping):
+            return str(issue.get("identifier") or issue.get("id") or "")
+        return None
+
+    def _linear_call(
+        self, query: str, variables: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if self._linear_request is not None:
+            return self._linear_request(query, dict(variables))
+        api_key = (os.getenv("LINEAR_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("LINEAR_API_KEY is not configured")
+        body = json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.linear.app/graphql",
+            data=body,
+            headers={
+                "Authorization": api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, Mapping):
+            raise RuntimeError("Linear GraphQL returned a non-object response")
+        return parsed
+
+
+def _hermes_home_dir() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _sanitize_state_key(value: str) -> str:
+    safe = "".join(
+        ch if (ch.isalnum() or ch in "._-") else "_" for ch in (value or "")
+    )
+    safe = safe.strip("._") or "unknown"
+    return safe[:200]
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 class SlackWebApiClient:
@@ -1315,6 +2300,7 @@ class HandoffDrainer:
         config: OrchestratorConfig,
         worker_id: str,
         decider: ConversationDecider | None = None,
+        remediator: HandoffRemediator | None = None,
         coordination_lock: FileLock | None = None,
         park_human_waits: bool = False,
         logger: logging.Logger | None = None,
@@ -1324,6 +2310,9 @@ class HandoffDrainer:
         self.config = config
         self.worker_id = worker_id
         self.decider = decider or HermesConversationDecider(logger=logger or LOGGER)
+        self.remediator = remediator or HandoffRemediator(
+            config=config, logger=logger or LOGGER
+        )
         self.coordination_lock = coordination_lock
         self.park_human_waits = park_human_waits
         self.logger = logger or LOGGER
@@ -1600,7 +2589,7 @@ class HandoffDrainer:
     def _post_delivery_message(
         self,
         *,
-        item: OutboxItem,
+        item: OutboxItem | None = None,
         handoff: Handoff,
         task: TaskContext,
         route: SlackRoute,
@@ -1640,11 +2629,80 @@ class HandoffDrainer:
             task=task,
         )
 
+    def _post_remediation_fyi(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        outcome: RemediationOutcome,
+    ) -> None:
+        """Best-effort FYI after an auto-resume. A failed FYI must not undo it."""
+        try:
+            route = resolve_slack_route(handoff, task, self.config)
+            if route is None:
+                return
+            message = build_remediation_fyi(handoff, task, outcome)
+            self._post_delivery_message(
+                handoff=handoff,
+                task=task,
+                route=route,
+                message=message,
+            )
+            self.metrics.agent_fyi_posted += 1
+            log_event(
+                self.logger,
+                "remediation_fyi_posted",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                category=outcome.category,
+            )
+        except Exception:
+            self.logger.exception("remediation FYI post failed; ignoring")
+
     def _handle_claimed_handoff(self, handoff: Handoff) -> DrainResult:
         task = self.quay.get_task_context(handoff.task_id)
         artifact = self.quay.get_artifact(handoff) if handoff.artifact_id else None
 
         brief = choose_direct_brief(handoff)
+        remediated = False
+        if brief is None and self.config.remediation_enabled:
+            brief = self.remediator.remediate(
+                handoff=handoff, task=task, artifact=artifact
+            )
+            if brief is not None:
+                remediated = True
+            else:
+                self.metrics.remediation_escalated += 1
+                # F4: even when Otto escalates, still capture any recurring
+                # Quay-CLI friction the model surfaced. Code-only and gated by
+                # remediation_friction_enabled inside record_friction; a no-op
+                # when there is no friction to file.
+                self.remediator.record_friction(
+                    outcome=self.remediator.last_outcome, task=task
+                )
+        if brief and remediated:
+            outcome = self.remediator.last_outcome
+            self.quay.submit_brief(handoff, brief, reason="blocker_auto_remediated")
+            self.quay.complete_claim(handoff)
+            self.metrics.agent_briefs_submitted += 1
+            log_event(
+                self.logger,
+                "brief_submitted_remediated",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                category=outcome.category if outcome else "",
+            )
+            if outcome is not None:
+                self._post_remediation_fyi(
+                    handoff=handoff, task=task, outcome=outcome
+                )
+                self.remediator.record_friction(outcome=outcome, task=task)
+            return DrainResult(
+                status="submitted_remediated",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                metrics=self.metrics.as_dict(),
+            )
         if brief:
             self.quay.submit_brief(handoff, brief, reason="blocker_resolved")
             self.quay.complete_claim(handoff)
@@ -3510,6 +4568,19 @@ def _positive_float(value: Any, *, default: float) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
+    return parsed if parsed > 0 else default
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return default
     return parsed if parsed > 0 else default
 
 

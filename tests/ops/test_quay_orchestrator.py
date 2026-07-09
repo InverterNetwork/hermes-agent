@@ -4,6 +4,7 @@ import dataclasses
 import importlib.util
 import json
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -2518,3 +2519,807 @@ def test_quay_cli_client_claims_waiting_human_handoff_for_parked_poll():
     assert handoff.human_question == "Question?"
     calls = [" ".join(call[1:]) for call in runner.calls]
     assert calls == ["handoff list --status waiting_human"]
+
+
+# ---------------------------------------------------------------------------
+# Agentic blocker remediation (BRIX-1878)
+# ---------------------------------------------------------------------------
+
+
+SAFE_BLOCKER_TEXT = (
+    "The ruff lint step failed: an unused import `os` in module foo. "
+    "Remove the unused import and rerun the linter."
+)
+
+
+def remediation_config(**overrides):
+    base = dict(
+        enabled=True,
+        default_slack_channel="C_FALLBACK",
+        remediation_enabled=True,
+        remediation_max_iterations=3,
+        remediation_max_tokens=4000,
+        remediation_max_attempts=2,
+    )
+    base.update(overrides)
+    return quay.OrchestratorConfig(**base)
+
+
+def safe_handoff(**overrides):
+    fields = dict(
+        handoff_id="handoff-rem",
+        task_id="task-rem",
+        artifact_id="artifact-rem",
+        reason="worker_blocker",
+        summary="Worker blocked: lint failure on an unused import.",
+    )
+    fields.update(overrides)
+    return quay.Handoff(**fields)
+
+
+def safe_task(**overrides):
+    fields = dict(task_id="task-rem", title="Fix lint", issue="BRIX-1878")
+    fields.update(overrides)
+    return quay.TaskContext(**fields)
+
+
+def safe_artifact(text=SAFE_BLOCKER_TEXT):
+    return quay.Artifact(artifact_id="artifact-rem", text=text, kind="blocker")
+
+
+class FakeRemediationAgent:
+    def __init__(self, response, *, record):
+        self._response = response
+        self._record = record
+
+    def run_conversation(self, prompt, **kwargs):
+        self._record.append((prompt, kwargs))
+        if isinstance(self._response, Exception):
+            raise self._response
+        return {"final_response": self._response, "total_tokens": 123}
+
+
+def make_remediator(response="", *, config=None, skill="SKILL BODY", linear_request=None):
+    calls = []
+
+    def factory():
+        return FakeRemediationAgent(response, record=calls)
+
+    rem = quay.HandoffRemediator(
+        config=config or remediation_config(),
+        agent_factory=factory,
+        skill_loader=(lambda: skill),
+        linear_request=linear_request,
+    )
+    rem.agent_calls = calls
+    return rem
+
+
+class FakeRemediator:
+    """Mirror of FakeDecider for the drain-loop wiring tests."""
+
+    def __init__(self, brief=None, *, outcome=None):
+        self.brief = brief
+        self.last_outcome = outcome
+        self.calls = []
+        self.friction_calls = []
+
+    def remediate(self, *, handoff, task, artifact):
+        self.calls.append((handoff, task, artifact))
+        return self.brief
+
+    def record_friction(self, *, outcome, task):
+        self.friction_calls.append((outcome, task))
+
+
+class FakeLinear:
+    def __init__(self, *, existing=False):
+        self.existing = existing
+        self.calls = []
+
+    def __call__(self, query, variables):
+        self.calls.append((query, variables))
+        if "issues(" in query:
+            nodes = (
+                [{"id": "iss_1", "identifier": "BRIX-9001", "url": "u"}]
+                if self.existing
+                else []
+            )
+            return {"data": {"issues": {"nodes": nodes}}}
+        if "issueCreate" in query:
+            return {
+                "data": {
+                    "issueCreate": {
+                        "success": True,
+                        "issue": {
+                            "id": "iss_new",
+                            "identifier": "BRIX-9100",
+                            "url": "u",
+                        },
+                    }
+                }
+            }
+        raise AssertionError(f"unexpected linear query: {query!r}")
+
+
+# -- pure guardrail functions ------------------------------------------------
+
+
+def test_never_auto_reason_flags_danger_categories():
+    for text in (
+        "We must decide the product requirement here.",
+        "This deletes the production database.",
+        "Rotate the leaked api key / credential.",
+        "This is unclear and ambiguous.",
+    ):
+        reason = quay._never_auto_reason(
+            safe_handoff(), safe_task(), safe_artifact(text=text)
+        )
+        assert reason is not None, text
+
+
+def test_never_auto_reason_allows_safe_lint_fix():
+    assert quay._never_auto_reason(safe_handoff(), safe_task(), safe_artifact()) is None
+
+
+def test_never_auto_reason_escalates_when_no_blocker_context():
+    assert (
+        quay._never_auto_reason(safe_handoff(), safe_task(), None)
+        == "no_blocker_context"
+    )
+
+
+def test_parse_remediation_response_strict():
+    assert quay.parse_remediation_response('{"action":"escalate"}') == {
+        "action": "escalate"
+    }
+    good = quay.parse_remediation_response(
+        '{"action":"resume","brief":"do x","category":"lint","rationale":"safe"}'
+    )
+    assert good["action"] == "resume"
+    assert good["brief"] == "do x"
+    # Missing required field, wrong action, and non-JSON all escalate.
+    assert quay.parse_remediation_response('{"action":"resume","brief":"x"}') is None
+    assert quay.parse_remediation_response('{"action":"proceed"}') is None
+    assert quay.parse_remediation_response("not json at all") is None
+    assert quay.parse_remediation_response("") is None
+    # Oversized response -> escalate.
+    assert quay.parse_remediation_response("{" + "a" * 40000 + "}") is None
+
+
+def test_parse_remediation_response_strips_fence_and_reads_friction():
+    text = (
+        "```json\n"
+        '{"action":"resume","brief":"fix it","category":"lint","rationale":"safe",'
+        '"friction":{"title":"t","detail":"d","signature":"sig-1"}}\n'
+        "```"
+    )
+    parsed = quay.parse_remediation_response(text)
+    assert parsed["friction"] == {"title": "t", "detail": "d", "signature": "sig-1"}
+    # Malformed friction invalidates the whole response.
+    bad = (
+        '{"action":"resume","brief":"fix","category":"lint","rationale":"safe",'
+        '"friction":{"title":"t"}}'
+    )
+    assert quay.parse_remediation_response(bad) is None
+
+
+# -- HandoffRemediator gates -------------------------------------------------
+
+
+def test_remediator_gate1_never_auto_skips_model():
+    rem = make_remediator(response='{"action":"resume","brief":"x","category":"lint","rationale":"ok"}')
+    result = rem.remediate(
+        handoff=safe_handoff(),
+        task=safe_task(),
+        artifact=safe_artifact(text="We need a product decision on requirements."),
+    )
+    assert result is None
+    assert rem.agent_calls == []  # model never invoked
+    assert rem.last_outcome is None
+
+
+def test_remediator_malformed_json_escalates():
+    rem = make_remediator(response="totally not json")
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert len(rem.agent_calls) == 1  # model WAS called; output rejected
+    assert rem.last_outcome is None
+
+
+def test_remediator_loop_guard_over_budget_escalates_without_model():
+    rem = make_remediator(response='{"action":"resume","brief":"x","category":"lint","rationale":"ok"}')
+    path = rem._attempts_path("task-rem")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("2", encoding="utf-8")  # == remediation_max_attempts
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert rem.agent_calls == []
+
+
+def test_remediator_missing_skill_escalates():
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        agent_factory=lambda: FakeRemediationAgent("", record=[]),
+        skill_loader=(lambda: None),
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+
+
+def test_remediator_happy_resume_returns_brief_and_bumps_counter():
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "Removing an unused import is safe and reversible.",
+        }
+    )
+    rem = make_remediator(response=response)
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief == "Remove the unused import in foo.py and rerun ruff."
+    assert rem.last_outcome is not None
+    assert rem.last_outcome.category == "scoped-known-fix"
+    assert rem.last_outcome.tokens == 123
+    # Durable loop guard advanced to 1 on disk.
+    assert rem._attempts_path("task-rem").read_text(encoding="utf-8") == "1"
+
+
+def test_remediator_gate2_blocks_never_auto_category():
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Ship the fix.",
+            "category": "security",
+            "rationale": "trust me",
+        }
+    )
+    rem = make_remediator(response=response)
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief is None  # BLOCKED by Gate #2
+    assert len(rem.agent_calls) == 1  # model ran, but its resume was rejected
+    assert rem.last_outcome is None
+
+
+def test_remediator_gate2_blocks_danger_brief_text():
+    # Category is allowlisted (passes gate (a)); the danger lives only in the
+    # brief text, so the keyword backstop (gate (b)) is what must block it.
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Drop the production database table to unblock.",
+            "category": "scoped-known-fix",
+            "rationale": "safe",
+        }
+    )
+    rem = make_remediator(response=response)
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief is None
+    assert rem.last_outcome is None
+
+
+def test_remediator_reads_skill_from_disk():
+    skill_dir = (
+        Path(os.environ["HERMES_HOME"])
+        / "skills"
+        / "quay"
+        / "quay-blocker-remediation"
+    )
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text("SKILL FROM DISK", encoding="utf-8")
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "safe",
+        }
+    )
+    calls = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        agent_factory=lambda: FakeRemediationAgent(response, record=calls),
+    )
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief == "Remove the unused import and rerun ruff."
+    # The system message carried the disk-loaded skill body.
+    assert "SKILL FROM DISK" in calls[0][1]["system_message"]
+
+
+def test_remediator_build_agent_applies_caps():
+    quay_mod_agent = FakeAgent
+    quay_mod_agent.instances = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(
+            remediation_max_iterations=5, remediation_max_tokens=1234
+        ),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=FakeAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    rem.remediate(handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact())
+    kwargs = FakeAgent.instances[-1].kwargs
+    assert kwargs["max_iterations"] == 5
+    assert kwargs["max_tokens"] == 1234
+    assert kwargs["enabled_toolsets"] == []
+    assert kwargs["platform"] == "quay-orchestrator"
+    assert kwargs["skip_context_files"] is True
+    assert kwargs["skip_memory"] is True
+
+
+# -- friction recorder -------------------------------------------------------
+
+
+def _friction_outcome(signature="quay-lint-truncation"):
+    return quay.RemediationOutcome(
+        brief="fix",
+        category="lint",
+        friction={
+            "title": "quay lint output truncated",
+            "detail": "the CLI truncates ruff output",
+            "signature": signature,
+        },
+    )
+
+
+def test_record_friction_creates_new_issue():
+    linear = FakeLinear(existing=False)
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    queries = [c[0] for c in linear.calls]
+    assert any("issues(" in q for q in queries)  # dedup search
+    assert any("issueCreate" in q for q in queries)  # created
+
+
+def test_record_friction_dedupes_existing_issue():
+    linear = FakeLinear(existing=True)
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    queries = [c[0] for c in linear.calls]
+    assert any("issues(" in q for q in queries)
+    assert not any("issueCreate" in q for q in queries)  # no create
+
+
+def test_record_friction_local_marker_short_circuits():
+    linear = FakeLinear(existing=False)
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    first_call_count = len(linear.calls)
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    assert len(linear.calls) == first_call_count  # marker avoided re-hitting Linear
+
+
+def test_record_friction_noop_when_flag_off():
+    linear = FakeLinear()
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=False),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    assert linear.calls == []
+
+
+# -- HandoffDrainer wiring ---------------------------------------------------
+
+
+def test_drain_flag_off_never_invokes_remediator():
+    handoff = safe_handoff(artifact_id=None)
+    quay_client = FakeQuayClient(handoff)
+    remediator = FakeRemediator(brief="should not be used")
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=quay.OrchestratorConfig(enabled=True),  # remediation_enabled False
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert remediator.calls == []  # feature inert
+    assert quay_client.submitted == []
+    assert result.status == "missing_default_slack_channel"
+
+
+def test_drain_remediation_escalate_does_not_submit():
+    handoff = safe_handoff(artifact_id=None)
+    quay_client = FakeQuayClient(handoff)
+    remediator = FakeRemediator(brief=None)  # remediate -> escalate
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(default_slack_channel=""),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert len(remediator.calls) == 1
+    assert quay_client.submitted == []
+    assert result.metrics["remediation_escalated"] == 1
+    assert result.status == "missing_default_slack_channel"
+
+
+def test_drain_remediation_happy_submits_and_posts_fyi():
+    outcome = quay.RemediationOutcome(
+        brief="Remove the unused import and rerun ruff.",
+        category="lint_fix",
+        rationale="safe",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    remediator = FakeRemediator(brief=outcome.brief, outcome=outcome)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=remediation_config(),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert result.status == "submitted_remediated"
+    assert quay_client.submitted == [
+        (handoff, outcome.brief, "blocker_auto_remediated")
+    ]
+    assert quay_client.completed == [handoff]
+    assert len(slack.questions) == 1  # FYI posted to fallback channel
+    fyi_text = slack.questions[0][1]
+    assert "Otto auto-resumed" in fyi_text
+    assert "lint_fix" in fyi_text
+    assert "reply here to override" in fyi_text
+    assert result.metrics["agent_briefs_submitted"] == 1
+    assert result.metrics["agent_fyi_posted"] == 1
+    assert remediator.friction_calls == [(outcome, quay_client.task)]
+
+
+def test_drain_remediation_end_to_end_with_real_remediator():
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "Removing an unused import is safe and reversible.",
+            "friction": {
+                "title": "quay lint output truncated",
+                "detail": "the CLI truncates ruff output",
+                "signature": "quay-lint-truncation",
+            },
+        }
+    )
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=response,
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=remediation_config(remediation_friction_enabled=True),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert result.status == "submitted_remediated"
+    assert quay_client.submitted[0][1].startswith("Remove the unused import")
+    assert quay_client.submitted[0][2] == "blocker_auto_remediated"
+    assert len(slack.questions) == 1
+    # Friction was filed to Linear (find + create).
+    assert any("issueCreate" in c[0] for c in linear.calls)
+
+
+# -- config plumbing ---------------------------------------------------------
+
+
+def test_config_remediation_defaults_off():
+    cfg = quay.OrchestratorConfig()
+    assert cfg.remediation_enabled is False
+    assert cfg.remediation_friction_enabled is False
+    assert cfg.remediation_max_attempts == 2
+    assert cfg.remediation_max_iterations == 3
+    assert cfg.remediation_linear_team_id == "28294e03-c1ce-4c2b-ba24-49e36179a321"
+
+
+def test_config_from_mapping_reads_remediation():
+    cfg = quay.OrchestratorConfig.from_mapping(
+        {
+            "remediation_enabled": True,
+            "remediation_max_iterations": 7,
+            "remediation_max_tokens": 999,
+            "remediation_max_attempts": 4,
+            "remediation_friction_enabled": True,
+            "remediation_linear_team_id": "team-xyz",
+        }
+    )
+    assert cfg.remediation_enabled is True
+    assert cfg.remediation_max_iterations == 7
+    assert cfg.remediation_max_tokens == 999
+    assert cfg.remediation_max_attempts == 4
+    assert cfg.remediation_friction_enabled is True
+    assert cfg.remediation_linear_team_id == "team-xyz"
+
+
+def test_config_env_overrides_remediation(monkeypatch):
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_ENABLED", "true")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ITERATIONS", "6")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_TOKENS", "2500")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_FRICTION_ENABLED", "yes")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID", "team-env")
+    cfg = quay.OrchestratorConfig().with_env_overrides()
+    assert cfg.remediation_enabled is True
+    assert cfg.remediation_max_iterations == 6
+    assert cfg.remediation_max_tokens == 2500
+    assert cfg.remediation_max_attempts == 5
+    assert cfg.remediation_friction_enabled is True
+    assert cfg.remediation_linear_team_id == "team-env"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review hardening: F1 allowlist, F2 tool-less, F3 fail-closed
+# loop guard, F4 friction-on-escalate (BRIX-1878).
+# ---------------------------------------------------------------------------
+
+
+# -- F1: allowlist as the enforceable floor ----------------------------------
+
+
+def test_auto_answerable_category_allowlist_membership():
+    for good in (
+        "prerequisite-baseline",
+        "stale-baseline",
+        "missing-invocation",
+        "transient-retry",
+        "scoped-known-fix",
+        "  Scoped-Known-Fix  ",  # normalized (strip + lowercase)
+    ):
+        assert quay._is_auto_answerable_category(good), good
+    for bad in ("lint_fix", "housekeeping", "", "escalate", "product", None, 123):
+        assert not quay._is_auto_answerable_category(bad), bad
+
+
+def test_drain_real_remediator_escalates_paraphrased_danger_briefs():
+    # Benign, allowlisted category (clears gate (a)) but a PARAPHRASED dangerous
+    # brief: the keyword backstop (gate (b)) over the model's own brief must
+    # catch it. Otto escalates and never submits a brief.
+    dangerous_briefs = [
+        "Apply the pending migration to the live production cluster.",
+        "Force-push to overwrite remote history so the branch matches local.",
+    ]
+    for brief_text in dangerous_briefs:
+        response = json.dumps(
+            {
+                "action": "resume",
+                "category": "scoped-known-fix",
+                "brief": brief_text,
+                "rationale": "quick and safe",
+            }
+        )
+        remediator = make_remediator(
+            response=response,
+            config=remediation_config(default_slack_channel=""),
+        )
+        handoff = safe_handoff()
+        quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+        drainer = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=FakeSlackClient(),
+            config=remediation_config(default_slack_channel=""),
+            worker_id="test-worker",
+            remediator=remediator,
+        )
+        result = drainer.drain_one()
+        assert quay_client.submitted == [], brief_text
+        assert result.metrics["remediation_escalated"] == 1, brief_text
+        # Model ran; its resume was rejected post-hoc by the gate.
+        assert len(remediator.agent_calls) == 1, brief_text
+
+
+def test_drain_real_remediator_escalates_novel_category():
+    # A safe brief but a NOVEL/unknown category (not one of the 5 canonical
+    # auto-answerable categories) must escalate: the allowlist is the floor.
+    # Under the old denylist this label carried no banned token and would have
+    # leaked through to an auto-resume.
+    response = json.dumps(
+        {
+            "action": "resume",
+            "category": "housekeeping",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "rationale": "safe and reversible",
+        }
+    )
+    remediator = make_remediator(
+        response=response,
+        config=remediation_config(default_slack_channel=""),
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(default_slack_channel=""),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []
+    assert result.metrics["remediation_escalated"] == 1
+    assert len(remediator.agent_calls) == 1
+
+
+# -- F2: tool-less guarantee regardless of ambient env -----------------------
+
+
+class ToolResolvingAgent:
+    """Agent stub whose ``.tools`` are computed by the REAL model_tools
+    resolver, exactly like ``agent_init.init_agent`` does. This exercises the
+    tool-less guarantee end-to-end rather than stubbing it out."""
+
+    instances: list = []
+
+    def __init__(self, **kwargs) -> None:
+        import model_tools
+
+        self.kwargs = kwargs
+        self.tools = model_tools.get_tool_definitions(
+            enabled_toolsets=kwargs.get("enabled_toolsets"),
+            disabled_toolsets=kwargs.get("disabled_toolsets"),
+            quiet_mode=True,
+        )
+        ToolResolvingAgent.instances.append(self)
+
+
+def test_remediation_agent_is_tool_less_even_with_kanban_env(monkeypatch):
+    # model_tools force-appends the `kanban` toolset when HERMES_KANBAN_TASK is
+    # set. The orchestrator agent must still resolve to ZERO tools.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "kanban-task-42")
+    ToolResolvingAgent.instances = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=ToolResolvingAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    agent = rem._build_agent(safe_handoff(), max_iterations=3, max_tokens=100)
+    assert agent.kwargs["enabled_toolsets"] == []
+    assert agent.kwargs["disabled_toolsets"] == ["kanban"]
+    # Force-append neutralized: the remediation agent holds no tools at all.
+    assert agent.tools == []
+
+
+# -- F3: loop guard fails CLOSED on a durable-write failure ------------------
+
+
+def test_remediator_loop_guard_write_failure_escalates_without_model(monkeypatch):
+    rem = make_remediator(
+        response='{"action":"resume","brief":"x","category":"scoped-known-fix","rationale":"ok"}'
+    )
+    real_write = Path.write_text
+
+    def failing_write(self, *args, **kwargs):
+        if "remediation-attempts" in str(self):
+            raise OSError("read-only file system")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(quay.Path, "write_text", failing_write)
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None  # cannot prove under-budget -> escalate
+    assert rem.agent_calls == []  # model NOT invoked (fail-closed before build)
+    assert rem.last_outcome is None
+
+
+# -- F4: friction captured on the escalate path too --------------------------
+
+
+def test_parse_remediation_response_escalate_carries_valid_friction():
+    parsed = quay.parse_remediation_response(
+        json.dumps(
+            {
+                "action": "escalate",
+                "friction": {"title": "t", "detail": "d", "signature": "sig"},
+            }
+        )
+    )
+    assert parsed == {
+        "action": "escalate",
+        "friction": {"title": "t", "detail": "d", "signature": "sig"},
+    }
+    # Invalid friction is dropped but the response still escalates.
+    parsed_bad = quay.parse_remediation_response(
+        json.dumps({"action": "escalate", "friction": {"title": "only-title"}})
+    )
+    assert parsed_bad == {"action": "escalate"}
+
+
+def _escalate_with_friction_response(signature: str) -> str:
+    return json.dumps(
+        {
+            "action": "escalate",
+            "friction": {
+                "title": "quay CLI cannot pass multiline briefs",
+                "detail": "the submit-brief flag rejects newlines",
+                "signature": signature,
+            },
+        }
+    )
+
+
+def test_drain_escalate_with_friction_records_but_still_escalates():
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=_escalate_with_friction_response("sig-escalate-1"),
+        config=remediation_config(
+            remediation_friction_enabled=True, default_slack_channel=""
+        ),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(
+            remediation_friction_enabled=True, default_slack_channel=""
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []  # escalated, not resumed
+    assert result.metrics["remediation_escalated"] == 1
+    assert any("issueCreate" in c[0] for c in linear.calls)  # friction filed
+
+
+def test_drain_escalate_with_friction_noop_when_flag_off():
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=_escalate_with_friction_response("sig-escalate-2"),
+        config=remediation_config(
+            remediation_friction_enabled=False, default_slack_channel=""
+        ),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(
+            remediation_friction_enabled=False, default_slack_channel=""
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []  # still escalates
+    assert result.metrics["remediation_escalated"] == 1
+    assert linear.calls == []  # friction NOT filed while the flag is off
