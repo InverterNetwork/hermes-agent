@@ -1140,8 +1140,9 @@ def test_drain_one_posts_guidance_prompt_when_reattaching_to_original_thread():
     assert slack.validations == [("GPRIVATE123", "999.000000")]
     assert slack.questions == []
     assert slack.acks
-    assert "blocked on product input" in slack.acks[0][1]
-    assert "Discuss freely in this thread" in slack.acks[0][1]
+    assert "*Quay worker blocked* — BRIX-1405 · repo-1" in slack.acks[0][1]
+    assert "Reason: blocked on product input" in slack.acks[0][1]
+    assert "Reply in thread and I'll resume the worker once it's clear." in slack.acks[0][1]
     assert slack.waits[0][0] == quay.SlackPostRef(
         channel_id="GPRIVATE123",
         ts="1002.000000",
@@ -1160,9 +1161,9 @@ def test_drain_one_posts_guidance_prompt_when_reattaching_to_original_thread():
     assert "--thread-ref GPRIVATE123:999.000000" in calls[6]
     assert "submit-brief task-cli --claim-id claim-1" in calls[7]
     assert "--reason advice_answered" in calls[7]
-    assert "Quay handoff reason: worker_blocker" in runner.file_payloads[0]
-    assert "blocked on product input" in runner.file_payloads[0]
-    assert "resume the worker once the path is clear" in runner.file_payloads[0]
+    assert "Quay handoff reason" not in runner.file_payloads[0]
+    assert "Reason: blocked on product input" in runner.file_payloads[0]
+    assert "resume the worker once it's clear" in runner.file_payloads[0]
     assert "resume:" not in runner.file_payloads[0]
     assert "Use the following human guidance" in runner.file_payloads[2]
     assert "U123" in runner.file_payloads[2]
@@ -1483,7 +1484,7 @@ def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
     assert len(slack.acks) == 2
     assert "decision engine hit an internal orchestrator error" in slack.acks[0][1]
     assert "No need to rephrase" in slack.acks[0][1]
-    assert "A Quay task needs human guidance" in slack.acks[1][1]
+    assert "*Quay worker blocked*" in slack.acks[1][1]
     assert slack.validations == [("C1234567890", "1000.000000")]
     assert len(decider.calls) == 1
 
@@ -1713,6 +1714,292 @@ def test_human_question_omits_contributor_without_author_metadata():
 
     assert "Contributor:" not in question
     assert "<@" not in question
+
+
+def test_human_question_promotes_question_and_strips_scaffolding():
+    task = quay.TaskContext(
+        task_id="task-q",
+        title="Wire up the importer",
+        issue="BRIX-1870",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-q",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a1",
+        text=(
+            "Blocked: the importer schema changed and two endpoints now exist.\n"
+            "Should we keep the old endpoint or migrate to the new one?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert lines[0] == "*Quay worker blocked* — BRIX-1870 · hermes-agent"
+    assert "Task: Wire up the importer" in lines
+    assert "Reason: Blocked: the importer schema changed and two endpoints now exist." in lines
+    assert "Need: Should we keep the old endpoint or migrate to the new one?" in lines
+    assert lines[-1] == "Reply in thread and I'll resume the worker once it's clear."
+    # Generic scaffolding + handoff-reason filler are gone.
+    assert "Quay handoff reason" not in question
+    assert "needs human guidance" not in question
+    assert "Handoff summary" not in question
+    assert "Blocker/context" not in question
+
+
+def test_human_question_budget_exhaustion_uses_reason_specific_defaults():
+    task = quay.TaskContext(
+        task_id="task-budget",
+        title="Refactor the client",
+        issue="BRIX-2001",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-budget",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        metadata={"budget_exhausted_artifact_id": 42},
+    )
+    artifact = quay.Artifact(
+        artifact_id="a2",
+        text="Attempt budget exhausted after 5 attempts without a passing build.",
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert lines[0] == "*Quay worker blocked — budget exhausted* — BRIX-2001 · hermes-agent"
+    assert "Reason: Attempt budget exhausted after 5 attempts without a passing build." in lines
+    assert "Need: approve more budget or stop the task." in lines
+
+
+def test_human_question_vague_blocker_falls_back_sanely():
+    task = quay.TaskContext(
+        task_id="task-vague",
+        title="Fix the flow",
+        issue="BRIX-3003",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-vague",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a3",
+        text="blocked on product input",
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert lines[0] == "*Quay worker blocked* — BRIX-3003 · hermes-agent"
+    assert "Reason: blocked on product input" in lines
+    assert "Need: advise how the worker should proceed." in lines
+    # No filler leaked in from the summary.
+    assert "Quay handoff reason" not in question
+    assert "Context:" not in question
+
+
+def test_human_question_promotes_question_from_artifact_over_summary_statement():
+    # Artifact carries only the question; the summary carries the statement.
+    # The statement becomes the Reason and the question is promoted to Need.
+    task = quay.TaskContext(
+        task_id="task-ctx",
+        title="Ship the feature",
+        issue="BRIX-4004",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-ctx",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Worker paused after the third failed migration.",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a4",
+        text="Should we roll back the migration or push forward?",
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Worker paused after the third failed migration." in lines
+    assert "Need: Should we roll back the migration or push forward?" in lines
+    # The summary statement is already the Reason, so it is not repeated.
+    assert "Context:" not in question
+
+
+def test_human_question_surfaces_summary_context_distinct_from_blocker():
+    task = quay.TaskContext(
+        task_id="task-ctx2",
+        title="Ship the feature",
+        issue="BRIX-4040",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-ctx2",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Third migration attempt; the prior two were rolled back.",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a4b",
+        text=(
+            "Blocked: the migration keeps failing on the users table.\n"
+            "Should we roll back or push forward?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the migration keeps failing on the users table." in lines
+    assert "Need: Should we roll back or push forward?" in lines
+    assert "Context: Third migration attempt; the prior two were rolled back." in lines
+
+
+def test_human_question_returns_explicit_question_verbatim():
+    task = quay.TaskContext(task_id="task-explicit", title="Explicit", issue="BRIX-5005")
+    handoff = quay.Handoff(
+        handoff_id="handoff-explicit",
+        task_id=task.task_id,
+        human_question="Can you confirm the staging DB URL before I continue?",
+        summary="Quay handoff reason: worker_blocker",
+    )
+    artifact = quay.Artifact(artifact_id="a5", text="unused", kind="blocker")
+
+    question = quay.build_human_question(handoff, task, artifact)
+
+    assert question == "Can you confirm the staging DB URL before I continue?"
+
+
+def test_human_question_returns_metadata_question_verbatim():
+    task = quay.TaskContext(task_id="task-meta-q", title="Meta", issue="BRIX-6006")
+    handoff = quay.Handoff(
+        handoff_id="handoff-meta-q",
+        task_id=task.task_id,
+        metadata={"human_question": "Which region should the worker target?"},
+    )
+
+    question = quay.build_human_question(handoff, task, None)
+
+    assert question == "Which region should the worker target?"
+
+
+def _blocker_handoff(task_id: str) -> "quay.Handoff":
+    return quay.Handoff(
+        handoff_id=f"handoff-{task_id}",
+        task_id=task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+
+
+def test_human_question_single_question_stays_compact_with_no_context():
+    task = quay.TaskContext(
+        task_id="task-compact", title="Wire it up", issue="BRIX-7001", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the importer schema changed and two endpoints now exist.\n"
+            "Should we keep the old endpoint or migrate to the new one?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the importer schema changed and two endpoints now exist." in lines
+    assert "Need: Should we keep the old endpoint or migrate to the new one?" in lines
+    # The common single-statement + single-question case must not sprout Context.
+    assert "Context:" not in question
+
+
+def test_human_question_second_question_overflows_into_context():
+    task = quay.TaskContext(
+        task_id="task-2q", title="Migrate", issue="BRIX-7002", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the migration keeps failing on the users table.\n"
+            "Should we roll back or push forward?\n"
+            "Do we also need to notify the on-call engineer?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the migration keeps failing on the users table." in lines
+    assert "Need: Should we roll back or push forward?" in lines
+    # The second question is never dropped — it overflows into Context. A single
+    # leftover renders inline (no bullet) to stay compact.
+    assert "Context: Do we also need to notify the on-call engineer?" in lines
+
+
+def test_human_question_non_question_ask_reaches_human_as_need():
+    task = quay.TaskContext(
+        task_id="task-softask", title="Refactor", issue="BRIX-7003", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "The refactor left two importer paths in place.\n"
+            "Unsure whether we should roll back or push forward"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: The refactor left two importer paths in place." in lines
+    # A real ask phrased without a "?" is promoted to Need, not dropped.
+    assert "Need: Unsure whether we should roll back or push forward" in lines
+    assert "Context:" not in question
+
+
+def test_human_question_diagnostic_detail_overflows_into_context_not_need():
+    task = quay.TaskContext(
+        task_id="task-detail", title="Fix build", issue="BRIX-7004", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the build fails after the refactor.\n"
+            "Does not compile after the refactor.\n"
+            "The types module now imports itself."
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the build fails after the refactor." in lines
+    # The declarative "Does not compile..." must not be mistaken for the ask.
+    assert "Need: Does not compile after the refactor." not in lines
+    assert "Need: advise how the worker should proceed." in lines
+    # Diagnostic detail lines survive verbatim in Context.
+    assert "Context:" in lines
+    assert "• Does not compile after the refactor." in lines
+    assert "• The types module now imports itself." in lines
 
 
 def test_stale_metadata_route_falls_back_and_records_fallback_thread():

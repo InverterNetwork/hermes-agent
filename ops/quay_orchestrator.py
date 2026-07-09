@@ -2419,38 +2419,229 @@ def _extract_slack_user_id(text: str) -> str | None:
     return None
 
 
+# ── Compact human-escalation message ────────────────────────────────────────
+#
+# When a Quay worker blocks, the orchestrator asks a human for guidance in
+# Slack. Humans triage these fast, so the renderer surfaces only signal-bearing
+# fields: a reason-specific header, the real blocker line, and the concrete
+# action we need — with generic handoff scaffolding and ``Quay handoff reason:``
+# filler stripped. The helpers below are small and pure so they stay testable.
+
+_HUMAN_QUESTION_FOOTER = "Reply in thread and I'll resume the worker once it's clear."
+
+# Lines the legacy renderer (or Quay's ``_summary_for_handoff`` fallback)
+# injects that carry no signal for a human. Matched case-insensitively against a
+# fully stripped line.
+_HANDOFF_FILLER_PREFIXES = ("quay handoff reason:",)
+_HANDOFF_FILLER_LINES = frozenset(
+    {
+        "a quay task needs human guidance before the next worker brief.",
+        "handoff summary:",
+        "blocker/context:",
+        "blocker:",
+        "context:",
+        "discuss freely in this thread. i will resume the worker once the path is clear.",
+        "reply in thread and i'll resume the worker once it's clear.",
+        "worker_blocker",
+    }
+)
+
+# A line WITHOUT a trailing ``?`` only counts as the ask when it opens with a
+# clear imperative / request. Ambiguous interrogative leads (does/what/how/…)
+# are deliberately excluded here so declaratives like "Does not compile after
+# the refactor." are not mistaken for the ask; a real question keeps its ``?``.
+_HANDOFF_IMPERATIVE_PREFIXES = (
+    "please", "confirm", "decide", "approve", "clarify", "provide",
+    "advise", "let me know", "need to", "needs to",
+    "should we", "should i", "shall we", "shall i",
+)
+
+# Softer signals used only as a fallback: when no strong ask is found and the
+# generic default would otherwise fire, a leftover line opening with one of
+# these (an uncertainty or a request) is promoted into ``Need:`` instead of
+# being left to overflow into ``Context:``. Kept conservative on purpose.
+_HANDOFF_SOFT_ASK_PREFIXES = (
+    "unsure", "not sure", "unclear", "uncertain", "wondering", "wonder ",
+    "should", "shall", "which", "whether", "need ", "needs ", "please",
+    "can we", "can i", "could we", "could i", "would we", "would it",
+    "let me know", "confirm", "decide", "clarify", "advise",
+    "want to know", "requesting", "request ",
+)
+
+
+def _clean_handoff_lines(text: str) -> list[str]:
+    """Split ``text`` into stripped, signal-bearing lines.
+
+    Drops blank lines plus the generic handoff scaffolding and
+    ``Quay handoff reason: <x>`` filler the renderer must not surface.
+    """
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered in _HANDOFF_FILLER_LINES:
+            continue
+        if any(lowered.startswith(prefix) for prefix in _HANDOFF_FILLER_PREFIXES):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _is_action_line(line: str) -> bool:
+    """True when ``line`` clearly reads as a question or a concrete ask.
+
+    A trailing ``?`` always qualifies. Without one, only a clear imperative /
+    request does — ambiguous interrogative leads are left to the softer,
+    fallback-only :func:`_promote_soft_ask` so plain declaratives are not
+    mislabelled as the ask.
+    """
+    lowered = line.strip().lower()
+    if not lowered:
+        return False
+    if lowered.endswith("?"):
+        return True
+    return lowered.startswith(_HANDOFF_IMPERATIVE_PREFIXES)
+
+
+def _first_blocker_line(lines: list[str]) -> str:
+    """The first real blocker statement — preferring a non-question line."""
+    for line in lines:
+        if not _is_action_line(line):
+            return line
+    return lines[0] if lines else ""
+
+
+def _promote_action_line(lines: list[str]) -> str:
+    """The first question/ask line, promotable into ``Need:`` (else empty)."""
+    for line in lines:
+        if _is_action_line(line):
+            return line
+    return ""
+
+
+def _promote_soft_ask(lines: list[str]) -> str:
+    """A leftover line that reads like an uncertainty/request (else empty).
+
+    Fallback used only when no strong ask was promoted, so a real ask phrased
+    without a ``?`` (e.g. "Unsure whether we should roll back or push forward")
+    still reaches the human as ``Need:`` rather than the generic default.
+    """
+    for line in lines:
+        if line.strip().lower().startswith(_HANDOFF_SOFT_ASK_PREFIXES):
+            return line
+    return ""
+
+
+def _handoff_reason_kind(handoff: Handoff, blocker_text: str) -> str:
+    """Classify the escalation so the header and default ``Need`` fit the case."""
+    reason = (handoff.reason or "").lower()
+    metadata = handoff.metadata if isinstance(handoff.metadata, Mapping) else {}
+    budget_artifact = metadata.get("budget_exhausted_artifact_id")
+    text = f"{blocker_text}\n{reason}".lower()
+    budget_signalled = (
+        "budget" in reason
+        or budget_artifact not in (None, "", 0, "0", "null", "none")
+        or (
+            "budget" in text
+            and any(
+                token in text
+                for token in ("exhaust", "exceed", "ran out", "run out", "depleted", "out of")
+            )
+        )
+    )
+    if budget_signalled:
+        return "budget"
+    if "manual" in reason or "manual resume" in text or "resume manually" in text:
+        return "manual_resume"
+    return "worker_blocker"
+
+
+def _handoff_header(kind: str) -> str:
+    if kind == "budget":
+        return "*Quay worker blocked — budget exhausted*"
+    if kind == "manual_resume":
+        return "*Quay worker blocked — manual resume needed*"
+    return "*Quay worker blocked*"
+
+
+def _handoff_default_need(kind: str) -> str:
+    if kind == "budget":
+        return "approve more budget or stop the task."
+    if kind == "manual_resume":
+        return "confirm it's safe to resume and I'll continue."
+    return "advise how the worker should proceed."
+
+
 def build_human_question(
     handoff: Handoff,
     task: TaskContext,
     artifact: Artifact | None,
 ) -> str:
+    # An explicit worker- or operator-authored question always wins verbatim;
+    # only the auto-generated scaffolding below is compacted.
     if handoff.human_question and handoff.human_question.strip():
         return handoff.human_question.strip()
     meta_question = handoff.metadata.get("human_question")
     if isinstance(meta_question, str) and meta_question.strip():
         return meta_question.strip()
 
-    lines = [
-        "A Quay task needs human guidance before the next worker brief.",
-        f"Task: {task.title or task.task_id}",
-    ]
+    artifact_lines = _clean_handoff_lines(artifact.text if artifact else "")
+    summary_lines = _clean_handoff_lines(handoff.summary)
+    # The artifact is the primary blocker; the summary supplements it. Consider
+    # both (artifact first) when picking the blocker statement and the ask.
+    combined_lines = list(dict.fromkeys(artifact_lines + summary_lines))
+
+    reason_line = _first_blocker_line(combined_lines)
+    kind = _handoff_reason_kind(handoff, "\n".join(combined_lines))
+
+    promoted = _promote_action_line(combined_lines)
+    if promoted and promoted != reason_line:
+        need_line = promoted
+    else:
+        # No strong ask: try to rescue a softly-phrased ask from the leftover
+        # before falling back to the reason-specific default.
+        leftover_for_ask = [line for line in combined_lines if line != reason_line]
+        need_line = _promote_soft_ask(leftover_for_ask) or _handoff_default_need(kind)
+
+    identifier = task.issue or task.task_id
+    repo = task.repo_id or handoff.repo_id
+    header = _handoff_header(kind)
+    header_suffix = " · ".join(part for part in (identifier, repo) if part)
+    if header_suffix:
+        header = f"{header} — {header_suffix}"
+
+    lines = [header]
+
+    title = (task.title or "").strip()
+    if title and title not in {identifier, repo, reason_line}:
+        lines.append(f"Task: {title}")
+
     author_mention = resolve_author_mention(handoff, task)
     if author_mention:
         lines.append(f"Contributor: {author_mention}")
-    if task.issue:
-        lines.append(f"Issue: {task.issue}")
-    if task.repo_id or handoff.repo_id:
-        lines.append(f"Repo: {task.repo_id or handoff.repo_id}")
-    if handoff.summary:
-        lines.extend(["", "Handoff summary:", handoff.summary.strip()])
-    if artifact and artifact.text.strip():
-        lines.extend(["", "Blocker/context:", artifact.text.strip()])
-    lines.extend(
-        [
-            "",
-            "Discuss freely in this thread. I will resume the worker once the path is clear.",
-        ]
-    )
+
+    if reason_line:
+        lines.append(f"Reason: {reason_line}")
+
+    if need_line:
+        lines.append(f"Need: {need_line}")
+
+    # Context: every non-filler blocker/summary line we have not already
+    # surfaced as Reason or Need. This guarantees no artifact signal — a second
+    # question, a soft ask, or diagnostic detail — is ever silently dropped,
+    # while staying empty for the common single-statement + single-question case.
+    used = {reason_line, need_line}
+    context_lines = [line for line in combined_lines if line not in used]
+    if context_lines:
+        if len(context_lines) == 1:
+            lines.append(f"Context: {context_lines[0]}")
+        else:
+            lines.append("Context:")
+            lines.extend(f"• {line}" for line in context_lines)
+
+    lines.append(_HUMAN_QUESTION_FOOTER)
     return "\n".join(lines)
 
 
