@@ -3029,6 +3029,12 @@ def test_record_friction_creates_new_issue():
     queries = [c[0] for c in linear.calls]
     assert any("issues(" in q for q in queries)  # dedup search
     assert any("issueCreate" in q for q in queries)  # created
+    # The create files into the AI Automation project, not the team root.
+    create_vars = next(v for q, v in linear.calls if "issueCreate" in q)
+    assert create_vars["input"]["projectId"] == (
+        quay.DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
+    )
+    assert create_vars["input"]["teamId"] == quay.DEFAULT_REMEDIATION_LINEAR_TEAM_ID
 
 
 def test_record_friction_dedupes_existing_issue():

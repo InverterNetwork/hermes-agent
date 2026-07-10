@@ -242,8 +242,10 @@ class DrainResult:
     metrics: Mapping[str, int] = field(default_factory=dict)
 
 
-# Default Linear team for Otto's Quay-CLI friction tickets (BRIX-1878).
+# Default Linear team + project for Otto's Quay-CLI friction tickets (BRIX-1878).
 DEFAULT_REMEDIATION_LINEAR_TEAM_ID = "28294e03-c1ce-4c2b-ba24-49e36179a321"
+# BRIX "AI Automation" project — friction tickets file here, not the team root.
+DEFAULT_REMEDIATION_LINEAR_PROJECT_ID = "273a789d-30a8-4a88-baac-9867df5aedb0"
 
 
 @dataclass(frozen=True)
@@ -269,6 +271,7 @@ class OrchestratorConfig:
     # ``remediation_enabled``. Default OFF: fully inert until explicitly enabled.
     remediation_escalation_message_enabled: bool = False
     remediation_linear_team_id: str = DEFAULT_REMEDIATION_LINEAR_TEAM_ID
+    remediation_linear_project_id: str = DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "OrchestratorConfig":
@@ -305,6 +308,10 @@ class OrchestratorConfig:
             remediation_linear_team_id=str(
                 raw.get("remediation_linear_team_id")
                 or DEFAULT_REMEDIATION_LINEAR_TEAM_ID
+            ),
+            remediation_linear_project_id=str(
+                raw.get("remediation_linear_project_id")
+                or DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
             ),
         )
 
@@ -399,6 +406,10 @@ class OrchestratorConfig:
             remediation_linear_team_id=(
                 os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID")
                 or self.remediation_linear_team_id
+            ),
+            remediation_linear_project_id=(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_PROJECT_ID")
+                or self.remediation_linear_project_id
             ),
         )
 
@@ -2065,10 +2076,16 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
             "mutation($input: IssueCreateInput!) { "
             "issueCreate(input: $input) { success issue { id identifier url } } }"
         )
-        data = self._linear_call(
-            mutation,
-            {"input": {"teamId": team_id, "title": title, "description": description}},
-        )
+        variables: dict[str, Any] = {
+            "teamId": team_id,
+            "title": title,
+            "description": description,
+        }
+        project_id = (self.config.remediation_linear_project_id or "").strip()
+        if project_id:
+            # File into the AI Automation project, not the team root.
+            variables["projectId"] = project_id
+        data = self._linear_call(mutation, {"input": variables})
         issue = (
             ((data.get("data") or {}).get("issueCreate") or {}).get("issue")
             if isinstance(data, Mapping)
