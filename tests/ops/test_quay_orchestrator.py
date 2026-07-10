@@ -2708,6 +2708,118 @@ def test_parse_remediation_response_strips_fence_and_reads_friction():
     assert quay.parse_remediation_response(bad) is None
 
 
+# -- BRIX-1878: model-authored escalation message ----------------------------
+
+
+def test_parse_escalate_accepts_and_strips_message():
+    parsed = quay.parse_remediation_response(
+        '{"action":"escalate","message":"  The worker needs a human decision.  "}'
+    )
+    assert parsed == {
+        "action": "escalate",
+        "message": "The worker needs a human decision.",
+    }
+
+
+def test_parse_escalate_message_blank_or_nonstring_treated_as_absent():
+    # Whitespace-only, non-string, and null all drop the message but STILL
+    # produce a valid escalate (a bad message never blocks the escalation).
+    for raw in (
+        '{"action":"escalate","message":"   "}',
+        '{"action":"escalate","message":123}',
+        '{"action":"escalate","message":null}',
+        '{"action":"escalate","message":["a"]}',
+    ):
+        parsed = quay.parse_remediation_response(raw)
+        assert parsed == {"action": "escalate"}, raw
+
+
+def test_parse_escalate_message_is_capped_with_ellipsis():
+    big = "x" * 5000
+    parsed = quay.parse_remediation_response(
+        '{"action":"escalate","message":"' + big + '"}'
+    )
+    assert len(parsed["message"]) == quay._MAX_ESCALATION_MESSAGE_CHARS
+    assert parsed["message"].endswith("…")
+
+
+def test_parse_resume_never_carries_message():
+    # A message on a resume object is ignored entirely: the resume shape is
+    # unchanged and the message must never ride along to influence gate logic.
+    parsed = quay.parse_remediation_response(
+        '{"action":"resume","brief":"do x","category":"lint","rationale":"safe",'
+        '"message":"sneaky broadcast"}'
+    )
+    assert parsed is not None
+    assert "message" not in parsed
+    assert sorted(parsed) == ["action", "brief", "category", "rationale"]
+
+
+def test_sanitize_escalation_message_neutralizes_all_ping_tokens():
+    hostile = (
+        "Heads up @channel and @here and @everyone: "
+        "<!channel> <!here> <!everyone> "
+        "ping <@U123456> and <@U999|alice> plus <!subteam^S042|@team> now"
+    )
+    out = quay._sanitize_escalation_message(hostile)
+    # No token that Slack would broadcast survives as a literal substring.
+    for banned in (
+        "@channel",
+        "@here",
+        "@everyone",
+        "<!channel>",
+        "<!here>",
+        "<!everyone>",
+        "<@U123456>",
+        "<@U999",
+        "<!subteam",
+    ):
+        assert banned not in out, banned
+    # Ordinary words are preserved (only the sigils are defanged).
+    for word in ("Heads", "up", "ping", "now", "channel", "here", "everyone"):
+        assert word in out
+
+
+def test_sanitize_escalation_message_preserves_ordinary_text_and_emails():
+    text = "Please confirm the rollout plan; contact alice@example.com if unsure."
+    out = quay._sanitize_escalation_message(text)
+    assert out == text  # no broadcast tokens -> untouched apart from whitespace
+
+
+def test_sanitize_escalation_message_collapses_whitespace_and_caps():
+    out = quay._sanitize_escalation_message("a\n\n\n   b\t\tc")
+    assert out == "a b c"
+    capped = quay._sanitize_escalation_message("y" * 5000)
+    assert len(capped) == quay._MAX_ESCALATION_MESSAGE_CHARS
+    assert capped.endswith("…")
+
+
+def test_sanitize_escalation_message_neutralizes_labeled_and_link_tokens():
+    # Regression: Slack parses the LABELED broadcast `<!channel|urgent>` as the
+    # same @channel ping as `<!channel>` — an anchored regex missed it. Also
+    # defang disguised hyperlinks and channel refs.
+    cases = [
+        "<!channel|urgent> deploy now",
+        "<!here|team ping>",
+        "<!everyone|all hands>",
+        "<!channel > trailing space",
+        "<!subteam^S1|marketing>",
+        "<@U123|admin> please look",
+        "@channel now",
+        "<https://evil.example|Approve here>",
+        "<#C0001|general>",
+    ]
+    for raw in cases:
+        out = quay._sanitize_escalation_message(raw).lower()
+        # No live broadcast/mention/entity token survives as a literal substring.
+        for banned in ("<!channel", "<!here", "<!everyone", "<!subteam",
+                       "<@", "<#", "<http",
+                       "@channel", "@here", "@everyone"):
+            assert banned not in out, f"{banned!r} survived in {out!r} from {raw!r}"
+    # Ordinary comparisons and emails are left intact.
+    assert quay._sanitize_escalation_message("a < b and x@y.com") == "a < b and x@y.com"
+
+
 # -- HandoffRemediator gates -------------------------------------------------
 
 
@@ -2776,6 +2888,31 @@ def test_remediator_happy_resume_returns_brief_and_bumps_counter():
     assert rem.last_outcome.tokens == 123
     # Durable loop guard advanced to 1 on disk.
     assert rem._attempts_path("task-rem").read_text(encoding="utf-8") == "1"
+
+
+def test_remediator_escalate_surfaces_message_via_last_outcome():
+    # An escalate with a message returns None (unchanged) but stashes the parsed
+    # message on last_outcome for the renderer. The message never touches the
+    # decision itself.
+    rem = make_remediator(
+        response='{"action":"escalate","message":"Need a human to pick the ruff version."}'
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert rem.last_outcome is not None
+    assert rem.last_outcome.message == "Need a human to pick the ruff version."
+    assert rem.last_outcome.brief == ""
+
+
+def test_remediator_escalate_without_message_leaves_outcome_none():
+    rem = make_remediator(response='{"action":"escalate"}')
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert rem.last_outcome is None
 
 
 def test_remediator_gate2_blocks_never_auto_category():
@@ -3038,6 +3175,259 @@ def test_drain_remediation_end_to_end_with_real_remediator():
     assert any("issueCreate" in c[0] for c in linear.calls)
 
 
+# -- BRIX-1878: model-authored escalation message, drain-level wiring --------
+
+
+ESCALATE_MESSAGE = "The worker hit an ambiguous config choice and needs a human call."
+
+
+def _escalate_message_response(message=ESCALATE_MESSAGE):
+    return json.dumps({"action": "escalate", "message": message})
+
+
+def _drain_escalation(config):
+    """Drive drain_one to the escalate branch with a real remediator.
+
+    Returns (result, slack, quay_client, remediator). A None Slack reply lets the
+    escalation post its question and then time out, so slack.questions[0] holds
+    exactly what was posted without any auto-resume submit.
+    """
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, task=safe_task(), artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(
+        response=_escalate_message_response(), config=config
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    return result, slack, quay_client, remediator
+
+
+def test_drain_message_mode_uses_model_body_with_scaffolding_no_submit():
+    # message-only mode: the model escalates WITH a message -> the posted Slack
+    # text is the model body wrapped in the deterministic header/contributor/
+    # footer, and submit_brief is NEVER called.
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    result, slack, quay_client, remediator = _drain_escalation(config)
+
+    assert quay_client.submitted == []  # hard invariant: no auto-resume
+    assert len(remediator.agent_calls) == 1  # the turn ran
+    assert len(slack.questions) == 1
+    posted = slack.questions[0][1]
+    assert ESCALATE_MESSAGE in posted  # model body
+    assert posted.startswith("*Quay worker blocked*")  # deterministic header
+    assert "BRIX-1878" in posted  # identifier from _handoff_header suffix
+    assert quay._HUMAN_QUESTION_FOOTER in posted  # shared footer
+    assert result.metrics["remediation_escalated"] == 1
+
+
+def test_drain_message_mode_no_message_falls_back_to_deterministic():
+    # message-only mode, model escalates with NO message -> posted text equals
+    # build_human_question exactly (deterministic template).
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(response='{"action":"escalate"}', config=config)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+
+    assert quay_client.submitted == []
+    assert len(slack.questions) == 1
+    expected = quay.build_human_question(handoff, quay_client.task, quay_client.artifact)
+    assert slack.questions[0][1] == expected
+    assert result.metrics["remediation_escalated"] == 1
+
+
+def test_drain_message_mode_never_submits_a_proposed_resume():
+    # HARD INVARIANT: in message-only mode, even a fully gate-cleared resume must
+    # NOT be submitted -- the message flag never enables auto-resume. It falls
+    # through to a deterministic escalation (the resume brief carries no message).
+    resume = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "safe and reversible",
+        }
+    )
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(response=resume, config=config)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+
+    assert quay_client.submitted == []  # resume suppressed
+    assert len(remediator.agent_calls) == 1
+    assert len(slack.questions) == 1
+    # No message on a resume -> deterministic template.
+    expected = quay.build_human_question(handoff, quay_client.task, quay_client.artifact)
+    assert slack.questions[0][1] == expected
+    assert result.metrics["remediation_escalated"] == 1
+
+
+def test_drain_both_flags_off_is_inert_and_byte_identical():
+    # State 1: both flags False -> the turn never runs and the escalation is
+    # byte-identical to today's deterministic template.
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(
+        response=_escalate_message_response(),
+        config=remediation_config(
+            remediation_enabled=False,
+            remediation_escalation_message_enabled=False,
+        ),
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C_ESC",
+            remediation_enabled=False,
+            remediation_escalation_message_enabled=False,
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+
+    assert remediator.agent_calls == []  # no model turn (inert)
+    assert quay_client.submitted == []
+    assert len(slack.questions) == 1
+    expected = quay.build_human_question(handoff, quay_client.task, quay_client.artifact)
+    assert slack.questions[0][1] == expected
+    assert result.status == "human_reply_timeout"
+
+
+def test_drain_remediation_only_ignores_model_message_on_escalate():
+    # State 3: remediation-only (auto-resume on, message flag off). On escalate the
+    # posted text is the deterministic template even though the model supplied a
+    # message -- the message flag gates message use.
+    config = remediation_config(
+        remediation_enabled=True,
+        remediation_escalation_message_enabled=False,
+        default_slack_channel="C_ESC",
+    )
+    result, slack, quay_client, remediator = _drain_escalation(config)
+
+    assert quay_client.submitted == []
+    assert len(slack.questions) == 1
+    posted = slack.questions[0][1]
+    assert ESCALATE_MESSAGE not in posted  # message ignored
+    # safe_handoff() is deterministic, so a fresh one reproduces the exact render.
+    expected = quay.build_human_question(
+        safe_handoff(), quay_client.task, quay_client.artifact
+    )
+    assert posted == expected
+
+
+def test_drain_both_flags_on_auto_resumes_and_uses_message_on_escalate():
+    # State 4a: both flags on, model resumes -> auto-resume still works.
+    resume = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "safe and reversible",
+        }
+    )
+    config = remediation_config(
+        remediation_enabled=True,
+        remediation_escalation_message_enabled=True,
+        remediation_max_attempts=5,  # two drains share task-rem's loop guard
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient()
+    remediator = make_remediator(response=resume, config=config)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert result.status == "submitted_remediated"
+    assert quay_client.submitted[0][1].startswith("Remove the unused import")
+
+    # State 4b: both flags on, model escalates with a message -> message is used.
+    config2 = remediation_config(
+        remediation_enabled=True,
+        remediation_escalation_message_enabled=True,
+        remediation_max_attempts=5,
+        default_slack_channel="C_ESC",
+    )
+    result2, slack2, quay_client2, _ = _drain_escalation(config2)
+    assert quay_client2.submitted == []
+    assert ESCALATE_MESSAGE in slack2.questions[0][1]
+
+
+def test_drain_escalation_message_neutralizes_broadcast_injection():
+    # A model message that tries to @channel the world must be neutralized before
+    # it reaches Slack.
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(
+        response=_escalate_message_response(
+            "URGENT <!channel> @everyone please look, ping <@U0DEADBEEF> now"
+        ),
+        config=config,
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    drainer.drain_one()
+    posted = slack.questions[0][1]
+    for banned in ("<!channel>", "@everyone", "<@U0DEADBEEF>"):
+        assert banned not in posted, banned
+    assert "URGENT" in posted and "please look" in posted
+
+
 def test_submit_reason_guard_matches_quay_cli_enum():
     # Quay's `submit-brief --help` accepts only these two reasons; the guard must
     # reject anything else (regression fence for the old "blocker_auto_remediated").
@@ -3057,6 +3447,7 @@ def test_config_remediation_defaults_off():
     cfg = quay.OrchestratorConfig()
     assert cfg.remediation_enabled is False
     assert cfg.remediation_friction_enabled is False
+    assert cfg.remediation_escalation_message_enabled is False
     assert cfg.remediation_max_attempts == 2
     assert cfg.remediation_max_iterations == 3
     assert cfg.remediation_linear_team_id == "28294e03-c1ce-4c2b-ba24-49e36179a321"
@@ -3070,6 +3461,7 @@ def test_config_from_mapping_reads_remediation():
             "remediation_max_tokens": 999,
             "remediation_max_attempts": 4,
             "remediation_friction_enabled": True,
+            "remediation_escalation_message_enabled": True,
             "remediation_linear_team_id": "team-xyz",
         }
     )
@@ -3078,7 +3470,24 @@ def test_config_from_mapping_reads_remediation():
     assert cfg.remediation_max_tokens == 999
     assert cfg.remediation_max_attempts == 4
     assert cfg.remediation_friction_enabled is True
+    assert cfg.remediation_escalation_message_enabled is True
     assert cfg.remediation_linear_team_id == "team-xyz"
+
+
+def test_config_escalation_message_flag_is_independent():
+    # The two flags are wired independently: enabling the message flag must not
+    # enable auto-resume, and vice versa.
+    msg_only = quay.OrchestratorConfig.from_mapping(
+        {"remediation_escalation_message_enabled": True}
+    )
+    assert msg_only.remediation_escalation_message_enabled is True
+    assert msg_only.remediation_enabled is False
+
+    resume_only = quay.OrchestratorConfig.from_mapping(
+        {"remediation_enabled": True}
+    )
+    assert resume_only.remediation_enabled is True
+    assert resume_only.remediation_escalation_message_enabled is False
 
 
 def test_config_env_overrides_remediation(monkeypatch):
@@ -3087,6 +3496,9 @@ def test_config_env_overrides_remediation(monkeypatch):
     monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_TOKENS", "2500")
     monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ATTEMPTS", "5")
     monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_FRICTION_ENABLED", "yes")
+    monkeypatch.setenv(
+        "QUAY_ORCHESTRATOR_REMEDIATION_ESCALATION_MESSAGE_ENABLED", "true"
+    )
     monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID", "team-env")
     cfg = quay.OrchestratorConfig().with_env_overrides()
     assert cfg.remediation_enabled is True
@@ -3094,6 +3506,7 @@ def test_config_env_overrides_remediation(monkeypatch):
     assert cfg.remediation_max_tokens == 2500
     assert cfg.remediation_max_attempts == 5
     assert cfg.remediation_friction_enabled is True
+    assert cfg.remediation_escalation_message_enabled is True
     assert cfg.remediation_linear_team_id == "team-env"
 
 
