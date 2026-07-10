@@ -5324,6 +5324,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     monkeypatch.setattr(server, "_probe_credentials", lambda _a: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
 
     # Shim register/unregister to observe leaks
     import tools.approval as _approval
@@ -5425,6 +5426,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     monkeypatch.setattr(server, "_probe_credentials", lambda _a: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
 
     import tools.approval as _approval
 
@@ -5442,8 +5444,9 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     # entries mid-run, which would flip this build thread's ``replaced`` check
     # to True and trigger a spurious unregister. Snapshot, clear, and restore
     # so this test sees only its own session regardless of shard composition.
-    _saved_sessions = dict(server._sessions)
-    server._sessions.clear()
+    with server._sessions_lock:
+        _saved_sessions = dict(server._sessions)
+        server._sessions.clear()
 
     try:
         resp = server.handle_request(
@@ -5456,7 +5459,8 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         sid = resp["result"]["session_id"]
 
         # Wait for the build to finish (ready event inside session dict).
-        session = server._sessions[sid]
+        with server._sessions_lock:
+            session = server._sessions[sid]
         built = session["agent_ready"].wait(timeout=10.0)
         assert built, "agent build did not complete within timeout"
 
@@ -5473,8 +5477,9 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         assert session.get("slash_worker") is not None
     finally:
         # Cleanup + restore sibling sessions we snapshotted.
-        server._sessions.clear()
-        server._sessions.update(_saved_sessions)
+        with server._sessions_lock:
+            server._sessions.clear()
+            server._sessions.update(_saved_sessions)
 
 
 def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
