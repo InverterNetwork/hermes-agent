@@ -207,5 +207,12 @@ quay_prepare_worker_github_auth() {
     quay_auth_fail_or_return "$mode" "${QUAY_AUTH_MINT_ERROR:-GitHub worker token mint failed}" "$validate_rc" || return "$?"
   fi
   token="$QUAY_AUTH_MINTED_WORKER_TOKEN"
+  quay_auth_validate_token "$token"
+  validate_rc=$?
+  if [[ "$validate_rc" -ne 0 ]]; then
+    quay_auth_fail_or_return "$mode" \
+      "minted GitHub worker token does not have required Quay repo/PR access" \
+      75 || return "$?"
+  fi
   quay_auth_export_worker_token "$token"
 }

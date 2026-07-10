@@ -246,6 +246,33 @@ def test_worker_auth_fails_without_token_helper(tmp_path: Path):
     assert not Path(env["QUAY_LOG"]).exists()
 
 
+def test_invalid_minted_worker_token_fails_before_quay(tmp_path: Path):
+    reviewer_env = tmp_path / "missing-reviewer.env"
+    env = _runner_env(tmp_path, reviewer_env)
+    env.update(
+        {
+            "GH_FAIL_TOKEN": "worker-token",
+            "GH_PR_LIST_EXIT": "1",
+            "GH_PR_LIST_STDERR": "HTTP 403: Resource not accessible by integration",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 75
+    assert "minted GitHub worker token does not have required Quay repo/PR access" in result.stderr
+    assert Path(env["HELPER_CALLS"]).read_text(encoding="utf-8").splitlines() == [
+        "config= app_id= override="
+    ]
+    assert not Path(env["QUAY_LOG"]).exists()
+
+
 def test_inherited_token_validation_outage_fails_without_minting(tmp_path: Path):
     reviewer_env = tmp_path / "missing-reviewer.env"
     env = _runner_env(tmp_path, reviewer_env)
@@ -329,6 +356,9 @@ def test_quay_orchestrator_runner_prepares_worker_github_auth(tmp_path: Path):
         bin_dir / "gh",
         "#!/usr/bin/env bash\n"
         'printf "gh-token=%s\\n" "${GH_TOKEN:-}" >> "$GH_LOG"\n'
+        'if [[ -n "${GH_FAIL_TOKEN:-}" && "${GH_TOKEN:-}" != "$GH_FAIL_TOKEN" ]]; then\n'
+        "  exit 0\n"
+        "fi\n"
         'if [[ "${GH_VALIDATE_EXIT:-0}" != "0" ]]; then\n'
         '  printf "%s\\n" "${GH_VALIDATE_STDERR:-gh: Bad credentials}" >&2\n'
         "fi\n"
@@ -374,6 +404,7 @@ def test_quay_orchestrator_runner_prepares_worker_github_auth(tmp_path: Path):
             "GH_LOG": str(tmp_path / "gh.calls"),
             "ORCH_LOG": str(tmp_path / "orch.calls"),
             "GH_TOKEN": "stale-worker-token",
+            "GH_FAIL_TOKEN": "stale-worker-token",
             "GH_VALIDATE_EXIT": "1",
             "HERMES_QUAY_GITHUB_AUTH_REPO": "InverterNetwork/hermes-agent",
         }

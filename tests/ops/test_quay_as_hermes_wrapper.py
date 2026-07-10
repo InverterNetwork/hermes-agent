@@ -311,6 +311,30 @@ class TestQuayAsHermesWrapper:
         assert "existing GitHub token is invalid; minting replacement" in result.stderr
         assert wrapper_env["helper_calls"].read_text(encoding="utf-8").splitlines() == ["mint"]
 
+    def test_invalid_minted_token_is_not_exported_to_quay(self, wrapper_env):
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        _render_wrapper(
+            wrapper,
+            agent_user=getpass.getuser(),
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(
+            wrapper,
+            wrapper_env,
+            extra_env={
+                "GH_PR_LIST_EXIT": "1",
+            },
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        log = _parse_quay_log(wrapper_env["quay_log"])
+        assert log["QUAY_WORKER_GH_TOKEN"] == ""
+        assert log["GH_TOKEN"] == ""
+        assert "minted GitHub token is invalid for Quay repos" in result.stderr
+        assert wrapper_env["helper_calls"].read_text(encoding="utf-8").splitlines() == ["mint"]
+
     def test_valid_existing_token_uses_repo_pr_scoped_probe(
         self,
         wrapper_env,
@@ -337,3 +361,47 @@ class TestQuayAsHermesWrapper:
             "GH_TOKEN: stub-from-envfile"
         ) in gh_log
         assert "ARGS: api rate_limit" not in gh_log
+
+    def test_existing_token_uses_installed_repo_origin_fallback(self, wrapper_env):
+        installed_repo = wrapper_env["target"] / "hermes-agent"
+        subprocess.run(
+            ["git", "init", str(installed_repo)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(installed_repo),
+                "remote",
+                "add",
+                "origin",
+                "https://x-access-token:secret@github.com/InverterNetwork/hermes-agent.git",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        wrapper = wrapper_env["tmp"] / "quay-as-hermes"
+        _render_wrapper(
+            wrapper,
+            agent_user=getpass.getuser(),
+            target_dir=wrapper_env["target"],
+            quay_bin=wrapper_env["quay_bin"],
+        )
+
+        result = _run_wrapper(
+            wrapper,
+            wrapper_env,
+            extra_env={"HERMES_QUAY_GITHUB_AUTH_REPO": ""},
+        )
+        assert result.returncode == 0, result.stderr + "\n" + result.stdout
+
+        assert not wrapper_env["helper_calls"].exists()
+        gh_log = wrapper_env["gh_log"].read_text(encoding="utf-8")
+        assert (
+            "ARGS: repo view InverterNetwork/hermes-agent --json viewerPermission "
+            "GH_TOKEN: stub-from-envfile"
+        ) in gh_log
