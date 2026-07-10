@@ -730,6 +730,8 @@ quay:
     remediation_escalation_message_enabled: true
     # Otto may auto-resume blockers his code gates deem safe & reversible.
     remediation_enabled: true
+    # Otto files recurring Quay-CLI friction he observes to Linear (BRIX team).
+    remediation_friction_enabled: true
 atlas:
   # Pinned Atlas CLI release tag. The installer downloads atlas-linux-<arch>
   # from the release below, verifies it against SHA256SUMS, and installs it
