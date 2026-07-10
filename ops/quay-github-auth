@@ -11,7 +11,8 @@ quay_auth_warn() {
 }
 
 quay_auth_die() {
-  printf '[%s] ERROR: %s\n' "$quay_auth_log_prefix" "$*" >&2
+  local message="$1"
+  printf '[%s] ERROR: %s\n' "$quay_auth_log_prefix" "$message" >&2
   exit "${2:-70}"
 }
 
@@ -34,10 +35,87 @@ quay_auth_export_worker_token() {
   export GITHUB_TOKEN="$token"
 }
 
+quay_auth_github_repo_from_url() {
+  local url="${1%.git}"
+  case "$url" in
+    https://github.com/*) printf '%s\n' "${url#https://github.com/}" ;;
+    http://github.com/*) printf '%s\n' "${url#http://github.com/}" ;;
+    https://*@github.com/*) printf '%s\n' "${url#https://*@github.com/}" ;;
+    http://*@github.com/*) printf '%s\n' "${url#http://*@github.com/}" ;;
+    git@github.com:*) printf '%s\n' "${url#git@github.com:}" ;;
+    ssh://git@github.com/*) printf '%s\n' "${url#ssh://git@github.com/}" ;;
+  esac
+}
+
+quay_auth_add_probe_repo() {
+  local repo="$1"
+  local existing
+  repo="${repo#https://github.com/}"
+  repo="${repo#http://github.com/}"
+  repo="${repo%.git}"
+  repo="${repo%/}"
+  [[ "$repo" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] || return 0
+  for existing in "${QUAY_AUTH_PROBE_REPOS[@]:-}"; do
+    [[ "$existing" == "$repo" ]] && return 0
+  done
+  QUAY_AUTH_PROBE_REPOS+=("$repo")
+}
+
+quay_auth_collect_probe_repos() {
+  QUAY_AUTH_PROBE_REPOS=()
+  local configured="${HERMES_QUAY_GITHUB_AUTH_REPOS:-${HERMES_QUAY_GITHUB_AUTH_REPO:-}}"
+  local repo
+  local repos_dir="${QUAY_DATA_DIR:-${HERMES_HOME:-$HOME/.hermes}/quay}/repos"
+  local bare
+  local remote
+  local home="${HERMES_HOME:-$HOME/.hermes}"
+
+  if [[ -n "$configured" ]]; then
+    configured="${configured//,/ }"
+    for repo in $configured; do
+      quay_auth_add_probe_repo "$repo"
+    done
+  fi
+
+  if [[ "${#QUAY_AUTH_PROBE_REPOS[@]}" -eq 0 && -d "$repos_dir" ]]; then
+    shopt -s nullglob
+    for bare in "$repos_dir"/*.git; do
+      remote="$(git -C "$bare" config --get remote.origin.url 2>/dev/null || true)"
+      repo="$(quay_auth_github_repo_from_url "$remote" || true)"
+      quay_auth_add_probe_repo "$repo"
+    done
+    shopt -u nullglob
+  fi
+
+  if [[ "${#QUAY_AUTH_PROBE_REPOS[@]}" -eq 0 && -n "${GITHUB_REPOSITORY:-}" ]]; then
+    quay_auth_add_probe_repo "$GITHUB_REPOSITORY"
+  fi
+
+  if [[ "${#QUAY_AUTH_PROBE_REPOS[@]}" -eq 0 && -d "$home/hermes-agent/.git" ]]; then
+    remote="$(git -C "$home/hermes-agent" config --get remote.origin.url 2>/dev/null || true)"
+    repo="$(quay_auth_github_repo_from_url "$remote" || true)"
+    quay_auth_add_probe_repo "$repo"
+  fi
+}
+
+quay_auth_classify_probe_failure() {
+  local output="$1"
+  if [[ "$output" =~ rate[[:space:]-]?limit|secondary[[:space:]-]?rate|429 ]]; then
+    quay_auth_warn "GitHub auth validation hit rate limiting: ${output//$'\n'/ }"
+    return 13
+  fi
+  if [[ "$output" =~ Bad[[:space:]]credentials|Requires[[:space:]]authentication|401|403|404|[Nn]ot[[:space:]]found|Resource[[:space:]]not[[:space:]]accessible|Could[[:space:]]not[[:space:]]resolve[[:space:]]to[[:space:]]a[[:space:]]Repository ]]; then
+    return 11
+  fi
+  quay_auth_warn "GitHub auth validation failed before token refresh: ${output//$'\n'/ }"
+  return 12
+}
+
 quay_auth_validate_token() {
   local token="$1"
   local output
   local rc
+  local repo
 
   [[ -n "$token" ]] || return 10
   if ! command -v gh >/dev/null 2>&1; then
@@ -45,23 +123,34 @@ quay_auth_validate_token() {
     return 12
   fi
 
-  output="$(
-    GH_TOKEN="$token" GITHUB_TOKEN="$token" gh api rate_limit 2>&1 >/dev/null
-  )"
-  rc=$?
-  if [[ "$rc" -eq 0 ]]; then
-    return 0
+  quay_auth_collect_probe_repos
+  if [[ "${#QUAY_AUTH_PROBE_REPOS[@]}" -eq 0 ]]; then
+    quay_auth_warn "no GitHub repository available for worker auth validation"
+    return 12
   fi
 
-  if [[ "$output" =~ rate[[:space:]-]?limit|secondary[[:space:]-]?rate|429 ]]; then
-    quay_auth_warn "GitHub auth validation hit rate limiting: ${output//$'\n'/ }"
-    return 13
-  fi
-  if [[ "$output" =~ Bad[[:space:]]credentials|Requires[[:space:]]authentication|401|403 ]]; then
-    return 11
-  fi
-  quay_auth_warn "GitHub auth validation failed before token refresh: ${output//$'\n'/ }"
-  return 12
+  for repo in "${QUAY_AUTH_PROBE_REPOS[@]}"; do
+    output="$(
+      GH_TOKEN="$token" GITHUB_TOKEN="$token" \
+        gh repo view "$repo" --json viewerPermission 2>&1 >/dev/null
+    )"
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      quay_auth_classify_probe_failure "$output"
+      return "$?"
+    fi
+
+    output="$(
+      GH_TOKEN="$token" GITHUB_TOKEN="$token" \
+        gh pr list -R "$repo" --limit 1 2>&1 >/dev/null
+    )"
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      quay_auth_classify_probe_failure "$output"
+      return "$?"
+    fi
+  done
+  return 0
 }
 
 quay_auth_mint_worker_token() {

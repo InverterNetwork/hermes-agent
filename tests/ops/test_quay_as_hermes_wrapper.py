@@ -66,7 +66,15 @@ def wrapper_env(tmp_path: Path) -> dict:
     gh.write_text(
         "#!/usr/bin/env bash\n"
         f'printf "ARGS: %s GH_TOKEN: %s GITHUB_TOKEN: %s\\n" "$*" "${{GH_TOKEN:-}}" "${{GITHUB_TOKEN:-}}" >> {gh_log}\n'
-        'exit "${GH_VALIDATE_EXIT:-0}"\n'
+        'exit_code=0\n'
+        'case "$*" in\n'
+        '  "repo view "*) exit_code="${GH_REPO_VIEW_EXIT:-${GH_VALIDATE_EXIT:-0}}" ;;\n'
+        '  "pr list "*) exit_code="${GH_PR_LIST_EXIT:-${GH_VALIDATE_EXIT:-0}}" ;;\n'
+        'esac\n'
+        'if [[ -n "${GH_FAIL_TOKEN:-}" && "${GH_TOKEN:-}" != "$GH_FAIL_TOKEN" ]]; then\n'
+        '  exit_code=0\n'
+        'fi\n'
+        'exit "$exit_code"\n'
     )
     gh.chmod(0o755)
 
@@ -150,6 +158,10 @@ def _run_wrapper(
     proc_env.pop("GITHUB_TOKEN", None)
     if extra_env:
         proc_env.update(extra_env)
+    proc_env.setdefault(
+        "HERMES_QUAY_GITHUB_AUTH_REPO",
+        "InverterNetwork/hermes-agent",
+    )
     return subprocess.run(
         [str(wrapper), "repo", "list"],
         env=proc_env, check=False, capture_output=True, text=True,
@@ -274,7 +286,7 @@ class TestQuayAsHermesWrapper:
         assert log["QUAY_DATA_DIR"] == str(override)
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
 
-    def test_invalid_existing_token_mints_replacement(self, wrapper_env):
+    def test_pr_unauthorized_existing_token_mints_replacement(self, wrapper_env):
         wrapper = wrapper_env["tmp"] / "quay-as-hermes"
         _render_wrapper(
             wrapper,
@@ -286,7 +298,10 @@ class TestQuayAsHermesWrapper:
         result = _run_wrapper(
             wrapper,
             wrapper_env,
-            extra_env={"GH_VALIDATE_EXIT": "1"},
+            extra_env={
+                "GH_FAIL_TOKEN": "stub-from-envfile",
+                "GH_PR_LIST_EXIT": "1",
+            },
         )
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
 
@@ -296,7 +311,7 @@ class TestQuayAsHermesWrapper:
         assert "existing GitHub token is invalid; minting replacement" in result.stderr
         assert wrapper_env["helper_calls"].read_text(encoding="utf-8").splitlines() == ["mint"]
 
-    def test_valid_existing_token_uses_installation_token_compatible_probe(
+    def test_valid_existing_token_uses_repo_pr_scoped_probe(
         self,
         wrapper_env,
     ):
@@ -313,4 +328,12 @@ class TestQuayAsHermesWrapper:
 
         assert not wrapper_env["helper_calls"].exists()
         gh_log = wrapper_env["gh_log"].read_text(encoding="utf-8")
-        assert "ARGS: api rate_limit GH_TOKEN: stub-from-envfile" in gh_log
+        assert (
+            "ARGS: repo view InverterNetwork/hermes-agent --json viewerPermission "
+            "GH_TOKEN: stub-from-envfile"
+        ) in gh_log
+        assert (
+            "ARGS: pr list -R InverterNetwork/hermes-agent --limit 1 "
+            "GH_TOKEN: stub-from-envfile"
+        ) in gh_log
+        assert "ARGS: api rate_limit" not in gh_log

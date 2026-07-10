@@ -41,10 +41,25 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
         gh,
         "#!/usr/bin/env bash\n"
         f'printf "args=%s GH_TOKEN=%s GITHUB_TOKEN=%s\\n" "$*" "${{GH_TOKEN:-}}" "${{GITHUB_TOKEN:-}}" >> {gh_log}\n'
-        'if [[ "${GH_VALIDATE_EXIT:-0}" != "0" ]]; then\n'
-        '  printf "%s\\n" "${GH_VALIDATE_STDERR:-gh: Bad credentials}" >&2\n'
+        'exit_code=0\n'
+        'stderr=""\n'
+        'case "$*" in\n'
+        '  "repo view "*)\n'
+        '    exit_code="${GH_REPO_VIEW_EXIT:-${GH_VALIDATE_EXIT:-0}}"\n'
+        '    stderr="${GH_REPO_VIEW_STDERR:-${GH_VALIDATE_STDERR:-gh: Bad credentials}}"\n'
+        '    ;;\n'
+        '  "pr list "*)\n'
+        '    exit_code="${GH_PR_LIST_EXIT:-${GH_VALIDATE_EXIT:-0}}"\n'
+        '    stderr="${GH_PR_LIST_STDERR:-${GH_VALIDATE_STDERR:-gh: Bad credentials}}"\n'
+        '    ;;\n'
+        'esac\n'
+        'if [[ -n "${GH_FAIL_TOKEN:-}" && "${GH_TOKEN:-}" != "$GH_FAIL_TOKEN" ]]; then\n'
+        '  exit_code=0\n'
+        'fi\n'
+        'if [[ "$exit_code" != "0" ]]; then\n'
+        '  printf "%s\\n" "$stderr" >&2\n'
         "fi\n"
-        'exit "${GH_VALIDATE_EXIT:-0}"\n',
+        'exit "$exit_code"\n',
     )
 
     calls = tmp_path / "helper.calls"
@@ -88,6 +103,7 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
             "HELPER_CALLS": str(calls),
             "QUAY_LOG": str(quay_log),
             "GH_LOG": str(gh_log),
+            "HERMES_QUAY_GITHUB_AUTH_REPO": "InverterNetwork/hermes-agent",
         }
     )
     env.pop("GH_TOKEN", None)
@@ -148,7 +164,7 @@ def test_reviewer_mint_ignores_generic_worker_helper_env(tmp_path: Path):
     assert calls == [f"config={reviewer_env} app_id= override="]
 
 
-def test_valid_existing_worker_token_uses_installation_token_compatible_probe(
+def test_valid_existing_worker_token_uses_repo_pr_scoped_probe(
     tmp_path: Path,
 ):
     reviewer_env = tmp_path / "missing-reviewer.env"
@@ -169,13 +185,28 @@ def test_valid_existing_worker_token_uses_installation_token_compatible_probe(
     assert "GH_TOKEN=caller-worker-token" in log
     assert not Path(env["HELPER_CALLS"]).exists()
     gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
-    assert "args=api rate_limit GH_TOKEN=caller-worker-token" in gh_log
+    assert (
+        "args=repo view InverterNetwork/hermes-agent --json viewerPermission "
+        "GH_TOKEN=caller-worker-token"
+    ) in gh_log
+    assert (
+        "args=pr list -R InverterNetwork/hermes-agent --limit 1 "
+        "GH_TOKEN=caller-worker-token"
+    ) in gh_log
+    assert "args=api rate_limit" not in gh_log
 
 
-def test_invalid_existing_worker_token_mints_replacement(tmp_path: Path):
+def test_pr_unauthorized_existing_worker_token_mints_replacement(tmp_path: Path):
     reviewer_env = tmp_path / "missing-reviewer.env"
     env = _runner_env(tmp_path, reviewer_env)
-    env.update({"GH_TOKEN": "stale-worker-token", "GH_VALIDATE_EXIT": "1"})
+    env.update(
+        {
+            "GH_TOKEN": "stale-worker-token",
+            "GH_FAIL_TOKEN": "stale-worker-token",
+            "GH_PR_LIST_EXIT": "1",
+            "GH_PR_LIST_STDERR": "HTTP 401: Bad credentials",
+        }
+    )
 
     result = subprocess.run(
         ["bash", str(RUNNER)],
@@ -192,6 +223,8 @@ def test_invalid_existing_worker_token_mints_replacement(tmp_path: Path):
     assert "inherited GitHub token is stale or unauthorized; minting replacement" in result.stderr
     calls = Path(env["HELPER_CALLS"]).read_text(encoding="utf-8").splitlines()
     assert calls == ["config= app_id= override="]
+    gh_log = Path(env["GH_LOG"]).read_text(encoding="utf-8")
+    assert "args=api rate_limit" not in gh_log
 
 
 def test_worker_auth_fails_without_token_helper(tmp_path: Path):
@@ -219,8 +252,8 @@ def test_inherited_token_validation_outage_fails_without_minting(tmp_path: Path)
     env.update(
         {
             "GH_TOKEN": "caller-worker-token",
-            "GH_VALIDATE_EXIT": "2",
-            "GH_VALIDATE_STDERR": "dial tcp: i/o timeout",
+            "GH_REPO_VIEW_EXIT": "2",
+            "GH_REPO_VIEW_STDERR": "dial tcp: i/o timeout",
         }
     )
 
@@ -247,8 +280,8 @@ def test_inherited_token_rate_limit_fails_without_stale_token_replacement(
     env.update(
         {
             "GH_TOKEN": "caller-worker-token",
-            "GH_VALIDATE_EXIT": "1",
-            "GH_VALIDATE_STDERR": "HTTP 403: API rate limit exceeded",
+            "GH_PR_LIST_EXIT": "1",
+            "GH_PR_LIST_STDERR": "HTTP 403: API rate limit exceeded",
         }
     )
 
@@ -342,6 +375,7 @@ def test_quay_orchestrator_runner_prepares_worker_github_auth(tmp_path: Path):
             "ORCH_LOG": str(tmp_path / "orch.calls"),
             "GH_TOKEN": "stale-worker-token",
             "GH_VALIDATE_EXIT": "1",
+            "HERMES_QUAY_GITHUB_AUTH_REPO": "InverterNetwork/hermes-agent",
         }
     )
 

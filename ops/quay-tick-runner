@@ -22,11 +22,14 @@
 #   HERMES_TOKEN_PYTHON  — venv python (default: render under
 #                          $HERMES_HOME/hermes-agent/venv/bin/python)
 #   QUAY_WORKER_GH_TOKEN / GH_TOKEN / GITHUB_TOKEN
-#                        — when any is set, kept if `gh api rate_limit`
-#                          accepts it. That probe supports both user tokens
-#                          and GitHub App installation tokens. Invalid/expired
-#                          values are replaced by a freshly minted helper
-#                          token exported under all three names.
+#                        — when any is set, kept only if repo/PR-scoped
+#                          GitHub probes accept it. Invalid, expired, or
+#                          repo-unauthorized values are replaced by a freshly
+#                          minted helper token exported under all three names.
+#   HERMES_QUAY_GITHUB_AUTH_REPO(S)
+#                        — optional owner/repo probe target(s). When unset,
+#                          the auth helper probes registered Quay bare clone
+#                          origins from $QUAY_DATA_DIR/repos.
 #   HERMES_REVIEWER_GH_CONFIG
 #                        — reviewer App env file (default:
 #                          /etc/hermes/reviewer.env)
