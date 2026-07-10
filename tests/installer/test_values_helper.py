@@ -1329,6 +1329,7 @@ class TestRenderQuayOrchestratorConfig:
             "quay_command": "/usr/local/bin/quay",
             "remediation_enabled": False,
             "remediation_escalation_message_enabled": False,
+            "remediation_friction_enabled": False,
             "reply_timeout_seconds": 1800,
             "slack_token_env": "SLACK_BOT_TOKEN",
         }
@@ -1405,7 +1406,8 @@ class TestRenderQuayOrchestratorConfig:
             "  orchestrator:\n"
             "    enabled: true\n"
             "    remediation_enabled: true\n"
-            "    remediation_escalation_message_enabled: true\n",
+            "    remediation_escalation_message_enabled: true\n"
+            "    remediation_friction_enabled: true\n",
             encoding="utf-8",
         )
         out = tmp_path / "orchestrator.json"
@@ -1414,6 +1416,7 @@ class TestRenderQuayOrchestratorConfig:
         cfg = json.loads(out.read_text())
         assert cfg["remediation_enabled"] is True
         assert cfg["remediation_escalation_message_enabled"] is True
+        assert cfg["remediation_friction_enabled"] is True
 
     def test_remediation_flag_must_be_bool(self, tmp_path: Path):
         values = tmp_path / "values.yaml"

@@ -966,6 +966,7 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
         # never-auto floor regardless of these toggles.
         "remediation_enabled": False,
         "remediation_escalation_message_enabled": False,
+        "remediation_friction_enabled": False,
     }
     if block is None:
         return defaults, None
@@ -989,7 +990,11 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
             )
         out["enabled"] = block["enabled"]
 
-    for bkey in ("remediation_enabled", "remediation_escalation_message_enabled"):
+    for bkey in (
+        "remediation_enabled",
+        "remediation_escalation_message_enabled",
+        "remediation_friction_enabled",
+    ):
         if bkey in block:
             if not isinstance(block[bkey], bool):
                 return defaults, (
