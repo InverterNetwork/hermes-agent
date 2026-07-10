@@ -962,6 +962,10 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
         "quay_command": "/usr/local/bin/quay",
         "reply_timeout_seconds": 1800,
         "poll_interval_seconds": 15,
+        # BRIX-1878 agentic blocker handling. Default off; the code enforces the
+        # never-auto floor regardless of these toggles.
+        "remediation_enabled": False,
+        "remediation_escalation_message_enabled": False,
     }
     if block is None:
         return defaults, None
@@ -984,6 +988,15 @@ def _validate_quay_orchestrator_block(block: Any) -> tuple[dict[str, Any], str |
                 f"(got {type(block['enabled']).__name__}: {block['enabled']!r})"
             )
         out["enabled"] = block["enabled"]
+
+    for bkey in ("remediation_enabled", "remediation_escalation_message_enabled"):
+        if bkey in block:
+            if not isinstance(block[bkey], bool):
+                return defaults, (
+                    f"quay.orchestrator.{bkey} must be a bool "
+                    f"(got {type(block[bkey]).__name__}: {block[bkey]!r})"
+                )
+            out[bkey] = block[bkey]
 
     if "default_slack_channel" in block:
         channel = block["default_slack_channel"]
