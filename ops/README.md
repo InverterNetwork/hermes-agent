@@ -566,10 +566,11 @@ that's `$GH_TOKEN`'s job, below.
 paths that can spawn work or recover parked `waiting_human` handoffs. If
 `$QUAY_WORKER_GH_TOKEN` /
 `$GH_TOKEN` / `$GITHUB_TOKEN` is already set, the runner first checks it
-with `gh api rate_limit`, which accepts both user tokens and GitHub App
-installation tokens. Valid caller-supplied tokens are kept. Stale or
-unauthorized inherited tokens are explicitly discarded and replaced by a
-fresh short-lived worker GitHub App installation token from
+with repo/PR-scoped probes (`gh repo view <repo> --json viewerPermission`
+and `gh pr list -R <repo> --limit 1`) against the configured Quay repos.
+Valid caller-supplied tokens are kept. Stale or repo-unauthorized inherited
+tokens are explicitly discarded and replaced by a fresh short-lived worker
+GitHub App installation token from
 `installer/hermes_github_token.py mint`, exported as
 `$QUAY_WORKER_GH_TOKEN`, `$GH_TOKEN`, and `$GITHUB_TOKEN`. Quay consumes
 `$QUAY_WORKER_GH_TOKEN` before spawning worker attempts, while `gh` and
@@ -587,6 +588,12 @@ with possibly stale GH_TOKEN/GITHUB_TOKEN`. A mint failure reports
 installation/rate limits. In these cases the tick runner exits before
 Quay runs, so a later non-auth worker failure remains attributable to the
 Quay path rather than stale inherited GitHub auth.
+
+Set `HERMES_QUAY_GITHUB_AUTH_REPO=owner/repo` or
+`HERMES_QUAY_GITHUB_AUTH_REPOS=owner/repo,owner/other` to pin the probe
+set explicitly. When unset, the helper derives GitHub repos from
+`$QUAY_DATA_DIR/repos/*.git` bare-clone origins, then falls back to
+`$GITHUB_REPOSITORY` or the installed `hermes-agent` origin when present.
 
 `quay-orchestrator-runner` runs the same auth preflight in optional mode.
 It exports a fresh worker token when possible and drops stale inherited

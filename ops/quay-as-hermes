@@ -37,9 +37,8 @@
 # Quay itself consumes $QUAY_WORKER_GH_TOKEN before spawning worker attempts,
 # while child tools still read $GH_TOKEN / $GITHUB_TOKEN, so all three names
 # are exported to the same token. Existing caller-supplied tokens are kept only
-# when `gh api rate_limit` accepts them; stale/expired values mint a
-# replacement. This endpoint accepts both user tokens and GitHub App
-# installation tokens, which the helper mints.
+# when repo/PR-scoped GitHub probes accept them; stale, expired, or
+# repo-unauthorized values mint a replacement.
 # Mirrors
 # ops/quay-tick-runner and ops/hermes-upstream-sync's preamble. Permissive
 # on helper failure: missing PEM or transient mint error → exec and let
@@ -75,9 +74,62 @@ token_is_valid() {
   token="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   [ -n "$token" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
+  repos=$(printf "%s" "${HERMES_QUAY_GITHUB_AUTH_REPOS:-${HERMES_QUAY_GITHUB_AUTH_REPO:-${GITHUB_REPOSITORY:-}}}" | tr "," " ")
+  if [ -n "$repos" ]; then
+    for repo in $repos; do
+      token_has_repo_pr_access "$repo" || return 1
+    done
+    return 0
+  fi
+  found_repo=0
+  if command -v git >/dev/null 2>&1; then
+    repos_dir="${QUAY_DATA_DIR:-__TARGET_DIR__/quay}/repos"
+    for bare in "$repos_dir"/*.git; do
+      [ -d "$bare" ] || continue
+      remote=$(git -C "$bare" config --get remote.origin.url 2>/dev/null || true)
+      repo=$(github_repo_from_url "$remote")
+      [ -n "$repo" ] || continue
+      found_repo=1
+      token_has_repo_pr_access "$repo" || return 1
+    done
+    if [ "$found_repo" != 1 ] && [ -d "__TARGET_DIR__/hermes-agent/.git" ]; then
+      remote=$(git -C "__TARGET_DIR__/hermes-agent" config --get remote.origin.url 2>/dev/null || true)
+      repo=$(github_repo_from_url "$remote")
+      if [ -n "$repo" ]; then
+        found_repo=1
+        token_has_repo_pr_access "$repo" || return 1
+      fi
+    fi
+  fi
+  [ "$found_repo" = 1 ] || return 0
+}
+
+token_has_repo_pr_access() {
+  repo="${1#https://github.com/}"
+  repo="${repo#http://github.com/}"
+  repo="${repo%.git}"
+  repo="${repo%/}"
+  [ -n "$repo" ] || return 1
   GH_TOKEN="$token" \
     GITHUB_TOKEN="$token" \
-    gh api rate_limit >/dev/null 2>&1
+    gh repo view "$repo" --json viewerPermission >/dev/null 2>&1 &&
+  GH_TOKEN="$token" \
+    GITHUB_TOKEN="$token" \
+    gh pr list -R "$repo" --limit 1 >/dev/null 2>&1
+}
+
+github_repo_from_url() {
+  remote="${1%.git}"
+  repo=""
+  case "$remote" in
+    https://github.com/*) repo="${remote#https://github.com/}" ;;
+    http://github.com/*) repo="${remote#http://github.com/}" ;;
+    https://*@github.com/*) repo="${remote#https://*@github.com/}" ;;
+    http://*@github.com/*) repo="${remote#http://*@github.com/}" ;;
+    git@github.com:*) repo="${remote#git@github.com:}" ;;
+    ssh://git@github.com/*) repo="${remote#ssh://git@github.com/}" ;;
+  esac
+  printf "%s\n" "$repo"
 }
 
 export_worker_token() {
@@ -97,6 +149,11 @@ mint_gh_token() {
   # App API hangs at the TCP/TLS layer.
   elif token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ]; then
     export_worker_token "$token"
+    if ! token_is_valid; then
+      printf "[quay-as-hermes] WARN: minted GitHub token is invalid for Quay repos; running quay without minted \$GH_TOKEN\n" >&2
+      unset QUAY_WORKER_GH_TOKEN GH_TOKEN GITHUB_TOKEN
+      return 1
+    fi
   else
     printf "[quay-as-hermes] WARN: token mint failed; running quay without minted \$GH_TOKEN\n" >&2
     return 1
