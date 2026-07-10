@@ -725,6 +725,11 @@ quay:
     quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
     poll_interval_seconds: 15
+    # BRIX-1878 agentic blocker handling (code enforces the never-auto floor):
+    # Otto authors concise escalation messages when he escalates (safe: message-only).
+    remediation_escalation_message_enabled: true
+    # Otto may auto-resume blockers his code gates deem safe & reversible.
+    remediation_enabled: true
 atlas:
   # Pinned Atlas CLI release tag. The installer downloads atlas-linux-<arch>
   # from the release below, verifies it against SHA256SUMS, and installs it
