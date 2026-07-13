@@ -18,8 +18,9 @@
 #
 # We also load __TARGET_DIR__/auth/quay.env so adapter tokens
 # (LINEAR_API_KEY, SLACK_TOKEN, …) reach ad-hoc invocations the same way
-# they reach the systemd tick — without this, operator commands like
-# `enqueue --linear-issue` fail despite the unit working fine.
+# they reach the systemd tick, then load /etc/default/quay-worker-env so
+# worker-useful host env such as RPC URLs is shared by scheduled ticks and
+# operator commands without storing values in repo-managed config.
 #
 # The load uses a strict KEY=VAL parser rather than shell `.` so
 # semantics match systemd's EnvironmentFile= (which never expands shell
@@ -29,7 +30,7 @@
 # closed. Skips comment lines, blank lines, and any key outside
 # [A-Z0-9_] (matches systemd's allowed key shape). The `[ -r … ]`
 # guard keeps the wrapper usable on fresh installs that haven't run
-# stage-secrets.sh yet.
+# stage-secrets.sh yet or haven't staged worker env.
 #
 # Finally, resolve the worker GitHub token from the GitHub App helper so any
 # operator command that shells out to `gh` (enqueue's PR-existence pre-flight,
@@ -50,7 +51,7 @@
 #                      from agent context) → skip sudo; the agent user is
 #                      intentionally not in sudoers, so `sudo -u self` would
 #                      reject and break agent-driven quay invocations.
-# The cd /, quay.env load, and $GH_TOKEN mint apply identically in both,
+# The cd /, env-file loads, and $GH_TOKEN mint apply identically in both,
 # so the body is held in AGENT_BODY and re-entered via
 # `sh -c "$AGENT_BODY" -- "$@"` either directly or under sudo. AGENT_BODY
 # is single-quoted, so its "$@" stays literal until sh expands it against
@@ -61,15 +62,18 @@
 
 AGENT_BODY='
 cd /
-ENV_FILE=__TARGET_DIR__/auth/quay.env
-if [ -r "$ENV_FILE" ]; then
+load_literal_env_file() {
+  env_file="$1"
+  [ -r "$env_file" ] || return 0
   while IFS="=" read -r key value || [ -n "$key" ]; do
     case "$key" in
       ""|[0-9]*|*[!A-Z0-9_]*) continue ;;
     esac
     export "$key=$value"
-  done < "$ENV_FILE"
-fi
+  done < "$env_file"
+}
+load_literal_env_file __TARGET_DIR__/auth/quay.env
+load_literal_env_file /etc/default/quay-worker-env
 token_is_valid() {
   token="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   [ -n "$token" ] || return 1

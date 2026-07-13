@@ -9,8 +9,8 @@ The wrapper has two invocation paths:
   intentionally not in sudoers, so `sudo -u self` would reject — the
   wrapper must skip sudo and exec the preamble + quay directly.
 
-Both branches must apply the same preamble (cd /, load quay.env, mint
-$GH_TOKEN). These tests render the wrapper the same way
+Both branches must apply the same preamble (cd /, load quay.env and
+quay-worker-env, mint $GH_TOKEN). These tests render the wrapper the same way
 setup-hermes.sh does (sed-substitute __AGENT_USER__ + __TARGET_DIR__),
 stub sudo + quay so we can assert which branch was taken without
 actually privilege-escalating, and stub gh/token-helper binaries so token
@@ -33,12 +33,14 @@ WRAPPER_SRC = REPO_ROOT / "ops" / "quay-as-hermes"
 
 def _render_wrapper(dst: Path, agent_user: str, target_dir: Path, quay_bin: Path) -> None:
     """Materialize the wrapper exactly the way setup-hermes.sh does, plus
-    one extra substitution so quay points at a tmp stub instead of
-    /usr/local/bin/quay."""
+    two extra substitutions so quay and the worker env file point at tmp
+    fixtures instead of host paths."""
+    worker_env = target_dir / "auth" / "quay-worker.env"
     body = WRAPPER_SRC.read_text()
     body = body.replace("__AGENT_USER__", agent_user)
     body = body.replace("__TARGET_DIR__", str(target_dir))
     body = body.replace("/usr/local/bin/quay", str(quay_bin))
+    body = body.replace("/etc/default/quay-worker-env", str(worker_env))
     dst.write_text(body)
     dst.chmod(0o755)
 
@@ -52,6 +54,13 @@ def wrapper_env(tmp_path: Path) -> dict:
     (target / "auth" / "quay.env").write_text(
         "GH_TOKEN=stub-from-envfile\n"
         "LINEAR_API_KEY=lin-stub\n"
+    )
+    (target / "auth" / "quay-worker.env").write_text(
+        "# host-managed worker env\n"
+        "RPC_URL_4326=https://rpc.example\n"
+        "1BAD=ignored\n"
+        "lowercase=ignored\n",
+        encoding="utf-8",
     )
 
     bin_dir = tmp_path / "bin"
@@ -112,6 +121,7 @@ def wrapper_env(tmp_path: Path) -> dict:
         f'  printf "QUAY_WORKER_GH_TOKEN: %s\\n" "${{QUAY_WORKER_GH_TOKEN:-}}"\n'
         f'  printf "GH_TOKEN: %s\\n" "${{GH_TOKEN:-}}"\n'
         f'  printf "LINEAR_API_KEY: %s\\n" "${{LINEAR_API_KEY:-}}"\n'
+        f'  printf "RPC_URL_4326: %s\\n" "${{RPC_URL_4326:-}}"\n'
         f'}} >> {quay_log}\n'
         "exit 0\n"
     )
@@ -209,6 +219,7 @@ class TestQuayAsHermesWrapper:
         assert log["QUAY_WORKER_GH_TOKEN"] == "stub-from-envfile"
         assert log["GH_TOKEN"] == "stub-from-envfile"
         assert log["LINEAR_API_KEY"] == "lin-stub"
+        assert log["RPC_URL_4326"] == "https://rpc.example"
 
     def test_agent_path_preserves_quay_data_dir_override(self, wrapper_env):
         wrapper = wrapper_env["tmp"] / "quay-as-hermes"
@@ -262,6 +273,7 @@ class TestQuayAsHermesWrapper:
         assert log["HERMES_HOME"] == str(wrapper_env["target"])
         assert log["QUAY_WORKER_GH_TOKEN"] == "stub-from-envfile"
         assert log["GH_TOKEN"] == "stub-from-envfile"
+        assert log["RPC_URL_4326"] == "https://rpc.example"
 
     def test_operator_path_preserves_quay_data_dir_override(self, wrapper_env):
         other_user = "not-" + getpass.getuser()
