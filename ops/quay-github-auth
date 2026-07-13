@@ -111,45 +111,94 @@ quay_auth_classify_probe_failure() {
   return 12
 }
 
+quay_auth_record_coverage_gap() {
+  local app_label="$1"
+  local repo="$2"
+  local action="$3"
+  local output="$4"
+  local detail="${output//$'\n'/ }"
+  if [[ -n "$detail" ]]; then
+    QUAY_AUTH_COVERAGE_GAPS+=("${app_label} App cannot access ${repo} during ${action}: ${detail}")
+  else
+    QUAY_AUTH_COVERAGE_GAPS+=("${app_label} App cannot access ${repo} during ${action}")
+  fi
+}
+
+quay_auth_probe_repo_access() {
+  local token="$1"
+  local app_label="$2"
+  local repo="$3"
+  local output
+  local rc
+
+  output="$(
+    GH_TOKEN="$token" GITHUB_TOKEN="$token" \
+      gh repo view "$repo" --json viewerPermission 2>&1 >/dev/null
+  )"
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    quay_auth_classify_probe_failure "$output"
+    rc=$?
+    if [[ "$rc" -eq 11 ]]; then
+      quay_auth_record_coverage_gap "$app_label" "$repo" "repo view" "$output"
+    fi
+    return "$rc"
+  fi
+
+  output="$(
+    GH_TOKEN="$token" GITHUB_TOKEN="$token" \
+      gh pr list -R "$repo" --limit 1 2>&1 >/dev/null
+  )"
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    quay_auth_classify_probe_failure "$output"
+    rc=$?
+    if [[ "$rc" -eq 11 ]]; then
+      quay_auth_record_coverage_gap "$app_label" "$repo" "pr list" "$output"
+    fi
+    return "$rc"
+  fi
+  return 0
+}
+
 quay_auth_validate_token() {
   local token="$1"
+  local app_label="${2:-worker}"
   local output
   local rc
   local repo
+  local had_coverage_gap=0
 
   [[ -n "$token" ]] || return 10
   if ! command -v gh >/dev/null 2>&1; then
-    quay_auth_warn "gh CLI not found while validating inherited GitHub token"
+    quay_auth_warn "gh CLI not found while validating ${app_label} GitHub token"
     return 12
   fi
 
   quay_auth_collect_probe_repos
   if [[ "${#QUAY_AUTH_PROBE_REPOS[@]}" -eq 0 ]]; then
-    quay_auth_warn "no GitHub repository available for worker auth validation"
+    quay_auth_warn "no GitHub repository available for ${app_label} auth validation"
     return 12
   fi
 
+  QUAY_AUTH_COVERAGE_GAPS=()
   for repo in "${QUAY_AUTH_PROBE_REPOS[@]}"; do
-    output="$(
-      GH_TOKEN="$token" GITHUB_TOKEN="$token" \
-        gh repo view "$repo" --json viewerPermission 2>&1 >/dev/null
-    )"
+    quay_auth_probe_repo_access "$token" "$app_label" "$repo"
     rc=$?
     if [[ "$rc" -ne 0 ]]; then
-      quay_auth_classify_probe_failure "$output"
-      return "$?"
-    fi
-
-    output="$(
-      GH_TOKEN="$token" GITHUB_TOKEN="$token" \
-        gh pr list -R "$repo" --limit 1 2>&1 >/dev/null
-    )"
-    rc=$?
-    if [[ "$rc" -ne 0 ]]; then
-      quay_auth_classify_probe_failure "$output"
-      return "$?"
+      if [[ "$rc" -eq 11 ]]; then
+        had_coverage_gap=1
+        continue
+      fi
+      return "$rc"
     fi
   done
+  if [[ "$had_coverage_gap" -eq 1 ]]; then
+    for output in "${QUAY_AUTH_COVERAGE_GAPS[@]}"; do
+      quay_auth_warn "GitHub App coverage gap: $output"
+    done
+    return 11
+  fi
   return 0
 }
 

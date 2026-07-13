@@ -34,8 +34,8 @@
 #                        — reviewer App env file (default:
 #                          /etc/hermes/reviewer.env)
 #   QUAY_REVIEWER_GH_TOKEN
-#                        — when set, used as-is and the reviewer helper is
-#                          skipped
+#                        — when set, validated as the reviewer App token and
+#                          the reviewer helper is skipped
 #   QUAY_BIN             — quay binary path (default: /usr/local/bin/quay)
 
 set -u
@@ -99,13 +99,27 @@ mint_from_helper() {
 }
 
 mint_reviewer_gh_token() {
-  [[ -n "${QUAY_REVIEWER_GH_TOKEN:-}" ]] && return 0
+  if [[ -n "${QUAY_REVIEWER_GH_TOKEN:-}" ]]; then
+    quay_auth_validate_token "$QUAY_REVIEWER_GH_TOKEN" "reviewer"
+    local validate_rc=$?
+    if [[ "$validate_rc" -ne 0 ]]; then
+      quay_auth_die "configured reviewer GitHub token does not have required Quay repo/PR access" 75
+    fi
+    return 0
+  fi
 
   local config="${HERMES_REVIEWER_GH_CONFIG:-/etc/hermes/reviewer.env}"
   [[ -f "$config" ]] || return 0
 
   local token
-  token="$(mint_from_helper "reviewer" "$config")" || return 0
+  if ! token="$(mint_from_helper "reviewer" "$config")"; then
+    quay_auth_die "reviewer GitHub token mint failed; check $config, network access, and reviewer App installation/rate limits" 75
+  fi
+  quay_auth_validate_token "$token" "reviewer"
+  local validate_rc=$?
+  if [[ "$validate_rc" -ne 0 ]]; then
+    quay_auth_die "minted reviewer GitHub token does not have required Quay repo/PR access" 75
+  fi
   export QUAY_REVIEWER_GH_TOKEN="$token"
 }
 

@@ -56,6 +56,9 @@ def _runner_env(tmp_path: Path, reviewer_env: Path) -> dict[str, str]:
         'if [[ -n "${GH_FAIL_TOKEN:-}" && "${GH_TOKEN:-}" != "$GH_FAIL_TOKEN" ]]; then\n'
         '  exit_code=0\n'
         'fi\n'
+        'if [[ -n "${GH_FAIL_REPO:-}" && "$*" != *"$GH_FAIL_REPO"* ]]; then\n'
+        '  exit_code=0\n'
+        'fi\n'
         'if [[ "$exit_code" != "0" ]]; then\n'
         '  printf "%s\\n" "$stderr" >&2\n'
         "fi\n"
@@ -131,6 +134,42 @@ def test_quay_tick_runner_exports_worker_and_reviewer_tokens(tmp_path: Path):
     assert "QUAY_WORKER_GH_TOKEN=worker-token" in log
     assert "GH_TOKEN=worker-token" in log
     assert "QUAY_REVIEWER_GH_TOKEN=reviewer-token" in log
+
+
+def test_reviewer_app_repo_coverage_gap_fails_before_quay(tmp_path: Path):
+    reviewer_env = tmp_path / "reviewer.env"
+    reviewer_env.write_text("HERMES_GH_APP_ID=reviewer\n", encoding="utf-8")
+    env = _runner_env(tmp_path, reviewer_env)
+    env.update(
+        {
+            "HERMES_QUAY_GITHUB_AUTH_REPOS": (
+                "InverterNetwork/hermes-agent,InverterNetwork/hermes-state"
+            ),
+            "GH_FAIL_TOKEN": "reviewer-token",
+            "GH_FAIL_REPO": "InverterNetwork/hermes-state",
+            "GH_PR_LIST_EXIT": "1",
+            "GH_PR_LIST_STDERR": "HTTP 404: Not Found",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 75
+    assert not Path(env["QUAY_LOG"]).exists()
+    assert (
+        "GitHub App coverage gap: reviewer App cannot access "
+        "InverterNetwork/hermes-state during pr list: HTTP 404: Not Found"
+    ) in result.stderr
+    assert (
+        "minted reviewer GitHub token does not have required Quay repo/PR access"
+        in result.stderr
+    )
 
 
 def test_reviewer_mint_ignores_generic_worker_helper_env(tmp_path: Path):

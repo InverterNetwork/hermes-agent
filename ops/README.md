@@ -605,11 +605,17 @@ notifications should not be held behind GitHub auth availability.
 
 When `/etc/hermes/reviewer.env` exists, the runner also mints a token
 from the reviewer App credentials and exports it as
-`$QUAY_REVIEWER_GH_TOKEN`. Quay uses that token only for reviewer
-attempts, keeping reviewer reviews under the reviewer App while worker
-attempts continue to use `$GH_TOKEN`. The helper cache for reviewer
-tokens lives at `/run/hermes/reviewer-token-cache.json`; the tick service
-creates `/run/hermes` with `RuntimeDirectory=hermes`.
+`$QUAY_REVIEWER_GH_TOKEN`. Before `quay tick` starts, the runner validates
+that reviewer token against the same registered Quay repo set as the worker
+token. A configured reviewer App that cannot view or list PRs for any repo
+fails the tick with an explicit coverage-gap warning naming the App and repo,
+for example `GitHub App coverage gap: reviewer App cannot access
+InverterNetwork/hermes-state ...`, instead of letting reviewer attempts
+404-loop later. Quay uses the reviewer token only for reviewer attempts,
+keeping reviewer reviews under the reviewer App while worker attempts
+continue to use `$GH_TOKEN`. The helper cache for reviewer tokens lives at
+`/run/hermes/reviewer-token-cache.json`; the tick service creates
+`/run/hermes` with `RuntimeDirectory=hermes`.
 
 The cache (5-min refresh margin) absorbs intra-tick churn. New tick and
 parked-handoff runner invocations refresh stale inherited env values
@@ -626,6 +632,13 @@ every repo with a `quay:` block in `deploy.values.yaml`. Adding a new
 quay-managed repo is a one-time GitHub-side step: open the App's
 Configure page on github.com and add the repo to its installation. Mint
 keeps working unchanged.
+
+On hosts with reviewer wiring, grant the same registered repo set to both
+GitHub Apps. The worker App must cover branch/PR creation, and the reviewer
+App must cover PR review posting. The runtime coverage check runs in
+`quay-tick-runner` after token minting and before `quay tick`, so a missing
+reviewer installation grant such as the BRIX-1900 `hermes-state` incident is
+reported as a startup auth failure rather than a silent per-task retry loop.
 
 If `gh pr list` returns 404/403 even with `$GH_TOKEN` set, the App is
 authenticated but lacks scope on the target repo — the fix is on
