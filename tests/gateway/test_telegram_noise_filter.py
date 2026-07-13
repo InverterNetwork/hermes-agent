@@ -145,6 +145,7 @@ def test_chat_gateways_keep_normal_answers(platform):
     assert _sanitize_gateway_final_response(platform, answer) == answer
 
 
+<<<<<<< HEAD
 def test_status_callback_mode_allows_expected_event_types():
     assert _status_callback_mode_allows("all", "lifecycle") is True
     assert _status_callback_mode_allows("all", "warn") is True
@@ -152,6 +153,15 @@ def test_status_callback_mode_allows_expected_event_types():
     assert _status_callback_mode_allows("warn", "warn") is True
     assert _status_callback_mode_allows("off", "warn") is False
     assert _status_callback_mode_allows(False, "warn") is False
+=======
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_drop_interrupt_sentinel(platform):
+    """The interrupt-while-waiting sentinel is metadata, not a reply (#7921)."""
+    sentinel = "Operation interrupted: waiting for model response (1.7s elapsed)."
+
+    assert _sanitize_gateway_final_response(platform, sentinel) == ""
+    assert _sanitize_gateway_final_response("local", sentinel) == sentinel
+>>>>>>> upstream/main
 
 
 def test_telegram_status_sanitizes_raw_provider_security_errors():
