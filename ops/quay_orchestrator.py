@@ -247,6 +247,12 @@ DEFAULT_REMEDIATION_LINEAR_TEAM_ID = "28294e03-c1ce-4c2b-ba24-49e36179a321"
 # BRIX "AI Automation" project — friction tickets file here, not the team root.
 DEFAULT_REMEDIATION_LINEAR_PROJECT_ID = "273a789d-30a8-4a88-baac-9867df5aedb0"
 
+# Quay enqueues review findings it wants filed as Linear issues under this
+# outbox kind + ``route_hint={"provider":"linear"}`` (BRIX-1896). The kind is
+# also the discriminant Quay folds into the Linear idempotency-key source, so
+# it must stay byte-identical to Quay's REVIEW_FINDING_LINEAR_ISSUE_OUTBOX_KIND.
+REVIEW_FINDING_LINEAR_ISSUE_KIND = "delivery.review_finding_linear_issue"
+
 
 @dataclass(frozen=True)
 class OrchestratorConfig:
@@ -272,6 +278,12 @@ class OrchestratorConfig:
     remediation_escalation_message_enabled: bool = False
     remediation_linear_team_id: str = DEFAULT_REMEDIATION_LINEAR_TEAM_ID
     remediation_linear_project_id: str = DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
+    # Linear team review findings (kind ``delivery.review_finding_linear_issue``)
+    # are filed under (BRIX-1896). Empty means "fall back to
+    # ``remediation_linear_team_id``" — resolved at delivery time, not here, so a
+    # deploy can point review findings at a different team without touching the
+    # friction team.
+    review_finding_linear_team_id: str = ""
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "OrchestratorConfig":
@@ -312,6 +324,9 @@ class OrchestratorConfig:
             remediation_linear_project_id=str(
                 raw.get("remediation_linear_project_id")
                 or DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
+            ),
+            review_finding_linear_team_id=str(
+                raw.get("review_finding_linear_team_id") or ""
             ),
         )
 
@@ -410,6 +425,10 @@ class OrchestratorConfig:
             remediation_linear_project_id=(
                 os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_PROJECT_ID")
                 or self.remediation_linear_project_id
+            ),
+            review_finding_linear_team_id=(
+                os.getenv("QUAY_ORCHESTRATOR_REVIEW_FINDING_LINEAR_TEAM_ID")
+                or self.review_finding_linear_team_id
             ),
         )
 
@@ -2095,6 +2114,41 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
             return str(issue.get("identifier") or issue.get("id") or "")
         return None
 
+    def create_review_finding_issue(
+        self, team_id: str, payload: Mapping[str, Any]
+    ) -> str:
+        """File a Quay review finding as a Linear issue (BRIX-1896).
+
+        Idempotent: the client-supplied issue ``id`` is a deterministic UUID
+        derived from the finding fingerprint, so a re-delivery of the same
+        outbox row re-creates nothing on Linear's side. Unlike the best-effort
+        friction path, this raises on any non-success response — the caller
+        must NOT complete the outbox item unless the issue actually landed.
+        """
+        title = str(payload.get("title") or "").strip() or "Quay review finding"
+        mutation = (
+            "mutation($input: IssueCreateInput!) { "
+            "issueCreate(input: $input) { success issue { id identifier url } } }"
+        )
+        variables: dict[str, Any] = {
+            "id": _review_finding_provider_idempotency_key(payload),
+            "teamId": team_id,
+            "title": title,
+            "description": _render_review_finding_issue_body(payload),
+        }
+        data = self._linear_call(mutation, {"input": variables})
+        result = (
+            (data.get("data") or {}).get("issueCreate")
+            if isinstance(data, Mapping)
+            else None
+        )
+        if not isinstance(result, Mapping) or result.get("success") is not True:
+            raise RuntimeError("Linear issueCreate did not succeed for review finding")
+        issue = result.get("issue")
+        if not isinstance(issue, Mapping):
+            raise RuntimeError("Linear issueCreate returned no issue for review finding")
+        return str(issue.get("identifier") or issue.get("id") or "")
+
     def _linear_call(
         self, query: str, variables: Mapping[str, Any]
     ) -> Mapping[str, Any]:
@@ -2523,6 +2577,12 @@ class HandoffDrainer:
             return self._fail_delivery_unexpected(item, exc)
 
     def _deliver_claimed_item(self, item: OutboxItem) -> DrainResult:
+        # Dispatch by provider BEFORE the Slack post: review findings Quay routes
+        # to Linear (BRIX-1896) must become Linear issues, not #code-factory
+        # posts. Everything else keeps the historical Slack behavior.
+        if _is_review_finding_linear_delivery(item):
+            return self._deliver_review_finding_linear_issue(item)
+
         task = self.quay.get_task_context(item.task_id)
         handoff = item.as_handoff(task)
         route = resolve_slack_route(handoff, task, self.config)
@@ -2570,6 +2630,43 @@ class HandoffDrainer:
         return DrainResult(
             status="delivery_delivered",
             handoff_id=handoff.handoff_id,
+            task_id=item.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _deliver_review_finding_linear_issue(self, item: OutboxItem) -> DrainResult:
+        # Resolve the team lazily so an unset review-finding team falls back to
+        # the friction team; a still-empty result is a config error that must
+        # fail/quarantine rather than silently fall back to Slack.
+        team_id = (
+            self.config.review_finding_linear_team_id
+            or self.config.remediation_linear_team_id
+            or ""
+        ).strip()
+        if not team_id:
+            raise RuntimeError(
+                "review finding Linear delivery has no usable team id "
+                "(set review_finding_linear_team_id or remediation_linear_team_id)"
+            )
+        issue = self.remediator.create_review_finding_issue(team_id, item.payload)
+        # Idempotent on Linear's side (client-supplied issue id), so at-least-once
+        # completion is safe: a retry after a completion failure re-creates
+        # nothing. Any creation failure raised above routes to quarantine via
+        # _handle_claimed_delivery_item — never a Slack fallback.
+        self.quay.complete_outbox_item(item)
+        self.metrics.delivery_items_delivered += 1
+        log_event(
+            self.logger,
+            "outbox_item_delivered",
+            outbox_item_id=item.outbox_item_id,
+            task_id=item.task_id,
+            kind=item.kind,
+            provider="linear",
+            linear_issue=issue,
+        )
+        return DrainResult(
+            status="delivery_delivered",
+            handoff_id=f"outbox:{item.outbox_item_id}",
             task_id=item.task_id,
             metrics=self.metrics.as_dict(),
         )
@@ -4559,6 +4656,95 @@ def _json_mapping_field(encoded: Any, fallback: Any = None) -> dict[str, Any]:
     if value is None:
         return {}
     return {"value": value}
+
+
+def _is_review_finding_linear_delivery(item: OutboxItem) -> bool:
+    """A delivery row Quay wants filed as a Linear issue, not Slack-posted.
+
+    Matches on either the dedicated kind or ``route_hint.provider == "linear"``
+    (BRIX-1896); Quay sets both, so either alone is sufficient here.
+    """
+    if item.kind.strip() == REVIEW_FINDING_LINEAR_ISSUE_KIND:
+        return True
+    provider = item.route_hint.get("provider")
+    return isinstance(provider, str) and provider.strip().lower() == "linear"
+
+
+def _review_finding_provider_idempotency_key(payload: Mapping[str, Any]) -> str:
+    """Deterministic Linear issue ``id`` for a review finding.
+
+    Mirrors Quay's ``linearIssueProviderIdempotencyKey`` byte-for-byte
+    (`packages/cli/src/core/review_finding_linear_outbox.ts`): a v5-shaped UUID
+    over ``kind:task_id:review_id:fingerprint``. Passing it as Linear's client
+    ``id`` makes ``issueCreate`` idempotent, so a re-delivery cannot duplicate.
+    """
+    source = ":".join(
+        [
+            REVIEW_FINDING_LINEAR_ISSUE_KIND,
+            str(payload.get("task_id") or ""),
+            str(payload.get("review_id") or ""),
+            str(payload.get("fingerprint") or ""),
+        ]
+    )
+    digest = bytearray(hashlib.sha256(source.encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    hexed = digest.hex()
+    return "-".join(
+        [hexed[0:8], hexed[8:12], hexed[12:16], hexed[16:20], hexed[20:32]]
+    )
+
+
+def _render_review_finding_issue_body(payload: Mapping[str, Any]) -> str:
+    """Compose the Linear issue body: finding text, principle, locations, PR."""
+    sections: list[str] = []
+    body_markdown = str(payload.get("body_markdown") or "").strip()
+    if body_markdown:
+        sections.append(body_markdown)
+    principle = payload.get("principle_text")
+    if isinstance(principle, str) and principle.strip():
+        sections.append(f"## quay-principle\n{principle.strip()}")
+    location_lines = _format_review_finding_locations(payload.get("locations"))
+    if location_lines:
+        sections.append("## Locations\n" + "\n".join(location_lines))
+    pr_url = payload.get("pr_url")
+    if isinstance(pr_url, str) and pr_url.strip():
+        sections.append(f"PR: {pr_url.strip()}")
+    return "\n\n".join(sections)
+
+
+def _format_review_finding_locations(locations: Any) -> list[str]:
+    if not isinstance(locations, list):
+        return []
+    lines: list[str] = []
+    for location in locations:
+        if not isinstance(location, Mapping):
+            continue
+        parts: list[str] = []
+        path = location.get("path")
+        if isinstance(path, str) and path.strip():
+            parts.append(path.strip())
+        line_range = _format_line_range(
+            location.get("start_line"), location.get("end_line")
+        )
+        if line_range:
+            parts.append(line_range)
+        lines.append(f"- {':'.join(parts) if parts else '(review body)'}")
+        url = location.get("url")
+        if isinstance(url, str) and url.strip():
+            lines.append(f"  {url.strip()}")
+    return lines
+
+
+def _format_line_range(start: Any, end: Any) -> str:
+    start_line = start if isinstance(start, int) and not isinstance(start, bool) else None
+    end_line = end if isinstance(end, int) and not isinstance(end, bool) else None
+    if start_line is None and end_line is None:
+        return ""
+    if start_line is not None and end_line is not None and start_line != end_line:
+        return f"{start_line}-{end_line}"
+    resolved = start_line if start_line is not None else end_line
+    return str(resolved)
 
 
 def delivery_message_from_outbox(

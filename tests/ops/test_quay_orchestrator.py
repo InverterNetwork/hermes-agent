@@ -3758,3 +3758,285 @@ def test_drain_escalate_with_friction_noop_when_flag_off():
     assert quay_client.submitted == []  # still escalates
     assert result.metrics["remediation_escalated"] == 1
     assert linear.calls == []  # friction NOT filed while the flag is off
+
+
+# -- BRIX-1896: review-finding Linear delivery -------------------------------
+
+
+def _review_finding_payload(**overrides):
+    payload = {
+        "finding_id": 44,
+        "task_id": "task-synthetic",
+        "review_id": "review-1",
+        "head_sha": "deadbeefcafe",
+        "fingerprint": "fp-abc123",
+        "title": "Settlement dependencies are self-contradictory",
+        "body_markdown": "The settlement module transitively depends on itself.",
+        "principle_text": "Modules must not form dependency cycles.",
+        "repo_id": "InverterNetwork/iTRY-monorepo",
+        "pr_number": 1000,
+        "pr_url": "https://github.com/InverterNetwork/iTRY-monorepo/pull/1000",
+        "locations": [
+            {
+                "path": "src/settle.ts",
+                "start_line": 10,
+                "end_line": 12,
+                "url": "https://github.com/InverterNetwork/iTRY-monorepo/blob/x/src/settle.ts#L10-L12",
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _review_finding_item(*, payload=None, kind=None, route_hint=None, outbox_item_id=330):
+    resolved_payload = payload if payload is not None else _review_finding_payload()
+    return quay.OutboxItem.from_mapping(
+        {
+            "outbox_item_id": outbox_item_id,
+            "task_id": str(resolved_payload.get("task_id") or "task-synthetic"),
+            "kind": kind if kind is not None else quay.REVIEW_FINDING_LINEAR_ISSUE_KIND,
+            "handler_class": "delivery",
+            "claim_id": f"outbox-claim-{outbox_item_id}",
+            "payload_json": json.dumps(resolved_payload),
+            "route_hint_json": json.dumps(
+                route_hint if route_hint is not None else {"provider": "linear"}
+            ),
+            "status": "pending",
+            "last_error": None,
+        }
+    )
+
+
+class FakeReviewFindingLinear:
+    """Fake Linear transport for the review-finding ``issueCreate`` mutation."""
+
+    def __init__(self, *, success=True):
+        self.success = success
+        self.calls = []
+
+    def __call__(self, query, variables):
+        self.calls.append((query, variables))
+        if "issueCreate" not in query:
+            raise AssertionError(f"unexpected linear query: {query!r}")
+        if not self.success:
+            return {"data": {"issueCreate": {"success": False, "issue": None}}}
+        return {
+            "data": {
+                "issueCreate": {
+                    "success": True,
+                    "issue": {
+                        "id": "iss_rf",
+                        "identifier": "BRIX-7001",
+                        "url": "https://linear.app/inverter/issue/BRIX-7001",
+                    },
+                }
+            }
+        }
+
+
+class ExplodingLinear:
+    """Fails the test if any Linear call is attempted (the Slack path never should)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, query, variables):
+        self.calls.append((query, variables))
+        raise AssertionError("Slack-kind delivery must not call Linear")
+
+
+def test_is_review_finding_linear_delivery_matches_kind_or_provider():
+    by_kind = _review_finding_item(route_hint={})
+    by_provider = _review_finding_item(kind="delivery.other", route_hint={"provider": "linear"})
+    slack_kind = delivery_item(route_hint={"channel_id": "CDELIVERY"})
+    assert quay._is_review_finding_linear_delivery(by_kind) is True
+    assert quay._is_review_finding_linear_delivery(by_provider) is True
+    assert quay._is_review_finding_linear_delivery(slack_kind) is False
+
+
+def test_render_review_finding_issue_body_omits_absent_sections():
+    body = quay._render_review_finding_issue_body(
+        {"body_markdown": "just the finding", "locations": []}
+    )
+    assert body == "just the finding"
+
+
+def test_drain_one_linear_review_finding_creates_issue_not_slack():
+    payload = _review_finding_payload()
+    item = _review_finding_item(payload=payload)
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = FakeReviewFindingLinear()
+    config = quay.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="CDELIVERY",
+        review_finding_linear_team_id="team-review-xyz",
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    # No Slack side effects whatsoever — this is the bug's whole point.
+    assert slack.questions == []
+    assert slack.acks == []
+    assert slack.validations == []
+    # Exactly one Linear issueCreate, filed to the review-finding team.
+    assert len(linear.calls) == 1
+    _, variables = linear.calls[0]
+    create_input = variables["input"]
+    assert create_input["teamId"] == "team-review-xyz"
+    assert create_input["title"] == payload["title"]
+    assert "projectId" not in create_input
+    # Idempotency: the client-supplied id is the deterministic fingerprint UUID.
+    assert create_input["id"] == quay._review_finding_provider_idempotency_key(payload)
+    # Body carries the finding text, principle, location, and PR url.
+    body = create_input["description"]
+    assert payload["body_markdown"] in body
+    assert "## quay-principle" in body
+    assert payload["principle_text"] in body
+    assert "src/settle.ts:10-12" in body
+    assert payload["pr_url"] in body
+    # Outbox row completed; nothing failed.
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+    assert result.metrics["delivery_items_delivered"] == 1
+
+
+def test_drain_one_linear_review_finding_falls_back_to_remediation_team():
+    payload = _review_finding_payload()
+    item = _review_finding_item(payload=payload)
+    quay_client = FakeOutboxQuayClient(item)
+    linear = FakeReviewFindingLinear()
+    # review_finding_linear_team_id unset -> fall back to the remediation team.
+    config = quay.OrchestratorConfig(
+        enabled=True, remediation_linear_team_id="team-remediation-fallback"
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert linear.calls[0][1]["input"]["teamId"] == "team-remediation-fallback"
+
+
+def test_drain_one_linear_review_finding_redelivery_is_idempotent():
+    payload = _review_finding_payload()
+    config = quay.OrchestratorConfig(
+        enabled=True, review_finding_linear_team_id="team-review-xyz"
+    )
+
+    def drain_once():
+        item = _review_finding_item(payload=payload)
+        quay_client = FakeOutboxQuayClient(item)
+        linear = FakeReviewFindingLinear()
+        drainer = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=FakeSlackClient(),
+            config=config,
+            worker_id="test-worker",
+            remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+        )
+        assert drainer.drain_one().status == "delivery_delivered"
+        return linear.calls[0][1]["input"]["id"]
+
+    # Re-delivery of the same finding reuses the same client-supplied issue id,
+    # so Linear's issueCreate dedupes it — no duplicate ticket.
+    first_id = drain_once()
+    second_id = drain_once()
+    assert first_id == second_id
+    assert first_id == quay._review_finding_provider_idempotency_key(payload)
+
+
+def test_drain_one_slack_kind_still_posts_and_skips_linear():
+    item = delivery_item(route_hint={"channel_id": "CDELIVERY"})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = ExplodingLinear()
+    config = quay.OrchestratorConfig(enabled=True)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert len(slack.questions) == 1
+    assert slack.questions[0][0] == "CDELIVERY"
+    assert linear.calls == []  # Slack kinds never touch Linear
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+
+
+def test_drain_one_linear_review_finding_without_team_quarantines_not_slack():
+    item = _review_finding_item()
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = FakeReviewFindingLinear()
+    config = quay.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="CDELIVERY",
+        review_finding_linear_team_id="",
+        remediation_linear_team_id="",
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    # No usable team id -> fail/quarantine, never a silent Slack fallback.
+    assert result.status == "runner_error"
+    assert slack.questions == []
+    assert slack.acks == []
+    assert linear.calls == []
+    assert quay_client.completed == []
+    assert len(quay_client.failed) == 1
+
+
+def test_drain_one_linear_review_finding_creation_failure_quarantines():
+    item = _review_finding_item()
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = FakeReviewFindingLinear(success=False)
+    config = quay.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="CDELIVERY",
+        review_finding_linear_team_id="team-review-xyz",
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    # A failed issueCreate must not complete the row nor fall back to Slack.
+    assert result.status == "runner_error"
+    assert slack.questions == []
+    assert quay_client.completed == []
+    assert len(quay_client.failed) == 1
