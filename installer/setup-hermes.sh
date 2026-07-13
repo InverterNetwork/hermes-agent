@@ -589,10 +589,12 @@ if [[ "$QUAY_ENABLED" -eq 1 ]]; then
   fi
 fi
 
-# ---------- runtime managers (bun, ...) ----------
+# ---------- runtime managers and worker toolchain (bun, anvil, ...) ----------
 # Ensure each repos[].quay.package_manager binary is on PATH before quay's
 # bootstrap shells out to install_cmd via /bin/sh -c (minimal PATH; no
-# shell profile sourced). No-op when no package_manager is declared.
+# shell profile sourced). When quay.version is set, this also provisions
+# host-level worker tools such as anvil so spawned task shells inherit them
+# from /usr/local/bin instead of relying on ad-hoc host prep.
 PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
   ensure-runtimes --values "$VALUES_FILE"
 

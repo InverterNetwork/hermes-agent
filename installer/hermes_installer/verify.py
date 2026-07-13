@@ -1121,6 +1121,27 @@ def _check_quay_artefacts(s: _State, repos_tsv: str) -> None:
         _check_mode_owner(s, label, rt_info, "755", s.rails_owner)
         _check_version_pin(s, f"{label} version", rt_path, rt_pin)
 
+    for tool_name in ("anvil",):
+        tool_path = rt_install_dir / tool_name
+        label = f"quay worker tool {tool_name}"
+        tool_pin = _values_get(
+            s.values_file,
+            s.values_helper,
+            f"quay.toolchain.{tool_name}.version",
+        )
+        if not tool_pin:
+            s.v_drift(
+                label,
+                f"no quay.toolchain.{tool_name}.version pin in {s.values_file}",
+            )
+            continue
+        tool_info = _executable_info(tool_path)
+        if tool_info is None:
+            s.v_drift(label, f"missing or non-executable: {tool_path}")
+            continue
+        _check_mode_owner(s, label, tool_info, "755", s.rails_owner)
+        _check_version_pin(s, f"{label} version", tool_path, tool_pin)
+
 
 def _atlas_kb_root(s: _State) -> Path:
     raw = _values_get(s.values_file, s.values_helper, "atlas.kb_root")

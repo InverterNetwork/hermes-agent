@@ -1,9 +1,10 @@
 """``python3 -m hermes_installer`` entry point.
 
 * ``ensure-runtimes`` — provision pinned runtime managers (bun, ...) the
-  ``repos[].quay.package_manager`` entries declare. Idempotent. Refuses
-  on SHA mismatch or missing pin. Requires euid 0 unless
-  ``--skip-root-check`` is passed (tests only).
+  ``repos[].quay.package_manager`` entries declare and Quay host-level
+  worker tools (anvil, ...). Idempotent. Refuses on SHA mismatch or
+  missing pin. Requires euid 0 unless ``--skip-root-check`` is passed
+  (tests only).
 * ``ensure-codex`` — provision the pinned Codex CLI as a root-managed
   binary when Atlas or the caller say Codex is required.
 * ``ensure-caddy-atlas-hub-route`` — install the public Caddy route that
@@ -33,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
 
     er = sub.add_parser(
         "ensure-runtimes",
-        help="provision pinned runtime managers (bun, ...) declared by repos[]",
+        help="provision pinned runtime managers and Quay worker toolchain binaries",
     )
     er.add_argument(
         "--values",
@@ -176,13 +177,14 @@ def main(argv: list[str] | None = None) -> int:
         # Lazy-import: ensure-runtimes pulls in PyYAML via .config, which we
         # don't want as a hard dependency of the verify path (verify shells
         # out to values_helper.py instead).
-        from .config import load_values, required_runtime_managers
+        from .config import load_values, required_quay_toolchain, required_runtime_managers
         from .runtimes import ensure_runtimes
 
         if not args.skip_root_check:
             require_root()
         values = load_values(args.values)
         pins = required_runtime_managers(values)
+        pins.update(required_quay_toolchain(values))
         ensure_runtimes(pins, install_dir=args.install_dir)
         return 0
 
