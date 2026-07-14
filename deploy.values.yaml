@@ -264,6 +264,14 @@
 #                                 boundary. Idempotent: a binary already at the
 #                                 pinned version is a no-op; a wrong version is
 #                                 replaced atomically.
+#   quay.toolchain             — pinned host-level worker tools the installer
+#                                 must guarantee on PATH when Quay is enabled.
+#                                 These are not repo package managers; they are
+#                                 task substrate used by worker commands/tests.
+#                                 `anvil` is installed from Foundry's verified
+#                                 Linux amd64 release tarball to
+#                                 `/usr/local/bin/anvil` so fork-test-capable
+#                                 repos can invoke it directly.
 #   Quay reference repos context — once quay.version points at an AST-136
 #                                 release, setup-hermes.sh renders
 #                                 `[context].reference_repos_root` to
@@ -591,6 +599,17 @@ repos:
       # Per-repo tag vocab intentionally omitted. Add per-repo vocab here
       # once real ticket flow informs the namespace shape; absence is the
       # explicit "no vocab yet" signal.
+  - id: brix-solvers
+    url: https://github.com/InverterNetwork/brix-solvers
+    # pnpm-workspaces monorepo of solver engines (CoW Protocol, Uniswap X)
+    # filling USDC -> RWA via on-chain mint. First ticket flow: BRIX-1913.
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
   - id: erpc
     url: https://github.com/InverterNetwork/erpc
     base_branch: main
@@ -708,6 +727,15 @@ quay:
     pnpm:
       version: "10.33.4"
       linux_x64_sha256: "ff1795595535a10d0dfe327303f3dd02377be141190b1f5756de68edde2cf813"
+  # Host-level worker tools. These are installed into /usr/local/bin when
+  # Quay is enabled so spawned task shells inherit them from the tick runtime.
+  # `anvil` is packaged inside Foundry's Linux amd64 tarball. Resolve the SHA
+  # from the matching upstream checksum before bumping:
+  #   curl -fsSL https://github.com/foundry-rs/foundry/releases/download/v<ver>/foundry_v<ver>_linux_amd64.sha256
+  toolchain:
+    anvil:
+      version: "1.7.1"
+      linux_x64_sha256: "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b"
   adapters:
     linear:
       enabled: true
@@ -738,7 +766,7 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.11"
+  version: "v0.1.12"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main

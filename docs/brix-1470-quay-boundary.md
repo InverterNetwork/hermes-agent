@@ -36,6 +36,7 @@ separate Quay task.
 | `quay.release_repo` | Keep in Hermes | Download location for the pinned Quay binary. |
 | `quay.codex` | Keep in Hermes | Root-managed Codex CLI binary pin. Used when Atlas or Quay is enabled. |
 | `quay.runtime_managers` | Keep in Hermes | Ensures package managers required by registered repos exist on PATH. |
+| `quay.toolchain` | Keep in Hermes | Ensures host-level Quay worker tools such as `anvil` exist on PATH for spawned workers. |
 | `quay.agent_invocation` | Move to Quay | No longer sourced from `deploy.values.yaml`; existing deployed `config.toml` values are preserved and Quay defaults apply on fresh installs. |
 | `quay.agents` | Move to Quay | Same as `quay.agent_invocation`; setup provisions the standard local agent CLI set for Quay-enabled hosts. |
 | `quay.adapters.*.*_env` | Keep in Hermes | Secret env-var names are wiring. |

@@ -836,6 +836,10 @@ BUN_VERSION = "1.3.9"
 BUN_LINUX_X64_SHA256 = (
     "4680e80e44e32aa718560ceae85d22ecfbf2efb8f3641782e35e4b7efd65a1aa"
 )
+ANVIL_VERSION = "1.7.1"
+ANVIL_LINUX_X64_SHA256 = (
+    "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b"
+)
 
 
 def _write_quay_stub(
@@ -1383,6 +1387,10 @@ def quay_install(install: dict) -> dict:
         "    bun:\n"
         f"      version: \"{BUN_VERSION}\"\n"
         f"      linux_x64_sha256: \"{BUN_LINUX_X64_SHA256}\"\n"
+        "  toolchain:\n"
+        "    anvil:\n"
+        f"      version: \"{ANVIL_VERSION}\"\n"
+        f"      linux_x64_sha256: \"{ANVIL_LINUX_X64_SHA256}\"\n"
         "  adapters:\n"
         "    linear:\n"
         "      enabled: true\n"
@@ -1497,6 +1505,14 @@ def quay_install(install: dict) -> dict:
     )
     bun_stub.chmod(0o755)
 
+    anvil_stub = bin_dir / "anvil"
+    anvil_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'if [[ "$1" == "--version" ]]; then echo "anvil {ANVIL_VERSION}"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    anvil_stub.chmod(0o755)
+
     codex_stub = bin_dir / "codex"
     codex_stub.write_text(
         "#!/usr/bin/env bash\n"
@@ -1529,6 +1545,7 @@ def quay_install(install: dict) -> dict:
     install["quay_runner"] = quay_runner
     install["quay_profile"] = quay_profile
     install["bun_bin"] = bun_stub
+    install["anvil_bin"] = anvil_stub
     install["codex_bin"] = codex_stub
     install["agent_home"] = agent_home
     install["systemd_dir"] = systemd_dir

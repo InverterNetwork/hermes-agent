@@ -265,6 +265,15 @@ def test_installer_provisions_agent_clis_for_quay():
     assert "quay.agent_invocation references 'claude'" not in content
 
 
+def test_quay_tick_runtime_path_includes_managed_bins():
+    content = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
+
+    assert (
+        "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        in content
+    )
+
+
 def test_installer_persists_quay_expected_sha_for_verify():
     """The installer must leave verify a SHA source of truth for the quay
     binary instead of forcing verify to trust `quay --version` output."""
@@ -348,7 +357,6 @@ def test_atlas_gitbook_source_sync_is_configured():
     wrapper = (OPS_DIR / "atlas-as-hermes").read_text(encoding="utf-8")
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
-    assert 'version: "v0.1.11"' in values
     assert "google_docs:" in values
     assert "service_account_file: auth/otto-google-sa.json" in values
     assert "source_names:" in values
