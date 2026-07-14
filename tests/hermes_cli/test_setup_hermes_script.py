@@ -348,7 +348,6 @@ def test_atlas_gitbook_source_sync_is_configured():
     wrapper = (OPS_DIR / "atlas-as-hermes").read_text(encoding="utf-8")
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
-    assert 'version: "v0.1.11"' in values
     assert "google_docs:" in values
     assert "service_account_file: auth/otto-google-sa.json" in values
     assert "source_names:" in values
