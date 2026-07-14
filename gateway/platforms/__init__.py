@@ -28,10 +28,14 @@ __all__ = [
     "SendResult",
     "QQAdapter",
     "YuanbaoAdapter",
+    "slack",
 ]
 
 
 def __getattr__(name):
+    if name == "slack":
+        from importlib import import_module
+        return import_module(".slack", __name__)
     if name == "QQAdapter":
         from .qqbot import QQAdapter  # noqa: F401
         return QQAdapter

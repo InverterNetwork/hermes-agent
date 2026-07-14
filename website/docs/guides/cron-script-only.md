@@ -29,6 +29,7 @@ Hermes calls this **no-agent mode**. It's the cron system minus the LLM.
 - **No LLM call.** Zero tokens, zero agent loop, zero model spend.
 - **Script is the job.** The script decides whether to alert. Emit output → message gets sent. Emit nothing → silent tick.
 - **Bash or Python.** `.sh` / `.bash` files run under `/bin/bash`; any other extension runs under the current Python interpreter. Anything in `~/.hermes/scripts/` is accepted.
+- **Managed state.** On managed installs, `~/.hermes/scripts/` points at `~/.hermes/state/scripts/`, so scripts sync with the rest of Hermes state.
 - **Same scheduler.** Lives in `cronjob` alongside LLM jobs — pausing, resuming, listing, logs, and delivery targeting all work the same way.
 
 ## When to Use It
@@ -151,7 +152,7 @@ The "silent when empty" behavior is the key to the classic watchdog pattern: the
 
 ## Script Rules
 
-Scripts must live in `~/.hermes/scripts/`. This is enforced at both job-creation time and run time — absolute paths, `~/` expansion, and path-traversal patterns (`../`) are rejected. The same directory is shared with the pre-check script gate used by LLM jobs.
+Scripts must live in `~/.hermes/scripts/`. This is enforced at both job-creation time and run time — absolute paths, `~/` expansion, and path-traversal patterns (`../`) are rejected. On managed installs that path is a managed symlink to `~/.hermes/state/scripts/`; put scripts there through the `~/.hermes/scripts/` path. The same directory is shared with the pre-check script gate used by LLM jobs.
 
 Interpreter choice is by file extension:
 
@@ -161,6 +162,51 @@ Interpreter choice is by file extension:
 | anything else | `sys.executable` (current Python) |
 
 We intentionally do NOT honour `#!/...` shebangs — keeping the interpreter set explicit and small reduces the surface the scheduler trusts.
+
+## Giving a Script a Secret
+
+Script-only jobs run with **every Hermes-managed secret stripped** from their environment — provider API keys, GitHub tokens, gateway bot tokens, the lot (see [Credential Scoping](/security#23-credential-scoping)). A script runs arbitrary third-party dependencies, so ambient secrets are one poisoned dep away from exfiltration. Strip-by-default is the safe posture.
+
+But sometimes the script legitimately needs one — a watchdog that posts directly to Slack needs `SLACK_BOT_TOKEN`. You opt that one secret in through **two gates that must both agree**:
+
+1. **You declare it** on the job with `secrets: [...]` — the names your script needs.
+2. **An operator allowlists it** in the host `config.yaml` under `cron.injectable_secrets`.
+
+Only the intersection is injected. Declaring a name the operator hasn't allowlisted (or that's on the never-injectable hard floor) does nothing except log a warning — the script still runs, just without that secret.
+
+```python
+# You declare what the script needs:
+cronjob(
+    action="create",
+    schedule="every 5m",
+    script="slack-heartbeat.sh",
+    no_agent=True,
+    deliver="local",
+    secrets=["SLACK_BOT_TOKEN"],   # the declaration gate
+)
+```
+
+```yaml
+# An operator authorizes it once in ~/.hermes/config.yaml:
+cron:
+  injectable_secrets:
+    - SLACK_BOT_TOKEN
+```
+
+The secret's value comes from the environment the gateway already has (staged `auth/*.env` / `~/.hermes/.env`), so a token like `SLACK_BOT_TOKEN` that's already configured for the gateway is **provisioned once and reused freely** — the operator just adds its name to the allowlist, and any job can then declare it.
+
+Inside the script the secret is a normal env var:
+
+```bash
+#!/usr/bin/env bash
+# slack-heartbeat.sh — posts a heartbeat using the injected token.
+curl -sS -X POST https://slack.com/api/chat.postMessage \
+  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+  -H "Content-type: application/json" \
+  -d '{"channel":"#ops","text":"host alive"}' > /dev/null
+```
+
+**Never injectable, even if allowlisted:** GitHub tokens, provider/model API keys, the Slack **app** token and signing secret, dashboard/session tokens, and other-platform bot tokens. `SLACK_BOT_TOKEN` is the one always-stripped secret that's eligible; everything on that hard floor is refused (with a warning) no matter what the config says. Declare only the names your script actually uses.
 
 ## Schedule Syntax
 

@@ -494,6 +494,8 @@ slack:
       - C094LCV1X36  # test-devops (private)
       - C0B5ZUS7WRG  # requested 2026-06-01
       - C0B79CZLM50  # requested 2026-06-01
+      - C0AHDA8S3M1  # requested 2026-06-27
+      - C0BGC0U8YSH  # requested 2026-07-10
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: "C0B3WAWLL0L"
@@ -531,6 +533,18 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "cd looping/backend && bun install && cd ../frontend && bun install"
+  - id: brix-prototyping-sandbox
+    url: https://github.com/InverterNetwork/brix-prototyping-sandbox
+    # Sandbox repo used for prototype glue / review intake. Keep bootstrap as a
+    # no-op until the repo grows a stable install surface we actually want Quay
+    # workers to rely on.
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      install_cmd: "true"
   - id: iTRY-frontends
     url: https://github.com/InverterNetwork/iTRY-frontends
     # GH default branch is `master` (not `main`).
@@ -615,6 +629,17 @@ repos:
     quay:
       package_manager: bun
       install_cmd: "bun install"
+  - id: hermes-state
+    url: https://github.com/InverterNetwork/hermes-state
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: bun
+      # State/config repo; workers do not need a package bootstrap before
+      # editing skills, memories, cron jobs, or deployment state.
+      install_cmd: "true"
   - id: atlas
     url: https://github.com/InverterNetwork/atlas
     base_branch: dev
@@ -630,7 +655,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.40"
+  version: "v0.3.41"
   # Public org-owned release repo for unauthenticated installer downloads.
   release_repo: InverterNetwork/quay
   # Quay Agent panel backend. All values here are non-secret and are loaded by
@@ -701,12 +726,19 @@ quay:
     quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
     poll_interval_seconds: 15
+    # BRIX-1878 agentic blocker handling (code enforces the never-auto floor):
+    # Otto authors concise escalation messages when he escalates (safe: message-only).
+    remediation_escalation_message_enabled: true
+    # Otto may auto-resume blockers his code gates deem safe & reversible.
+    remediation_enabled: true
+    # Otto files recurring Quay-CLI friction he observes to Linear (BRIX team).
+    remediation_friction_enabled: true
 atlas:
   # Pinned Atlas CLI release tag. The installer downloads atlas-linux-<arch>
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.11"
+  version: "v0.1.12"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main

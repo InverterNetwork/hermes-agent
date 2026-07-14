@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Install the BRIX-1626 dev NAV Sepolia publisher cron job.
+"""Install and verify the dev NAV Sepolia publisher cron job.
 
 This is intentionally an operator-run installer: Hermes cron jobs and scripts
 live in host state under HERMES_HOME, not in the source checkout. Running this
 script materializes the deterministic no-agent script payload and upserts the
-daily cron record.
+daily cron record. ``--verify`` audits the live host state after deployment, and
+``--run-now`` executes the same materialized script path used by cron.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -81,15 +84,17 @@ else
   exit 1
 fi
 
-if [ -n "${DEV_NAV_PUBLISH_PASSWORD_FILE:-}" ]; then
-  if [ ! -r "$DEV_NAV_PUBLISH_PASSWORD_FILE" ]; then
-    echo "dev-nav-publish failed: DEV_NAV_PUBLISH_PASSWORD_FILE is not readable: $DEV_NAV_PUBLISH_PASSWORD_FILE" >&2
-    exit 1
-  fi
-  signer_args+=(--password-file "$DEV_NAV_PUBLISH_PASSWORD_FILE")
+if [ -z "${DEV_NAV_PUBLISH_PASSWORD_FILE:-}" ]; then
+  echo "dev-nav-publish failed: set DEV_NAV_PUBLISH_PASSWORD_FILE so cast cannot prompt interactively" >&2
+  exit 1
 fi
+if [ ! -r "$DEV_NAV_PUBLISH_PASSWORD_FILE" ]; then
+  echo "dev-nav-publish failed: DEV_NAV_PUBLISH_PASSWORD_FILE is not readable: $DEV_NAV_PUBLISH_PASSWORD_FILE" >&2
+  exit 1
+fi
+signer_args+=(--password-file "$DEV_NAV_PUBLISH_PASSWORD_FILE")
 
-if [ -n "${DEV_NAV_PUBLISH_PRIVATE_KEY:-}${NAV_PUBLISH_PRIVATE_KEY:-}" ]; then
+if [ -n "${DEV_NAV_PUBLISH_PRIVATE_KEY+x}${NAV_PUBLISH_PRIVATE_KEY+x}" ]; then
   echo "dev-nav-publish failed: raw private-key env vars are not accepted; use a Foundry keystore account" >&2
   exit 1
 fi
@@ -165,18 +170,86 @@ printf '\n'
 '''
 
 
-def install() -> None:
-    hermes_home = get_hermes_home()
-    scripts_dir = hermes_home / "scripts"
+class VerificationError(RuntimeError):
+    """Raised when host cron state does not match the expected NAV job."""
+
+
+def _script_path() -> Path:
+    return get_hermes_home() / "scripts" / SCRIPT_NAME
+
+
+def _write_script() -> Path:
+    scripts_dir = get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
     script_path = scripts_dir / SCRIPT_NAME
     script_path.write_text(SCRIPT_PAYLOAD, encoding="utf-8")
     script_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    return script_path
 
-    from cron.jobs import create_job, list_jobs, update_job
 
-    existing = next((job for job in list_jobs(include_disabled=True) if job.get("name") == JOB_NAME), None)
+def _matching_jobs():
+    from cron.jobs import list_jobs
+
+    return [job for job in list_jobs(include_disabled=True) if job.get("name") == JOB_NAME]
+
+
+def _verify_job_shape(job: dict) -> list[str]:
+    errors: list[str] = []
+    schedule = job.get("schedule") or {}
+    checks = {
+        "schedule.kind": schedule.get("kind") == "cron",
+        "schedule.expr": schedule.get("expr") == JOB_SCHEDULE,
+        "schedule_display": job.get("schedule_display") == JOB_SCHEDULE,
+        "script": job.get("script") == SCRIPT_NAME,
+        "no_agent": job.get("no_agent") is True,
+        "enabled": job.get("enabled") is True,
+        "state": job.get("state") == "scheduled",
+        "prompt": job.get("prompt") in {None, ""},
+    }
+    for field, ok in checks.items():
+        if not ok:
+            errors.append(f"{field} drifted")
+    return errors
+
+
+def verify_installed() -> dict:
+    """Verify the materialized host state for the dev NAV cron job."""
+
+    script_path = _script_path()
+    errors: list[str] = []
+    if not script_path.is_file():
+        errors.append(f"missing script: {script_path}")
+    else:
+        if script_path.read_text(encoding="utf-8") != SCRIPT_PAYLOAD:
+            errors.append(f"script payload drifted: {script_path}")
+        mode = script_path.stat().st_mode
+        expected_mode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+        if stat.S_IMODE(mode) != expected_mode:
+            errors.append(f"script mode is {stat.S_IMODE(mode):03o}, expected 700")
+
+    jobs = _matching_jobs()
+    if len(jobs) != 1:
+        errors.append(f"expected exactly one {JOB_NAME!r} job, found {len(jobs)}")
+    elif job_errors := _verify_job_shape(jobs[0]):
+        errors.extend(job_errors)
+
+    if errors:
+        raise VerificationError("; ".join(errors))
+
+    return {
+        "job": jobs[0],
+        "script": script_path,
+    }
+
+
+def install() -> None:
+    script_path = _write_script()
+
+    from cron.jobs import create_job, remove_job, update_job
+
+    matches = _matching_jobs()
+    existing = matches[0] if matches else None
     if existing:
         job = update_job(
             existing["id"],
@@ -193,6 +266,8 @@ def install() -> None:
                 "paused_reason": None,
             },
         )
+        for duplicate in matches[1:]:
+            remove_job(duplicate["id"])
         action = "updated"
     else:
         job = create_job(
@@ -205,13 +280,70 @@ def install() -> None:
         )
         action = "created"
 
+    verified = verify_installed()
     print(f"{action} cron job {job['id']}: {JOB_NAME}")
     print(f"script: {script_path}")
     print(f"schedule: {JOB_SCHEDULE} UTC (09:30 Europe/Istanbul)")
     print(f"oracle: {DEV_NAV_ORACLE_ADDRESS}")
     print("mode: no_agent script-only")
+    print(f"verified: cron job {verified['job']['id']} and script payload match expected host state")
+
+
+def run_now() -> None:
+    """Execute the installed script once and stream its verification output."""
+
+    verified = verify_installed()
+    script_path = verified["script"]
+    env = os.environ.copy()
+    env.setdefault("HERMES_HOME", str(get_hermes_home()))
+    result = subprocess.run(
+        ["bash", str(script_path)],
+        cwd=str(get_hermes_home()),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=int(os.environ.get("DEV_NAV_RUN_NOW_TIMEOUT", "180")),
+        check=False,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Install, verify, and optionally execute the host-managed dev "
+            "Sepolia NAV publisher cron job."
+        )
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Only verify that the live HERMES_HOME script and cron job are installed correctly.",
+    )
+    parser.add_argument(
+        "--run-now",
+        action="store_true",
+        help="After install/verify, execute the installed script once to publish and verify on-chain.",
+    )
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     os.environ.setdefault("HERMES_IGNORE_RULES", "1")
-    install()
+    args = _parse_args(sys.argv[1:])
+    if args.verify:
+        try:
+            state = verify_installed()
+        except VerificationError as exc:
+            print(f"dev NAV cron verification failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        print(f"dev NAV cron verified: job={state['job']['id']} script={state['script']}")
+    else:
+        install()
+    if args.run_now:
+        run_now()

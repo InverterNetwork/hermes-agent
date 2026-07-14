@@ -159,6 +159,12 @@ def main(argv: list[str] | None = None) -> int:
         help="path to deploy.values.yaml (defaults to <fork>/deploy.values.yaml)",
     )
     vr.add_argument(
+        "--state",
+        type=Path,
+        default=None,
+        help="local hermes-state source path used by setup-hermes.sh fixture installs",
+    )
+    vr.add_argument(
         "--gh-api-base",
         default=None,
         help="override GitHub API base URL (CI only; production uses api.github.com)",
@@ -253,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                 auth_method=args.auth_method,
                 quiet=args.quiet,
                 values=args.values,
+                state=args.state,
                 gh_api_base=args.gh_api_base,
             )
         )

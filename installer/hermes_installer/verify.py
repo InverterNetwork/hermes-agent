@@ -36,6 +36,7 @@ from .caddy import caddyfile_has_atlas_hub_route
 
 
 _REFERENCE_REPOS_MIN_QUAY_VERSION = (0, 3, 10)
+_STATE_MANAGED_DIRS = ("skills", "memories", "cron", "scripts")
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,7 @@ class VerifyArgs:
     auth_method: str = "none"
     quiet: bool = False
     values: Path | None = None
+    state: Path | None = None
     gh_api_base: str | None = None
 
 
@@ -309,7 +311,12 @@ def _git_config_file_get_all_as_agent(s: _State, config_file: Path, key: str) ->
 
 
 def _v_check_clone_basics(
-    s: _State, label: str, clone_path: Path, expected_url: str, expected_owner: str,
+    s: _State,
+    label: str,
+    clone_path: Path,
+    expected_url: str,
+    expected_owner: str,
+    alternate_expected_urls: set[str] | None = None,
 ) -> None:
     """Verify-side counterpart to bash ``_v_check_clone_basics`` — emits
     v_ok/v_drift for owner + literal stored origin URL on a clone."""
@@ -319,7 +326,8 @@ def _v_check_clone_basics(
     else:
         s.v_drift(f"{label} ownership", f"expected {expected_owner}, got {owner}")
     origin = _git_config_get(clone_path, "remote.origin.url")
-    if origin == expected_url:
+    expected_urls = {expected_url, *(alternate_expected_urls or set())}
+    if origin in expected_urls:
         s.v_ok(f"{label} origin: {origin}")
     else:
         s.v_drift(
@@ -643,7 +651,7 @@ def _check_gateway_org_defaults(s: _State) -> None:
 
 def _check_state_symlinks(s: _State) -> None:
     target = s.args.target
-    for d in ("skills", "memories", "cron"):
+    for d in _STATE_MANAGED_DIRS:
         link = target / d
         if link.is_symlink():
             tgt = os.readlink(link)
@@ -665,6 +673,26 @@ def _check_state_repo(s: _State, app_auth_expected: bool) -> None:
         s.v_ok(f"state .git ownership: {sown}")
     else:
         s.v_drift("state ownership", f"expected {s.agent_owner}, got {sown}")
+    for d in _STATE_MANAGED_DIRS:
+        path = state / d
+        info = _stat_info(path)
+        if not path.is_dir() or info is None:
+            s.v_drift(f"state/{d}", f"missing or not a directory: {path}")
+            continue
+        mode, owner, _group_name = info
+        try:
+            st_mode = path.stat().st_mode
+            writable = bool(st_mode & stat.S_IWUSR)
+            searchable = bool(st_mode & stat.S_IXUSR)
+        except OSError:
+            writable = searchable = False
+        if owner == s.agent_owner and writable and searchable:
+            s.v_ok(f"state/{d}: {mode} {owner}")
+        else:
+            s.v_drift(
+                f"state/{d}",
+                f"mode={mode} owner={owner} (expected {s.agent_owner}-writable directory)",
+            )
     for k in ("user.name", "user.email"):
         # `--local` so we only read this repo's own config — accepting global
         # values would mask drift after a `git config --unset`.
@@ -778,6 +806,39 @@ def _parse_repos_tsv(tsv: str) -> list[tuple[str, str, str, str, str]]:
         parts += [""] * (5 - len(parts))
         rows.append(tuple(parts[:5]))  # type: ignore[arg-type]
     return rows
+
+
+def _is_legacy_state_repo_fixture(
+    args: VerifyArgs, repo_id: str, repo_url: str,
+) -> bool:
+    return (
+        args.auth_method == "none"
+        and args.state is not None
+        and repo_id == "hermes-state"
+        and repo_url == "https://github.com/InverterNetwork/hermes-state"
+    )
+
+
+def _legacy_state_repo_fixture_urls(s: _State, repo_id: str, repo_url: str) -> set[str]:
+    if repo_id != "hermes-state":
+        return set()
+    if repo_url != "https://github.com/InverterNetwork/hermes-state":
+        return set()
+    state_origin = _git_config_get(s.args.target / "state", "remote.origin.url")
+    if not state_origin:
+        return set()
+    if re.match(r"^(https?://|ssh://|git://|git@)", state_origin):
+        return set()
+    return {state_origin, f"file://{state_origin}"}
+
+
+def _effective_repos_tsv(args: VerifyArgs, repos_tsv: str) -> str:
+    rows = []
+    for repo_id, repo_url, repo_base, repo_pkg, repo_install in _parse_repos_tsv(repos_tsv):
+        if _is_legacy_state_repo_fixture(args, repo_id, repo_url):
+            repo_url = f"file://{args.state}"
+        rows.append("\t".join((repo_id, repo_url, repo_base, repo_pkg, repo_install)))
+    return "\n".join(rows)
 
 
 def _parse_quay_version(value: str) -> tuple[int, int, int] | None:
@@ -1845,6 +1906,7 @@ def _check_per_entry_repos(
     for repo_id, repo_url, repo_base, repo_pkg, _install in _parse_repos_tsv(repos_tsv):
         if not repo_id:
             continue
+        fixture_urls = _legacy_state_repo_fixture_urls(s, repo_id, repo_url)
         code_dir = code_root / repo_id
         if not (code_dir / ".git").is_dir():
             s.v_drift(
@@ -1853,9 +1915,18 @@ def _check_per_entry_repos(
             )
         else:
             _v_check_clone_basics(
-                s, f"code mirror {repo_id}", code_dir, repo_url, s.agent_owner,
+                s,
+                f"code mirror {repo_id}",
+                code_dir,
+                repo_url,
+                s.agent_owner,
+                fixture_urls,
             )
-            if repo_pkg and repo_url.startswith("https://github.com/"):
+            if (
+                repo_pkg
+                and repo_url.startswith("https://github.com/")
+                and not fixture_urls
+            ):
                 _v_check_github_app_clone_auth(
                     s,
                     f"code mirror {repo_id}",
@@ -1885,9 +1956,14 @@ def _check_per_entry_repos(
                 s.v_drift(f"quay repo {repo_id}", f"bare clone missing: {bare}")
             else:
                 _v_check_clone_basics(
-                    s, f"quay repo {repo_id}", bare, repo_url, s.agent_owner,
+                    s,
+                    f"quay repo {repo_id}",
+                    bare,
+                    repo_url,
+                    s.agent_owner,
+                    fixture_urls,
                 )
-                if repo_url.startswith("https://github.com/"):
+                if repo_url.startswith("https://github.com/") and not fixture_urls:
                     _v_check_github_app_clone_auth(
                         s,
                         f"quay repo {repo_id}",
@@ -2765,6 +2841,7 @@ def run(
             "repos[] schema",
             "values_helper.py list-repos exited non-zero (run it manually for details)",
         )
+    repos_tsv = _effective_repos_tsv(args, repos_tsv)
     if quay_version:
         _check_quay_artefacts(s, repos_tsv)
         _check_quay_github_app_gitconfig(s, required=app_auth_expected)

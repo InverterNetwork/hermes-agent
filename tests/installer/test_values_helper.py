@@ -1327,6 +1327,9 @@ class TestRenderQuayOrchestratorConfig:
             "enabled": False,
             "poll_interval_seconds": 15,
             "quay_command": "/usr/local/bin/quay",
+            "remediation_enabled": False,
+            "remediation_escalation_message_enabled": False,
+            "remediation_friction_enabled": False,
             "reply_timeout_seconds": 1800,
             "slack_token_env": "SLACK_BOT_TOKEN",
         }
@@ -1394,6 +1397,38 @@ class TestRenderQuayOrchestratorConfig:
         r = _run(values, "validate-schema")
         assert r.returncode == 1
         assert "quay.orchestrator.enabled must be a bool" in r.stderr
+
+    def test_renders_remediation_flags(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            '  agent_invocation: "claude < {prompt_file}"\n'
+            "  orchestrator:\n"
+            "    enabled: true\n"
+            "    remediation_enabled: true\n"
+            "    remediation_escalation_message_enabled: true\n"
+            "    remediation_friction_enabled: true\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "orchestrator.json"
+        r = _run(values, "render-quay-orchestrator-config", "--out", str(out))
+        assert r.returncode == 0, r.stderr
+        cfg = json.loads(out.read_text())
+        assert cfg["remediation_enabled"] is True
+        assert cfg["remediation_escalation_message_enabled"] is True
+        assert cfg["remediation_friction_enabled"] is True
+
+    def test_remediation_flag_must_be_bool(self, tmp_path: Path):
+        values = tmp_path / "values.yaml"
+        values.write_text(
+            "quay:\n"
+            "  orchestrator:\n"
+            '    remediation_enabled: "yes"\n',
+            encoding="utf-8",
+        )
+        r = _run(values, "validate-schema")
+        assert r.returncode == 1
+        assert "quay.orchestrator.remediation_enabled must be a bool" in r.stderr
 
 
 class TestRenderQuayConfigAgents:
@@ -1645,6 +1680,14 @@ class TestListRepos:
             "alpha\thttps://github.com/example/alpha\tmain\tbun\tbun install",
             "beta\thttps://github.com/example/beta\ttrunk\tnpm\tnpm ci --no-audit",
         ]
+
+    def test_deployment_registers_hermes_state_for_quay(self):
+        r = _run(REPO_ROOT / "deploy.values.yaml", "list-repos", "--quay")
+        assert r.returncode == 0, r.stderr
+        assert (
+            "hermes-state\thttps://github.com/InverterNetwork/hermes-state\tmain\tbun\ttrue"
+            in r.stdout.splitlines()
+        )
 
     def test_get_repo_config_add_emits_quay_payload_with_optional_fields(
         self, tmp_path: Path

@@ -18,8 +18,9 @@
 #
 # We also load __TARGET_DIR__/auth/quay.env so adapter tokens
 # (LINEAR_API_KEY, SLACK_TOKEN, …) reach ad-hoc invocations the same way
-# they reach the systemd tick — without this, operator commands like
-# `enqueue --linear-issue` fail despite the unit working fine.
+# they reach the systemd tick, then load /etc/default/quay-worker-env so
+# worker-useful host env such as RPC URLs is shared by scheduled ticks and
+# operator commands without storing values in repo-managed config.
 #
 # The load uses a strict KEY=VAL parser rather than shell `.` so
 # semantics match systemd's EnvironmentFile= (which never expands shell
@@ -29,7 +30,7 @@
 # closed. Skips comment lines, blank lines, and any key outside
 # [A-Z0-9_] (matches systemd's allowed key shape). The `[ -r … ]`
 # guard keeps the wrapper usable on fresh installs that haven't run
-# stage-secrets.sh yet.
+# stage-secrets.sh yet or haven't staged worker env.
 #
 # Finally, resolve the worker GitHub token from the GitHub App helper so any
 # operator command that shells out to `gh` (enqueue's PR-existence pre-flight,
@@ -37,9 +38,8 @@
 # Quay itself consumes $QUAY_WORKER_GH_TOKEN before spawning worker attempts,
 # while child tools still read $GH_TOKEN / $GITHUB_TOKEN, so all three names
 # are exported to the same token. Existing caller-supplied tokens are kept only
-# when `gh api rate_limit` accepts them; stale/expired values mint a
-# replacement. This endpoint accepts both user tokens and GitHub App
-# installation tokens, which the helper mints.
+# when repo/PR-scoped GitHub probes accept them; stale, expired, or
+# repo-unauthorized values mint a replacement.
 # Mirrors
 # ops/quay-tick-runner and ops/hermes-upstream-sync's preamble. Permissive
 # on helper failure: missing PEM or transient mint error → exec and let
@@ -51,7 +51,7 @@
 #                      from agent context) → skip sudo; the agent user is
 #                      intentionally not in sudoers, so `sudo -u self` would
 #                      reject and break agent-driven quay invocations.
-# The cd /, quay.env load, and $GH_TOKEN mint apply identically in both,
+# The cd /, env-file loads, and $GH_TOKEN mint apply identically in both,
 # so the body is held in AGENT_BODY and re-entered via
 # `sh -c "$AGENT_BODY" -- "$@"` either directly or under sudo. AGENT_BODY
 # is single-quoted, so its "$@" stays literal until sh expands it against
@@ -62,22 +62,78 @@
 
 AGENT_BODY='
 cd /
-ENV_FILE=__TARGET_DIR__/auth/quay.env
-if [ -r "$ENV_FILE" ]; then
+load_literal_env_file() {
+  env_file="$1"
+  [ -r "$env_file" ] || return 0
   while IFS="=" read -r key value || [ -n "$key" ]; do
     case "$key" in
       ""|[0-9]*|*[!A-Z0-9_]*) continue ;;
     esac
     export "$key=$value"
-  done < "$ENV_FILE"
-fi
+  done < "$env_file"
+}
+load_literal_env_file __TARGET_DIR__/auth/quay.env
+load_literal_env_file /etc/default/quay-worker-env
 token_is_valid() {
   token="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   [ -n "$token" ] || return 1
   command -v gh >/dev/null 2>&1 || return 1
+  repos=$(printf "%s" "${HERMES_QUAY_GITHUB_AUTH_REPOS:-${HERMES_QUAY_GITHUB_AUTH_REPO:-${GITHUB_REPOSITORY:-}}}" | tr "," " ")
+  if [ -n "$repos" ]; then
+    for repo in $repos; do
+      token_has_repo_pr_access "$repo" || return 1
+    done
+    return 0
+  fi
+  found_repo=0
+  if command -v git >/dev/null 2>&1; then
+    repos_dir="${QUAY_DATA_DIR:-__TARGET_DIR__/quay}/repos"
+    for bare in "$repos_dir"/*.git; do
+      [ -d "$bare" ] || continue
+      remote=$(git -C "$bare" config --get remote.origin.url 2>/dev/null || true)
+      repo=$(github_repo_from_url "$remote")
+      [ -n "$repo" ] || continue
+      found_repo=1
+      token_has_repo_pr_access "$repo" || return 1
+    done
+    if [ "$found_repo" != 1 ] && [ -d "__TARGET_DIR__/hermes-agent/.git" ]; then
+      remote=$(git -C "__TARGET_DIR__/hermes-agent" config --get remote.origin.url 2>/dev/null || true)
+      repo=$(github_repo_from_url "$remote")
+      if [ -n "$repo" ]; then
+        found_repo=1
+        token_has_repo_pr_access "$repo" || return 1
+      fi
+    fi
+  fi
+  [ "$found_repo" = 1 ] || return 0
+}
+
+token_has_repo_pr_access() {
+  repo="${1#https://github.com/}"
+  repo="${repo#http://github.com/}"
+  repo="${repo%.git}"
+  repo="${repo%/}"
+  [ -n "$repo" ] || return 1
   GH_TOKEN="$token" \
     GITHUB_TOKEN="$token" \
-    gh api rate_limit >/dev/null 2>&1
+    gh repo view "$repo" --json viewerPermission >/dev/null 2>&1 &&
+  GH_TOKEN="$token" \
+    GITHUB_TOKEN="$token" \
+    gh pr list -R "$repo" --limit 1 >/dev/null 2>&1
+}
+
+github_repo_from_url() {
+  remote="${1%.git}"
+  repo=""
+  case "$remote" in
+    https://github.com/*) repo="${remote#https://github.com/}" ;;
+    http://github.com/*) repo="${remote#http://github.com/}" ;;
+    https://*@github.com/*) repo="${remote#https://*@github.com/}" ;;
+    http://*@github.com/*) repo="${remote#http://*@github.com/}" ;;
+    git@github.com:*) repo="${remote#git@github.com:}" ;;
+    ssh://git@github.com/*) repo="${remote#ssh://git@github.com/}" ;;
+  esac
+  printf "%s\n" "$repo"
 }
 
 export_worker_token() {
@@ -97,6 +153,11 @@ mint_gh_token() {
   # App API hangs at the TCP/TLS layer.
   elif token=$(timeout 30 "$PY" "$HELPER" mint 2>/dev/null) && [ -n "$token" ]; then
     export_worker_token "$token"
+    if ! token_is_valid; then
+      printf "[quay-as-hermes] WARN: minted GitHub token is invalid for Quay repos; running quay without minted \$GH_TOKEN\n" >&2
+      unset QUAY_WORKER_GH_TOKEN GH_TOKEN GITHUB_TOKEN
+      return 1
+    fi
   else
     printf "[quay-as-hermes] WARN: token mint failed; running quay without minted \$GH_TOKEN\n" >&2
     return 1

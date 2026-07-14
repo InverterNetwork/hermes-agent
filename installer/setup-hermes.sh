@@ -203,8 +203,19 @@ _git_as_owner() {
 # preserve check.
 _check_clone_origin_or_die() {
   local kind="$1" dir="$2" expected_url="$3"
+  shift 3
   local actual_url
   actual_url="$(_git_as_owner "$dir" config --get remote.origin.url 2>/dev/null || true)"
+  if [[ "$actual_url" == "$expected_url" ]]; then
+    return 0
+  fi
+  local alternate_url
+  for alternate_url in "$@"; do
+    [[ -n "$alternate_url" ]] || continue
+    if [[ "$actual_url" == "$alternate_url" ]]; then
+      return 0
+    fi
+  done
   if [[ "$actual_url" != "$expected_url" ]]; then
     echo "FAIL: $dir origin=$actual_url, expected $expected_url" >&2
     echo "      refusing to silently re-point an existing $kind." >&2
@@ -229,6 +240,7 @@ if [[ "$VERIFY" -eq 1 ]]; then
   )
   [[ "$QUIET" -eq 1 ]]      && verify_args+=( --quiet )
   [[ -n "$VALUES_FILE" ]]   && verify_args+=( --values "$VALUES_FILE" )
+  [[ -n "$STATE_DIR" ]]     && verify_args+=( --state "$STATE_DIR" )
   [[ -n "$GH_API_BASE" ]]   && verify_args+=( --gh-api-base "$GH_API_BASE" )
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   exec env "PYTHONPATH=$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
@@ -370,9 +382,57 @@ fi
 # clone/push; SSH deploy-key rewrites are skipped for those entries. Fail fast
 # before any provisioning so the operator doesn't half-install with an auth
 # model that can't push.
+_is_legacy_state_repo_fixture() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ "$AUTH_METHOD" == "none" \
+    && -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]]
+}
+
+_use_local_state_repo_source_for_quay() {
+  local repo_id="$1"
+  local repo_url="$2"
+  [[ -n "$STATE_DIR" \
+    && "$repo_id" == "hermes-state" \
+    && "$repo_url" == "https://github.com/InverterNetwork/hermes-state" ]] || return 1
+  if [[ "$AUTH_METHOD" == "none" ]]; then
+    return 0
+  fi
+  [[ -z "$STATE_ORIGIN_URL" \
+    || ! "$STATE_ORIGIN_URL" =~ ^(https?://|ssh://|git://|git@) ]]
+}
+
+_effective_repo_url() {
+  local repo_id="$1"
+  local repo_url="$2"
+  if _use_local_state_repo_source_for_quay "$repo_id" "$repo_url"; then
+    printf 'file://%s\n' "$STATE_DIR"
+  else
+    printf '%s\n' "$repo_url"
+  fi
+}
+
+_alternate_clone_origin_urls() {
+  local repo_id="$1"
+  local repo_url="$2"
+  _use_local_state_repo_source_for_quay "$repo_id" "$repo_url" || return 0
+  printf '%s\n' "$STATE_DIR"
+  printf 'file://%s\n' "$STATE_DIR"
+}
+
+_repo_config_with_effective_url() {
+  local repo_config_json="$1"
+  local repo_url="$2"
+  python3 -c 'import json, sys; p=json.loads(sys.argv[1]); p["repo_url"]=sys.argv[2]; print(json.dumps(p, separators=(",", ":")))' \
+    "$repo_config_json" "$repo_url"
+}
+
 _quay_gh_ids=()
 while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
   [[ -z "$repo_id" || -z "$repo_pkg" ]] && continue
+  _is_legacy_state_repo_fixture "$repo_id" "$repo_url" && continue
   [[ "$repo_url" =~ ^https://github\.com/[^/]+/[^/]+$ ]] || continue
   _quay_gh_ids+=("$repo_id")
 done < <(python3 "$VALUES_HELPER" --values "$VALUES_FILE" list-repos 2>/dev/null || true)
@@ -1072,8 +1132,8 @@ EOF
 fi
 
 # ---------- state (agent-owned, writable) ----------
-# state/ is a clone of the private hermes-state repo. skills/memories/cron at
-# the render-target root are symlinks into state/, so the agent's writes show
+# state/ is a clone of the private hermes-state repo. skills/memories/cron/scripts
+# at the render-target root are symlinks into state/, so the agent's writes show
 # up as git changes that the auto-commit pipeline (future work) can ship.
 #
 # Re-run policy: if state/ already has a .git, leave it alone — destroying it
@@ -1747,6 +1807,8 @@ fi
 if [[ -n "$ALL_REPOS_TSV" ]]; then
   while IFS=$'\t' read -r repo_id repo_url repo_base repo_pkg repo_install; do
     [[ -z "$repo_id" ]] && continue
+    repo_values_url="$repo_url"
+    repo_url="$(_effective_repo_url "$repo_id" "$repo_url")"
 
     # ---- per-repo url.insteadOf rewrite (code-only github.com entries) ----
     # quay-managed github.com entries skip the SSH rewrite and use the App
@@ -1819,8 +1881,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
 
     # ---- code mirror at $TARGET/code/<id>/ ----
     code_dir="$CODE_ROOT/$repo_id"
+    mapfile -t alternate_clone_origins < <(_alternate_clone_origin_urls "$repo_id" "$repo_values_url")
     if [[ -d "$code_dir/.git" ]]; then
-      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url"
+      _check_clone_origin_or_die "code mirror" "$code_dir" "$repo_url" "${alternate_clone_origins[@]}"
       echo "==> code mirror $repo_id present at $code_dir (preserving)"
     else
       echo "==> cloning $repo_url into $code_dir"
@@ -1849,7 +1912,7 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
       else
         bare="$TARGET_DIR/quay/repos/${repo_id}.git"
         if [[ -d "$bare" ]]; then
-          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url"
+          _check_clone_origin_or_die "bare clone" "$bare" "$repo_url" "${alternate_clone_origins[@]}"
           echo "==> quay bare clone $repo_id present (preserving)"
         else
           echo "==> cloning $repo_url into $bare"
@@ -1877,6 +1940,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
               get-repo-config "$repo_id" --mode update
           )"
+          if _is_legacy_state_repo_fixture "$repo_id" "$repo_values_url"; then
+            repo_config_json="$(_repo_config_with_effective_url "$repo_config_json" "$repo_url")"
+          fi
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo update \
               --id "$repo_id" \
@@ -1887,6 +1953,9 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
             python3 "$VALUES_HELPER" --values "$VALUES_FILE" \
               get-repo-config "$repo_id" --mode add
           )"
+          if _is_legacy_state_repo_fixture "$repo_id" "$repo_values_url"; then
+            repo_config_json="$(_repo_config_with_effective_url "$repo_config_json" "$repo_url")"
+          fi
           sudo -u "$AGENT_USER" \
             env QUAY_DATA_DIR="$TARGET_DIR/quay" "$QUAY_BIN_DST" repo add \
               --input "$repo_config_json" >/dev/null
@@ -1913,11 +1982,18 @@ if [[ -n "$ALL_REPOS_TSV" ]]; then
 fi
 
 # Symlinks at render-target root so the agent's existing paths
-# ($TARGET/skills, $TARGET/memories, $TARGET/cron) keep working but writes
-# land inside the git repo. ln -snf is idempotent: replaces existing symlinks
-# in place and refuses to descend into a real directory (we error below if so).
-echo "==> wiring state symlinks (skills, memories, cron)"
-for d in skills memories cron; do
+# ($TARGET/skills, $TARGET/memories, $TARGET/cron, $TARGET/scripts) keep working
+# but writes land inside the git repo. ln -snf is idempotent: replaces existing
+# symlinks in place and refuses to descend into a real directory (we error below
+# if so).
+echo "==> wiring state symlinks (skills, memories, cron, scripts)"
+for d in skills memories cron scripts; do
+  if [[ ! -e "$STATE_TARGET/$d" ]]; then
+    install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$STATE_TARGET/$d"
+  elif [[ ! -d "$STATE_TARGET/$d" ]]; then
+    echo "FAIL: $STATE_TARGET/$d exists but is not a directory." >&2
+    exit 1
+  fi
   link="$TARGET_DIR/$d"
   # Pre-clean: if a previous v0 install left real dirs here, they need to go.
   # Safe-to-remove check: no regular files / symlinks / sockets anywhere in
@@ -2304,12 +2380,42 @@ fi
 QUAY_TICK_SRC="$OPS_DIR/quay-tick.service"
 QUAY_TICK_RUNNER_SRC="$OPS_DIR/quay-tick-runner"
 QUAY_TICK_RUNNER_DST="/usr/local/sbin/quay-tick-runner"
+QUAY_GITHUB_AUTH_SRC="$OPS_DIR/quay-github-auth"
+QUAY_GITHUB_AUTH_DST="$TARGET_DIR/hermes-agent/ops/quay-github-auth"
 
-if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" && -f "$QUAY_TICK_RUNNER_SRC" ]]; then
+if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" && -f "$QUAY_TICK_RUNNER_SRC" && -f "$QUAY_GITHUB_AUTH_SRC" ]]; then
+  if [[ "$(readlink -f "$QUAY_GITHUB_AUTH_SRC")" != "$(readlink -f "$QUAY_GITHUB_AUTH_DST" 2>/dev/null || printf '%s' "$QUAY_GITHUB_AUTH_DST")" ]]; then
+    echo "==> installing quay GitHub auth helper at $QUAY_GITHUB_AUTH_DST"
+    install -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$QUAY_GITHUB_AUTH_SRC" "$QUAY_GITHUB_AUTH_DST"
+  fi
+
   echo "==> installing quay-tick-runner at $QUAY_TICK_RUNNER_DST"
   install -o root -g root -m 0755 "$QUAY_TICK_RUNNER_SRC" "$QUAY_TICK_RUNNER_DST"
 
   install -d -o root -g root -m 0755 /etc/default
+  if [[ -f /etc/default/quay-worker-env ]]; then
+    echo "==> /etc/default/quay-worker-env already present (preserving)"
+    if [[ -L /etc/default/quay-worker-env ]]; then
+      echo "==> /etc/default/quay-worker-env is a symlink; leaving target ownership/mode to host provisioning"
+    else
+      chown root:"$AGENT_USER" /etc/default/quay-worker-env || true
+      chmod 0640 /etc/default/quay-worker-env || true
+    fi
+  else
+    echo "==> seeding /etc/default/quay-worker-env"
+    cat >/etc/default/quay-worker-env <<'EOF'
+# Generated by setup-hermes.sh — host-managed env inherited by Quay workers.
+# Edits here survive re-runs of the installer. Put worker-useful values staged
+# by host provisioning here, for example:
+#
+# RPC_URL_4326=https://rpc.example
+#
+# Do not commit these values to deploy.values.yaml, repo config, or tickets.
+EOF
+    chown root:"$AGENT_USER" /etc/default/quay-worker-env
+    chmod 0640 /etc/default/quay-worker-env
+  fi
+
   if [[ -f /etc/default/quay-tick ]]; then
     echo "==> /etc/default/quay-tick already present (preserving)"
   else
@@ -2319,7 +2425,8 @@ if [[ "$QUAY_ENABLED" -eq 1 && -f "$QUAY_TICK_SRC" && -f "$QUAY_TICK_RUNNER_SRC"
 # Edits here survive re-runs of the installer; delete this file to force
 # regeneration from defaults. Empty by default — QUAY_DATA_DIR is set
 # directly on the unit, and adapter tokens flow from <HERMES_HOME>/auth/
-# quay.env (staged by stage-secrets.sh).
+# quay.env (staged by stage-secrets.sh). Put worker-inherited host env
+# such as RPC_URL_4326 in /etc/default/quay-worker-env instead.
 EOF
     chown root:root /etc/default/quay-tick
     chmod 0644 /etc/default/quay-tick
@@ -2457,6 +2564,13 @@ fi
 rm -f /usr/local/sbin/brix-orchestrator-runner
 
 if [[ "$QUAY_ENABLED" -eq 1 && "$QUAY_ORCHESTRATOR_ENABLED" -eq 1 && -f "$QUAY_ORCH_SERVICE_SRC" && -f "$QUAY_ORCH_TIMER_SRC" && -f "$QUAY_ORCH_RUNNER_SRC" ]]; then
+  if [[ -f "$QUAY_GITHUB_AUTH_SRC" ]]; then
+    if [[ "$(readlink -f "$QUAY_GITHUB_AUTH_SRC")" != "$(readlink -f "$QUAY_GITHUB_AUTH_DST" 2>/dev/null || printf '%s' "$QUAY_GITHUB_AUTH_DST")" ]]; then
+      echo "==> installing quay GitHub auth helper at $QUAY_GITHUB_AUTH_DST"
+      install -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$QUAY_GITHUB_AUTH_SRC" "$QUAY_GITHUB_AUTH_DST"
+    fi
+  fi
+
   echo "==> installing quay-orchestrator-runner at $QUAY_ORCH_RUNNER_DST"
   install -o root -g root -m 0755 "$QUAY_ORCH_RUNNER_SRC" "$QUAY_ORCH_RUNNER_DST"
 
@@ -2701,7 +2815,7 @@ fi
 state_git_owner="$(stat -c '%U' "$STATE_TARGET/.git")"
 [[ "$state_git_owner" == "$AGENT_USER" ]] \
   || { echo "FAIL: $STATE_TARGET/.git owned by $state_git_owner, expected $AGENT_USER" >&2; exit 1; }
-for d in skills memories cron; do
+for d in skills memories cron scripts; do
   [[ -L "$TARGET_DIR/$d" ]] \
     || { echo "FAIL: $TARGET_DIR/$d is not a symlink" >&2; exit 1; }
   resolved="$(readlink "$TARGET_DIR/$d")"
@@ -2766,7 +2880,7 @@ fi
 # symlinks after the initial state clone chown; restore the ownership invariant
 # before the installer returns so future `git add .` from the agent cannot
 # trip on root-owned files.
-for d in skills memories cron; do
+for d in skills memories cron scripts; do
   [[ -e "$STATE_TARGET/$d" ]] && chown -R "$AGENT_USER:$AGENT_USER" "$STATE_TARGET/$d"
 done
 

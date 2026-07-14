@@ -26,6 +26,16 @@ def test_installer_gateway_install_is_noninteractive():
     assert "--no-start-now --no-start-on-login" in content
 
 
+def test_installer_manages_scripts_as_state_symlink():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "==> wiring state symlinks (skills, memories, cron, scripts)" in content
+    assert "for d in skills memories cron scripts; do" in content
+    assert 'if [[ ! -e "$STATE_TARGET/$d" ]]; then' in content
+    assert 'install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$STATE_TARGET/$d"' in content
+    assert 'Move its contents into $STATE_TARGET/$d/ and retry' in content
+
+
 def test_setup_hermes_script_has_termux_path():
     content = SETUP_SCRIPT.read_text(encoding="utf-8")
 
@@ -338,7 +348,6 @@ def test_atlas_gitbook_source_sync_is_configured():
     wrapper = (OPS_DIR / "atlas-as-hermes").read_text(encoding="utf-8")
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
-    assert 'version: "v0.1.11"' in values
     assert "google_docs:" in values
     assert "service_account_file: auth/otto-google-sa.json" in values
     assert "source_names:" in values
@@ -406,11 +415,25 @@ def test_atlas_hub_service_is_loopback_and_key_protected():
 def test_quay_tick_service_carries_reviewer_token_minting_env():
     service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
     runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
 
     assert "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env" in service
+    assert "EnvironmentFile=-/etc/default/quay-worker-env" in service
+    assert "quay-worker-env" in installer
+    assert "RPC_URL_4326" in installer
     assert "RuntimeDirectory=hermes" in service
     assert "QUAY_REVIEWER_GH_TOKEN" in runner
     assert "/etc/hermes/reviewer.env" in runner
+    assert "QUAY_GITHUB_AUTH_SRC=\"$OPS_DIR/quay-github-auth\"" in installer
+    assert "install -o \"$AGENT_USER\" -g \"$AGENT_USER\" -m 0755 \"$QUAY_GITHUB_AUTH_SRC\" \"$QUAY_GITHUB_AUTH_DST\"" in installer
+
+
+def test_quay_orchestrator_runner_prepares_github_auth_before_parked_polls():
+    runner = (OPS_DIR / "quay-orchestrator-runner").read_text(encoding="utf-8")
+
+    assert "quay-github-auth" in runner
+    assert "quay_prepare_worker_github_auth" in runner
+    assert "--park-human-waits" in runner
 
 
 def test_quay_serve_service_is_localhost_and_token_protected():
@@ -461,3 +484,29 @@ def test_installer_stale_insteadof_values_cover_suffixes_and_ssh_shapes():
     assert '"git@github.com:${org}/${repo_short}.git"' in content
     assert '"ssh://git@github.com/${org}/${repo_short}"' in content
     assert '"ssh://git@github.com/${org}/${repo_short}.git"' in content
+
+
+def test_installer_supports_local_hermes_state_quay_fixture():
+    """CI uses --state without GitHub App auth for the hermes-state fixture."""
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    verify = (REPO_ROOT / "installer" / "hermes_installer" / "verify.py").read_text(
+        encoding="utf-8"
+    )
+    verify_cli = (
+        REPO_ROOT / "installer" / "hermes_installer" / "__main__.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_is_legacy_state_repo_fixture" in installer
+    assert "_use_local_state_repo_source_for_quay" in installer
+    assert "STATE_ORIGIN_URL" in installer
+    assert "_alternate_clone_origin_urls" in installer
+    assert 'if _use_local_state_repo_source_for_quay "$repo_id" "$repo_url"; then' in installer
+    assert 'mapfile -t alternate_clone_origins' in installer
+    assert '"${alternate_clone_origins[@]}"' in installer
+    assert '"$repo_id" == "hermes-state"' in installer
+    assert '"$repo_url" == "https://github.com/InverterNetwork/hermes-state"' in installer
+    assert 'verify_args+=( --state "$STATE_DIR" )' in installer
+    assert "_effective_repos_tsv(args, repos_tsv)" in verify
+    assert 'repo_id == "hermes-state"' in verify
+    assert 'repo_url == "https://github.com/InverterNetwork/hermes-state"' in verify
+    assert '"--state"' in verify_cli

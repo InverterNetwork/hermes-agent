@@ -190,6 +190,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_INFERENCE_PROVIDER",
     "HERMES_TUI_PROVIDER",
     "HERMES_MANAGED",
+    "HERMES_MANAGED_DIR",
     "HERMES_DEV",
     "HERMES_CONTAINER",
     "HERMES_EPHEMERAL_SYSTEM_PROMPT",
@@ -534,6 +535,14 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "behaviour — e.g. PTY tests that signal their own child).",
     )
 
+    # The pyproject addopts pin ``--timeout-method=signal`` relies on
+    # ``signal.SIGALRM``, which does not exist on Windows — pytest-timeout
+    # raises AttributeError at timer setup and the whole run aborts before any
+    # test executes. Fall back to the thread-based timer on Windows so the
+    # suite runs natively there (POSIX keeps the more reliable signal method).
+    if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
+        config.option.timeout_method = "thread"
+
 
 @pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):
@@ -562,6 +571,7 @@ def _live_system_guard(request, monkeypatch):
         return
 
     import os as _os
+    import re as _re
     import shlex as _shlex
     import subprocess as _subprocess
 
@@ -714,6 +724,41 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _runs_hermes_update(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd)
+        low = cmd_str.lower()
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+
+        lower_tokens = [str(tok).lower() for tok in tokens]
+        basenames = [
+            tok.replace("\\", "/").rsplit("/", 1)[-1]
+            for tok in lower_tokens
+        ]
+        for idx, head in enumerate(basenames[:-1]):
+            if head in {"hermes", "hermes.exe"} and lower_tokens[idx + 1] == "update":
+                return True
+        for idx, tok in enumerate(lower_tokens[:-2]):
+            if (
+                basenames[idx].startswith("python")
+                and lower_tokens[idx + 1] == "-m"
+                and lower_tokens[idx + 2] == "hermes_cli.main"
+            ):
+                next_idx = idx + 3
+                if next_idx < len(lower_tokens) and lower_tokens[next_idx] == "update":
+                    return True
+
+        # Shell wrapper forms such as: bash -c "hermes update --gateway".
+        return bool(
+            _re.search(r"(?<![-\w/])hermes(?:\.exe)?\s+update\b", low)
+            or _re.search(
+                r"(?<![-\w/])python(?:\d+(?:\.\d+)?)?(?:\.exe)?\s+-m\s+hermes_cli\.main\s+update\b",
+                low,
+            )
+        )
+
     def _check_subprocess_cmd(name, cmd):
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
@@ -741,18 +786,7 @@ def _live_system_guard(request, monkeypatch):
         # tree (PPid=1) and nearly impossible to trace without explicit
         # inotify/SHA watchdogs.  Any test that legitimately needs to exercise
         # the update-spawn path must mock subprocess.Popen explicitly.
-        cmd_str = _cmd_to_string(cmd)
-        low = cmd_str.lower()
-        if "update" in low and (
-            # hermes update / hermes update --gateway / setsid bash -c ... hermes update
-            ("hermes" in low and "update" in low.split())
-            or
-            # python -m hermes_cli.main update --gateway
-            ("hermes_cli" in low and "update" in low.split())
-            or
-            # venv/bin/hermes update  (absolute path variant used in tests)
-            (".venv/bin/hermes" in low and "update" in low)
-        ):
+        if _runs_hermes_update(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "

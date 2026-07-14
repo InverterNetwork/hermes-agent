@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -79,6 +81,10 @@ class FakeQuayClient:
         self.recorded_reply = (handoff, reply, thread_ref)
 
     def submit_brief(self, handoff, brief: str, *, reason: str) -> None:
+        # Match production: reject any reason quay's CLI would reject, so the
+        # fake can't mask an invalid-reason regression (e.g. the auto-remediated
+        # path once passed a non-existent "blocker_auto_remediated").
+        quay._validate_submit_reason(reason)
         if self.state != "claimed":
             raise RuntimeError(f"wrong_state: cannot submit brief from {self.state}")
         self.state = "queued"
@@ -165,6 +171,89 @@ class FakeOutboxQuayClient:
             raise RuntimeError(f"wrong_state: cannot fail outbox from {self.state}")
         self.state = "pending"
         self.failed.append((item, reason))
+
+
+class ReclaimingOutboxQuayClient:
+    """Round-trips fail_outbox_item reasons back as the row's ``last_error`` on
+    the next claim, and honors terminal markers by refusing to re-claim.
+
+    This mirrors the exact Quay outbox contract the quarantine logic depends
+    on (documented at ops/quay_orchestrator.py), so bounded retry and the
+    terminal-skip can be exercised across successive drains instead of being
+    faked with a hard-coded ``last_error``.
+    """
+
+    def __init__(self, raw, *, task=None) -> None:
+        self._raw = dict(raw)
+        self.task = task or quay.TaskContext(
+            task_id=str(raw.get("task_id") or ""),
+            title="Review approved PR",
+            issue="BRIX-1447",
+            repo_id="hermes-agent",
+        )
+        self.completed: list[object] = []
+        self.failed: list[tuple[object, str]] = []
+        self.claims = 0
+
+    def claim_work(self, worker_id: str):
+        if quay._terminal_outbox_row_reason(self._raw):
+            return None
+        self.claims += 1
+        return quay.OutboxItem.from_mapping(self._raw)
+
+    def claim_handoff(self, worker_id: str):
+        return None
+
+    def get_task_context(self, task_id: str):
+        return self.task
+
+    def complete_outbox_item(self, item) -> None:
+        self._raw["status"] = "completed"
+        self.completed.append(item)
+
+    def fail_outbox_item(self, item, reason: str) -> None:
+        self._raw["last_error"] = reason
+        self._raw["status"] = "pending"
+        self.failed.append((item, reason))
+
+
+def delivery_raw(*, route_hint=None, payload=None, **extra):
+    raw = {
+        "outbox_item_id": 31,
+        "task_id": "task-delivery",
+        "kind": "slack.pr_ready_approved",
+        "handler_class": "delivery",
+        "claim_id": "outbox-claim-31",
+        "payload_json": json.dumps(
+            payload or {"message": "PR #44 is approved and ready."}
+        ),
+        "route_hint_json": json.dumps(
+            route_hint if route_hint is not None else {"channel_id": "CDELIVERY"}
+        ),
+        "status": "pending",
+        "last_error": None,
+    }
+    raw.update(extra)
+    return raw
+
+
+class _CapturingLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _capturing_logger(name: str) -> tuple[logging.Logger, _CapturingLogHandler]:
+    logger = logging.getLogger(name)
+    logger.handlers.clear()
+    handler = _CapturingLogHandler()
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    return logger, handler
 
 
 class FakeSlackClient:
@@ -444,6 +533,53 @@ class RecordingWrongClassOutboxRunner:
         raise AssertionError(f"unexpected quay command: {command!r}")
 
 
+class RecordingTerminalThenReadyOutboxRunner:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        command = argv[1:]
+        if command == [
+            "outbox",
+            "list",
+            "--status",
+            "pending",
+            "--handler-class",
+            "delivery",
+        ]:
+            return FakeCompletedProcess(
+                '[{"outbox_item_id":22,"task_id":"task-poisoned",'
+                '"kind":"slack.pr_ready_approved","handler_class":"delivery",'
+                '"status":"pending","last_error":"terminal:missing_default_slack_channel"},'
+                '{"outbox_item_id":23,"task_id":"task-ready",'
+                '"kind":"slack.pr_ready_approved","handler_class":"delivery",'
+                '"payload_json":"{\\"message\\":\\"PR #45 is approved.\\"}",'
+                '"route_hint_json":"{\\"channel_id\\":\\"CDELIVERY\\"}",'
+                '"status":"pending","last_error":null}]\n'
+            )
+        if command == ["outbox", "claim", "23"]:
+            return FakeCompletedProcess(
+                '{"outbox_item_id":23,"task_id":"task-ready",'
+                '"kind":"slack.pr_ready_approved","handler_class":"delivery",'
+                '"status":"claimed","claim_id":"delivery-claim-23"}\n'
+            )
+        if command == ["task", "get", "task-ready"]:
+            return FakeCompletedProcess(
+                '{"task_id":"task-ready","repo_id":"repo-1",'
+                '"external_ref":"BRIX-1842","branch_name":"quay/ready"}\n'
+            )
+        if command == [
+            "outbox",
+            "complete",
+            "23",
+            "--claim-id",
+            "delivery-claim-23",
+        ]:
+            return FakeCompletedProcess('{"outbox_item_id":23,"status":"completed"}\n')
+        raise AssertionError(f"unexpected quay command: {command!r}")
+
+
 def test_drain_one_submits_direct_next_brief_without_slack():
     handoff = quay.Handoff(
         handoff_id="handoff-1",
@@ -510,6 +646,37 @@ def test_drain_one_delivers_outbox_item_to_existing_thread():
     assert quay_client.failed == []
     assert result.metrics["outbox_items_claimed"] == 1
     assert result.metrics["delivery_items_delivered"] == 1
+
+
+def test_drain_one_delivers_outbox_item_with_prefixed_slack_thread_ref():
+    item = delivery_item(
+        payload={
+            "external_ref": "BRIX-1842",
+            "repo_id": "InverterNetwork/hermes-agent",
+            "pr_number": 44,
+            "route_hint": {"slack_thread_ref": "slack:C1234567890:1000.000000"},
+        }
+    )
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.validations == [("C1234567890", "1000.000000")]
+    assert slack.acks[0][0] == quay.SlackPostRef(
+        channel_id="C1234567890",
+        ts="1000.000000",
+        thread_ts="1000.000000",
+    )
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
 
 
 def test_pr_ready_approved_message_dedupes_note_against_rendered_fields():
@@ -597,7 +764,7 @@ def test_drain_one_delivery_stale_thread_falls_back_to_default_channel():
     assert quay_client.failed == []
 
 
-def test_drain_one_delivery_outbox_failure_marks_item_retryable():
+def test_drain_one_delivery_missing_route_marks_item_terminal():
     item = delivery_item(route_hint={})
     quay_client = FakeOutboxQuayClient(item)
     slack = FakeSlackClient()
@@ -613,10 +780,10 @@ def test_drain_one_delivery_outbox_failure_marks_item_retryable():
     assert result.status == "missing_default_slack_channel"
     assert slack.questions == []
     assert quay_client.completed == []
-    assert quay_client.failed == [(item, "missing_default_slack_channel")]
+    assert quay_client.failed == [(item, "terminal:missing_default_slack_channel")]
 
 
-def test_drain_one_delivery_slack_failure_marks_item_retryable():
+def test_drain_one_delivery_terminal_slack_failure_marks_item_terminal():
     item = delivery_item(route_hint={})
     quay_client = FakeOutboxQuayClient(item)
     slack = FakeSlackClient(
@@ -637,8 +804,120 @@ def test_drain_one_delivery_slack_failure_marks_item_retryable():
     assert result.status == "slack_api_error"
     assert quay_client.completed == []
     assert quay_client.failed == [
-        (item, "slack_api_error:chat.postMessage:channel_not_found")
+        (item, "terminal:slack_api_error:chat.postMessage:channel_not_found")
     ]
+
+
+def test_drain_one_delivery_msg_too_long_quarantines_immediately():
+    item = delivery_item(route_hint={"channel_id": "CDELIVERY"})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "msg_too_long")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    # msg_too_long is a deterministic bad payload: quarantined on the first
+    # failure so it cannot starve the rows behind it.
+    assert result.status == "slack_api_error"
+    assert quay_client.completed == []
+    assert quay_client.failed == [
+        (item, "terminal:slack_api_error:chat.postMessage:msg_too_long")
+    ]
+
+
+def test_drain_one_delivery_transient_slack_error_retries_then_quarantines():
+    quay_client = ReclaimingOutboxQuayClient(delivery_raw())
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "ratelimited")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    statuses = [
+        drainer.drain_one().status
+        for _ in range(quay.MAX_DELIVERY_ATTEMPTS + 2)
+    ]
+    reasons = [reason for _, reason in quay_client.failed]
+
+    # ratelimited is transient: retried with an incrementing marker for the
+    # first MAX-1 attempts, then quarantined once the budget is exhausted.
+    retryable = [r for r in reasons if r.startswith(quay._DELIVERY_ATTEMPT_MARKER)]
+    assert len(retryable) == quay.MAX_DELIVERY_ATTEMPTS - 1
+    assert reasons[0].startswith("delivery_attempt=1:")
+    assert reasons[-1].startswith("terminal:exhausted_retries:")
+    assert "ratelimited" in reasons[-1]
+    # Once quarantined the row is no longer re-claimed, so later drains find
+    # no work rather than re-poisoning the outbox forever.
+    assert statuses[-1] == "no_handoff"
+    assert quay_client.completed == []
+
+
+def test_drain_one_delivery_unexpected_error_is_bounded_and_never_crashes_drain():
+    quay_client = ReclaimingOutboxQuayClient(delivery_raw())
+    slack = FakeSlackClient(post_error=ValueError("deterministic render bug"))
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    statuses = []
+    for _ in range(quay.MAX_DELIVERY_ATTEMPTS + 1):
+        # A deterministic non-Slack exception must not propagate out of the
+        # drain (previously it re-raised and crashed the tick every time).
+        statuses.append(drainer.drain_one().status)
+
+    reasons = [reason for _, reason in quay_client.failed]
+    assert all(status in {"runner_error", "no_handoff"} for status in statuses)
+    assert reasons[0].startswith("delivery_attempt=1:runner_error:ValueError:")
+    assert reasons[-1].startswith("terminal:exhausted_retries:")
+    assert "ValueError" in reasons[-1]
+    assert statuses[-1] == "no_handoff"
+    assert quay_client.completed == []
+
+
+def test_drain_one_delivery_not_in_channel_alerts_and_retries_not_silently_dropped():
+    logger, handler = _capturing_logger("test.operator-alert")
+    quay_client = ReclaimingOutboxQuayClient(delivery_raw())
+    slack = FakeSlackClient(
+        post_error=quay.SlackApiError("chat.postMessage", "not_in_channel")
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+        logger=logger,
+    )
+
+    result = drainer.drain_one()
+
+    # not_in_channel is human-recoverable: NOT silently quarantined on the
+    # first failure (retried within the budget so a quick channel fix
+    # auto-delivers) and surfaced as a loud ERROR-level operator alert.
+    assert result.status == "slack_api_error"
+    first_reason = quay_client.failed[0][1]
+    assert first_reason.startswith("delivery_attempt=1:")
+    assert "not_in_channel" in first_reason
+    alerts = [
+        rec
+        for rec in handler.records
+        if "outbox_item_operator_action_required" in rec.getMessage()
+    ]
+    assert alerts, "expected a loud operator-action alert"
+    assert alerts[0].levelno == logging.ERROR
 
 
 def test_cli_quay_adapter_claims_delivery_outbox_and_leaves_workflow_for_handoff():
@@ -684,6 +963,124 @@ def test_cli_quay_adapter_fails_claimed_outbox_item_with_wrong_handler_class():
         "--error unsupported_handler_class:workflow_intervention",
         "handoff list --status pending",
     ]
+
+
+def test_cli_quay_adapter_skips_terminal_outbox_row_and_claims_later_ready_item():
+    runner = RecordingTerminalThenReadyOutboxRunner()
+    quay_client = quay.QuayCliClient(command="/bin/quay", runner=runner)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(enabled=True),
+        worker_id="test-worker",
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert slack.questions[0][0] == "CDELIVERY"
+    calls = [" ".join(call[1:]) for call in runner.calls]
+    assert calls == [
+        "outbox list --status pending --handler-class delivery",
+        "outbox claim 23",
+        "task get task-ready",
+        "outbox complete 23 --claim-id delivery-claim-23",
+    ]
+
+
+def test_parse_slack_thread_ref_accepts_both_shapes_and_rejects_truncated_prefix():
+    assert quay._parse_slack_thread_ref("C123:1000.0") == ("C123", "1000.0")
+    assert quay._parse_slack_thread_ref("slack:C123:1000.0") == ("C123", "1000.0")
+    assert quay._parse_slack_thread_ref("SLACK:C123:1000.0") == ("C123", "1000.0")
+    # Truncated legacy prefix must be rejected, not read as channel="slack".
+    assert quay._parse_slack_thread_ref("slack:C123") is None
+    assert quay._parse_slack_thread_ref("slack:") is None
+    assert quay._parse_slack_thread_ref("slack") is None
+    assert quay._parse_slack_thread_ref("slack:slack:C123:1000.0") is None
+    assert quay._parse_slack_thread_ref("C123") is None
+    assert quay._parse_slack_thread_ref("C123:") is None
+    assert quay._parse_slack_thread_ref("") is None
+
+
+def test_delivery_slack_error_disposition_splits_transient_operator_terminal():
+    def disp(error: str) -> str:
+        return quay._delivery_slack_error_disposition(
+            quay.SlackApiError("chat.postMessage", error)
+        )
+
+    # Transient -> retryable within the attempt budget.
+    assert disp("ratelimited") == "retryable"
+    assert disp("service_unavailable") == "retryable"
+    assert disp("internal_error") == "retryable"
+    assert disp("transport_error:<urlopen error timed out>") == "retryable"
+    assert disp("transport_error:HTTP Error 503: Service Unavailable") == "retryable"
+    # Human-recoverable channel state -> operator alert (still retried).
+    assert disp("not_in_channel") == "operator"
+    assert disp("is_archived") == "operator"
+    # Deterministic bad payload/route -> quarantine immediately.
+    assert disp("msg_too_long") == "terminal"
+    assert disp("invalid_blocks") == "terminal"
+    assert disp("channel_not_found") == "terminal"
+    assert disp("thread_not_found") == "terminal"
+
+
+def test_terminal_outbox_row_reason_tolerates_field_and_wrapper_variance():
+    # Marker under each accepted error-field name.
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "terminal:missing_default_slack_channel"}
+    )
+    assert quay._terminal_outbox_row_reason({"error": "quarantine:bad"})
+    assert quay._terminal_outbox_row_reason(
+        {"last_error_message": "terminal:slack_api_error"}
+    )
+    # Terminal status name variants.
+    assert quay._terminal_outbox_row_reason({"status": "dead_letter"})
+    assert quay._terminal_outbox_row_reason({"state": "quarantined"})
+    # A Quay wrapper prefix before our marker is still detected.
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "delivery handler failed: terminal:msg_too_long"}
+    )
+    # Retryable rows (attempt marker / plain transient) are NOT skipped.
+    assert (
+        quay._terminal_outbox_row_reason(
+            {"last_error": "delivery_attempt=2:slack_api_error:chat.postMessage:ratelimited"}
+        )
+        is None
+    )
+    assert quay._terminal_outbox_row_reason({"last_error": None, "status": "pending"}) is None
+    assert quay._terminal_outbox_row_reason({}) is None
+
+
+def test_terminal_outbox_row_reason_rejects_free_text_terminal_false_positive():
+    # A RETRYABLE-in-flight row whose embedded exception text merely CONTAINS
+    # " terminal:" as free text must NOT be misdetected as terminal (would be a
+    # silent early skip / drop).
+    retryable_free_text = {
+        "last_error": (
+            "delivery_attempt=1:runner_error:RuntimeError: "
+            "connection terminal: reset by peer"
+        )
+    }
+    assert quay._terminal_outbox_row_reason(retryable_free_text) is None
+
+    # Even without a delivery_attempt= marker, free text after the marker that
+    # isn't a recognized terminal reason token stays non-terminal.
+    assert (
+        quay._terminal_outbox_row_reason(
+            {"last_error": "socket read: terminal: reset by peer"}
+        )
+        is None
+    )
+
+    # Genuine terminal writes are still detected: the orchestrator's own
+    # canonical prefix, and a Quay wrapper in front of a recognized token.
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "terminal:channel_not_found"}
+    )
+    assert quay._terminal_outbox_row_reason(
+        {"last_error": "quay-wrapper: terminal:exhausted_retries:attempt=5:runner_error"}
+    )
 
 
 def test_outbox_unsupported_only_masks_missing_outbox_list_contract():
@@ -748,8 +1145,9 @@ def test_drain_one_posts_guidance_prompt_when_reattaching_to_original_thread():
     assert slack.validations == [("GPRIVATE123", "999.000000")]
     assert slack.questions == []
     assert slack.acks
-    assert "blocked on product input" in slack.acks[0][1]
-    assert "Discuss freely in this thread" in slack.acks[0][1]
+    assert "*Quay worker blocked* — BRIX-1405 · repo-1" in slack.acks[0][1]
+    assert "Reason: blocked on product input" in slack.acks[0][1]
+    assert "Reply in thread and I'll resume the worker once it's clear." in slack.acks[0][1]
     assert slack.waits[0][0] == quay.SlackPostRef(
         channel_id="GPRIVATE123",
         ts="1002.000000",
@@ -768,9 +1166,9 @@ def test_drain_one_posts_guidance_prompt_when_reattaching_to_original_thread():
     assert "--thread-ref GPRIVATE123:999.000000" in calls[6]
     assert "submit-brief task-cli --claim-id claim-1" in calls[7]
     assert "--reason advice_answered" in calls[7]
-    assert "Quay handoff reason: worker_blocker" in runner.file_payloads[0]
-    assert "blocked on product input" in runner.file_payloads[0]
-    assert "resume the worker once the path is clear" in runner.file_payloads[0]
+    assert "Quay handoff reason" not in runner.file_payloads[0]
+    assert "Reason: blocked on product input" in runner.file_payloads[0]
+    assert "resume the worker once it's clear" in runner.file_payloads[0]
     assert "resume:" not in runner.file_payloads[0]
     assert "Use the following human guidance" in runner.file_payloads[2]
     assert "U123" in runner.file_payloads[2]
@@ -1091,7 +1489,7 @@ def test_orchestrator_decider_error_retry_does_not_reprocess_old_reply():
     assert len(slack.acks) == 2
     assert "decision engine hit an internal orchestrator error" in slack.acks[0][1]
     assert "No need to rephrase" in slack.acks[0][1]
-    assert "A Quay task needs human guidance" in slack.acks[1][1]
+    assert "*Quay worker blocked*" in slack.acks[1][1]
     assert slack.validations == [("C1234567890", "1000.000000")]
     assert len(decider.calls) == 1
 
@@ -1321,6 +1719,292 @@ def test_human_question_omits_contributor_without_author_metadata():
 
     assert "Contributor:" not in question
     assert "<@" not in question
+
+
+def test_human_question_promotes_question_and_strips_scaffolding():
+    task = quay.TaskContext(
+        task_id="task-q",
+        title="Wire up the importer",
+        issue="BRIX-1870",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-q",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a1",
+        text=(
+            "Blocked: the importer schema changed and two endpoints now exist.\n"
+            "Should we keep the old endpoint or migrate to the new one?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert lines[0] == "*Quay worker blocked* — BRIX-1870 · hermes-agent"
+    assert "Task: Wire up the importer" in lines
+    assert "Reason: Blocked: the importer schema changed and two endpoints now exist." in lines
+    assert "Need: Should we keep the old endpoint or migrate to the new one?" in lines
+    assert lines[-1] == "Reply in thread and I'll resume the worker once it's clear."
+    # Generic scaffolding + handoff-reason filler are gone.
+    assert "Quay handoff reason" not in question
+    assert "needs human guidance" not in question
+    assert "Handoff summary" not in question
+    assert "Blocker/context" not in question
+
+
+def test_human_question_budget_exhaustion_uses_reason_specific_defaults():
+    task = quay.TaskContext(
+        task_id="task-budget",
+        title="Refactor the client",
+        issue="BRIX-2001",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-budget",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        metadata={"budget_exhausted_artifact_id": 42},
+    )
+    artifact = quay.Artifact(
+        artifact_id="a2",
+        text="Attempt budget exhausted after 5 attempts without a passing build.",
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert lines[0] == "*Quay worker blocked — budget exhausted* — BRIX-2001 · hermes-agent"
+    assert "Reason: Attempt budget exhausted after 5 attempts without a passing build." in lines
+    assert "Need: approve more budget or stop the task." in lines
+
+
+def test_human_question_vague_blocker_falls_back_sanely():
+    task = quay.TaskContext(
+        task_id="task-vague",
+        title="Fix the flow",
+        issue="BRIX-3003",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-vague",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a3",
+        text="blocked on product input",
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert lines[0] == "*Quay worker blocked* — BRIX-3003 · hermes-agent"
+    assert "Reason: blocked on product input" in lines
+    assert "Need: advise how the worker should proceed." in lines
+    # No filler leaked in from the summary.
+    assert "Quay handoff reason" not in question
+    assert "Context:" not in question
+
+
+def test_human_question_promotes_question_from_artifact_over_summary_statement():
+    # Artifact carries only the question; the summary carries the statement.
+    # The statement becomes the Reason and the question is promoted to Need.
+    task = quay.TaskContext(
+        task_id="task-ctx",
+        title="Ship the feature",
+        issue="BRIX-4004",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-ctx",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Worker paused after the third failed migration.",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a4",
+        text="Should we roll back the migration or push forward?",
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Worker paused after the third failed migration." in lines
+    assert "Need: Should we roll back the migration or push forward?" in lines
+    # The summary statement is already the Reason, so it is not repeated.
+    assert "Context:" not in question
+
+
+def test_human_question_surfaces_summary_context_distinct_from_blocker():
+    task = quay.TaskContext(
+        task_id="task-ctx2",
+        title="Ship the feature",
+        issue="BRIX-4040",
+        repo_id="hermes-agent",
+    )
+    handoff = quay.Handoff(
+        handoff_id="handoff-ctx2",
+        task_id=task.task_id,
+        reason="worker_blocker",
+        summary="Third migration attempt; the prior two were rolled back.",
+    )
+    artifact = quay.Artifact(
+        artifact_id="a4b",
+        text=(
+            "Blocked: the migration keeps failing on the users table.\n"
+            "Should we roll back or push forward?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(handoff, task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the migration keeps failing on the users table." in lines
+    assert "Need: Should we roll back or push forward?" in lines
+    assert "Context: Third migration attempt; the prior two were rolled back." in lines
+
+
+def test_human_question_returns_explicit_question_verbatim():
+    task = quay.TaskContext(task_id="task-explicit", title="Explicit", issue="BRIX-5005")
+    handoff = quay.Handoff(
+        handoff_id="handoff-explicit",
+        task_id=task.task_id,
+        human_question="Can you confirm the staging DB URL before I continue?",
+        summary="Quay handoff reason: worker_blocker",
+    )
+    artifact = quay.Artifact(artifact_id="a5", text="unused", kind="blocker")
+
+    question = quay.build_human_question(handoff, task, artifact)
+
+    assert question == "Can you confirm the staging DB URL before I continue?"
+
+
+def test_human_question_returns_metadata_question_verbatim():
+    task = quay.TaskContext(task_id="task-meta-q", title="Meta", issue="BRIX-6006")
+    handoff = quay.Handoff(
+        handoff_id="handoff-meta-q",
+        task_id=task.task_id,
+        metadata={"human_question": "Which region should the worker target?"},
+    )
+
+    question = quay.build_human_question(handoff, task, None)
+
+    assert question == "Which region should the worker target?"
+
+
+def _blocker_handoff(task_id: str) -> "quay.Handoff":
+    return quay.Handoff(
+        handoff_id=f"handoff-{task_id}",
+        task_id=task_id,
+        reason="worker_blocker",
+        summary="Quay handoff reason: worker_blocker",
+    )
+
+
+def test_human_question_single_question_stays_compact_with_no_context():
+    task = quay.TaskContext(
+        task_id="task-compact", title="Wire it up", issue="BRIX-7001", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the importer schema changed and two endpoints now exist.\n"
+            "Should we keep the old endpoint or migrate to the new one?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the importer schema changed and two endpoints now exist." in lines
+    assert "Need: Should we keep the old endpoint or migrate to the new one?" in lines
+    # The common single-statement + single-question case must not sprout Context.
+    assert "Context:" not in question
+
+
+def test_human_question_second_question_overflows_into_context():
+    task = quay.TaskContext(
+        task_id="task-2q", title="Migrate", issue="BRIX-7002", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the migration keeps failing on the users table.\n"
+            "Should we roll back or push forward?\n"
+            "Do we also need to notify the on-call engineer?"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the migration keeps failing on the users table." in lines
+    assert "Need: Should we roll back or push forward?" in lines
+    # The second question is never dropped — it overflows into Context. A single
+    # leftover renders inline (no bullet) to stay compact.
+    assert "Context: Do we also need to notify the on-call engineer?" in lines
+
+
+def test_human_question_non_question_ask_reaches_human_as_need():
+    task = quay.TaskContext(
+        task_id="task-softask", title="Refactor", issue="BRIX-7003", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "The refactor left two importer paths in place.\n"
+            "Unsure whether we should roll back or push forward"
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: The refactor left two importer paths in place." in lines
+    # A real ask phrased without a "?" is promoted to Need, not dropped.
+    assert "Need: Unsure whether we should roll back or push forward" in lines
+    assert "Context:" not in question
+
+
+def test_human_question_diagnostic_detail_overflows_into_context_not_need():
+    task = quay.TaskContext(
+        task_id="task-detail", title="Fix build", issue="BRIX-7004", repo_id="hermes-agent"
+    )
+    artifact = quay.Artifact(
+        artifact_id="a",
+        text=(
+            "Blocked: the build fails after the refactor.\n"
+            "Does not compile after the refactor.\n"
+            "The types module now imports itself."
+        ),
+        kind="blocker",
+    )
+
+    question = quay.build_human_question(_blocker_handoff(task.task_id), task, artifact)
+    lines = question.splitlines()
+
+    assert "Reason: Blocked: the build fails after the refactor." in lines
+    # The declarative "Does not compile..." must not be mistaken for the ask.
+    assert "Need: Does not compile after the refactor." not in lines
+    assert "Need: advise how the worker should proceed." in lines
+    # Diagnostic detail lines survive verbatim in Context.
+    assert "Context:" in lines
+    assert "• Does not compile after the refactor." in lines
+    assert "• The types module now imports itself." in lines
 
 
 def test_stale_metadata_route_falls_back_and_records_fallback_thread():
@@ -1839,3 +2523,1520 @@ def test_quay_cli_client_claims_waiting_human_handoff_for_parked_poll():
     assert handoff.human_question == "Question?"
     calls = [" ".join(call[1:]) for call in runner.calls]
     assert calls == ["handoff list --status waiting_human"]
+
+
+# ---------------------------------------------------------------------------
+# Agentic blocker remediation (BRIX-1878)
+# ---------------------------------------------------------------------------
+
+
+SAFE_BLOCKER_TEXT = (
+    "The ruff lint step failed: an unused import `os` in module foo. "
+    "Remove the unused import and rerun the linter."
+)
+
+
+def remediation_config(**overrides):
+    base = dict(
+        enabled=True,
+        default_slack_channel="C_FALLBACK",
+        remediation_enabled=True,
+        remediation_max_iterations=3,
+        remediation_max_tokens=4000,
+        remediation_max_attempts=2,
+    )
+    base.update(overrides)
+    return quay.OrchestratorConfig(**base)
+
+
+def safe_handoff(**overrides):
+    fields = dict(
+        handoff_id="handoff-rem",
+        task_id="task-rem",
+        artifact_id="artifact-rem",
+        reason="worker_blocker",
+        summary="Worker blocked: lint failure on an unused import.",
+    )
+    fields.update(overrides)
+    return quay.Handoff(**fields)
+
+
+def safe_task(**overrides):
+    fields = dict(task_id="task-rem", title="Fix lint", issue="BRIX-1878")
+    fields.update(overrides)
+    return quay.TaskContext(**fields)
+
+
+def safe_artifact(text=SAFE_BLOCKER_TEXT):
+    return quay.Artifact(artifact_id="artifact-rem", text=text, kind="blocker")
+
+
+class FakeRemediationAgent:
+    def __init__(self, response, *, record):
+        self._response = response
+        self._record = record
+
+    def run_conversation(self, prompt, **kwargs):
+        self._record.append((prompt, kwargs))
+        if isinstance(self._response, Exception):
+            raise self._response
+        return {"final_response": self._response, "total_tokens": 123}
+
+
+def make_remediator(response="", *, config=None, skill="SKILL BODY", linear_request=None):
+    calls = []
+
+    def factory():
+        return FakeRemediationAgent(response, record=calls)
+
+    rem = quay.HandoffRemediator(
+        config=config or remediation_config(),
+        agent_factory=factory,
+        skill_loader=(lambda: skill),
+        linear_request=linear_request,
+    )
+    rem.agent_calls = calls
+    return rem
+
+
+class FakeRemediator:
+    """Mirror of FakeDecider for the drain-loop wiring tests."""
+
+    def __init__(self, brief=None, *, outcome=None):
+        self.brief = brief
+        self.last_outcome = outcome
+        self.calls = []
+        self.friction_calls = []
+
+    def remediate(self, *, handoff, task, artifact):
+        self.calls.append((handoff, task, artifact))
+        return self.brief
+
+    def record_friction(self, *, outcome, task):
+        self.friction_calls.append((outcome, task))
+
+
+class FakeLinear:
+    def __init__(self, *, existing=False):
+        self.existing = existing
+        self.calls = []
+
+    def __call__(self, query, variables):
+        self.calls.append((query, variables))
+        if "issues(" in query:
+            nodes = (
+                [{"id": "iss_1", "identifier": "BRIX-9001", "url": "u"}]
+                if self.existing
+                else []
+            )
+            return {"data": {"issues": {"nodes": nodes}}}
+        if "issueCreate" in query:
+            return {
+                "data": {
+                    "issueCreate": {
+                        "success": True,
+                        "issue": {
+                            "id": "iss_new",
+                            "identifier": "BRIX-9100",
+                            "url": "u",
+                        },
+                    }
+                }
+            }
+        raise AssertionError(f"unexpected linear query: {query!r}")
+
+
+# -- pure guardrail functions ------------------------------------------------
+
+
+def test_never_auto_reason_flags_danger_categories():
+    for text in (
+        "We must decide the product requirement here.",
+        "This deletes the production database.",
+        "Rotate the leaked api key / credential.",
+        "This is unclear and ambiguous.",
+    ):
+        reason = quay._never_auto_reason(
+            safe_handoff(), safe_task(), safe_artifact(text=text)
+        )
+        assert reason is not None, text
+
+
+def test_never_auto_reason_allows_safe_lint_fix():
+    assert quay._never_auto_reason(safe_handoff(), safe_task(), safe_artifact()) is None
+
+
+def test_never_auto_reason_escalates_when_no_blocker_context():
+    assert (
+        quay._never_auto_reason(safe_handoff(), safe_task(), None)
+        == "no_blocker_context"
+    )
+
+
+def test_parse_remediation_response_strict():
+    assert quay.parse_remediation_response('{"action":"escalate"}') == {
+        "action": "escalate"
+    }
+    good = quay.parse_remediation_response(
+        '{"action":"resume","brief":"do x","category":"lint","rationale":"safe"}'
+    )
+    assert good["action"] == "resume"
+    assert good["brief"] == "do x"
+    # Missing required field, wrong action, and non-JSON all escalate.
+    assert quay.parse_remediation_response('{"action":"resume","brief":"x"}') is None
+    assert quay.parse_remediation_response('{"action":"proceed"}') is None
+    assert quay.parse_remediation_response("not json at all") is None
+    assert quay.parse_remediation_response("") is None
+    # Oversized response -> escalate.
+    assert quay.parse_remediation_response("{" + "a" * 40000 + "}") is None
+
+
+def test_parse_remediation_response_strips_fence_and_reads_friction():
+    text = (
+        "```json\n"
+        '{"action":"resume","brief":"fix it","category":"lint","rationale":"safe",'
+        '"friction":{"title":"t","detail":"d","signature":"sig-1"}}\n'
+        "```"
+    )
+    parsed = quay.parse_remediation_response(text)
+    assert parsed["friction"] == {"title": "t", "detail": "d", "signature": "sig-1"}
+    # Malformed friction invalidates the whole response.
+    bad = (
+        '{"action":"resume","brief":"fix","category":"lint","rationale":"safe",'
+        '"friction":{"title":"t"}}'
+    )
+    assert quay.parse_remediation_response(bad) is None
+
+
+# -- BRIX-1878: model-authored escalation message ----------------------------
+
+
+def test_parse_escalate_accepts_and_strips_message():
+    parsed = quay.parse_remediation_response(
+        '{"action":"escalate","message":"  The worker needs a human decision.  "}'
+    )
+    assert parsed == {
+        "action": "escalate",
+        "message": "The worker needs a human decision.",
+    }
+
+
+def test_parse_escalate_message_blank_or_nonstring_treated_as_absent():
+    # Whitespace-only, non-string, and null all drop the message but STILL
+    # produce a valid escalate (a bad message never blocks the escalation).
+    for raw in (
+        '{"action":"escalate","message":"   "}',
+        '{"action":"escalate","message":123}',
+        '{"action":"escalate","message":null}',
+        '{"action":"escalate","message":["a"]}',
+    ):
+        parsed = quay.parse_remediation_response(raw)
+        assert parsed == {"action": "escalate"}, raw
+
+
+def test_parse_escalate_message_is_capped_with_ellipsis():
+    big = "x" * 5000
+    parsed = quay.parse_remediation_response(
+        '{"action":"escalate","message":"' + big + '"}'
+    )
+    assert len(parsed["message"]) == quay._MAX_ESCALATION_MESSAGE_CHARS
+    assert parsed["message"].endswith("…")
+
+
+def test_parse_resume_never_carries_message():
+    # A message on a resume object is ignored entirely: the resume shape is
+    # unchanged and the message must never ride along to influence gate logic.
+    parsed = quay.parse_remediation_response(
+        '{"action":"resume","brief":"do x","category":"lint","rationale":"safe",'
+        '"message":"sneaky broadcast"}'
+    )
+    assert parsed is not None
+    assert "message" not in parsed
+    assert sorted(parsed) == ["action", "brief", "category", "rationale"]
+
+
+def test_sanitize_escalation_message_neutralizes_all_ping_tokens():
+    hostile = (
+        "Heads up @channel and @here and @everyone: "
+        "<!channel> <!here> <!everyone> "
+        "ping <@U123456> and <@U999|alice> plus <!subteam^S042|@team> now"
+    )
+    out = quay._sanitize_escalation_message(hostile)
+    # No token that Slack would broadcast survives as a literal substring.
+    for banned in (
+        "@channel",
+        "@here",
+        "@everyone",
+        "<!channel>",
+        "<!here>",
+        "<!everyone>",
+        "<@U123456>",
+        "<@U999",
+        "<!subteam",
+    ):
+        assert banned not in out, banned
+    # Ordinary words are preserved (only the sigils are defanged).
+    for word in ("Heads", "up", "ping", "now", "channel", "here", "everyone"):
+        assert word in out
+
+
+def test_sanitize_escalation_message_preserves_ordinary_text_and_emails():
+    text = "Please confirm the rollout plan; contact alice@example.com if unsure."
+    out = quay._sanitize_escalation_message(text)
+    assert out == text  # no broadcast tokens -> untouched apart from whitespace
+
+
+def test_sanitize_escalation_message_collapses_whitespace_and_caps():
+    out = quay._sanitize_escalation_message("a\n\n\n   b\t\tc")
+    assert out == "a b c"
+    capped = quay._sanitize_escalation_message("y" * 5000)
+    assert len(capped) == quay._MAX_ESCALATION_MESSAGE_CHARS
+    assert capped.endswith("…")
+
+
+def test_sanitize_escalation_message_neutralizes_labeled_and_link_tokens():
+    # Regression: Slack parses the LABELED broadcast `<!channel|urgent>` as the
+    # same @channel ping as `<!channel>` — an anchored regex missed it. Also
+    # defang disguised hyperlinks and channel refs.
+    cases = [
+        "<!channel|urgent> deploy now",
+        "<!here|team ping>",
+        "<!everyone|all hands>",
+        "<!channel > trailing space",
+        "<!subteam^S1|marketing>",
+        "<@U123|admin> please look",
+        "@channel now",
+        "<https://evil.example|Approve here>",
+        "<#C0001|general>",
+    ]
+    for raw in cases:
+        out = quay._sanitize_escalation_message(raw).lower()
+        # No live broadcast/mention/entity token survives as a literal substring.
+        for banned in ("<!channel", "<!here", "<!everyone", "<!subteam",
+                       "<@", "<#", "<http",
+                       "@channel", "@here", "@everyone"):
+            assert banned not in out, f"{banned!r} survived in {out!r} from {raw!r}"
+    # Ordinary comparisons and emails are left intact.
+    assert quay._sanitize_escalation_message("a < b and x@y.com") == "a < b and x@y.com"
+
+
+# -- HandoffRemediator gates -------------------------------------------------
+
+
+def test_remediator_gate1_never_auto_skips_model():
+    rem = make_remediator(response='{"action":"resume","brief":"x","category":"lint","rationale":"ok"}')
+    result = rem.remediate(
+        handoff=safe_handoff(),
+        task=safe_task(),
+        artifact=safe_artifact(text="We need a product decision on requirements."),
+    )
+    assert result is None
+    assert rem.agent_calls == []  # model never invoked
+    assert rem.last_outcome is None
+
+
+def test_remediator_malformed_json_escalates():
+    rem = make_remediator(response="totally not json")
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert len(rem.agent_calls) == 1  # model WAS called; output rejected
+    assert rem.last_outcome is None
+
+
+def test_remediator_loop_guard_over_budget_escalates_without_model():
+    rem = make_remediator(response='{"action":"resume","brief":"x","category":"lint","rationale":"ok"}')
+    path = rem._attempts_path("task-rem")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("2", encoding="utf-8")  # == remediation_max_attempts
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert rem.agent_calls == []
+
+
+def test_remediator_missing_skill_escalates():
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        agent_factory=lambda: FakeRemediationAgent("", record=[]),
+        skill_loader=(lambda: None),
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+
+
+def test_remediator_happy_resume_returns_brief_and_bumps_counter():
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "Removing an unused import is safe and reversible.",
+        }
+    )
+    rem = make_remediator(response=response)
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief == "Remove the unused import in foo.py and rerun ruff."
+    assert rem.last_outcome is not None
+    assert rem.last_outcome.category == "scoped-known-fix"
+    assert rem.last_outcome.tokens == 123
+    # Durable loop guard advanced to 1 on disk.
+    assert rem._attempts_path("task-rem").read_text(encoding="utf-8") == "1"
+
+
+def test_remediator_escalate_surfaces_message_via_last_outcome():
+    # An escalate with a message returns None (unchanged) but stashes the parsed
+    # message on last_outcome for the renderer. The message never touches the
+    # decision itself.
+    rem = make_remediator(
+        response='{"action":"escalate","message":"Need a human to pick the ruff version."}'
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert rem.last_outcome is not None
+    assert rem.last_outcome.message == "Need a human to pick the ruff version."
+    assert rem.last_outcome.brief == ""
+
+
+def test_remediator_escalate_without_message_leaves_outcome_none():
+    rem = make_remediator(response='{"action":"escalate"}')
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None
+    assert rem.last_outcome is None
+
+
+def test_remediator_gate2_blocks_never_auto_category():
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Ship the fix.",
+            "category": "security",
+            "rationale": "trust me",
+        }
+    )
+    rem = make_remediator(response=response)
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief is None  # BLOCKED by Gate #2
+    assert len(rem.agent_calls) == 1  # model ran, but its resume was rejected
+    assert rem.last_outcome is None
+
+
+def test_remediator_gate2_blocks_danger_brief_text():
+    # Category is allowlisted (passes gate (a)); the danger lives only in the
+    # brief text, so the keyword backstop (gate (b)) is what must block it.
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Drop the production database table to unblock.",
+            "category": "scoped-known-fix",
+            "rationale": "safe",
+        }
+    )
+    rem = make_remediator(response=response)
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief is None
+    assert rem.last_outcome is None
+
+
+def test_remediator_reads_skill_from_disk():
+    skill_dir = (
+        Path(os.environ["HERMES_HOME"])
+        / "skills"
+        / "quay"
+        / "quay-blocker-remediation"
+    )
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text("SKILL FROM DISK", encoding="utf-8")
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "safe",
+        }
+    )
+    calls = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        agent_factory=lambda: FakeRemediationAgent(response, record=calls),
+    )
+    brief = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert brief == "Remove the unused import and rerun ruff."
+    # The system message carried the disk-loaded skill body.
+    assert "SKILL FROM DISK" in calls[0][1]["system_message"]
+
+
+def test_remediator_build_agent_applies_caps():
+    quay_mod_agent = FakeAgent
+    quay_mod_agent.instances = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(
+            remediation_max_iterations=5, remediation_max_tokens=1234
+        ),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=FakeAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    rem.remediate(handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact())
+    kwargs = FakeAgent.instances[-1].kwargs
+    assert kwargs["max_iterations"] == 5
+    assert kwargs["max_tokens"] == 1234
+    assert kwargs["enabled_toolsets"] == []
+    assert kwargs["platform"] == "quay-orchestrator"
+    assert kwargs["skip_context_files"] is True
+    assert kwargs["skip_memory"] is True
+
+
+# -- friction recorder -------------------------------------------------------
+
+
+def _friction_outcome(signature="quay-lint-truncation"):
+    return quay.RemediationOutcome(
+        brief="fix",
+        category="lint",
+        friction={
+            "title": "quay lint output truncated",
+            "detail": "the CLI truncates ruff output",
+            "signature": signature,
+        },
+    )
+
+
+def test_record_friction_creates_new_issue():
+    linear = FakeLinear(existing=False)
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    queries = [c[0] for c in linear.calls]
+    assert any("issues(" in q for q in queries)  # dedup search
+    assert any("issueCreate" in q for q in queries)  # created
+    # The create files into the AI Automation project, not the team root.
+    create_vars = next(v for q, v in linear.calls if "issueCreate" in q)
+    assert create_vars["input"]["projectId"] == (
+        quay.DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
+    )
+    assert create_vars["input"]["teamId"] == quay.DEFAULT_REMEDIATION_LINEAR_TEAM_ID
+
+
+def test_record_friction_dedupes_existing_issue():
+    linear = FakeLinear(existing=True)
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    queries = [c[0] for c in linear.calls]
+    assert any("issues(" in q for q in queries)
+    assert not any("issueCreate" in q for q in queries)  # no create
+
+
+def test_record_friction_local_marker_short_circuits():
+    linear = FakeLinear(existing=False)
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    first_call_count = len(linear.calls)
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    assert len(linear.calls) == first_call_count  # marker avoided re-hitting Linear
+
+
+def test_record_friction_noop_when_flag_off():
+    linear = FakeLinear()
+    rem = quay.HandoffRemediator(
+        config=remediation_config(remediation_friction_enabled=False),
+        linear_request=linear,
+    )
+    rem.record_friction(outcome=_friction_outcome(), task=safe_task())
+    assert linear.calls == []
+
+
+# -- HandoffDrainer wiring ---------------------------------------------------
+
+
+def test_drain_flag_off_never_invokes_remediator():
+    handoff = safe_handoff(artifact_id=None)
+    quay_client = FakeQuayClient(handoff)
+    remediator = FakeRemediator(brief="should not be used")
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=quay.OrchestratorConfig(enabled=True),  # remediation_enabled False
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert remediator.calls == []  # feature inert
+    assert quay_client.submitted == []
+    assert result.status == "missing_default_slack_channel"
+
+
+def test_drain_remediation_escalate_does_not_submit():
+    handoff = safe_handoff(artifact_id=None)
+    quay_client = FakeQuayClient(handoff)
+    remediator = FakeRemediator(brief=None)  # remediate -> escalate
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(default_slack_channel=""),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert len(remediator.calls) == 1
+    assert quay_client.submitted == []
+    assert result.metrics["remediation_escalated"] == 1
+    assert result.status == "missing_default_slack_channel"
+
+
+def test_drain_remediation_happy_submits_and_posts_fyi():
+    outcome = quay.RemediationOutcome(
+        brief="Remove the unused import and rerun ruff.",
+        category="lint_fix",
+        rationale="safe",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    remediator = FakeRemediator(brief=outcome.brief, outcome=outcome)
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=remediation_config(),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert result.status == "submitted_remediated"
+    assert quay_client.submitted == [
+        (handoff, outcome.brief, "blocker_resolved")
+    ]
+    assert quay_client.completed == [handoff]
+    assert len(slack.questions) == 1  # FYI posted to fallback channel
+    fyi_text = slack.questions[0][1]
+    assert "Otto auto-resumed" in fyi_text
+    assert "lint_fix" in fyi_text
+    assert "reply here to override" in fyi_text
+    assert result.metrics["agent_briefs_submitted"] == 1
+    assert result.metrics["agent_fyi_posted"] == 1
+    assert remediator.friction_calls == [(outcome, quay_client.task)]
+
+
+def test_drain_remediation_end_to_end_with_real_remediator():
+    response = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "Removing an unused import is safe and reversible.",
+            "friction": {
+                "title": "quay lint output truncated",
+                "detail": "the CLI truncates ruff output",
+                "signature": "quay-lint-truncation",
+            },
+        }
+    )
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=response,
+        config=remediation_config(remediation_friction_enabled=True),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient()
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=remediation_config(remediation_friction_enabled=True),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert result.status == "submitted_remediated"
+    assert quay_client.submitted[0][1].startswith("Remove the unused import")
+    assert quay_client.submitted[0][2] == "blocker_resolved"
+    assert len(slack.questions) == 1
+    # Friction was filed to Linear (find + create).
+    assert any("issueCreate" in c[0] for c in linear.calls)
+
+
+# -- BRIX-1878: model-authored escalation message, drain-level wiring --------
+
+
+ESCALATE_MESSAGE = "The worker hit an ambiguous config choice and needs a human call."
+
+
+def _escalate_message_response(message=ESCALATE_MESSAGE):
+    return json.dumps({"action": "escalate", "message": message})
+
+
+def _drain_escalation(config):
+    """Drive drain_one to the escalate branch with a real remediator.
+
+    Returns (result, slack, quay_client, remediator). A None Slack reply lets the
+    escalation post its question and then time out, so slack.questions[0] holds
+    exactly what was posted without any auto-resume submit.
+    """
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, task=safe_task(), artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(
+        response=_escalate_message_response(), config=config
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    return result, slack, quay_client, remediator
+
+
+def test_drain_message_mode_uses_model_body_with_scaffolding_no_submit():
+    # message-only mode: the model escalates WITH a message -> the posted Slack
+    # text is the model body wrapped in the deterministic header/contributor/
+    # footer, and submit_brief is NEVER called.
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    result, slack, quay_client, remediator = _drain_escalation(config)
+
+    assert quay_client.submitted == []  # hard invariant: no auto-resume
+    assert len(remediator.agent_calls) == 1  # the turn ran
+    assert len(slack.questions) == 1
+    posted = slack.questions[0][1]
+    assert ESCALATE_MESSAGE in posted  # model body
+    assert posted.startswith("*Quay worker blocked*")  # deterministic header
+    assert "BRIX-1878" in posted  # identifier from _handoff_header suffix
+    assert quay._HUMAN_QUESTION_FOOTER in posted  # shared footer
+    assert result.metrics["remediation_escalated"] == 1
+
+
+def test_drain_message_mode_no_message_falls_back_to_deterministic():
+    # message-only mode, model escalates with NO message -> posted text equals
+    # build_human_question exactly (deterministic template).
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(response='{"action":"escalate"}', config=config)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+
+    assert quay_client.submitted == []
+    assert len(slack.questions) == 1
+    expected = quay.build_human_question(handoff, quay_client.task, quay_client.artifact)
+    assert slack.questions[0][1] == expected
+    assert result.metrics["remediation_escalated"] == 1
+
+
+def test_drain_message_mode_never_submits_a_proposed_resume():
+    # HARD INVARIANT: in message-only mode, even a fully gate-cleared resume must
+    # NOT be submitted -- the message flag never enables auto-resume. It falls
+    # through to a deterministic escalation (the resume brief carries no message).
+    resume = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "safe and reversible",
+        }
+    )
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(response=resume, config=config)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+
+    assert quay_client.submitted == []  # resume suppressed
+    assert len(remediator.agent_calls) == 1
+    assert len(slack.questions) == 1
+    # No message on a resume -> deterministic template.
+    expected = quay.build_human_question(handoff, quay_client.task, quay_client.artifact)
+    assert slack.questions[0][1] == expected
+    assert result.metrics["remediation_escalated"] == 1
+
+
+def test_drain_both_flags_off_is_inert_and_byte_identical():
+    # State 1: both flags False -> the turn never runs and the escalation is
+    # byte-identical to today's deterministic template.
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(
+        response=_escalate_message_response(),
+        config=remediation_config(
+            remediation_enabled=False,
+            remediation_escalation_message_enabled=False,
+        ),
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=quay.OrchestratorConfig(
+            enabled=True,
+            default_slack_channel="C_ESC",
+            remediation_enabled=False,
+            remediation_escalation_message_enabled=False,
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+
+    assert remediator.agent_calls == []  # no model turn (inert)
+    assert quay_client.submitted == []
+    assert len(slack.questions) == 1
+    expected = quay.build_human_question(handoff, quay_client.task, quay_client.artifact)
+    assert slack.questions[0][1] == expected
+    assert result.status == "human_reply_timeout"
+
+
+def test_drain_remediation_only_ignores_model_message_on_escalate():
+    # State 3: remediation-only (auto-resume on, message flag off). On escalate the
+    # posted text is the deterministic template even though the model supplied a
+    # message -- the message flag gates message use.
+    config = remediation_config(
+        remediation_enabled=True,
+        remediation_escalation_message_enabled=False,
+        default_slack_channel="C_ESC",
+    )
+    result, slack, quay_client, remediator = _drain_escalation(config)
+
+    assert quay_client.submitted == []
+    assert len(slack.questions) == 1
+    posted = slack.questions[0][1]
+    assert ESCALATE_MESSAGE not in posted  # message ignored
+    # safe_handoff() is deterministic, so a fresh one reproduces the exact render.
+    expected = quay.build_human_question(
+        safe_handoff(), quay_client.task, quay_client.artifact
+    )
+    assert posted == expected
+
+
+def test_drain_both_flags_on_auto_resumes_and_uses_message_on_escalate():
+    # State 4a: both flags on, model resumes -> auto-resume still works.
+    resume = json.dumps(
+        {
+            "action": "resume",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "category": "scoped-known-fix",
+            "rationale": "safe and reversible",
+        }
+    )
+    config = remediation_config(
+        remediation_enabled=True,
+        remediation_escalation_message_enabled=True,
+        remediation_max_attempts=5,  # two drains share task-rem's loop guard
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient()
+    remediator = make_remediator(response=resume, config=config)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert result.status == "submitted_remediated"
+    assert quay_client.submitted[0][1].startswith("Remove the unused import")
+
+    # State 4b: both flags on, model escalates with a message -> message is used.
+    config2 = remediation_config(
+        remediation_enabled=True,
+        remediation_escalation_message_enabled=True,
+        remediation_max_attempts=5,
+        default_slack_channel="C_ESC",
+    )
+    result2, slack2, quay_client2, _ = _drain_escalation(config2)
+    assert quay_client2.submitted == []
+    assert ESCALATE_MESSAGE in slack2.questions[0][1]
+
+
+def test_drain_escalation_message_neutralizes_broadcast_injection():
+    # A model message that tries to @channel the world must be neutralized before
+    # it reaches Slack.
+    config = remediation_config(
+        remediation_enabled=False,
+        remediation_escalation_message_enabled=True,
+        default_slack_channel="C_ESC",
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    slack = FakeSlackClient(reply=None)
+    remediator = make_remediator(
+        response=_escalate_message_response(
+            "URGENT <!channel> @everyone please look, ping <@U0DEADBEEF> now"
+        ),
+        config=config,
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    drainer.drain_one()
+    posted = slack.questions[0][1]
+    for banned in ("<!channel>", "@everyone", "<@U0DEADBEEF>"):
+        assert banned not in posted, banned
+    assert "URGENT" in posted and "please look" in posted
+
+
+def test_submit_reason_guard_matches_quay_cli_enum():
+    # Quay's `submit-brief --help` accepts only these two reasons; the guard must
+    # reject anything else (regression fence for the old "blocker_auto_remediated").
+    assert quay._QUAY_SUBMIT_REASONS == frozenset(
+        {"blocker_resolved", "advice_answered"}
+    )
+    assert quay._validate_submit_reason("blocker_resolved") == "blocker_resolved"
+    assert quay._validate_submit_reason("advice_answered") == "advice_answered"
+    with pytest.raises(ValueError):
+        quay._validate_submit_reason("blocker_auto_remediated")
+
+
+# -- config plumbing ---------------------------------------------------------
+
+
+def test_config_remediation_defaults_off():
+    cfg = quay.OrchestratorConfig()
+    assert cfg.remediation_enabled is False
+    assert cfg.remediation_friction_enabled is False
+    assert cfg.remediation_escalation_message_enabled is False
+    assert cfg.remediation_max_attempts == 2
+    assert cfg.remediation_max_iterations == 3
+    assert cfg.remediation_linear_team_id == "28294e03-c1ce-4c2b-ba24-49e36179a321"
+
+
+def test_config_from_mapping_reads_remediation():
+    cfg = quay.OrchestratorConfig.from_mapping(
+        {
+            "remediation_enabled": True,
+            "remediation_max_iterations": 7,
+            "remediation_max_tokens": 999,
+            "remediation_max_attempts": 4,
+            "remediation_friction_enabled": True,
+            "remediation_escalation_message_enabled": True,
+            "remediation_linear_team_id": "team-xyz",
+        }
+    )
+    assert cfg.remediation_enabled is True
+    assert cfg.remediation_max_iterations == 7
+    assert cfg.remediation_max_tokens == 999
+    assert cfg.remediation_max_attempts == 4
+    assert cfg.remediation_friction_enabled is True
+    assert cfg.remediation_escalation_message_enabled is True
+    assert cfg.remediation_linear_team_id == "team-xyz"
+
+
+def test_config_escalation_message_flag_is_independent():
+    # The two flags are wired independently: enabling the message flag must not
+    # enable auto-resume, and vice versa.
+    msg_only = quay.OrchestratorConfig.from_mapping(
+        {"remediation_escalation_message_enabled": True}
+    )
+    assert msg_only.remediation_escalation_message_enabled is True
+    assert msg_only.remediation_enabled is False
+
+    resume_only = quay.OrchestratorConfig.from_mapping(
+        {"remediation_enabled": True}
+    )
+    assert resume_only.remediation_enabled is True
+    assert resume_only.remediation_escalation_message_enabled is False
+
+
+def test_config_env_overrides_remediation(monkeypatch):
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_ENABLED", "true")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ITERATIONS", "6")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_TOKENS", "2500")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ATTEMPTS", "5")
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_FRICTION_ENABLED", "yes")
+    monkeypatch.setenv(
+        "QUAY_ORCHESTRATOR_REMEDIATION_ESCALATION_MESSAGE_ENABLED", "true"
+    )
+    monkeypatch.setenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID", "team-env")
+    cfg = quay.OrchestratorConfig().with_env_overrides()
+    assert cfg.remediation_enabled is True
+    assert cfg.remediation_max_iterations == 6
+    assert cfg.remediation_max_tokens == 2500
+    assert cfg.remediation_max_attempts == 5
+    assert cfg.remediation_friction_enabled is True
+    assert cfg.remediation_escalation_message_enabled is True
+    assert cfg.remediation_linear_team_id == "team-env"
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review hardening: F1 allowlist, F2 tool-less, F3 fail-closed
+# loop guard, F4 friction-on-escalate (BRIX-1878).
+# ---------------------------------------------------------------------------
+
+
+# -- F1: allowlist as the enforceable floor ----------------------------------
+
+
+def test_auto_answerable_category_allowlist_membership():
+    for good in (
+        "prerequisite-baseline",
+        "stale-baseline",
+        "missing-invocation",
+        "transient-retry",
+        "scoped-known-fix",
+        "  Scoped-Known-Fix  ",  # normalized (strip + lowercase)
+    ):
+        assert quay._is_auto_answerable_category(good), good
+    for bad in ("lint_fix", "housekeeping", "", "escalate", "product", None, 123):
+        assert not quay._is_auto_answerable_category(bad), bad
+
+
+def test_drain_real_remediator_escalates_paraphrased_danger_briefs():
+    # Benign, allowlisted category (clears gate (a)) but a PARAPHRASED dangerous
+    # brief: the keyword backstop (gate (b)) over the model's own brief must
+    # catch it. Otto escalates and never submits a brief.
+    dangerous_briefs = [
+        "Apply the pending migration to the live production cluster.",
+        "Force-push to overwrite remote history so the branch matches local.",
+    ]
+    for brief_text in dangerous_briefs:
+        response = json.dumps(
+            {
+                "action": "resume",
+                "category": "scoped-known-fix",
+                "brief": brief_text,
+                "rationale": "quick and safe",
+            }
+        )
+        remediator = make_remediator(
+            response=response,
+            config=remediation_config(default_slack_channel=""),
+        )
+        handoff = safe_handoff()
+        quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+        drainer = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=FakeSlackClient(),
+            config=remediation_config(default_slack_channel=""),
+            worker_id="test-worker",
+            remediator=remediator,
+        )
+        result = drainer.drain_one()
+        assert quay_client.submitted == [], brief_text
+        assert result.metrics["remediation_escalated"] == 1, brief_text
+        # Model ran; its resume was rejected post-hoc by the gate.
+        assert len(remediator.agent_calls) == 1, brief_text
+
+
+def test_drain_real_remediator_escalates_novel_category():
+    # A safe brief but a NOVEL/unknown category (not one of the 5 canonical
+    # auto-answerable categories) must escalate: the allowlist is the floor.
+    # Under the old denylist this label carried no banned token and would have
+    # leaked through to an auto-resume.
+    response = json.dumps(
+        {
+            "action": "resume",
+            "category": "housekeeping",
+            "brief": "Remove the unused import in foo.py and rerun ruff.",
+            "rationale": "safe and reversible",
+        }
+    )
+    remediator = make_remediator(
+        response=response,
+        config=remediation_config(default_slack_channel=""),
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(default_slack_channel=""),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []
+    assert result.metrics["remediation_escalated"] == 1
+    assert len(remediator.agent_calls) == 1
+
+
+# -- F2: tool-less guarantee regardless of ambient env -----------------------
+
+
+class ToolResolvingAgent:
+    """Agent stub whose ``.tools`` are computed by the REAL model_tools
+    resolver, exactly like ``agent_init.init_agent`` does. This exercises the
+    tool-less guarantee end-to-end rather than stubbing it out."""
+
+    instances: list = []
+
+    def __init__(self, **kwargs) -> None:
+        import model_tools
+
+        self.kwargs = kwargs
+        self.tools = model_tools.get_tool_definitions(
+            enabled_toolsets=kwargs.get("enabled_toolsets"),
+            disabled_toolsets=kwargs.get("disabled_toolsets"),
+            quiet_mode=True,
+        )
+        ToolResolvingAgent.instances.append(self)
+
+
+def test_remediation_agent_is_tool_less_even_with_kanban_env(monkeypatch):
+    # model_tools force-appends the `kanban` toolset when HERMES_KANBAN_TASK is
+    # set. The orchestrator agent must still resolve to ZERO tools.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "kanban-task-42")
+    ToolResolvingAgent.instances = []
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=ToolResolvingAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    agent = rem._build_agent(safe_handoff(), max_iterations=3, max_tokens=100)
+    assert agent.kwargs["enabled_toolsets"] == []
+    assert agent.kwargs["disabled_toolsets"] == ["kanban"]
+    # Force-append neutralized: the remediation agent holds no tools at all.
+    assert agent.tools == []
+
+
+# -- F3: loop guard fails CLOSED on a durable-write failure ------------------
+
+
+def test_remediator_loop_guard_write_failure_escalates_without_model(monkeypatch):
+    rem = make_remediator(
+        response='{"action":"resume","brief":"x","category":"scoped-known-fix","rationale":"ok"}'
+    )
+    real_write = Path.write_text
+
+    def failing_write(self, *args, **kwargs):
+        if "remediation-attempts" in str(self):
+            raise OSError("read-only file system")
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(quay.Path, "write_text", failing_write)
+    result = rem.remediate(
+        handoff=safe_handoff(), task=safe_task(), artifact=safe_artifact()
+    )
+    assert result is None  # cannot prove under-budget -> escalate
+    assert rem.agent_calls == []  # model NOT invoked (fail-closed before build)
+    assert rem.last_outcome is None
+
+
+# -- F4: friction captured on the escalate path too --------------------------
+
+
+def test_parse_remediation_response_escalate_carries_valid_friction():
+    parsed = quay.parse_remediation_response(
+        json.dumps(
+            {
+                "action": "escalate",
+                "friction": {"title": "t", "detail": "d", "signature": "sig"},
+            }
+        )
+    )
+    assert parsed == {
+        "action": "escalate",
+        "friction": {"title": "t", "detail": "d", "signature": "sig"},
+    }
+    # Invalid friction is dropped but the response still escalates.
+    parsed_bad = quay.parse_remediation_response(
+        json.dumps({"action": "escalate", "friction": {"title": "only-title"}})
+    )
+    assert parsed_bad == {"action": "escalate"}
+
+
+def _escalate_with_friction_response(signature: str) -> str:
+    return json.dumps(
+        {
+            "action": "escalate",
+            "friction": {
+                "title": "quay CLI cannot pass multiline briefs",
+                "detail": "the submit-brief flag rejects newlines",
+                "signature": signature,
+            },
+        }
+    )
+
+
+def test_drain_escalate_with_friction_records_but_still_escalates():
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=_escalate_with_friction_response("sig-escalate-1"),
+        config=remediation_config(
+            remediation_friction_enabled=True, default_slack_channel=""
+        ),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(
+            remediation_friction_enabled=True, default_slack_channel=""
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []  # escalated, not resumed
+    assert result.metrics["remediation_escalated"] == 1
+    assert any("issueCreate" in c[0] for c in linear.calls)  # friction filed
+
+
+def test_drain_escalate_with_friction_noop_when_flag_off():
+    linear = FakeLinear(existing=False)
+    remediator = make_remediator(
+        response=_escalate_with_friction_response("sig-escalate-2"),
+        config=remediation_config(
+            remediation_friction_enabled=False, default_slack_channel=""
+        ),
+        linear_request=linear,
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(
+            remediation_friction_enabled=False, default_slack_channel=""
+        ),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []  # still escalates
+    assert result.metrics["remediation_escalated"] == 1
+    assert linear.calls == []  # friction NOT filed while the flag is off
+
+
+# -- BRIX-1896: review-finding Linear delivery -------------------------------
+
+
+def _review_finding_payload(**overrides):
+    payload = {
+        "finding_id": 44,
+        "task_id": "task-synthetic",
+        "review_id": "review-1",
+        "head_sha": "deadbeefcafe",
+        "fingerprint": "fp-abc123",
+        "title": "Settlement dependencies are self-contradictory",
+        "body_markdown": "The settlement module transitively depends on itself.",
+        "principle_text": "Modules must not form dependency cycles.",
+        "repo_id": "InverterNetwork/iTRY-monorepo",
+        "pr_number": 1000,
+        "pr_url": "https://github.com/InverterNetwork/iTRY-monorepo/pull/1000",
+        "locations": [
+            {
+                "path": "src/settle.ts",
+                "start_line": 10,
+                "end_line": 12,
+                "url": "https://github.com/InverterNetwork/iTRY-monorepo/blob/x/src/settle.ts#L10-L12",
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _review_finding_item(*, payload=None, kind=None, route_hint=None, outbox_item_id=330):
+    resolved_payload = payload if payload is not None else _review_finding_payload()
+    return quay.OutboxItem.from_mapping(
+        {
+            "outbox_item_id": outbox_item_id,
+            "task_id": str(resolved_payload.get("task_id") or "task-synthetic"),
+            "kind": kind if kind is not None else quay.REVIEW_FINDING_LINEAR_ISSUE_KIND,
+            "handler_class": "delivery",
+            "claim_id": f"outbox-claim-{outbox_item_id}",
+            "payload_json": json.dumps(resolved_payload),
+            "route_hint_json": json.dumps(
+                route_hint if route_hint is not None else {"provider": "linear"}
+            ),
+            "status": "pending",
+            "last_error": None,
+        }
+    )
+
+
+class FakeReviewFindingLinear:
+    """Fake Linear transport for the review-finding ``issueCreate`` mutation."""
+
+    def __init__(self, *, success=True):
+        self.success = success
+        self.calls = []
+
+    def __call__(self, query, variables):
+        self.calls.append((query, variables))
+        if "issueCreate" not in query:
+            raise AssertionError(f"unexpected linear query: {query!r}")
+        if not self.success:
+            return {"data": {"issueCreate": {"success": False, "issue": None}}}
+        return {
+            "data": {
+                "issueCreate": {
+                    "success": True,
+                    "issue": {
+                        "id": "iss_rf",
+                        "identifier": "BRIX-7001",
+                        "url": "https://linear.app/inverter/issue/BRIX-7001",
+                    },
+                }
+            }
+        }
+
+
+class ExplodingLinear:
+    """Fails the test if any Linear call is attempted (the Slack path never should)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, query, variables):
+        self.calls.append((query, variables))
+        raise AssertionError("Slack-kind delivery must not call Linear")
+
+
+def test_is_review_finding_linear_delivery_matches_kind_or_provider():
+    by_kind = _review_finding_item(route_hint={})
+    by_provider = _review_finding_item(kind="delivery.other", route_hint={"provider": "linear"})
+    slack_kind = delivery_item(route_hint={"channel_id": "CDELIVERY"})
+    assert quay._is_review_finding_linear_delivery(by_kind) is True
+    assert quay._is_review_finding_linear_delivery(by_provider) is True
+    assert quay._is_review_finding_linear_delivery(slack_kind) is False
+
+
+def test_render_review_finding_issue_body_omits_absent_sections():
+    body = quay._render_review_finding_issue_body(
+        {"body_markdown": "just the finding", "locations": []}
+    )
+    assert body == "just the finding"
+
+
+def test_drain_one_linear_review_finding_creates_issue_not_slack():
+    payload = _review_finding_payload()
+    item = _review_finding_item(payload=payload)
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = FakeReviewFindingLinear()
+    config = quay.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="CDELIVERY",
+        review_finding_linear_team_id="team-review-xyz",
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    # No Slack side effects whatsoever — this is the bug's whole point.
+    assert slack.questions == []
+    assert slack.acks == []
+    assert slack.validations == []
+    # Exactly one Linear issueCreate, filed to the review-finding team.
+    assert len(linear.calls) == 1
+    _, variables = linear.calls[0]
+    create_input = variables["input"]
+    assert create_input["teamId"] == "team-review-xyz"
+    assert create_input["title"] == payload["title"]
+    assert "projectId" not in create_input
+    # Idempotency: the client-supplied id is the deterministic fingerprint UUID.
+    assert create_input["id"] == quay._review_finding_provider_idempotency_key(payload)
+    # Body carries the finding text, principle, location, and PR url.
+    body = create_input["description"]
+    assert payload["body_markdown"] in body
+    assert "## quay-principle" in body
+    assert payload["principle_text"] in body
+    assert "src/settle.ts:10-12" in body
+    assert payload["pr_url"] in body
+    # Outbox row completed; nothing failed.
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+    assert result.metrics["delivery_items_delivered"] == 1
+
+
+def test_drain_one_linear_review_finding_falls_back_to_remediation_team():
+    payload = _review_finding_payload()
+    item = _review_finding_item(payload=payload)
+    quay_client = FakeOutboxQuayClient(item)
+    linear = FakeReviewFindingLinear()
+    # review_finding_linear_team_id unset -> fall back to the remediation team.
+    config = quay.OrchestratorConfig(
+        enabled=True, remediation_linear_team_id="team-remediation-fallback"
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert linear.calls[0][1]["input"]["teamId"] == "team-remediation-fallback"
+
+
+def test_drain_one_linear_review_finding_redelivery_is_idempotent():
+    payload = _review_finding_payload()
+    config = quay.OrchestratorConfig(
+        enabled=True, review_finding_linear_team_id="team-review-xyz"
+    )
+
+    def drain_once():
+        item = _review_finding_item(payload=payload)
+        quay_client = FakeOutboxQuayClient(item)
+        linear = FakeReviewFindingLinear()
+        drainer = quay.HandoffDrainer(
+            quay=quay_client,
+            slack=FakeSlackClient(),
+            config=config,
+            worker_id="test-worker",
+            remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+        )
+        assert drainer.drain_one().status == "delivery_delivered"
+        return linear.calls[0][1]["input"]["id"]
+
+    # Re-delivery of the same finding reuses the same client-supplied issue id,
+    # so Linear's issueCreate dedupes it — no duplicate ticket.
+    first_id = drain_once()
+    second_id = drain_once()
+    assert first_id == second_id
+    assert first_id == quay._review_finding_provider_idempotency_key(payload)
+
+
+def test_drain_one_slack_kind_still_posts_and_skips_linear():
+    item = delivery_item(route_hint={"channel_id": "CDELIVERY"})
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = ExplodingLinear()
+    config = quay.OrchestratorConfig(enabled=True)
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    assert result.status == "delivery_delivered"
+    assert len(slack.questions) == 1
+    assert slack.questions[0][0] == "CDELIVERY"
+    assert linear.calls == []  # Slack kinds never touch Linear
+    assert quay_client.completed == [item]
+    assert quay_client.failed == []
+
+
+def test_drain_one_linear_review_finding_without_team_quarantines_not_slack():
+    item = _review_finding_item()
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = FakeReviewFindingLinear()
+    config = quay.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="CDELIVERY",
+        review_finding_linear_team_id="",
+        remediation_linear_team_id="",
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    # No usable team id -> fail/quarantine, never a silent Slack fallback.
+    assert result.status == "runner_error"
+    assert slack.questions == []
+    assert slack.acks == []
+    assert linear.calls == []
+    assert quay_client.completed == []
+    assert len(quay_client.failed) == 1
+
+
+def test_drain_one_linear_review_finding_creation_failure_quarantines():
+    item = _review_finding_item()
+    quay_client = FakeOutboxQuayClient(item)
+    slack = FakeSlackClient()
+    linear = FakeReviewFindingLinear(success=False)
+    config = quay.OrchestratorConfig(
+        enabled=True,
+        default_slack_channel="CDELIVERY",
+        review_finding_linear_team_id="team-review-xyz",
+    )
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=slack,
+        config=config,
+        worker_id="test-worker",
+        remediator=quay.HandoffRemediator(config=config, linear_request=linear),
+    )
+
+    result = drainer.drain_one()
+
+    # A failed issueCreate must not complete the row nor fall back to Slack.
+    assert result.status == "runner_error"
+    assert slack.questions == []
+    assert quay_client.completed == []
+    assert len(quay_client.failed) == 1

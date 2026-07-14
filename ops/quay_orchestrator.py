@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -225,6 +226,9 @@ class RunMetrics:
     no_handoff: int = 0
     lock_busy: int = 0
     errors: int = 0
+    agent_briefs_submitted: int = 0
+    agent_fyi_posted: int = 0
+    remediation_escalated: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return dataclasses.asdict(self)
@@ -238,6 +242,18 @@ class DrainResult:
     metrics: Mapping[str, int] = field(default_factory=dict)
 
 
+# Default Linear team + project for Otto's Quay-CLI friction tickets (BRIX-1878).
+DEFAULT_REMEDIATION_LINEAR_TEAM_ID = "28294e03-c1ce-4c2b-ba24-49e36179a321"
+# BRIX "AI Automation" project — friction tickets file here, not the team root.
+DEFAULT_REMEDIATION_LINEAR_PROJECT_ID = "273a789d-30a8-4a88-baac-9867df5aedb0"
+
+# Quay enqueues review findings it wants filed as Linear issues under this
+# outbox kind + ``route_hint={"provider":"linear"}`` (BRIX-1896). The kind is
+# also the discriminant Quay folds into the Linear idempotency-key source, so
+# it must stay byte-identical to Quay's REVIEW_FINDING_LINEAR_ISSUE_OUTBOX_KIND.
+REVIEW_FINDING_LINEAR_ISSUE_KIND = "delivery.review_finding_linear_issue"
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     enabled: bool = False
@@ -247,6 +263,27 @@ class OrchestratorConfig:
     reply_timeout_seconds: float = 1800.0
     poll_interval_seconds: float = 15.0
     lock_path: Path | None = None
+    # Agentic blocker remediation (BRIX-1878). Default OFF: Otto never touches a
+    # live handoff unless every one of these flags is explicitly enabled.
+    remediation_enabled: bool = False
+    remediation_max_iterations: int = 3
+    remediation_max_tokens: int = 4000
+    remediation_max_attempts: int = 2
+    remediation_friction_enabled: bool = False
+    # Model-authored human-facing escalation message (BRIX-1878). Decoupled from
+    # ``remediation_enabled``: this flag only lets the (already bounded) turn
+    # author the Slack escalation text on the escalate path. It NEVER enables an
+    # auto-resume — a gate-cleared resume is still only submitted under
+    # ``remediation_enabled``. Default OFF: fully inert until explicitly enabled.
+    remediation_escalation_message_enabled: bool = False
+    remediation_linear_team_id: str = DEFAULT_REMEDIATION_LINEAR_TEAM_ID
+    remediation_linear_project_id: str = DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
+    # Linear team review findings (kind ``delivery.review_finding_linear_issue``)
+    # are filed under (BRIX-1896). Empty means "fall back to
+    # ``remediation_linear_team_id``" — resolved at delivery time, not here, so a
+    # deploy can point review findings at a different team without touching the
+    # friction team.
+    review_finding_linear_team_id: str = ""
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "OrchestratorConfig":
@@ -262,6 +299,35 @@ class OrchestratorConfig:
                 raw.get("poll_interval_seconds"), default=15.0
             ),
             lock_path=Path(str(raw["lock_path"])) if raw.get("lock_path") else None,
+            remediation_enabled=_as_bool(
+                raw.get("remediation_enabled"), default=False
+            ),
+            remediation_max_iterations=_positive_int(
+                raw.get("remediation_max_iterations"), default=3
+            ),
+            remediation_max_tokens=_positive_int(
+                raw.get("remediation_max_tokens"), default=4000
+            ),
+            remediation_max_attempts=_positive_int(
+                raw.get("remediation_max_attempts"), default=2
+            ),
+            remediation_friction_enabled=_as_bool(
+                raw.get("remediation_friction_enabled"), default=False
+            ),
+            remediation_escalation_message_enabled=_as_bool(
+                raw.get("remediation_escalation_message_enabled"), default=False
+            ),
+            remediation_linear_team_id=str(
+                raw.get("remediation_linear_team_id")
+                or DEFAULT_REMEDIATION_LINEAR_TEAM_ID
+            ),
+            remediation_linear_project_id=str(
+                raw.get("remediation_linear_project_id")
+                or DEFAULT_REMEDIATION_LINEAR_PROJECT_ID
+            ),
+            review_finding_linear_team_id=str(
+                raw.get("review_finding_linear_team_id") or ""
+            ),
         )
 
     def with_env_overrides(self) -> "OrchestratorConfig":
@@ -298,6 +364,31 @@ class OrchestratorConfig:
             "QUAY_ORCHESTRATOR_LOCK",
             "BRIX_ORCHESTRATOR_LOCK",
         )
+        remediation_enabled = self.remediation_enabled
+        remediation_enabled_env = os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_ENABLED")
+        if remediation_enabled_env is not None:
+            remediation_enabled = _as_bool(
+                remediation_enabled_env, default=remediation_enabled
+            )
+        remediation_friction_enabled = self.remediation_friction_enabled
+        remediation_friction_env = os.getenv(
+            "QUAY_ORCHESTRATOR_REMEDIATION_FRICTION_ENABLED"
+        )
+        if remediation_friction_env is not None:
+            remediation_friction_enabled = _as_bool(
+                remediation_friction_env, default=remediation_friction_enabled
+            )
+        remediation_escalation_message_enabled = (
+            self.remediation_escalation_message_enabled
+        )
+        remediation_escalation_message_env = os.getenv(
+            "QUAY_ORCHESTRATOR_REMEDIATION_ESCALATION_MESSAGE_ENABLED"
+        )
+        if remediation_escalation_message_env is not None:
+            remediation_escalation_message_enabled = _as_bool(
+                remediation_escalation_message_env,
+                default=remediation_escalation_message_enabled,
+            )
         return dataclasses.replace(
             self,
             enabled=enabled,
@@ -310,6 +401,35 @@ class OrchestratorConfig:
             reply_timeout_seconds=timeout,
             poll_interval_seconds=interval,
             lock_path=Path(lock_env) if lock_env else self.lock_path,
+            remediation_enabled=remediation_enabled,
+            remediation_max_iterations=_positive_int(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ITERATIONS"),
+                default=self.remediation_max_iterations,
+            ),
+            remediation_max_tokens=_positive_int(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_TOKENS"),
+                default=self.remediation_max_tokens,
+            ),
+            remediation_max_attempts=_positive_int(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_MAX_ATTEMPTS"),
+                default=self.remediation_max_attempts,
+            ),
+            remediation_friction_enabled=remediation_friction_enabled,
+            remediation_escalation_message_enabled=(
+                remediation_escalation_message_enabled
+            ),
+            remediation_linear_team_id=(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_TEAM_ID")
+                or self.remediation_linear_team_id
+            ),
+            remediation_linear_project_id=(
+                os.getenv("QUAY_ORCHESTRATOR_REMEDIATION_LINEAR_PROJECT_ID")
+                or self.remediation_linear_project_id
+            ),
+            review_finding_linear_team_id=(
+                os.getenv("QUAY_ORCHESTRATOR_REVIEW_FINDING_LINEAR_TEAM_ID")
+                or self.review_finding_linear_team_id
+            ),
         )
 
 
@@ -434,6 +554,24 @@ class QuayCommandError(RuntimeError):
         self.code = code
         suffix = f" ({code})" if code else ""
         super().__init__(f"quay command failed{suffix}: {' '.join(argv)}")
+
+
+# Quay's `submit-brief --reason` accepts ONLY these two values (verified via
+# `quay submit-brief --help`). Any other value fails at the CLI mid-drain, so we
+# validate at the call site to fail loudly instead. In particular the agentic
+# remediation path resolves a blocker, so it reuses `blocker_resolved` — the
+# auto-vs-human distinction lives in the `brief_submitted_remediated` log event
+# and the Slack FYI, not in this enum.
+_QUAY_SUBMIT_REASONS: frozenset[str] = frozenset({"blocker_resolved", "advice_answered"})
+
+
+def _validate_submit_reason(reason: str) -> str:
+    if reason not in _QUAY_SUBMIT_REASONS:
+        raise ValueError(
+            f"invalid submit-brief reason {reason!r}; "
+            f"quay accepts only {sorted(_QUAY_SUBMIT_REASONS)}"
+        )
+    return reason
 
 
 class QuayCliClient:
@@ -597,6 +735,17 @@ class QuayCliClient:
             outbox_item_id = str(row.get("outbox_item_id") or row.get("id") or "")
             if not outbox_item_id:
                 continue
+            terminal_reason = _terminal_outbox_row_reason(row)
+            if terminal_reason:
+                log_event(
+                    self._logger,
+                    "outbox_claim_skipped",
+                    worker_id=worker_id,
+                    outbox_item_id=outbox_item_id,
+                    task_id=str(row.get("task_id") or ""),
+                    reason=terminal_reason,
+                )
+                continue
             try:
                 claim = self._run_json(["outbox", "claim", outbox_item_id])
             except QuayCommandError as exc:
@@ -719,6 +868,7 @@ class QuayCliClient:
         *,
         reason: str,
     ) -> None:
+        _validate_submit_reason(reason)
         claim_id = self._claim_id(handoff)
         with _temp_text_file(brief) as path:
             self._run_json(
@@ -837,12 +987,36 @@ class QuayCliClient:
         return metadata
 
 
-class HermesConversationDecider:
-    """LLM-backed Quay orchestrator decision step.
+def _assert_agent_tool_less(agent: Any) -> None:
+    """Guarantee an orchestrator agent resolved to ZERO tools.
 
-    Humans talk normally in Slack. This component decides whether that
-    discussion has enough information to resume the worker, or whether the
-    orchestrator should ask/confirm one more thing.
+    The orchestrator's ``AIAgent`` instances (Slack decider + blocker
+    remediator) must never hold a tool: the model is a pure reasoner and every
+    state change is performed by orchestrator code. ``enabled_toolsets=[]``
+    alone is NOT sufficient because ``model_tools`` force-appends the ``kanban``
+    toolset whenever ``HERMES_KANBAN_TASK`` is set in the ambient env. This
+    check fails loudly if any tool survives, so the agent can never silently
+    gain a capability from the environment.
+    """
+    tools = getattr(agent, "tools", None)
+    if tools:
+        try:
+            names = sorted(t["function"]["name"] for t in tools)
+        except (TypeError, KeyError, AttributeError):
+            names = [str(t) for t in tools]
+        raise RuntimeError(
+            "orchestrator agent must be tool-less but resolved tools: "
+            + ", ".join(names)
+        )
+
+
+class _OrchestratorAgentBuilder:
+    """Shared bounded-``AIAgent`` runtime/model resolution for the orchestrator.
+
+    Both the Slack conversation decider and the blocker remediator run a scoped,
+    tool-less ``AIAgent`` under the same provider/model resolution rules. This
+    base owns that plumbing so the two callers cannot drift apart; each supplies
+    its own iteration/token caps via ``_build_agent``.
     """
 
     def __init__(
@@ -864,52 +1038,17 @@ class HermesConversationDecider:
         self._model_normalizer = model_normalizer
         self._agent_class = agent_class
 
-    def decide(
+    def _build_agent(
         self,
-        *,
         handoff: Handoff,
-        task: TaskContext,
-        artifact: Artifact | None,
-        question: str,
-        replies: list[SlackReply],
-        posted_messages: list[str],
-    ) -> ConversationDecision:
-        if not replies:
-            return ConversationDecision(action="wait")
-
-        agent = self._build_agent(handoff)
-        prompt = build_orchestrator_decision_prompt(
-            handoff=handoff,
-            task=task,
-            artifact=artifact,
-            question=question,
-            replies=replies,
-            posted_messages=posted_messages,
-        )
-        result = agent.run_conversation(
-            prompt,
-            system_message=ORCHESTRATOR_DECISION_SYSTEM,
-            conversation_history=[],
-            task_id=f"quay-orchestrator:{handoff.task_id}",
-        )
-        text = ""
-        if isinstance(result, Mapping):
-            text = str(result.get("final_response") or "")
-        else:
-            text = str(result or "")
-        decision = parse_decision_response(text)
-        log_event(
-            self._logger,
-            "orchestrator_conversation_decision",
-            handoff_id=handoff.handoff_id,
-            task_id=handoff.task_id,
-            action=decision.action,
-        )
-        return decision
-
-    def _build_agent(self, handoff: Handoff) -> Any:
+        *,
+        max_iterations: int,
+        max_tokens: int | None = None,
+    ) -> Any:
         if self._agent_factory is not None:
-            return self._agent_factory()
+            agent = self._agent_factory()
+            _assert_agent_tool_less(agent)
+            return agent
         runtime = self._resolve_runtime()
         agent_class = self._agent_class
         if agent_class is None:
@@ -917,7 +1056,7 @@ class HermesConversationDecider:
 
             agent_class = AIAgent
 
-        return agent_class(
+        kwargs: dict[str, Any] = dict(
             model=self._resolve_model(runtime),
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -926,14 +1065,27 @@ class HermesConversationDecider:
             acp_command=runtime.get("command"),
             acp_args=list(runtime.get("args") or []),
             credential_pool=runtime.get("credential_pool"),
-            max_iterations=2,
+            max_iterations=max_iterations,
             quiet_mode=True,
+            # Tool-less by construction. An empty ``enabled_toolsets`` is not
+            # enough: ``model_tools`` force-appends the ``kanban`` toolset
+            # whenever ``HERMES_KANBAN_TASK`` is set in the ambient env.
+            # Explicitly disabling ``kanban`` overrides that force-append so the
+            # orchestrator agent resolves to ZERO tools regardless of env — an
+            # explicit API rather than mutating global ``os.environ``. The
+            # post-build ``_assert_agent_tool_less`` check is the backstop.
             enabled_toolsets=[],
+            disabled_toolsets=["kanban"],
             skip_context_files=True,
             skip_memory=True,
             platform="quay-orchestrator",
             session_id=orchestrator_session_id(handoff),
         )
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        agent = agent_class(**kwargs)
+        _assert_agent_tool_less(agent)
+        return agent
 
     def _resolve_runtime(self) -> Mapping[str, Any]:
         resolver = self._runtime_resolver
@@ -1036,6 +1188,1010 @@ class HermesConversationDecider:
             return str(resolver(provider) or "").strip()
         except Exception:
             return ""
+
+
+class HermesConversationDecider(_OrchestratorAgentBuilder):
+    """LLM-backed Quay orchestrator decision step.
+
+    Humans talk normally in Slack. This component decides whether that
+    discussion has enough information to resume the worker, or whether the
+    orchestrator should ask/confirm one more thing.
+    """
+
+    def decide(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+        question: str,
+        replies: list[SlackReply],
+        posted_messages: list[str],
+    ) -> ConversationDecision:
+        if not replies:
+            return ConversationDecision(action="wait")
+
+        agent = self._build_agent(handoff, max_iterations=2)
+        prompt = build_orchestrator_decision_prompt(
+            handoff=handoff,
+            task=task,
+            artifact=artifact,
+            question=question,
+            replies=replies,
+            posted_messages=posted_messages,
+        )
+        result = agent.run_conversation(
+            prompt,
+            system_message=ORCHESTRATOR_DECISION_SYSTEM,
+            conversation_history=[],
+            task_id=f"quay-orchestrator:{handoff.task_id}",
+        )
+        text = ""
+        if isinstance(result, Mapping):
+            text = str(result.get("final_response") or "")
+        else:
+            text = str(result or "")
+        decision = parse_decision_response(text)
+        log_event(
+            self._logger,
+            "orchestrator_conversation_decision",
+            handoff_id=handoff.handoff_id,
+            task_id=handoff.task_id,
+            action=decision.action,
+        )
+        return decision
+
+
+# ---------------------------------------------------------------------------
+# Agentic blocker remediation (BRIX-1878)
+#
+# SAFETY: Otto may auto-answer a blocked worker only when EVERY guardrail below
+# agrees. The model NEVER holds a tool; it only proposes JSON. All state
+# transitions (``submit_brief``, Linear writes) are performed by orchestrator
+# code AFTER the deterministic gates below. When anything is unclear the code
+# escalates to a human — the model's opinion cannot override that.
+# ---------------------------------------------------------------------------
+
+# Deterministic never-auto categories. If any substring here appears in the
+# blocker/handoff/model text, the handoff is escalated to a human, full stop.
+_NEVER_AUTO_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "product_or_requirements_decision": (
+        "product decision",
+        "product call",
+        "requirement",
+        "requirements",
+        "acceptance criteria",
+        "scope change",
+        "change scope",
+        "design decision",
+        "which approach",
+        "which option",
+        "which feature",
+        "business logic",
+        "business decision",
+        "should we",
+        "do we want",
+        "product owner",
+        "stakeholder",
+        "roadmap",
+    ),
+    "irreversible_or_production_change": (
+        "production",
+        "prod deploy",
+        "deploy to prod",
+        "irreversible",
+        "cannot be undone",
+        "can't be undone",
+        "not reversible",
+        "force push",
+        "force-push",
+        "rollback",
+        "mainnet",
+        "live environment",
+        "destructive",
+        "delete",
+        "drop table",
+        "tear down",
+        "teardown",
+        "release to production",
+    ),
+    "security": (
+        "security",
+        "vulnerability",
+        "vulnerabilities",
+        "cve-",
+        "exploit",
+        "auth bypass",
+        "authentication bypass",
+        "authorization",
+        "access control",
+        "privilege",
+        "rce",
+        "xss",
+        "csrf",
+        "sql injection",
+        "injection attack",
+        "malicious",
+    ),
+    "spend_or_budget": (
+        "budget",
+        "spend",
+        "overspend",
+        "invoice",
+        "billing",
+        "payment",
+        "purchase",
+        "procurement",
+        "pay for",
+        "pricing tier",
+        "upgrade plan",
+    ),
+    "credentials_or_secrets": (
+        "credential",
+        "secret",
+        "api key",
+        "api_key",
+        "apikey",
+        "password",
+        "private key",
+        "ssh key",
+        "access token",
+        "auth token",
+        "bearer token",
+        "mnemonic",
+        "seed phrase",
+        "wallet key",
+        "keystore",
+        ".env secret",
+    ),
+    "data_changes": (
+        "data migration",
+        "migrate data",
+        "database migration",
+        "schema migration",
+        "drop column",
+        "delete rows",
+        "delete records",
+        "truncate",
+        "alter table",
+        "wipe data",
+        "purge data",
+        "production data",
+        "customer data",
+        "user data",
+        "backfill",
+    ),
+    "ambiguous_intent": (
+        "unclear",
+        "ambiguous",
+        "not sure what",
+        "unsure",
+        "need clarification",
+        "needs clarification",
+        "please clarify",
+        "what did you mean",
+        "which one",
+        "don't know what",
+        "cannot determine",
+        "can't determine",
+        "undecided",
+    ),
+}
+
+# Category tokens that, if the model claims them, are treated as never-auto.
+_NEVER_AUTO_CATEGORY_TOKENS: tuple[str, ...] = (
+    "product",
+    "requirement",
+    "design",
+    "security",
+    "vuln",
+    "credential",
+    "secret",
+    "password",
+    "token",
+    "spend",
+    "budget",
+    "billing",
+    "payment",
+    "cost",
+    "data",
+    "migration",
+    "migrate",
+    "irreversible",
+    "prod",
+    "production",
+    "deploy",
+    "release",
+    "destructive",
+    "delete",
+    "ambiguous",
+    "unclear",
+    "unknown",
+    "escalate",
+)
+
+# Canonical auto-answerable categories (companion skill hermes-state #32). This
+# allowlist is the ENFORCEABLE FLOOR for auto-resume: a model resume is accepted
+# only when its category normalizes to one of these five. Everything else — a
+# novel label, a relabeled danger, an empty/miscased/non-string value —
+# escalates. The keyword denylist above (`_never_auto_reason` /
+# `_is_never_auto_category`) is kept as defense-in-depth over the brief text; it
+# does NOT replace this floor.
+_AUTO_ANSWERABLE_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "prerequisite-baseline",
+        "stale-baseline",
+        "missing-invocation",
+        "transient-retry",
+        "scoped-known-fix",
+    }
+)
+
+
+def _normalize_category(category: Any) -> str:
+    """Strip + lowercase a model-proposed category; non-strings normalize to ''."""
+    if not isinstance(category, str):
+        return ""
+    return category.strip().lower()
+
+
+def _is_auto_answerable_category(category: Any) -> bool:
+    """True only when ``category`` is a member of the canonical allowlist."""
+    return _normalize_category(category) in _AUTO_ANSWERABLE_CATEGORIES
+
+
+REMEDIATION_GUARDRAIL_SYSTEM = (
+    "You are the Quay orchestrator's blocker-remediation guardrail. A worker is "
+    "blocked and you decide whether the orchestrator may auto-resume it WITHOUT a "
+    "human in the loop, running on a live orchestrator.\n"
+    "You have NO tools. You only emit ONE JSON object and nothing else.\n"
+    "NEVER auto-resume (always output {\"action\":\"escalate\"}) when the blocker "
+    "involves ANY of: a product or requirements decision; an irreversible or "
+    "production change; security; spend or budget; credentials or secrets; data "
+    "changes; or any ambiguous, unclear, or under-specified intent.\n"
+    "When you are unsure for ANY reason, output {\"action\":\"escalate\"}.\n"
+    "Only propose a resume when the fix is objectively safe, reversible, and fully "
+    "determined by the blocker context (for example a lint or formatting fix, a "
+    "trivial and obvious test correction, or a mechanical follow-up that the "
+    "worker already described).\n"
+    "You never perform actions; the orchestrator code, not you, decides whether to "
+    "act on your proposal and re-checks every guardrail first.\n"
+    "Output schema (JSON only, no prose, no code fence):\n"
+    "  {\"action\":\"escalate\"}\n"
+    "  On escalate you MAY add an optional \"message\": a concise, human-facing "
+    "recommendation of how to proceed plus the one confirmation or input you need "
+    "(follow the skill's \"Writing the escalation message\" guidance — recommend "
+    "only when it is directly grounded in the blocker; when evidence is thin, ask "
+    "for the missing input instead of guessing). Omit it if you cannot summarize "
+    "usefully. Example: {\"action\":\"escalate\",\"message\":\"...\"}\n"
+    "OR\n"
+    "  {\"action\":\"resume\",\"brief\":\"<resume guidance for the worker>\","
+    "\"category\":\"<auto-answerable category>\",\"rationale\":\"<why it is safe "
+    "and reversible>\",\"friction\":{\"title\":\"...\",\"detail\":\"...\","
+    "\"signature\":\"...\"}}\n"
+    "The friction object is optional; include it only to record a recurring "
+    "Quay-CLI friction the worker hit.\n"
+    "--- BEGIN SKILL ---\n"
+)
+
+# Hard caps: any response beyond these is treated as malformed -> escalate.
+_MAX_REMEDIATION_RESPONSE_CHARS = 20000
+_MAX_REMEDIATION_BRIEF_CHARS = 6000
+_MAX_FRICTION_FIELD_CHARS = 4000
+# The optional model-authored escalation message is human-facing prose; cap it so
+# a single blocked worker cannot flood a Slack thread. Applied both when parsing
+# and when sanitizing (defence in depth).
+_MAX_ESCALATION_MESSAGE_CHARS = 800
+
+
+@dataclass(frozen=True)
+class RemediationOutcome:
+    brief: str
+    category: str
+    rationale: str = ""
+    friction: Mapping[str, str] | None = None
+    # Optional model-authored human-facing escalation message, carried ONLY for
+    # the escalate path. NEVER read by any gate / allowlist / loop-guard / resume
+    # decision — the renderer reads it after the decision has been made.
+    message: str | None = None
+    tokens: int = 0
+
+
+def _never_auto_reason(
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+    *,
+    proposed_category: str = "",
+    proposed_brief: str = "",
+) -> str | None:
+    """Deterministic (no-model) never-auto classifier.
+
+    Returns a human-readable reason string when the handoff must NOT be
+    auto-remediated (the caller escalates), or ``None`` when the deterministic
+    checks find no reason to block. Conservative by design: missing blocker
+    context is itself a reason to escalate.
+    """
+    blocker_text = artifact.text if artifact else ""
+    # Pre-model gate: with no blocker context we cannot reason safely.
+    if not proposed_category and not proposed_brief:
+        if not blocker_text or not blocker_text.strip():
+            return "no_blocker_context"
+
+    parts = [
+        handoff.reason or "",
+        handoff.summary or "",
+        blocker_text,
+        proposed_category or "",
+        proposed_brief or "",
+    ]
+    try:
+        parts.append(json.dumps(task.metadata, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        parts.append(str(task.metadata))
+    haystack = "\n".join(parts).lower()
+
+    for category, needles in _NEVER_AUTO_CATEGORIES.items():
+        for needle in needles:
+            if needle in haystack:
+                return f"{category}:{needle.strip()}"
+
+    if proposed_category:
+        category_lower = proposed_category.strip().lower()
+        for token in _NEVER_AUTO_CATEGORY_TOKENS:
+            if token in category_lower:
+                return f"never_auto_category:{category_lower}"
+
+    return None
+
+
+def _is_never_auto_category(category: str) -> bool:
+    category_lower = (category or "").strip().lower()
+    if not category_lower:
+        return True
+    return any(token in category_lower for token in _NEVER_AUTO_CATEGORY_TOKENS)
+
+
+def _parse_friction(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    title = value.get("title")
+    detail = value.get("detail")
+    signature = value.get("signature")
+    fields = {}
+    for key, raw in (("title", title), ("detail", detail), ("signature", signature)):
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        text = raw.strip()
+        if len(text) > _MAX_FRICTION_FIELD_CHARS:
+            return None
+        fields[key] = text
+    return fields
+
+
+def _coerce_escalation_message(value: Any) -> str | None:
+    """Defensively coerce a raw escalate ``message`` into a capped string.
+
+    Returns ``None`` (message treated as absent) unless ``value`` is a non-empty
+    string. The message is optional: escalate is valid with or without it, and a
+    missing / blank / non-string / oversized value must never block the escalate.
+    Oversized text is truncated with an ellipsis rather than rejected.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if len(text) > _MAX_ESCALATION_MESSAGE_CHARS:
+        text = text[: _MAX_ESCALATION_MESSAGE_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def parse_remediation_response(text: str) -> dict[str, Any] | None:
+    """Strictly parse the remediation turn's JSON.
+
+    Accepts ONLY ``{"action":"escalate"}`` or a fully-formed resume object.
+    Anything malformed, missing a required field, or oversized returns ``None``
+    so the caller escalates to a human.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > _MAX_REMEDIATION_RESPONSE_CHARS:
+        return None
+    if raw.startswith("```"):
+        raw = _strip_json_fence(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        else:
+            return None
+    if not isinstance(data, Mapping):
+        return None
+
+    action = str(data.get("action") or "").strip().lower()
+    if action == "escalate":
+        # F4: preserve a valid friction object on the escalate path so the
+        # orchestrator can still capture a recurring Quay-CLI friction even when
+        # Otto cannot self-resolve. Invalid/oversized friction is dropped (we
+        # still escalate); a bad friction never blocks the escalation.
+        escalation: dict[str, Any] = {"action": "escalate"}
+        # Optional human-facing escalation message. Carried ONLY on the escalate
+        # path; it does not (and must not) influence the resume/gate logic below.
+        message = _coerce_escalation_message(data.get("message"))
+        if message is not None:
+            escalation["message"] = message
+        if data.get("friction") is not None:
+            parsed_friction = _parse_friction(data.get("friction"))
+            if parsed_friction is not None:
+                escalation["friction"] = parsed_friction
+        return escalation
+    if action != "resume":
+        return None
+
+    brief = data.get("brief")
+    category = data.get("category")
+    rationale = data.get("rationale")
+    if not isinstance(brief, str) or not brief.strip():
+        return None
+    if not isinstance(category, str) or not category.strip():
+        return None
+    if not isinstance(rationale, str) or not rationale.strip():
+        return None
+    if len(brief) > _MAX_REMEDIATION_BRIEF_CHARS:
+        return None
+
+    result: dict[str, Any] = {
+        "action": "resume",
+        "brief": brief.strip(),
+        "category": category.strip(),
+        "rationale": rationale.strip(),
+    }
+    if "friction" in data and data.get("friction") is not None:
+        parsed_friction = _parse_friction(data.get("friction"))
+        if parsed_friction is None:
+            return None
+        result["friction"] = parsed_friction
+    return result
+
+
+def build_remediation_prompt(
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+) -> str:
+    payload = {
+        "task": {
+            "task_id": task.task_id,
+            "title": task.title,
+            "issue": task.issue,
+            "repo_id": task.repo_id or handoff.repo_id,
+            "metadata": task.metadata,
+        },
+        "handoff": {
+            "handoff_id": handoff.handoff_id,
+            "reason": handoff.reason,
+            "summary": handoff.summary,
+        },
+        "blocker": artifact.text if artifact else "",
+    }
+    return (
+        "A Quay worker is blocked. Decide whether it can be safely auto-resumed "
+        "without a human, following every rule in the system message.\n"
+        "Return only the JSON object described in the system message.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    )
+
+
+def build_remediation_fyi(
+    handoff: Handoff,
+    task: TaskContext,
+    outcome: RemediationOutcome,
+) -> str:
+    target = task.issue or task.title or task.task_id
+    blocker = ""
+    if handoff.summary and handoff.summary.strip():
+        blocker = handoff.summary.strip().splitlines()[0].strip()
+    preview = outcome.brief.strip()
+    if len(preview) > 400:
+        preview = preview[:397].rstrip() + "..."
+    lines = [f"Otto auto-resumed a blocked Quay worker for {target}."]
+    lines.append(f"Task: {task.task_id}")
+    if blocker:
+        lines.append(f"Blocker: {blocker}")
+    lines.append(f"Category: {outcome.category}")
+    lines.append(f"Brief: {preview}")
+    lines.append("Auto-resumed; reply here to override.")
+    return "\n".join(lines)
+
+
+class HandoffRemediator(_OrchestratorAgentBuilder):
+    """Bounded, guardrailed agentic remediation for blocked worker handoffs.
+
+    ``remediate`` returns a resume brief ONLY when both the pre-model and
+    post-model deterministic gates agree it is safe; any doubt, crash, or model
+    malfunction degrades to ``None`` (human escalation). The model is a pure
+    reasoner with no tools: the orchestrator, not the model, performs every
+    state change.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: OrchestratorConfig,
+        logger: logging.Logger | None = None,
+        agent_factory: Any | None = None,
+        runtime_resolver: Any | None = None,
+        default_model_resolver: Any | None = None,
+        model_catalog_resolver: Any | None = None,
+        model_normalizer: Any | None = None,
+        agent_class: Any | None = None,
+        skill_loader: Any | None = None,
+        linear_request: Any | None = None,
+    ) -> None:
+        super().__init__(
+            logger=logger,
+            agent_factory=agent_factory,
+            runtime_resolver=runtime_resolver,
+            default_model_resolver=default_model_resolver,
+            model_catalog_resolver=model_catalog_resolver,
+            model_normalizer=model_normalizer,
+            agent_class=agent_class,
+        )
+        self.config = config
+        self._skill_loader = skill_loader
+        self._linear_request = linear_request
+        self.last_outcome: RemediationOutcome | None = None
+
+    # -- public API --------------------------------------------------------
+
+    def remediate(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        artifact: Artifact | None,
+    ) -> str | None:
+        self.last_outcome = None
+        try:
+            # Gate #1a (pre-model): deterministic never-auto classifier.
+            never = _never_auto_reason(handoff, task, artifact)
+            if never is not None:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="pre_model_never_auto",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    reason=never,
+                )
+                return None
+
+            # Gate #1b (pre-model): durable per-task loop guard.
+            attempts = self._read_attempts(handoff.task_id)
+            if attempts >= self.config.remediation_max_attempts:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="loop_guard",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    attempts=attempts,
+                    max_attempts=self.config.remediation_max_attempts,
+                )
+                return None
+
+            skill_body = self._load_skill()
+            if not skill_body:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="missing_skill",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                )
+                return None
+
+            # Consume one attempt now: we are about to invoke the model. Fail
+            # CLOSED — if we cannot durably record the attempt we treat
+            # ourselves as OVER-BUDGET and escalate WITHOUT calling the model
+            # ("if I can't prove I'm under budget, I don't spend an attempt").
+            try:
+                self._bump_attempts(handoff.task_id)
+            except OSError:
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="loop_guard_write_failed",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                )
+                return None
+
+            agent = self._build_agent(
+                handoff,
+                max_iterations=self.config.remediation_max_iterations,
+                max_tokens=self.config.remediation_max_tokens,
+            )
+            system_message = REMEDIATION_GUARDRAIL_SYSTEM + skill_body
+            prompt = build_remediation_prompt(handoff, task, artifact)
+            result = agent.run_conversation(
+                prompt,
+                system_message=system_message,
+                conversation_history=[],
+                task_id=f"quay-orchestrator:{handoff.task_id}",
+            )
+            if isinstance(result, Mapping):
+                text = str(result.get("final_response") or "")
+                tokens = _safe_int(result.get("total_tokens"))
+            else:
+                text = str(result or "")
+                tokens = 0
+
+            parsed = parse_remediation_response(text)
+            if parsed is None or parsed.get("action") != "resume":
+                # F4: the model escalated (or its output was rejected). If it
+                # still supplied a valid friction object, surface it via
+                # ``last_outcome`` so the orchestrator can record it (code-only,
+                # behind ``remediation_friction_enabled``) while still escalating.
+                # BRIX-1878: likewise carry any model-authored escalation message
+                # so the orchestrator can render it in place of the deterministic
+                # template (gated by ``remediation_escalation_message_enabled``).
+                # Both are escalate-path-only and read AFTER this decision — they
+                # never affect the gate/allowlist/loop-guard logic above.
+                friction = (
+                    parsed.get("friction") if isinstance(parsed, Mapping) else None
+                )
+                message = (
+                    parsed.get("message") if isinstance(parsed, Mapping) else None
+                )
+                if friction or message:
+                    self.last_outcome = RemediationOutcome(
+                        brief="",
+                        category="",
+                        friction=friction,
+                        message=message,
+                        tokens=tokens,
+                    )
+                log_event(
+                    self._logger,
+                    "remediation_attempt",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    decision="escalate",
+                    tokens=tokens,
+                )
+                return None
+
+            brief = str(parsed.get("brief") or "").strip()
+            category = str(parsed.get("category") or "").strip()
+
+            # Gate #2 (post-model): a resume is accepted ONLY IF BOTH hold:
+            #   (a) the model's category is a member of the canonical
+            #       auto-answerable allowlist (the ENFORCEABLE FLOOR), AND
+            #   (b) the deterministic never-auto keyword scan over the model's
+            #       own category+brief finds nothing.
+            # The allowlist is the primary, enforceable gate; the keyword scan
+            # (`_never_auto_reason` / `_is_never_auto_category`) is kept as
+            # defense-in-depth. Both are layers among several: LLM judgment, a
+            # narrow allowlist, worker-sandbox limits, and an FYI-with-undo. Any
+            # category that is novel, empty, relabeled, miscased, or non-string
+            # fails (a) and escalates.
+            if not brief:
+                return None
+            allowlisted = _is_auto_answerable_category(category)
+            gate2 = _never_auto_reason(
+                handoff,
+                task,
+                artifact,
+                proposed_category=category,
+                proposed_brief=brief,
+            )
+            if not allowlisted or gate2 is not None or _is_never_auto_category(category):
+                if not allowlisted:
+                    reason = (
+                        "category_not_allowlisted:"
+                        + (_normalize_category(category) or "<empty>")
+                    )
+                elif gate2 is not None:
+                    reason = gate2
+                else:
+                    reason = f"never_auto_category:{category.lower()}"
+                log_event(
+                    self._logger,
+                    "remediation_gate_blocked",
+                    gate="post_model_allowlist",
+                    task_id=handoff.task_id,
+                    handoff_id=handoff.handoff_id,
+                    category=category,
+                    reason=reason,
+                    tokens=tokens,
+                )
+                return None
+
+            outcome = RemediationOutcome(
+                brief=brief,
+                category=category,
+                rationale=str(parsed.get("rationale") or ""),
+                friction=parsed.get("friction"),
+                tokens=tokens,
+            )
+            self.last_outcome = outcome
+            log_event(
+                self._logger,
+                "remediation_attempt",
+                task_id=handoff.task_id,
+                handoff_id=handoff.handoff_id,
+                decision="resume",
+                category=category,
+                tokens=tokens,
+            )
+            return brief
+        except Exception:
+            # A crash must degrade to human escalation, never drop the handoff.
+            self._logger.exception("remediation crashed; escalating to human")
+            self.last_outcome = None
+            return None
+
+    def record_friction(
+        self,
+        *,
+        outcome: RemediationOutcome | None,
+        task: TaskContext,
+    ) -> None:
+        """Best-effort: file recurring Quay-CLI friction to Linear.
+
+        Never raises. Deduped both by a local per-signature marker (avoids
+        re-hitting Linear across ticks) and by a GraphQL title search.
+        """
+        if not self.config.remediation_friction_enabled:
+            return
+        if outcome is None or not outcome.friction:
+            return
+        friction = outcome.friction
+        signature = str(friction.get("signature") or "").strip()
+        if not signature:
+            return
+        try:
+            if self._friction_marker_exists(signature):
+                return
+            team_id = self.config.remediation_linear_team_id
+            existing = self._linear_find_friction(team_id, signature)
+            if existing:
+                log_event(
+                    self._logger,
+                    "remediation_friction_deduped",
+                    task_id=task.task_id,
+                    signature=signature,
+                    issue=existing,
+                )
+            else:
+                created = self._linear_create_friction(team_id, friction, signature)
+                log_event(
+                    self._logger,
+                    "remediation_friction_filed",
+                    task_id=task.task_id,
+                    signature=signature,
+                    issue=created,
+                )
+            self._write_friction_marker(signature)
+        except Exception:
+            self._logger.exception("friction recording failed; ignoring")
+
+    # -- skill loading -----------------------------------------------------
+
+    def _load_skill(self) -> str | None:
+        if self._skill_loader is not None:
+            try:
+                body = self._skill_loader()
+            except Exception:
+                self._logger.exception("remediation skill loader failed")
+                return None
+            body = (body or "").strip() if isinstance(body, str) else ""
+            return body or None
+        path = self._skill_path()
+        try:
+            if not path.is_file():
+                return None
+            body = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            self._logger.exception("failed to read remediation skill")
+            return None
+        return body or None
+
+    def _skill_path(self) -> Path:
+        return (
+            _hermes_home_dir()
+            / "skills"
+            / "quay"
+            / "quay-blocker-remediation"
+            / "SKILL.md"
+        )
+
+    # -- durable loop guard ------------------------------------------------
+
+    def _attempts_path(self, task_id: str) -> Path:
+        safe = _sanitize_state_key(task_id)
+        return _hermes_home_dir() / "quay" / "remediation-attempts" / safe
+
+    def _read_attempts(self, task_id: str) -> int:
+        path = self._attempts_path(task_id)
+        try:
+            return int((path.read_text(encoding="utf-8") or "0").strip() or "0")
+        except (OSError, ValueError):
+            return 0
+
+    def _bump_attempts(self, task_id: str) -> int:
+        # Fail CLOSED: a failure to durably record the attempt MUST propagate so
+        # the caller treats it as over-budget and escalates. Swallowing the
+        # error here (fail-open) would let a read-only/full filesystem re-invoke
+        # the model every tick without ever advancing the counter — unbounded.
+        path = self._attempts_path(task_id)
+        nxt = self._read_attempts(task_id) + 1
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(nxt), encoding="utf-8")
+        return nxt
+
+    # -- friction markers --------------------------------------------------
+
+    def _friction_marker_path(self, signature: str) -> Path:
+        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:32]
+        return _hermes_home_dir() / "quay" / "friction-markers" / digest
+
+    def _friction_marker_exists(self, signature: str) -> bool:
+        return self._friction_marker_path(signature).exists()
+
+    def _write_friction_marker(self, signature: str) -> None:
+        path = self._friction_marker_path(signature)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(signature, encoding="utf-8")
+        except OSError:
+            self._logger.exception("failed to persist friction marker")
+
+    # -- Linear (code-only, never an agent tool) ---------------------------
+
+    def _linear_find_friction(self, team_id: str, signature: str) -> str | None:
+        query = (
+            "query($team: ID!, $needle: String!) { "
+            "issues(filter: {team: {id: {eq: $team}}, "
+            "title: {containsIgnoreCase: $needle}}, first: 1) "
+            "{ nodes { id identifier url } } }"
+        )
+        data = self._linear_call(
+            query, {"team": team_id, "needle": signature}
+        )
+        nodes = (
+            ((data.get("data") or {}).get("issues") or {}).get("nodes")
+            if isinstance(data, Mapping)
+            else None
+        )
+        if isinstance(nodes, list) and nodes:
+            first = nodes[0]
+            if isinstance(first, Mapping):
+                return str(first.get("identifier") or first.get("id") or "")
+        return None
+
+    def _linear_create_friction(
+        self,
+        team_id: str,
+        friction: Mapping[str, str],
+        signature: str,
+    ) -> str | None:
+        title = f"{friction.get('title', '').strip()} [otto-friction:{signature}]"
+        detail = friction.get("detail", "").strip()
+        description = (
+            f"{detail}\n\n"
+            f"_Filed automatically by Otto (Quay-CLI friction capture)._\n"
+            f"Signature: `{signature}`\n"
+            f"Tag: `[otto-friction]`"
+        )
+        mutation = (
+            "mutation($input: IssueCreateInput!) { "
+            "issueCreate(input: $input) { success issue { id identifier url } } }"
+        )
+        variables: dict[str, Any] = {
+            "teamId": team_id,
+            "title": title,
+            "description": description,
+        }
+        project_id = (self.config.remediation_linear_project_id or "").strip()
+        if project_id:
+            # File into the AI Automation project, not the team root.
+            variables["projectId"] = project_id
+        data = self._linear_call(mutation, {"input": variables})
+        issue = (
+            ((data.get("data") or {}).get("issueCreate") or {}).get("issue")
+            if isinstance(data, Mapping)
+            else None
+        )
+        if isinstance(issue, Mapping):
+            return str(issue.get("identifier") or issue.get("id") or "")
+        return None
+
+    def create_review_finding_issue(
+        self, team_id: str, payload: Mapping[str, Any]
+    ) -> str:
+        """File a Quay review finding as a Linear issue (BRIX-1896).
+
+        Idempotent: the client-supplied issue ``id`` is a deterministic UUID
+        derived from the finding fingerprint, so a re-delivery of the same
+        outbox row re-creates nothing on Linear's side. Unlike the best-effort
+        friction path, this raises on any non-success response — the caller
+        must NOT complete the outbox item unless the issue actually landed.
+        """
+        title = str(payload.get("title") or "").strip() or "Quay review finding"
+        mutation = (
+            "mutation($input: IssueCreateInput!) { "
+            "issueCreate(input: $input) { success issue { id identifier url } } }"
+        )
+        variables: dict[str, Any] = {
+            "id": _review_finding_provider_idempotency_key(payload),
+            "teamId": team_id,
+            "title": title,
+            "description": _render_review_finding_issue_body(payload),
+        }
+        data = self._linear_call(mutation, {"input": variables})
+        result = (
+            (data.get("data") or {}).get("issueCreate")
+            if isinstance(data, Mapping)
+            else None
+        )
+        if not isinstance(result, Mapping) or result.get("success") is not True:
+            raise RuntimeError("Linear issueCreate did not succeed for review finding")
+        issue = result.get("issue")
+        if not isinstance(issue, Mapping):
+            raise RuntimeError("Linear issueCreate returned no issue for review finding")
+        return str(issue.get("identifier") or issue.get("id") or "")
+
+    def _linear_call(
+        self, query: str, variables: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        if self._linear_request is not None:
+            return self._linear_request(query, dict(variables))
+        api_key = (os.getenv("LINEAR_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("LINEAR_API_KEY is not configured")
+        body = json.dumps({"query": query, "variables": dict(variables)}).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.linear.app/graphql",
+            data=body,
+            headers={
+                "Authorization": api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+        parsed = json.loads(raw)
+        if not isinstance(parsed, Mapping):
+            raise RuntimeError("Linear GraphQL returned a non-object response")
+        return parsed
+
+
+def _hermes_home_dir() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _sanitize_state_key(value: str) -> str:
+    safe = "".join(
+        ch if (ch.isalnum() or ch in "._-") else "_" for ch in (value or "")
+    )
+    safe = safe.strip("._") or "unknown"
+    return safe[:200]
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 class SlackWebApiClient:
@@ -1304,6 +2460,7 @@ class HandoffDrainer:
         config: OrchestratorConfig,
         worker_id: str,
         decider: ConversationDecider | None = None,
+        remediator: HandoffRemediator | None = None,
         coordination_lock: FileLock | None = None,
         park_human_waits: bool = False,
         logger: logging.Logger | None = None,
@@ -1313,6 +2470,9 @@ class HandoffDrainer:
         self.config = config
         self.worker_id = worker_id
         self.decider = decider or HermesConversationDecider(logger=logger or LOGGER)
+        self.remediator = remediator or HandoffRemediator(
+            config=config, logger=logger or LOGGER
+        )
         self.coordination_lock = coordination_lock
         self.park_human_waits = park_human_waits
         self.logger = logger or LOGGER
@@ -1405,16 +2565,34 @@ class HandoffDrainer:
         return result
 
     def _handle_claimed_delivery_item(self, item: OutboxItem) -> DrainResult:
+        # A single poisoned row must never crash the drain or block the rows
+        # behind it: any Slack error is classified, and any other unexpected
+        # exception is retried within a bounded budget and then quarantined —
+        # nothing here re-raises.
+        try:
+            return self._deliver_claimed_item(item)
+        except SlackApiError as exc:
+            return self._fail_delivery_slack_error(item, exc)
+        except Exception as exc:  # noqa: BLE001 - one bad row must not crash drain
+            return self._fail_delivery_unexpected(item, exc)
+
+    def _deliver_claimed_item(self, item: OutboxItem) -> DrainResult:
+        # Dispatch by provider BEFORE the Slack post: review findings Quay routes
+        # to Linear (BRIX-1896) must become Linear issues, not #code-factory
+        # posts. Everything else keeps the historical Slack behavior.
+        if _is_review_finding_linear_delivery(item):
+            return self._deliver_review_finding_linear_issue(item)
+
         task = self.quay.get_task_context(item.task_id)
         handoff = item.as_handoff(task)
         route = resolve_slack_route(handoff, task, self.config)
         if route is None:
             reason = "missing_default_slack_channel"
-            self.quay.fail_outbox_item(item, reason)
+            self._fail_terminal_delivery_item(item, reason)
             self.metrics.claims_released += 1
             log_event(
                 self.logger,
-                "outbox_item_failed",
+                "outbox_item_quarantined",
                 outbox_item_id=item.outbox_item_id,
                 task_id=item.task_id,
                 reason=reason,
@@ -1427,43 +2605,13 @@ class HandoffDrainer:
             )
 
         message = delivery_message_from_outbox(item, task)
-        try:
-            post_ref = self._post_delivery_message(
-                item=item,
-                handoff=handoff,
-                task=task,
-                route=route,
-                message=message,
-            )
-        except SlackApiError as exc:
-            self.metrics.errors += 1
-            reason = f"slack_api_error:{exc.method}:{exc.error}"
-            self.quay.fail_outbox_item(item, reason)
-            self.metrics.claims_released += 1
-            log_event(
-                self.logger,
-                "outbox_item_failed",
-                outbox_item_id=item.outbox_item_id,
-                task_id=item.task_id,
-                reason=reason,
-                slack_method=exc.method,
-                slack_error=exc.error,
-            )
-            return DrainResult(
-                status="slack_api_error",
-                handoff_id=handoff.handoff_id,
-                task_id=item.task_id,
-                metrics=self.metrics.as_dict(),
-            )
-        except Exception as exc:
-            self.metrics.errors += 1
-            reason = f"runner_error: {type(exc).__name__}: {exc}"
-            try:
-                self.quay.fail_outbox_item(item, reason)
-                self.metrics.claims_released += 1
-            except Exception:
-                self.logger.exception("failed to mark delivery outbox item failed")
-            raise
+        post_ref = self._post_delivery_message(
+            item=item,
+            handoff=handoff,
+            task=task,
+            route=route,
+            message=message,
+        )
 
         # Slack delivery is at-least-once: if the post succeeds but marking the
         # outbox item complete fails, a later retry may post the same message.
@@ -1486,10 +2634,165 @@ class HandoffDrainer:
             metrics=self.metrics.as_dict(),
         )
 
+    def _deliver_review_finding_linear_issue(self, item: OutboxItem) -> DrainResult:
+        # Resolve the team lazily so an unset review-finding team falls back to
+        # the friction team; a still-empty result is a config error that must
+        # fail/quarantine rather than silently fall back to Slack.
+        team_id = (
+            self.config.review_finding_linear_team_id
+            or self.config.remediation_linear_team_id
+            or ""
+        ).strip()
+        if not team_id:
+            raise RuntimeError(
+                "review finding Linear delivery has no usable team id "
+                "(set review_finding_linear_team_id or remediation_linear_team_id)"
+            )
+        issue = self.remediator.create_review_finding_issue(team_id, item.payload)
+        # Idempotent on Linear's side (client-supplied issue id), so at-least-once
+        # completion is safe: a retry after a completion failure re-creates
+        # nothing. Any creation failure raised above routes to quarantine via
+        # _handle_claimed_delivery_item — never a Slack fallback.
+        self.quay.complete_outbox_item(item)
+        self.metrics.delivery_items_delivered += 1
+        log_event(
+            self.logger,
+            "outbox_item_delivered",
+            outbox_item_id=item.outbox_item_id,
+            task_id=item.task_id,
+            kind=item.kind,
+            provider="linear",
+            linear_issue=issue,
+        )
+        return DrainResult(
+            status="delivery_delivered",
+            handoff_id=f"outbox:{item.outbox_item_id}",
+            task_id=item.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _fail_delivery_slack_error(
+        self, item: OutboxItem, exc: SlackApiError
+    ) -> DrainResult:
+        self.metrics.errors += 1
+        reason = f"slack_api_error:{exc.method}:{exc.error}"
+        disposition = _delivery_slack_error_disposition(exc)
+        if disposition == "terminal":
+            self._fail_terminal_delivery_item(item, reason)
+            self.metrics.claims_released += 1
+            log_event(
+                self.logger,
+                "outbox_item_quarantined",
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
+                slack_method=exc.method,
+                slack_error=exc.error,
+            )
+            return DrainResult(
+                status="slack_api_error",
+                handoff_id=f"outbox:{item.outbox_item_id}",
+                task_id=item.task_id,
+                metrics=self.metrics.as_dict(),
+            )
+        if disposition == "operator":
+            # Human-recoverable (invite the bot / unarchive). Never silently
+            # dropped: alert loudly and retry within the budget so a quick fix
+            # auto-delivers before the row is quarantined.
+            log_event(
+                self.logger,
+                "outbox_item_operator_action_required",
+                level=logging.ERROR,
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=reason,
+                slack_method=exc.method,
+                slack_error=exc.error,
+                remediation="invite the Slack bot to the channel or unarchive it, then requeue",
+            )
+        return self._retry_or_quarantine_delivery_item(
+            item,
+            reason,
+            status="slack_api_error",
+            slack_method=exc.method,
+            slack_error=exc.error,
+        )
+
+    def _fail_delivery_unexpected(self, item: OutboxItem, exc: Exception) -> DrainResult:
+        self.metrics.errors += 1
+        detail = str(exc).replace("\n", " ").strip()
+        reason = f"runner_error:{type(exc).__name__}:{detail}"
+        self.logger.exception(
+            "unexpected error delivering outbox item %s", item.outbox_item_id
+        )
+        return self._retry_or_quarantine_delivery_item(
+            item, reason, status="runner_error"
+        )
+
+    def _retry_or_quarantine_delivery_item(
+        self,
+        item: OutboxItem,
+        reason: str,
+        *,
+        status: str,
+        slack_method: str | None = None,
+        slack_error: str | None = None,
+    ) -> DrainResult:
+        attempts = _delivery_attempt_count(item) + 1
+        if attempts >= MAX_DELIVERY_ATTEMPTS:
+            terminal_reason = f"exhausted_retries:attempt={attempts}:{reason}"
+            try:
+                self._fail_terminal_delivery_item(item, terminal_reason)
+                self.metrics.claims_released += 1
+            except Exception:
+                self.logger.exception(
+                    "failed to quarantine exhausted delivery outbox item"
+                )
+            log_event(
+                self.logger,
+                "outbox_item_quarantined",
+                level=logging.ERROR,
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=terminal_reason,
+                attempts=attempts,
+                slack_method=slack_method,
+                slack_error=slack_error,
+            )
+        else:
+            retry_reason = f"{_DELIVERY_ATTEMPT_MARKER}{attempts}:{reason}"
+            try:
+                self.quay.fail_outbox_item(item, retry_reason)
+                self.metrics.claims_released += 1
+            except Exception:
+                self.logger.exception(
+                    "failed to mark delivery outbox item for retry"
+                )
+            log_event(
+                self.logger,
+                "outbox_item_failed",
+                outbox_item_id=item.outbox_item_id,
+                task_id=item.task_id,
+                reason=retry_reason,
+                attempts=attempts,
+                slack_method=slack_method,
+                slack_error=slack_error,
+            )
+        return DrainResult(
+            status=status,
+            handoff_id=f"outbox:{item.outbox_item_id}",
+            task_id=item.task_id,
+            metrics=self.metrics.as_dict(),
+        )
+
+    def _fail_terminal_delivery_item(self, item: OutboxItem, reason: str) -> None:
+        terminal_reason = f"terminal:{reason}"
+        self.quay.fail_outbox_item(item, terminal_reason)
+
     def _post_delivery_message(
         self,
         *,
-        item: OutboxItem,
+        item: OutboxItem | None = None,
         handoff: Handoff,
         task: TaskContext,
         route: SlackRoute,
@@ -1529,11 +2832,104 @@ class HandoffDrainer:
             task=task,
         )
 
+    def _post_remediation_fyi(
+        self,
+        *,
+        handoff: Handoff,
+        task: TaskContext,
+        outcome: RemediationOutcome,
+    ) -> None:
+        """Best-effort FYI after an auto-resume. A failed FYI must not undo it."""
+        try:
+            route = resolve_slack_route(handoff, task, self.config)
+            if route is None:
+                return
+            message = build_remediation_fyi(handoff, task, outcome)
+            self._post_delivery_message(
+                handoff=handoff,
+                task=task,
+                route=route,
+                message=message,
+            )
+            self.metrics.agent_fyi_posted += 1
+            log_event(
+                self.logger,
+                "remediation_fyi_posted",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                category=outcome.category,
+            )
+        except Exception:
+            self.logger.exception("remediation FYI post failed; ignoring")
+
     def _handle_claimed_handoff(self, handoff: Handoff) -> DrainResult:
         task = self.quay.get_task_context(handoff.task_id)
         artifact = self.quay.get_artifact(handoff) if handoff.artifact_id else None
 
         brief = choose_direct_brief(handoff)
+        remediated = False
+        # Run the (bounded, guardrailed) remediation turn when EITHER auto-resume
+        # OR the escalation-message feature is enabled. The two flags are
+        # independent: the message flag lets the turn run purely to author a
+        # human-facing escalation, and NEVER authorizes an auto-resume.
+        if brief is None and (
+            self.config.remediation_enabled
+            or self.config.remediation_escalation_message_enabled
+        ):
+            brief = self.remediator.remediate(
+                handoff=handoff, task=task, artifact=artifact
+            )
+            # A gate-cleared resume is submitted ONLY under remediation_enabled.
+            # In message-only mode a proposed resume is deliberately dropped
+            # (brief -> None) so we fall through to escalate; the message flag
+            # must never enable an auto-resume.
+            if brief is not None and self.config.remediation_enabled:
+                remediated = True
+            else:
+                if brief is not None:
+                    # Message-only mode: the model proposed a gate-cleared resume
+                    # but auto-resume is disabled, so we escalate instead.
+                    log_event(
+                        self.logger,
+                        "remediation_resume_suppressed_message_only",
+                        handoff_id=handoff.handoff_id,
+                        task_id=handoff.task_id,
+                    )
+                    brief = None
+                self.metrics.remediation_escalated += 1
+                # F4: even when Otto escalates, still capture any recurring
+                # Quay-CLI friction the model surfaced. Code-only and gated by
+                # remediation_friction_enabled inside record_friction; a no-op
+                # when there is no friction to file.
+                self.remediator.record_friction(
+                    outcome=self.remediator.last_outcome, task=task
+                )
+        if brief and remediated:
+            outcome = self.remediator.last_outcome
+            # Resolving a blocker -> the only Quay-valid resume reason for this
+            # handoff kind. The "auto-remediated" distinction is recorded in the
+            # log event and FYI below, not the reason enum.
+            self.quay.submit_brief(handoff, brief, reason="blocker_resolved")
+            self.quay.complete_claim(handoff)
+            self.metrics.agent_briefs_submitted += 1
+            log_event(
+                self.logger,
+                "brief_submitted_remediated",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                category=outcome.category if outcome else "",
+            )
+            if outcome is not None:
+                self._post_remediation_fyi(
+                    handoff=handoff, task=task, outcome=outcome
+                )
+                self.remediator.record_friction(outcome=outcome, task=task)
+            return DrainResult(
+                status="submitted_remediated",
+                handoff_id=handoff.handoff_id,
+                task_id=handoff.task_id,
+                metrics=self.metrics.as_dict(),
+            )
         if brief:
             self.quay.submit_brief(handoff, brief, reason="blocker_resolved")
             self.quay.complete_claim(handoff)
@@ -1570,7 +2966,17 @@ class HandoffDrainer:
                 metrics=self.metrics.as_dict(),
             )
 
-        question = build_human_question(handoff, task, artifact)
+        # Use a model-authored escalation body ONLY when the message feature is
+        # enabled AND the remediation turn actually supplied one; otherwise the
+        # renderer falls back to the deterministic build_human_question. Read
+        # after the decision, this can never affect any gate or the resume path.
+        model_message = None
+        if (
+            self.config.remediation_escalation_message_enabled
+            and self.remediator.last_outcome is not None
+        ):
+            model_message = self.remediator.last_outcome.message
+        question = build_escalation_message(handoff, task, artifact, model_message)
         if handoff_is_waiting_for_human(handoff):
             return self._poll_waiting_human_handoff(
                 handoff=handoff,
@@ -2308,38 +3714,348 @@ def _extract_slack_user_id(text: str) -> str | None:
     return None
 
 
+# ── Compact human-escalation message ────────────────────────────────────────
+#
+# When a Quay worker blocks, the orchestrator asks a human for guidance in
+# Slack. Humans triage these fast, so the renderer surfaces only signal-bearing
+# fields: a reason-specific header, the real blocker line, and the concrete
+# action we need — with generic handoff scaffolding and ``Quay handoff reason:``
+# filler stripped. The helpers below are small and pure so they stay testable.
+
+_HUMAN_QUESTION_FOOTER = "Reply in thread and I'll resume the worker once it's clear."
+
+# Lines the legacy renderer (or Quay's ``_summary_for_handoff`` fallback)
+# injects that carry no signal for a human. Matched case-insensitively against a
+# fully stripped line.
+_HANDOFF_FILLER_PREFIXES = ("quay handoff reason:",)
+_HANDOFF_FILLER_LINES = frozenset(
+    {
+        "a quay task needs human guidance before the next worker brief.",
+        "handoff summary:",
+        "blocker/context:",
+        "blocker:",
+        "context:",
+        "discuss freely in this thread. i will resume the worker once the path is clear.",
+        "reply in thread and i'll resume the worker once it's clear.",
+        "worker_blocker",
+    }
+)
+
+# A line WITHOUT a trailing ``?`` only counts as the ask when it opens with a
+# clear imperative / request. Ambiguous interrogative leads (does/what/how/…)
+# are deliberately excluded here so declaratives like "Does not compile after
+# the refactor." are not mistaken for the ask; a real question keeps its ``?``.
+_HANDOFF_IMPERATIVE_PREFIXES = (
+    "please", "confirm", "decide", "approve", "clarify", "provide",
+    "advise", "let me know", "need to", "needs to",
+    "should we", "should i", "shall we", "shall i",
+)
+
+# Softer signals used only as a fallback: when no strong ask is found and the
+# generic default would otherwise fire, a leftover line opening with one of
+# these (an uncertainty or a request) is promoted into ``Need:`` instead of
+# being left to overflow into ``Context:``. Kept conservative on purpose.
+_HANDOFF_SOFT_ASK_PREFIXES = (
+    "unsure", "not sure", "unclear", "uncertain", "wondering", "wonder ",
+    "should", "shall", "which", "whether", "need ", "needs ", "please",
+    "can we", "can i", "could we", "could i", "would we", "would it",
+    "let me know", "confirm", "decide", "clarify", "advise",
+    "want to know", "requesting", "request ",
+)
+
+
+def _clean_handoff_lines(text: str) -> list[str]:
+    """Split ``text`` into stripped, signal-bearing lines.
+
+    Drops blank lines plus the generic handoff scaffolding and
+    ``Quay handoff reason: <x>`` filler the renderer must not surface.
+    """
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered in _HANDOFF_FILLER_LINES:
+            continue
+        if any(lowered.startswith(prefix) for prefix in _HANDOFF_FILLER_PREFIXES):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _is_action_line(line: str) -> bool:
+    """True when ``line`` clearly reads as a question or a concrete ask.
+
+    A trailing ``?`` always qualifies. Without one, only a clear imperative /
+    request does — ambiguous interrogative leads are left to the softer,
+    fallback-only :func:`_promote_soft_ask` so plain declaratives are not
+    mislabelled as the ask.
+    """
+    lowered = line.strip().lower()
+    if not lowered:
+        return False
+    if lowered.endswith("?"):
+        return True
+    return lowered.startswith(_HANDOFF_IMPERATIVE_PREFIXES)
+
+
+def _first_blocker_line(lines: list[str]) -> str:
+    """The first real blocker statement — preferring a non-question line."""
+    for line in lines:
+        if not _is_action_line(line):
+            return line
+    return lines[0] if lines else ""
+
+
+def _promote_action_line(lines: list[str]) -> str:
+    """The first question/ask line, promotable into ``Need:`` (else empty)."""
+    for line in lines:
+        if _is_action_line(line):
+            return line
+    return ""
+
+
+def _promote_soft_ask(lines: list[str]) -> str:
+    """A leftover line that reads like an uncertainty/request (else empty).
+
+    Fallback used only when no strong ask was promoted, so a real ask phrased
+    without a ``?`` (e.g. "Unsure whether we should roll back or push forward")
+    still reaches the human as ``Need:`` rather than the generic default.
+    """
+    for line in lines:
+        if line.strip().lower().startswith(_HANDOFF_SOFT_ASK_PREFIXES):
+            return line
+    return ""
+
+
+def _handoff_reason_kind(handoff: Handoff, blocker_text: str) -> str:
+    """Classify the escalation so the header and default ``Need`` fit the case."""
+    reason = (handoff.reason or "").lower()
+    metadata = handoff.metadata if isinstance(handoff.metadata, Mapping) else {}
+    budget_artifact = metadata.get("budget_exhausted_artifact_id")
+    text = f"{blocker_text}\n{reason}".lower()
+    budget_signalled = (
+        "budget" in reason
+        or budget_artifact not in (None, "", 0, "0", "null", "none")
+        or (
+            "budget" in text
+            and any(
+                token in text
+                for token in ("exhaust", "exceed", "ran out", "run out", "depleted", "out of")
+            )
+        )
+    )
+    if budget_signalled:
+        return "budget"
+    if "manual" in reason or "manual resume" in text or "resume manually" in text:
+        return "manual_resume"
+    return "worker_blocker"
+
+
+def _handoff_header(kind: str) -> str:
+    if kind == "budget":
+        return "*Quay worker blocked — budget exhausted*"
+    if kind == "manual_resume":
+        return "*Quay worker blocked — manual resume needed*"
+    return "*Quay worker blocked*"
+
+
+def _handoff_default_need(kind: str) -> str:
+    if kind == "budget":
+        return "approve more budget or stop the task."
+    if kind == "manual_resume":
+        return "confirm it's safe to resume and I'll continue."
+    return "advise how the worker should proceed."
+
+
 def build_human_question(
     handoff: Handoff,
     task: TaskContext,
     artifact: Artifact | None,
 ) -> str:
+    # An explicit worker- or operator-authored question always wins verbatim;
+    # only the auto-generated scaffolding below is compacted.
     if handoff.human_question and handoff.human_question.strip():
         return handoff.human_question.strip()
     meta_question = handoff.metadata.get("human_question")
     if isinstance(meta_question, str) and meta_question.strip():
         return meta_question.strip()
 
-    lines = [
-        "A Quay task needs human guidance before the next worker brief.",
-        f"Task: {task.title or task.task_id}",
-    ]
+    artifact_lines = _clean_handoff_lines(artifact.text if artifact else "")
+    summary_lines = _clean_handoff_lines(handoff.summary)
+    # The artifact is the primary blocker; the summary supplements it. Consider
+    # both (artifact first) when picking the blocker statement and the ask.
+    combined_lines = list(dict.fromkeys(artifact_lines + summary_lines))
+
+    reason_line = _first_blocker_line(combined_lines)
+    kind = _handoff_reason_kind(handoff, "\n".join(combined_lines))
+
+    promoted = _promote_action_line(combined_lines)
+    if promoted and promoted != reason_line:
+        need_line = promoted
+    else:
+        # No strong ask: try to rescue a softly-phrased ask from the leftover
+        # before falling back to the reason-specific default.
+        leftover_for_ask = [line for line in combined_lines if line != reason_line]
+        need_line = _promote_soft_ask(leftover_for_ask) or _handoff_default_need(kind)
+
+    identifier = task.issue or task.task_id
+    repo = task.repo_id or handoff.repo_id
+    header = _handoff_header(kind)
+    header_suffix = " · ".join(part for part in (identifier, repo) if part)
+    if header_suffix:
+        header = f"{header} — {header_suffix}"
+
+    lines = [header]
+
+    title = (task.title or "").strip()
+    if title and title not in {identifier, repo, reason_line}:
+        lines.append(f"Task: {title}")
+
     author_mention = resolve_author_mention(handoff, task)
     if author_mention:
         lines.append(f"Contributor: {author_mention}")
-    if task.issue:
-        lines.append(f"Issue: {task.issue}")
-    if task.repo_id or handoff.repo_id:
-        lines.append(f"Repo: {task.repo_id or handoff.repo_id}")
-    if handoff.summary:
-        lines.extend(["", "Handoff summary:", handoff.summary.strip()])
-    if artifact and artifact.text.strip():
-        lines.extend(["", "Blocker/context:", artifact.text.strip()])
-    lines.extend(
-        [
-            "",
-            "Discuss freely in this thread. I will resume the worker once the path is clear.",
-        ]
+
+    if reason_line:
+        lines.append(f"Reason: {reason_line}")
+
+    if need_line:
+        lines.append(f"Need: {need_line}")
+
+    # Context: every non-filler blocker/summary line we have not already
+    # surfaced as Reason or Need. This guarantees no artifact signal — a second
+    # question, a soft ask, or diagnostic detail — is ever silently dropped,
+    # while staying empty for the common single-statement + single-question case.
+    used = {reason_line, need_line}
+    context_lines = [line for line in combined_lines if line not in used]
+    if context_lines:
+        if len(context_lines) == 1:
+            lines.append(f"Context: {context_lines[0]}")
+        else:
+            lines.append("Context:")
+            lines.extend(f"• {line}" for line in context_lines)
+
+    lines.append(_HUMAN_QUESTION_FOOTER)
+    return "\n".join(lines)
+
+
+# A zero-width space wedged into a mention token breaks the exact-substring that
+# Slack (and a human's eye) reads as a ping, while keeping the text legible.
+_MENTION_NEUTRALIZER = "\u200b"
+
+# Slack broadcast tokens and raw mention tokens. The model message is authored
+# from attacker-influenceable blocker text, so it must never be able to @-ping a
+# channel or a person. Each pattern is de-fanged so the visible text survives but
+# cannot broadcast.
+# NOTE: consume the optional label — Slack parses `<!channel|urgent>` as the same
+# broadcast as `<!channel>`, so `\b[^>]*>` (mirroring the subteam pattern) is
+# required; an anchored `...)>` regex misses the labeled/spaced form and it pings.
+_BROADCAST_TOKEN_RE = re.compile(r"<!(channel|here|everyone)\b[^>]*>", re.IGNORECASE)
+_SUBTEAM_TOKEN_RE = re.compile(r"<!subteam\^[^>]*>", re.IGNORECASE)
+_RAW_USER_MENTION_RE = re.compile(r"<@([^>]*)>")
+_BARE_BROADCAST_RE = re.compile(r"@(channel|here|everyone)\b", re.IGNORECASE)
+# Backstop for every other Slack angle-bracket entity: channel refs `<#C..>`,
+# disguised hyperlinks `<https://..|label>`, or any `<!..>`/`<@..>` form the
+# passes above didn't fully consume. The lookahead requires a Slack sigil or URL
+# scheme right after `<`, so ordinary text like "a < b" is left untouched.
+_SLACK_ENTITY_OPEN_RE = re.compile(r"<(?=[@#!]|https?://|mailto:|tel:)", re.IGNORECASE)
+
+
+def _defang_raw_user_mention(match: "re.Match[str]") -> str:
+    inner = match.group(1).strip()
+    label = inner.split("|", 1)[-1].strip() or inner.split("|", 1)[0].strip()
+    return "@" + _MENTION_NEUTRALIZER + (label or "user")
+
+
+def _sanitize_escalation_message(text: str) -> str:
+    """Neutralize broadcast/mention injection in a model-authored message.
+
+    The message is composed from attacker-influenceable blocker text, so before
+    it can reach Slack we defang every token that could ping: ``@channel`` /
+    ``@here`` / ``@everyone``, the Slack broadcast tokens ``<!channel>`` /
+    ``<!here>`` / ``<!everyone>`` (including their labeled ``<!channel|label>``
+    forms), user-group ``<!subteam^...>`` tokens, raw ``<@Uxxxx>`` user mentions,
+    and any other Slack angle-bracket entity (channel refs, disguised
+    hyperlinks). Each is rewritten so the visible text is preserved but the exact
+    ping/link substring no longer exists. Also collapses whitespace and caps the
+    length. Pure and side-effect free.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = text
+    # Slack broadcast tokens -> visible but inert (no literal ``<!channel>`` and
+    # no literal ``@channel`` left behind).
+    cleaned = _BROADCAST_TOKEN_RE.sub(
+        lambda m: "@" + _MENTION_NEUTRALIZER + m.group(1).lower(), cleaned
     )
+    # User-group pings.
+    cleaned = _SUBTEAM_TOKEN_RE.sub("@" + _MENTION_NEUTRALIZER + "group", cleaned)
+    # Raw user mentions <@Uxxxx> / <@Uxxxx|name>.
+    cleaned = _RAW_USER_MENTION_RE.sub(_defang_raw_user_mention, cleaned)
+    # Bare @channel / @here / @everyone (both the originals and none of the
+    # already-neutralized forms above, which carry a zero-width space).
+    cleaned = _BARE_BROADCAST_RE.sub(
+        lambda m: "@" + _MENTION_NEUTRALIZER + m.group(1).lower(), cleaned
+    )
+    # Break any remaining Slack angle-bracket entity (disguised hyperlink,
+    # channel ref, or a mention/broadcast form missed above) by wedging a
+    # zero-width space after the opening `<`, so Slack renders it as inert
+    # literal text instead of a live link/ref/ping.
+    cleaned = _SLACK_ENTITY_OPEN_RE.sub("<" + _MENTION_NEUTRALIZER, cleaned)
+    # Collapse to a compact single block and cap the size.
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > _MAX_ESCALATION_MESSAGE_CHARS:
+        cleaned = cleaned[: _MAX_ESCALATION_MESSAGE_CHARS - 1].rstrip() + "…"
+    return cleaned
+
+
+def build_escalation_message(
+    handoff: Handoff,
+    task: TaskContext,
+    artifact: Artifact | None,
+    model_message: str | None,
+) -> str:
+    """Render the human escalation, optionally using a model-authored body.
+
+    When ``model_message`` sanitizes to a non-empty string, it becomes the BODY
+    of the escalation, wrapped in the SAME deterministic routing scaffolding
+    :func:`build_human_question` uses (reason-specific header + identifier·repo,
+    a ``Contributor:`` mention, and the shared footer). When it is ``None`` /
+    blank, this falls back to :func:`build_human_question` unchanged. An explicit
+    worker/operator ``human_question`` still wins verbatim (highest priority).
+    """
+    # Highest priority: an explicit worker/operator question is authoritative and
+    # must win over any model-authored message (mirrors build_human_question).
+    if handoff.human_question and handoff.human_question.strip():
+        return handoff.human_question.strip()
+    meta_question = handoff.metadata.get("human_question")
+    if isinstance(meta_question, str) and meta_question.strip():
+        return meta_question.strip()
+
+    body = _sanitize_escalation_message(model_message or "")
+    if not body:
+        # No usable model message -> byte-identical to today's escalation.
+        return build_human_question(handoff, task, artifact)
+
+    artifact_lines = _clean_handoff_lines(artifact.text if artifact else "")
+    summary_lines = _clean_handoff_lines(handoff.summary)
+    combined_lines = list(dict.fromkeys(artifact_lines + summary_lines))
+    kind = _handoff_reason_kind(handoff, "\n".join(combined_lines))
+
+    identifier = task.issue or task.task_id
+    repo = task.repo_id or handoff.repo_id
+    header = _handoff_header(kind)
+    header_suffix = " · ".join(part for part in (identifier, repo) if part)
+    if header_suffix:
+        header = f"{header} — {header_suffix}"
+
+    lines = [header]
+    author_mention = resolve_author_mention(handoff, task)
+    if author_mention:
+        lines.append(f"Contributor: {author_mention}")
+    lines.append(body)
+    lines.append(_HUMAN_QUESTION_FOOTER)
     return "\n".join(lines)
 
 
@@ -2585,14 +4301,211 @@ def _coerce_slack_route(value: Any, *, source: str) -> SlackRoute | None:
 
 
 def _parse_slack_thread_ref(value: str) -> tuple[str, str] | None:
-    left, sep, right = value.strip().partition(":")
-    if not sep:
+    parts = [part.strip() for part in value.strip().split(":")]
+    if parts and parts[0].lower() == "slack":
+        # A `slack:` prefix is only valid in the full `slack:CHANNEL:THREAD_TS`
+        # shape. Reject anything else (e.g. a truncated `slack:CHANNEL`) rather
+        # than mis-reading "slack" as the channel id.
+        if len(parts) != 3:
+            return None
+        channel_id, thread_ts = parts[1], parts[2]
+    elif len(parts) == 2:
+        channel_id, thread_ts = parts
+    else:
         return None
-    channel_id = left.strip()
-    thread_ts = right.strip()
     if not channel_id or not thread_ts:
         return None
     return channel_id, thread_ts
+
+
+# --- Delivery outbox quarantine contract ------------------------------------
+#
+# One deterministically-bad delivery row must never starve the rows behind it.
+# The orchestrator marks such rows with a `terminal:` error prefix and skips
+# them on later drains. This only works if `quay outbox list --status pending`
+# faithfully round-trips what `quay outbox fail --error <reason>` wrote, i.e.:
+#
+#   * a failed row is re-listed under `--status pending` (retryable), OR is
+#     dropped from the pending list entirely once it is dead-lettered — either
+#     way it stops being re-claimed; and
+#   * the `--error` string survives on the row under one of `last_error`,
+#     `error`, or `last_error_message`, with our `terminal:` marker intact
+#     (optionally behind a Quay wrapper prefix such as "... : terminal:...").
+#
+# `MAX_DELIVERY_ATTEMPTS` also bounds retries for genuinely transient failures
+# and for unexpected (non-Slack) exceptions, so even if Quay exposes no native
+# attempt counter the row is quarantined after a few ticks. The fallback
+# counter is carried in the `delivery_attempt=<n>` marker embedded in the
+# retryable failure reason (read back via the same last_error round-trip).
+MAX_DELIVERY_ATTEMPTS = 5
+
+_DELIVERY_ATTEMPT_MARKER = "delivery_attempt="
+
+# Slack Web API `error` values (and the synthetic `transport_error:` prefix
+# used for network / 5xx / 429 failures) that are genuinely transient: the same
+# payload and route can succeed on a later tick, so these are retried within the
+# attempt budget rather than quarantined immediately.
+_RETRYABLE_SLACK_ERRORS = frozenset(
+    {
+        "ratelimited",
+        "rate_limited",
+        "service_unavailable",
+        "internal_error",
+        "fatal_error",
+        "backend_error",
+        "request_timeout",
+        "timeout",
+        "gateway_timeout",
+        "connection_error",
+    }
+)
+
+# Deterministic Slack errors a human can still clear by fixing the destination
+# channel (invite the bot / unarchive). Retried within the attempt budget so a
+# quick fix auto-delivers, and surfaced loudly (see the operator alert) so the
+# message is never silently dropped.
+_OPERATOR_RECOVERABLE_SLACK_ERRORS = frozenset(
+    {
+        "not_in_channel",
+        "is_archived",
+    }
+)
+
+
+def _delivery_slack_error_disposition(exc: SlackApiError) -> str:
+    """Classify a Slack delivery failure.
+
+    Returns ``retryable`` (transient — retry within the attempt budget),
+    ``operator`` (channel-level, human-recoverable — retry within budget *and*
+    alert), or ``terminal`` (deterministic bad payload/route — quarantine
+    immediately so it cannot starve the outbox).
+    """
+    error = (exc.error or "").strip().lower()
+    if error.startswith("transport_error:") or error in _RETRYABLE_SLACK_ERRORS:
+        return "retryable"
+    if error in _OPERATOR_RECOVERABLE_SLACK_ERRORS:
+        return "operator"
+    return "terminal"
+
+
+def _delivery_attempt_count(item: OutboxItem) -> int:
+    """Best-effort count of prior delivery attempts for a claimed row.
+
+    Prefers a native counter on the raw Quay outbox row; otherwise falls back
+    to the ``delivery_attempt=<n>`` marker this orchestrator embeds in the
+    retryable failure reason, so bounded retry still works when Quay exposes no
+    attempt counter.
+    """
+    raw = item.metadata.get("quay_outbox")
+    if not isinstance(raw, Mapping):
+        return 0
+    for key in ("delivery_attempts", "attempt_count", "attempts", "retry_count"):
+        value = raw.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return _attempt_from_marker(_row_error(raw))
+
+
+def _row_error(row: Mapping[str, Any]) -> str:
+    return str(
+        row.get("last_error")
+        or row.get("error")
+        or row.get("last_error_message")
+        or ""
+    )
+
+
+def _attempt_from_marker(reason: str) -> int:
+    marker_at = reason.find(_DELIVERY_ATTEMPT_MARKER)
+    if marker_at < 0:
+        return 0
+    tail = reason[marker_at + len(_DELIVERY_ATTEMPT_MARKER) :]
+    digits = ""
+    for ch in tail:
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return int(digits) if digits else 0
+
+
+# Reason tokens that legitimately follow a `terminal:` / `quarantine:` marker.
+# Wrapper-tolerance only fires when the marker is followed by one of these, so
+# arbitrary error free-text that merely contains the word "terminal" (e.g.
+# "connection terminal: reset by peer") is never misread as a terminal row.
+_TERMINAL_REASON_TOKENS = frozenset(
+    {
+        "missing_default_slack_channel",
+        "slack_api_error",
+        "exhausted_retries",
+        "channel_not_found",
+        "thread_not_found",
+        "not_in_channel",
+        "is_archived",
+        "msg_too_long",
+        "invalid_blocks",
+        "invalid_arguments",
+        "restricted_action",
+        "quarantined",
+    }
+)
+
+
+def _leading_reason_token(text: str) -> str:
+    token = ""
+    for ch in text:
+        if ch == ":" or ch.isspace():
+            break
+        token += ch
+    return token
+
+
+def _wrapped_terminal_reason(lowered: str) -> bool:
+    """True only if a `terminal:`/`quarantine:` marker sits behind a wrapper
+    boundary AND is immediately followed by a recognized terminal reason token.
+    """
+    for marker in ("terminal:", "quarantine:"):
+        for sep in (" " + marker, ":" + marker):
+            idx = lowered.find(sep)
+            while idx >= 0:
+                after = lowered[idx + len(sep) :]
+                if _leading_reason_token(after) in _TERMINAL_REASON_TOKENS:
+                    return True
+                idx = lowered.find(sep, idx + 1)
+    return False
+
+
+def _terminal_outbox_row_reason(row: Mapping[str, Any]) -> str | None:
+    status = str(row.get("status") or row.get("state") or "").strip().lower()
+    if status in {
+        "terminal",
+        "quarantined",
+        "quarantine",
+        "failed_terminal",
+        "dead",
+        "dead_letter",
+    }:
+        return f"terminal_status:{status}"
+    last_error = _row_error(row).strip()
+    if not last_error:
+        return None
+    lowered = last_error.lower()
+    # Canonical marker the orchestrator itself writes — always authoritative.
+    if lowered.startswith("terminal:") or lowered.startswith("quarantine:"):
+        return last_error
+    # A row still carrying a delivery_attempt= retry marker is retryable-in-flight:
+    # never let wrapper-tolerance misread free text inside its reason as terminal.
+    if _DELIVERY_ATTEMPT_MARKER in lowered:
+        return None
+    # Tolerate a Quay wrapper prefix, e.g. "quay-wrapper: terminal:exhausted_retries",
+    # but only when the marker is followed by a recognized terminal reason token.
+    if _wrapped_terminal_reason(lowered):
+        return last_error
+    return None
 
 
 def load_config(path: Path | None) -> OrchestratorConfig:
@@ -2632,9 +4545,15 @@ def build_quay_client(config: OrchestratorConfig) -> QuayClient:
     return QuayCliClient(command=config.quay_command, logger=LOGGER)
 
 
-def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
+def log_event(
+    logger: logging.Logger,
+    event: str,
+    *,
+    level: int = logging.INFO,
+    **fields: Any,
+) -> None:
     record = {"event": event, **fields}
-    logger.info(json.dumps(record, sort_keys=True))
+    logger.log(level, json.dumps(record, sort_keys=True))
 
 
 def run_drain_one(args: argparse.Namespace) -> int:
@@ -2737,6 +4656,95 @@ def _json_mapping_field(encoded: Any, fallback: Any = None) -> dict[str, Any]:
     if value is None:
         return {}
     return {"value": value}
+
+
+def _is_review_finding_linear_delivery(item: OutboxItem) -> bool:
+    """A delivery row Quay wants filed as a Linear issue, not Slack-posted.
+
+    Matches on either the dedicated kind or ``route_hint.provider == "linear"``
+    (BRIX-1896); Quay sets both, so either alone is sufficient here.
+    """
+    if item.kind.strip() == REVIEW_FINDING_LINEAR_ISSUE_KIND:
+        return True
+    provider = item.route_hint.get("provider")
+    return isinstance(provider, str) and provider.strip().lower() == "linear"
+
+
+def _review_finding_provider_idempotency_key(payload: Mapping[str, Any]) -> str:
+    """Deterministic Linear issue ``id`` for a review finding.
+
+    Mirrors Quay's ``linearIssueProviderIdempotencyKey`` byte-for-byte
+    (`packages/cli/src/core/review_finding_linear_outbox.ts`): a v5-shaped UUID
+    over ``kind:task_id:review_id:fingerprint``. Passing it as Linear's client
+    ``id`` makes ``issueCreate`` idempotent, so a re-delivery cannot duplicate.
+    """
+    source = ":".join(
+        [
+            REVIEW_FINDING_LINEAR_ISSUE_KIND,
+            str(payload.get("task_id") or ""),
+            str(payload.get("review_id") or ""),
+            str(payload.get("fingerprint") or ""),
+        ]
+    )
+    digest = bytearray(hashlib.sha256(source.encode("utf-8")).digest()[:16])
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    hexed = digest.hex()
+    return "-".join(
+        [hexed[0:8], hexed[8:12], hexed[12:16], hexed[16:20], hexed[20:32]]
+    )
+
+
+def _render_review_finding_issue_body(payload: Mapping[str, Any]) -> str:
+    """Compose the Linear issue body: finding text, principle, locations, PR."""
+    sections: list[str] = []
+    body_markdown = str(payload.get("body_markdown") or "").strip()
+    if body_markdown:
+        sections.append(body_markdown)
+    principle = payload.get("principle_text")
+    if isinstance(principle, str) and principle.strip():
+        sections.append(f"## quay-principle\n{principle.strip()}")
+    location_lines = _format_review_finding_locations(payload.get("locations"))
+    if location_lines:
+        sections.append("## Locations\n" + "\n".join(location_lines))
+    pr_url = payload.get("pr_url")
+    if isinstance(pr_url, str) and pr_url.strip():
+        sections.append(f"PR: {pr_url.strip()}")
+    return "\n\n".join(sections)
+
+
+def _format_review_finding_locations(locations: Any) -> list[str]:
+    if not isinstance(locations, list):
+        return []
+    lines: list[str] = []
+    for location in locations:
+        if not isinstance(location, Mapping):
+            continue
+        parts: list[str] = []
+        path = location.get("path")
+        if isinstance(path, str) and path.strip():
+            parts.append(path.strip())
+        line_range = _format_line_range(
+            location.get("start_line"), location.get("end_line")
+        )
+        if line_range:
+            parts.append(line_range)
+        lines.append(f"- {':'.join(parts) if parts else '(review body)'}")
+        url = location.get("url")
+        if isinstance(url, str) and url.strip():
+            lines.append(f"  {url.strip()}")
+    return lines
+
+
+def _format_line_range(start: Any, end: Any) -> str:
+    start_line = start if isinstance(start, int) and not isinstance(start, bool) else None
+    end_line = end if isinstance(end, int) and not isinstance(end, bool) else None
+    if start_line is None and end_line is None:
+        return ""
+    if start_line is not None and end_line is not None and start_line != end_line:
+        return f"{start_line}-{end_line}"
+    resolved = start_line if start_line is not None else end_line
+    return str(resolved)
 
 
 def delivery_message_from_outbox(
@@ -3005,6 +5013,19 @@ def _positive_float(value: Any, *, default: float) -> float:
         parsed = float(value)
     except (TypeError, ValueError):
         return default
+    return parsed if parsed > 0 else default
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return default
     return parsed if parsed > 0 else default
 
 

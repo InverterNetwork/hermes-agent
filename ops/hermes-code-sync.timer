@@ -2,12 +2,22 @@
 Description=Run hermes-code-sync every 5 minutes
 
 [Timer]
-# Initial delay after boot to let the network settle.
-OnBootSec=60s
-# Cadence: 5 minutes between ticks. Independent of quay-tick (which keeps
-# bare clones fresh on its own cadence). Override in
-# /etc/systemd/system/hermes-code-sync.timer.d/override.conf to retune.
-OnUnitActiveSec=5min
+# Wall-clock cadence: every 5 minutes (BRIX-1874). Independent of quay-tick
+# (which keeps bare clones fresh on its own cadence). Anchored on the wall
+# clock via OnCalendar rather than OnBootSec/OnUnitActiveSec, so the timer
+# always has a next elapse and always re-arms after any stop/restart. A
+# monotonic-only schedule (OnUnitActiveSec re-anchors off the *previous*
+# service activation) can compute NO next trigger if the service is stopped and
+# the timer is later started past boot with no prior activation to anchor on —
+# it then sits active with `Trigger: n/a` and silently never fires again.
+#
+# Retune with an override drop-in
+# (/etc/systemd/system/hermes-code-sync.timer.d/override.conf via
+# `sudo systemctl edit hermes-code-sync.timer`), resetting OnCalendar first:
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=*:0/10
+OnCalendar=*:0/5
 AccuracySec=30s
 Persistent=true
 Unit=hermes-code-sync.service

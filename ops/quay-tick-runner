@@ -11,10 +11,9 @@
 # Mirrors ops/hermes-upstream-sync's preamble — same helper, same env-var
 # contract — with a role-specific reviewer config path layered on top.
 #
-# Permissive on helper failure: if the App PEM isn't staged or mint
-# errors transiently, we exec `quay tick` without that token. Quay's
-# existing auth-error message surfaces downstream, rather than blocking
-# the timer on a transient mint failure.
+# Strict on worker helper failure: stale inherited tokens are replaced and
+# missing/unmintable tokens fail before `quay tick`, so waiting_human recovery
+# and spawned workers never run with stale GH_TOKEN/GITHUB_TOKEN.
 #
 # Environment overrides (mostly for tests / non-default installs):
 #   HERMES_HOME          — install root (default: $HOME/.hermes)
@@ -23,11 +22,14 @@
 #   HERMES_TOKEN_PYTHON  — venv python (default: render under
 #                          $HERMES_HOME/hermes-agent/venv/bin/python)
 #   QUAY_WORKER_GH_TOKEN / GH_TOKEN / GITHUB_TOKEN
-#                        — when any is set, kept if `gh api rate_limit`
-#                          accepts it. That probe supports both user tokens
-#                          and GitHub App installation tokens. Invalid/expired
-#                          values are replaced by a freshly minted helper
-#                          token exported under all three names.
+#                        — when any is set, kept only if repo/PR-scoped
+#                          GitHub probes accept it. Invalid, expired, or
+#                          repo-unauthorized values are replaced by a freshly
+#                          minted helper token exported under all three names.
+#   HERMES_QUAY_GITHUB_AUTH_REPO(S)
+#                        — optional owner/repo probe target(s). When unset,
+#                          the auth helper probes registered Quay bare clone
+#                          origins from $QUAY_DATA_DIR/repos.
 #   HERMES_REVIEWER_GH_CONFIG
 #                        — reviewer App env file (default:
 #                          /etc/hermes/reviewer.env)
@@ -41,21 +43,17 @@ set -u
 LOG_PREFIX="quay-tick-runner"
 warn() { printf '[%s] WARN: %s\n' "$LOG_PREFIX" "$*" >&2; }
 
-token_is_valid() {
-  local token="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
-  [[ -n "$token" ]] || return 1
-  command -v gh >/dev/null 2>&1 || return 1
-  GH_TOKEN="$token" \
-    GITHUB_TOKEN="$token" \
-    gh api rate_limit >/dev/null 2>&1
-}
-
-export_worker_token() {
-  local token="$1"
-  export QUAY_WORKER_GH_TOKEN="$token"
-  export GH_TOKEN="$token"
-  export GITHUB_TOKEN="$token"
-}
+AUTH_HELPER="${HERMES_QUAY_GITHUB_AUTH:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/ops/quay-github-auth}"
+if [[ ! -f "$AUTH_HELPER" ]]; then
+  AUTH_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quay-github-auth"
+fi
+if [[ ! -f "$AUTH_HELPER" ]]; then
+  printf '[%s] ERROR: GitHub auth helper not found; checked HERMES_QUAY_GITHUB_AUTH and %s\n' "$LOG_PREFIX" "$AUTH_HELPER" >&2
+  exit 64
+fi
+quay_auth_log_prefix="$LOG_PREFIX"
+# shellcheck source=ops/quay-github-auth
+source "$AUTH_HELPER"
 
 mint_from_helper() {
   local label="$1"
@@ -100,22 +98,6 @@ mint_from_helper() {
   printf '%s\n' "$token"
 }
 
-mint_worker_gh_token() {
-  local existing="${QUAY_WORKER_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
-  if [[ -n "$existing" ]]; then
-    if token_is_valid; then
-      export_worker_token "$existing"
-      return 0
-    fi
-    warn "existing worker GitHub token is invalid; minting replacement"
-    unset QUAY_WORKER_GH_TOKEN GH_TOKEN GITHUB_TOKEN
-  fi
-
-  local token
-  token="$(mint_from_helper "worker" "")" || return 0
-  export_worker_token "$token"
-}
-
 mint_reviewer_gh_token() {
   [[ -n "${QUAY_REVIEWER_GH_TOKEN:-}" ]] && return 0
 
@@ -127,6 +109,6 @@ mint_reviewer_gh_token() {
   export QUAY_REVIEWER_GH_TOKEN="$token"
 }
 
-mint_worker_gh_token
+quay_prepare_worker_github_auth
 mint_reviewer_gh_token
 exec "${QUAY_BIN:-/usr/local/bin/quay}" tick "$@"
