@@ -2320,7 +2320,13 @@ if [[ -f "$UPSTREAM_SYNC_SRC" ]]; then
   else
     echo "==> provisioning upstream-sync workspace at $UPSTREAM_WORKSPACE"
     install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 "$UPSTREAM_WORKSPACE"
-    sudo -u "$AGENT_USER" git clone --quiet "$FORK_ORIGIN_URL" "$UPSTREAM_WORKSPACE"
+    # Clone from the already-staged local fork instead of going back out to the
+    # network. This keeps installer smoke tests deterministic and avoids a
+    # first-install GitHub credential dependency; reset origin afterward so the
+    # long-lived sync workspace still pushes/fetches against the configured fork.
+    sudo -u "$AGENT_USER" git clone --quiet "$FORK_DIR" "$UPSTREAM_WORKSPACE"
+    sudo -u "$AGENT_USER" git -C "$UPSTREAM_WORKSPACE" \
+      remote set-url origin "$FORK_ORIGIN_URL"
     sudo -u "$AGENT_USER" git -C "$UPSTREAM_WORKSPACE" \
       remote add upstream "$UPSTREAM_REMOTE_URL"
     sudo -u "$AGENT_USER" git -C "$UPSTREAM_WORKSPACE" \
