@@ -599,6 +599,17 @@ repos:
       # Per-repo tag vocab intentionally omitted. Add per-repo vocab here
       # once real ticket flow informs the namespace shape; absence is the
       # explicit "no vocab yet" signal.
+  - id: brix-solvers
+    url: https://github.com/InverterNetwork/brix-solvers
+    # pnpm-workspaces monorepo of solver engines (CoW Protocol, Uniswap X)
+    # filling USDC -> RWA via on-chain mint. First ticket flow: BRIX-1913.
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
   - id: erpc
     url: https://github.com/InverterNetwork/erpc
     base_branch: main

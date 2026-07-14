@@ -89,6 +89,7 @@ jobs:
         #   * iTRY-monorepo       — quay-managed, base_branch: dev
         #   * itry-liquidation-bot — quay-managed, base_branch: main
         #   * brix-indexer        — quay-managed, base_branch: dev
+        #   * brix-solvers        — quay-managed, base_branch: main
         #   * erpc                — quay-managed, base_branch: main
         #   * iTry-contracts      — quay-managed, base_branch: main
         #   * quay                — quay-managed, base_branch: dev
@@ -115,6 +116,7 @@ jobs:
           ITRY_MONOREPO_FIXTURE=/srv/hermes/repos/quay-fixtures/iTRY-monorepo
           ITRY_LIQUIDATION_BOT_FIXTURE=/srv/hermes/repos/quay-fixtures/itry-liquidation-bot
           BRIX_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-indexer
+          BRIX_SOLVERS_FIXTURE=/srv/hermes/repos/quay-fixtures/brix-solvers
           ERPC_FIXTURE=/srv/hermes/repos/quay-fixtures/erpc
           ITRY_CONTRACTS_FIXTURE=/srv/hermes/repos/quay-fixtures/iTry-contracts
           QUAY_FIXTURE=/srv/hermes/repos/quay-fixtures/quay
@@ -141,6 +143,7 @@ jobs:
           # brix-indexer real repo lives on `dev`; init the fixture there
           # directly so the values entry's base_branch=dev resolves cleanly.
           init_fixture "$BRIX_FIXTURE" "init fixture" dev
+          init_fixture "$BRIX_SOLVERS_FIXTURE" "init fixture"
           init_fixture "$ERPC_FIXTURE" "init fixture"
           init_fixture "$ITRY_CONTRACTS_FIXTURE" "init fixture"
           init_fixture "$QUAY_FIXTURE" "init fixture" dev
@@ -168,7 +171,7 @@ jobs:
           # scalar intact (a column-0 line would terminate it); `sed`
           # strips the indent before Python sees it, so the script reads
           # as column-0 module-level code.
-          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$ITRY_LIQUIDATION_BOT_FIXTURE" "$BRIX_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$HERMES_AGENT_FIXTURE" "$BRIX_PROTOTYPES_FIXTURE" "$BRIX_PROTOTYPING_SANDBOX_FIXTURE" "$ATLAS_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
+          sed 's/^          //' <<'PY' | sudo python3 - "$BRIX_LANDING_FIXTURE" "$ITRY_FRONTENDS_FIXTURE" "$ITRY_MONOREPO_FIXTURE" "$ITRY_LIQUIDATION_BOT_FIXTURE" "$BRIX_FIXTURE" "$BRIX_SOLVERS_FIXTURE" "$ERPC_FIXTURE" "$ITRY_CONTRACTS_FIXTURE" "$QUAY_FIXTURE" "$HERMES_AGENT_FIXTURE" "$BRIX_PROTOTYPES_FIXTURE" "$BRIX_PROTOTYPING_SANDBOX_FIXTURE" "$ATLAS_FIXTURE" "$CODE_FIXTURE" "$DEV_FIXTURE"
           import sys, yaml
           (
               brix_landing_fixture,
@@ -176,6 +179,7 @@ jobs:
               itry_monorepo_fixture,
               itry_liquidation_bot_fixture,
               brix_fixture,
+              brix_solvers_fixture,
               erpc_fixture,
               itry_contracts_fixture,
               quay_fixture,
@@ -185,7 +189,7 @@ jobs:
               atlas_fixture,
               code_fixture,
               dev_fixture,
-          ) = sys.argv[1:15]
+          ) = sys.argv[1:16]
           path = "/srv/hermes/repos/hermes-agent/deploy.values.yaml"
           with open(path) as f:
               data = yaml.safe_load(f)
@@ -195,6 +199,7 @@ jobs:
               "iTRY-monorepo": itry_monorepo_fixture,
               "itry-liquidation-bot": itry_liquidation_bot_fixture,
               "brix-indexer": brix_fixture,
+              "brix-solvers": brix_solvers_fixture,
               "erpc": erpc_fixture,
               "iTry-contracts": itry_contracts_fixture,
               "quay": quay_fixture,
@@ -448,6 +453,7 @@ jobs:
               iTRY-monorepo:/srv/hermes/repos/quay-fixtures/iTRY-monorepo \
               itry-liquidation-bot:/srv/hermes/repos/quay-fixtures/itry-liquidation-bot \
               brix-indexer:/srv/hermes/repos/quay-fixtures/brix-indexer \
+              brix-solvers:/srv/hermes/repos/quay-fixtures/brix-solvers \
               erpc:/srv/hermes/repos/quay-fixtures/erpc \
               iTry-contracts:/srv/hermes/repos/quay-fixtures/iTry-contracts \
               quay:/srv/hermes/repos/quay-fixtures/quay \
@@ -464,7 +470,7 @@ jobs:
             done
             registered=$(env QUAY_DATA_DIR="$T/quay" /usr/local/bin/quay repo list \
               | python3 -c "import json,sys;print(\"\\n\".join(r[\"repo_id\"] for r in json.load(sys.stdin)))")
-            for id in brix-landing iTRY-frontends iTRY-monorepo itry-liquidation-bot brix-indexer erpc iTry-contracts quay hermes-agent brix-prototypes atlas; do
+            for id in brix-landing iTRY-frontends iTRY-monorepo itry-liquidation-bot brix-indexer brix-solvers erpc iTry-contracts quay hermes-agent brix-prototypes atlas; do
               grep -Fxq "$id" <<< "$registered" \
                 || { echo "FAIL: $id not registered (got: $registered)"; exit 1; }
             done
@@ -491,6 +497,7 @@ jobs:
               iTRY-monorepo:dev \
               itry-liquidation-bot:main \
               brix-indexer:dev \
+              brix-solvers:main \
               erpc:main \
               iTry-contracts:main \
               quay:dev \
@@ -545,6 +552,7 @@ jobs:
               iTRY-monorepo:dev \
               itry-liquidation-bot:main \
               brix-indexer:dev \
+              brix-solvers:main \
               erpc:main \
               iTry-contracts:main \
               quay:dev \
