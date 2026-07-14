@@ -34,6 +34,9 @@ Nine units live here:
   `/etc/default/quay-worker-env` and inherited by spawned worker panes.
   `QUAY_DATA_DIR` points at `<HERMES_HOME>/quay/`. Operates on the
   subset of `repos[]` entries carrying a `quay:` block.
+  Worker shells inherit the service PATH, including `/usr/local/bin`,
+  where the installer places pinned runtime managers and host-level
+  worker tools such as `anvil`.
 * **`quay-serve`** — localhost-only Admin UI/API service. Installed only
   when the pinned Quay binary passes `quay serve --help`. Supporting
   release binaries serve the embedded UI, bind to `127.0.0.1:9731`, use
@@ -75,7 +78,7 @@ Nine units live here:
 | `ops/hermes-gateway.service.d/ops-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops.env` (non-prod AWS creds — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` — plus `NEW_RELIC_API_KEY`, `NEW_RELIC_ACCOUNT_ID`, `NEW_RELIC_GRAPHQL_ENDPOINT`). Powers the `aws-lambda-debug`, `dynamodb-query`, and `new-relic-lambda` skills. Staged via `stage-secrets.sh`. The AWS keys must be from an IAM user/role with **read-only** Lambda + CloudWatch Logs + CloudFormation + DynamoDB policies attached — the skills can't enforce read-only, IAM is the boundary. |
 | `ops/hermes-gateway.service.d/ops-prod-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops-prod.env` (PROD AWS creds — `AWS_PROD_ACCESS_KEY_ID`, `AWS_PROD_SECRET_ACCESS_KEY`). Kept in a separate file from `ops.env` so the prod surface is visible at the filesystem level; skills (`aws-lambda-debug-prod`, `dynamodb-query-prod`) remap `AWS_PROD_*` onto the canonical AWS env-var names per-command. Same IAM rule applies — these must be read-only prod keys, ideally from a dedicated IAM user with no other privileges. Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, `API_SERVER_*`, `QUAY_AGENT_PROVIDER`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
-| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. Loads `/etc/default/quay-worker-env` for host-managed worker env such as RPC URLs. |
+| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. Loads `/etc/default/quay-worker-env` for host-managed worker env such as RPC URLs and sets an explicit PATH containing `/usr/local/bin` so worker attempts can resolve installer-managed tools such as `anvil`. |
 | `ops/quay-github-auth`                     | Shared runtime GitHub auth preflight. Installed under `<HERMES_HOME>/hermes-agent/ops/`; validates inherited worker tokens, replaces stale ones, and fails clearly on missing helper/config or GitHub validation/mint outages before Quay runs. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Sources `quay-github-auth`, keeps a valid pre-set worker GitHub token or mints one via `installer/hermes_github_token.py`, exports it as `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
@@ -107,6 +110,34 @@ installer is the supported path.
 `com.hermes.sync.plist` (launchd) is not shipped yet — the installer is
 Linux/systemd-only as of v0.1. Tracked under the macOS TODO at the top of
 `installer/setup-hermes.sh`.
+
+## Worker substrate: Anvil
+
+`setup-hermes.sh` provisions Foundry's `anvil` as a supported Quay worker
+runtime dependency whenever Quay is enabled. The pin lives in
+`deploy.values.yaml` under `quay.toolchain.anvil`:
+
+```yaml
+quay:
+  toolchain:
+    anvil:
+      version: "1.7.1"
+      linux_x64_sha256: "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b"
+```
+
+The installer downloads
+`foundry_v<version>_linux_amd64.tar.gz` from the upstream Foundry GitHub
+release, verifies the pinned tarball SHA256, extracts the `anvil` member,
+and installs it as `/usr/local/bin/anvil` (`root:root 0755`). `quay-tick`
+workers inherit `/usr/local/bin` from the systemd service runtime, so
+fork-test-capable repos can invoke `anvil` directly from worker runs.
+
+After an install or pin bump, verify the host-level worker substrate with:
+
+```sh
+sudo -u <agent> -H /usr/local/bin/anvil --version
+sudo installer/setup-hermes.sh --verify
+```
 
 ## Pre-install: claude auth (quay workers)
 

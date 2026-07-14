@@ -12,6 +12,8 @@ asset has.
 from __future__ import annotations
 
 import hashlib
+import io
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -41,6 +43,24 @@ def build_bun_zip(out_dir: Path, version: str) -> tuple[Path, str]:
     return zip_path, sha
 
 
+def build_anvil_tar(out_dir: Path, version: str) -> tuple[Path, str]:
+    """Create a Foundry-shaped tarball containing ``anvil``.
+
+    Returns (tar_path, sha256). The member layout matches the recipe in
+    ``installer/hermes_installer/runtimes.py:_RECIPES['anvil']``.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tar_path = out_dir / "foundry.tar.gz"
+    body = fake_bun_script(version).encode()
+    with tarfile.open(tar_path, "w:gz") as tf:
+        info = tarfile.TarInfo("anvil")
+        info.mode = 0o755
+        info.size = len(body)
+        tf.addfile(info, fileobj=io.BytesIO(body))
+    sha = hashlib.sha256(tar_path.read_bytes()).hexdigest()
+    return tar_path, sha
+
+
 def build_fake_binary(out_dir: Path, name: str, version: str) -> tuple[Path, str]:
     """Create a fake plain-binary asset (bash script reporting ``--version``)
     in ``out_dir``. Returns (binary_path, sha256). Mirrors the upstream
@@ -67,13 +87,21 @@ def fake_bun_zip(tmp_path: Path) -> tuple[Path, str]:
 
 
 @pytest.fixture
-def patch_urlretrieve(monkeypatch, fake_bun_zip):
-    """Stub ``urllib.request.urlretrieve`` to copy the fake zip's bytes
+def fake_anvil_tar(tmp_path: Path) -> tuple[Path, str]:
+    """Pre-built Foundry-shaped tarball + its SHA256."""
+    return build_anvil_tar(tmp_path / "src", "1.7.1")
+
+
+@pytest.fixture
+def patch_urlretrieve(monkeypatch, fake_bun_zip, fake_anvil_tar):
+    """Stub ``urllib.request.urlretrieve`` to copy fake release asset bytes
     instead of going to the network."""
     src_zip, _sha = fake_bun_zip
+    src_tar, _anvil_sha = fake_anvil_tar
 
-    def _fake(url: str, dst):  # noqa: ARG001 — url not asserted
-        Path(dst).write_bytes(src_zip.read_bytes())
+    def _fake(url: str, dst):
+        src = src_tar if "foundry" in url else src_zip
+        Path(dst).write_bytes(src.read_bytes())
 
     monkeypatch.setattr(runtimes.urllib.request, "urlretrieve", _fake)
     return _fake

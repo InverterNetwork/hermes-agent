@@ -25,6 +25,10 @@ Group=__AGENT_USER__
 # tick) which install root to read auth/github-app.{pem,env} from.
 Environment=QUAY_DATA_DIR=__TARGET_DIR__/quay
 Environment=HERMES_HOME=__TARGET_DIR__
+# Worker attempts inherit the tick process environment. Keep the managed
+# binary directory explicit so repo tests can resolve installer-provisioned
+# tools such as anvil without relying on a login shell profile.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Reviewer App credentials live outside HERMES_HOME because they are a
 # separate deploy-rendered identity. quay-tick-runner reads this file and
 # exports QUAY_REVIEWER_GH_TOKEN for reviewer attempts.
