@@ -990,13 +990,12 @@ class QuayCliClient:
 def _assert_agent_tool_less(agent: Any) -> None:
     """Guarantee an orchestrator agent resolved to ZERO tools.
 
-    The orchestrator's ``AIAgent`` instances (Slack decider + blocker
-    remediator) must never hold a tool: the model is a pure reasoner and every
-    state change is performed by orchestrator code. ``enabled_toolsets=[]``
-    alone is NOT sufficient because ``model_tools`` force-appends the ``kanban``
-    toolset whenever ``HERMES_KANBAN_TASK`` is set in the ambient env. This
-    check fails loudly if any tool survives, so the agent can never silently
-    gain a capability from the environment.
+    The Slack conversation decider must never hold a tool: the model is a pure
+    reasoner and every state change is performed by orchestrator code.
+    ``enabled_toolsets=[]`` alone is NOT sufficient because ``model_tools``
+    force-appends the ``kanban`` toolset whenever ``HERMES_KANBAN_TASK`` is set
+    in the ambient env. This check fails loudly if any tool survives, so the
+    decider can never silently gain a capability from the environment.
     """
     tools = getattr(agent, "tools", None)
     if tools:
@@ -1010,13 +1009,91 @@ def _assert_agent_tool_less(agent: Any) -> None:
         )
 
 
+_QUAY_DIAGNOSTIC_TOOLSETS: list[str] = ["quay_diagnostic"]
+_QUAY_DIAGNOSTIC_ALLOWED_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "session_search",
+        "skill_view",
+        "skills_list",
+        "web_extract",
+        "web_search",
+    }
+)
+_QUAY_DIAGNOSTIC_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
+    {
+        "browser_back",
+        "browser_cdp",
+        "browser_click",
+        "browser_dialog",
+        "browser_navigate",
+        "browser_press",
+        "browser_scroll",
+        "browser_type",
+        "close_terminal",
+        "computer_use",
+        "cronjob",
+        "delegate_task",
+        "execute_code",
+        "ha_call_service",
+        "image_generate",
+        "kanban_block",
+        "kanban_comment",
+        "kanban_complete",
+        "kanban_create",
+        "kanban_heartbeat",
+        "kanban_link",
+        "kanban_unblock",
+        "memory",
+        "patch",
+        "process",
+        "project_create",
+        "project_switch",
+        "skill_manage",
+        "terminal",
+        "todo",
+        "write_file",
+    }
+)
+
+
+def _resolved_tool_names(agent: Any) -> list[str]:
+    tools = getattr(agent, "tools", None) or []
+    names: list[str] = []
+    for tool in tools:
+        try:
+            name = tool["function"]["name"]
+        except (TypeError, KeyError):
+            name = str(tool)
+        names.append(str(name))
+    return sorted(names)
+
+
+def _assert_agent_diagnostic_only(agent: Any) -> None:
+    """Guarantee the blocker remediator resolved only read-only diagnostics."""
+    names = _resolved_tool_names(agent)
+    forbidden = sorted(set(names) & _QUAY_DIAGNOSTIC_FORBIDDEN_TOOLS)
+    if forbidden:
+        raise RuntimeError(
+            "orchestrator diagnostic agent resolved mutation-capable tools: "
+            + ", ".join(forbidden)
+        )
+    unexpected = sorted(set(names) - _QUAY_DIAGNOSTIC_ALLOWED_TOOLS)
+    if unexpected:
+        raise RuntimeError(
+            "orchestrator diagnostic agent resolved non-diagnostic tools: "
+            + ", ".join(unexpected)
+        )
+
+
 class _OrchestratorAgentBuilder:
     """Shared bounded-``AIAgent`` runtime/model resolution for the orchestrator.
 
-    Both the Slack conversation decider and the blocker remediator run a scoped,
-    tool-less ``AIAgent`` under the same provider/model resolution rules. This
-    base owns that plumbing so the two callers cannot drift apart; each supplies
-    its own iteration/token caps via ``_build_agent``.
+    Both the Slack conversation decider and the blocker remediator run a scoped
+    ``AIAgent`` under the same provider/model resolution rules. This base owns
+    that plumbing so the two callers cannot drift apart; each supplies its own
+    iteration/token caps and tool policy via ``_build_agent``.
     """
 
     def __init__(
@@ -1044,10 +1121,16 @@ class _OrchestratorAgentBuilder:
         *,
         max_iterations: int,
         max_tokens: int | None = None,
+        tool_policy: str = "none",
     ) -> Any:
+        if tool_policy not in {"none", "diagnostic"}:
+            raise ValueError(f"unknown orchestrator tool policy: {tool_policy}")
         if self._agent_factory is not None:
             agent = self._agent_factory()
-            _assert_agent_tool_less(agent)
+            if tool_policy == "none":
+                _assert_agent_tool_less(agent)
+            else:
+                _assert_agent_diagnostic_only(agent)
             return agent
         runtime = self._resolve_runtime()
         agent_class = self._agent_class
@@ -1056,6 +1139,15 @@ class _OrchestratorAgentBuilder:
 
             agent_class = AIAgent
 
+        # ``none`` keeps the Slack human-conversation decider as a pure reasoner.
+        # ``diagnostic`` gives the blocker remediator an explicit read-only
+        # inspection surface for Quay state/logs/artifacts before escalating.
+        # Kanban lifecycle tools stay disabled in both modes: task mutations are
+        # performed by this orchestrator after deterministic gates, never by
+        # model-authored tool calls.
+        enabled_toolsets = (
+            [] if tool_policy == "none" else list(_QUAY_DIAGNOSTIC_TOOLSETS)
+        )
         kwargs: dict[str, Any] = dict(
             model=self._resolve_model(runtime),
             api_key=runtime.get("api_key"),
@@ -1067,14 +1159,7 @@ class _OrchestratorAgentBuilder:
             credential_pool=runtime.get("credential_pool"),
             max_iterations=max_iterations,
             quiet_mode=True,
-            # Tool-less by construction. An empty ``enabled_toolsets`` is not
-            # enough: ``model_tools`` force-appends the ``kanban`` toolset
-            # whenever ``HERMES_KANBAN_TASK`` is set in the ambient env.
-            # Explicitly disabling ``kanban`` overrides that force-append so the
-            # orchestrator agent resolves to ZERO tools regardless of env — an
-            # explicit API rather than mutating global ``os.environ``. The
-            # post-build ``_assert_agent_tool_less`` check is the backstop.
-            enabled_toolsets=[],
+            enabled_toolsets=enabled_toolsets,
             disabled_toolsets=["kanban"],
             skip_context_files=True,
             skip_memory=True,
@@ -1084,7 +1169,10 @@ class _OrchestratorAgentBuilder:
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         agent = agent_class(**kwargs)
-        _assert_agent_tool_less(agent)
+        if tool_policy == "none":
+            _assert_agent_tool_less(agent)
+        else:
+            _assert_agent_diagnostic_only(agent)
         return agent
 
     def _resolve_runtime(self) -> Mapping[str, Any]:
@@ -1246,10 +1334,11 @@ class HermesConversationDecider(_OrchestratorAgentBuilder):
 # Agentic blocker remediation (BRIX-1878)
 #
 # SAFETY: Otto may auto-answer a blocked worker only when EVERY guardrail below
-# agrees. The model NEVER holds a tool; it only proposes JSON. All state
-# transitions (``submit_brief``, Linear writes) are performed by orchestrator
-# code AFTER the deterministic gates below. When anything is unclear the code
-# escalates to a human — the model's opinion cannot override that.
+# agrees. The blocker remediator may use local tools to inspect evidence, but it
+# still only proposes JSON. All state transitions (``submit_brief``, Linear
+# writes) are performed by orchestrator code AFTER the deterministic gates below.
+# When anything is unclear the code escalates to a human — the model's opinion
+# cannot override that.
 # ---------------------------------------------------------------------------
 
 # Deterministic never-auto categories. If any substring here appears in the
@@ -1428,6 +1517,18 @@ _AUTO_ANSWERABLE_CATEGORIES: frozenset[str] = frozenset(
 )
 
 
+_DIAGNOSTIC_ONLY_PREMODEL_REASONS: frozenset[str] = frozenset(
+    {"spend_or_budget:budget"}
+)
+_RETRY_BUDGET_DIAGNOSTIC_MARKERS: tuple[str, ...] = (
+    "budget_exhausted",
+    "budget exhausted",
+    "retry budget",
+    "retry-budget",
+    "retry_budget",
+)
+
+
 def _normalize_category(category: Any) -> str:
     """Strip + lowercase a model-proposed category; non-strings normalize to ''."""
     if not isinstance(category, str):
@@ -1440,22 +1541,59 @@ def _is_auto_answerable_category(category: Any) -> bool:
     return _normalize_category(category) in _AUTO_ANSWERABLE_CATEGORIES
 
 
+def _should_run_diagnostic_turn_for_never_auto(
+    reason: str | None,
+    *,
+    handoff: Handoff,
+    artifact: Artifact | None,
+) -> bool:
+    """Allow evidence gathering for never-auto symptoms that need inspection.
+
+    Budget exhaustion is never auto-resumable, but it is often only a symptom of
+    a deeper blocker (missing worktree, auth, retry loop, conflict, CI failure).
+    Do not stop before the remediator can inspect local evidence and author a
+    useful escalation. Gate #2 still scans the same reason and blocks any resume.
+    """
+    if not reason or reason not in _DIAGNOSTIC_ONLY_PREMODEL_REASONS:
+        return False
+    haystack = "\n".join(
+        part
+        for part in (
+            handoff.reason or "",
+            handoff.summary or "",
+            artifact.text if artifact else "",
+        )
+        if part
+    ).lower()
+    return any(
+        marker in haystack for marker in _RETRY_BUDGET_DIAGNOSTIC_MARKERS
+    )
+
+
 REMEDIATION_GUARDRAIL_SYSTEM = (
     "You are the Quay orchestrator's blocker-remediation guardrail. A worker is "
     "blocked and you decide whether the orchestrator may auto-resume it WITHOUT a "
     "human in the loop, running on a live orchestrator.\n"
-    "You have NO tools. You only emit ONE JSON object and nothing else.\n"
+    "You may use tools to inspect local Quay state, task metadata, attempts/events, "
+    "artifacts, logs, worktree existence, and related evidence needed to diagnose "
+    "the blocker. Use tools for diagnosis only: do not repair, resume, mutate task "
+    "state, edit files, push branches, post messages, create issues, or perform any "
+    "other side effect. You only emit ONE JSON object and nothing else.\n"
     "NEVER auto-resume (always output {\"action\":\"escalate\"}) when the blocker "
     "involves ANY of: a product or requirements decision; an irreversible or "
     "production change; security; spend or budget; credentials or secrets; data "
     "changes; or any ambiguous, unclear, or under-specified intent.\n"
+    "For budget_exhausted / retry-budget handoffs, treat budget exhaustion as a "
+    "symptom, not a root cause. Inspect the available evidence and report the "
+    "underlying blocker only when evidence supports it; otherwise say what "
+    "evidence is missing. Do not speculate or say \"most likely\".\n"
     "When you are unsure for ANY reason, output {\"action\":\"escalate\"}.\n"
     "Only propose a resume when the fix is objectively safe, reversible, and fully "
     "determined by the blocker context (for example a lint or formatting fix, a "
     "trivial and obvious test correction, or a mechanical follow-up that the "
     "worker already described).\n"
-    "You never perform actions; the orchestrator code, not you, decides whether to "
-    "act on your proposal and re-checks every guardrail first.\n"
+    "You never perform actions beyond inspection; the orchestrator code, not you, "
+    "decides whether to act on your proposal and re-checks every guardrail first.\n"
     "Output schema (JSON only, no prose, no code fence):\n"
     "  {\"action\":\"escalate\"}\n"
     "  On escalate you MAY add an optional \"message\": a concise, human-facing "
@@ -1715,8 +1853,8 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
 
     ``remediate`` returns a resume brief ONLY when both the pre-model and
     post-model deterministic gates agree it is safe; any doubt, crash, or model
-    malfunction degrades to ``None`` (human escalation). The model is a pure
-    reasoner with no tools: the orchestrator, not the model, performs every
+    malfunction degrades to ``None`` (human escalation). The model may inspect
+    local Quay evidence, but the orchestrator, not the model, performs every
     state change.
     """
 
@@ -1762,15 +1900,25 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
             # Gate #1a (pre-model): deterministic never-auto classifier.
             never = _never_auto_reason(handoff, task, artifact)
             if never is not None:
+                if not _should_run_diagnostic_turn_for_never_auto(
+                    never, handoff=handoff, artifact=artifact
+                ):
+                    log_event(
+                        self._logger,
+                        "remediation_gate_blocked",
+                        gate="pre_model_never_auto",
+                        task_id=handoff.task_id,
+                        handoff_id=handoff.handoff_id,
+                        reason=never,
+                    )
+                    return None
                 log_event(
                     self._logger,
-                    "remediation_gate_blocked",
-                    gate="pre_model_never_auto",
+                    "remediation_diagnostic_turn_for_never_auto",
                     task_id=handoff.task_id,
                     handoff_id=handoff.handoff_id,
                     reason=never,
                 )
-                return None
 
             # Gate #1b (pre-model): durable per-task loop guard.
             attempts = self._read_attempts(handoff.task_id)
@@ -1817,6 +1965,7 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
                 handoff,
                 max_iterations=self.config.remediation_max_iterations,
                 max_tokens=self.config.remediation_max_tokens,
+                tool_policy="diagnostic",
             )
             system_message = REMEDIATION_GUARDRAIL_SYSTEM + skill_body
             prompt = build_remediation_prompt(handoff, task, artifact)

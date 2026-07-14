@@ -2835,6 +2835,79 @@ def test_remediator_gate1_never_auto_skips_model():
     assert rem.last_outcome is None
 
 
+def test_remediator_budget_exhausted_runs_diagnostic_turn_for_escalation():
+    # Budget exhaustion is a symptom that needs evidence inspection, not a
+    # pre-model stop. The diagnostic turn may author an escalation message, but
+    # it still returns None (human escalation).
+    rem = make_remediator(
+        response=json.dumps(
+            {
+                "action": "escalate",
+                "message": (
+                    "Root cause: missing worktree. Remediation: recreate the "
+                    "worktree and retry."
+                ),
+            }
+        )
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(
+            reason="budget_exhausted",
+            summary="Worker blocked: retry budget exhausted.",
+        ),
+        task=safe_task(),
+        artifact=safe_artifact(
+            text="Budget exhausted after repeated no_progress attempts."
+        ),
+    )
+    assert result is None
+    assert len(rem.agent_calls) == 1
+    assert rem.last_outcome is not None
+    assert "missing worktree" in rem.last_outcome.message
+
+
+def test_remediator_billing_budget_skips_model():
+    rem = make_remediator(
+        response='{"action":"resume","brief":"approve billing","category":"scoped-known-fix","rationale":"ok"}'
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(
+            reason="billing_question",
+            summary="Worker blocked: invoice approval needs a budget decision.",
+        ),
+        task=safe_task(),
+        artifact=safe_artifact(
+            text="Need approval for invoice payment and a pricing tier upgrade."
+        ),
+    )
+    assert result is None
+    assert rem.agent_calls == []
+    assert rem.last_outcome is None
+
+
+def test_remediator_budget_exhausted_resume_is_still_blocked_post_model():
+    # Even if the diagnostic model proposes a normally allowlisted resume,
+    # Gate #2 re-scans the handoff evidence and blocks budget-related resumes.
+    rem = make_remediator(
+        response=json.dumps(
+            {
+                "action": "resume",
+                "brief": "Recreate the worktree and continue.",
+                "category": "scoped-known-fix",
+                "rationale": "The evidence shows the recorded worktree is missing.",
+            }
+        )
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(reason="budget_exhausted"),
+        task=safe_task(),
+        artifact=safe_artifact(text="Budget exhausted after a retry loop."),
+    )
+    assert result is None
+    assert len(rem.agent_calls) == 1
+    assert rem.last_outcome is None
+
+
 def test_remediator_malformed_json_escalates():
     rem = make_remediator(response="totally not json")
     result = rem.remediate(
@@ -2998,7 +3071,8 @@ def test_remediator_build_agent_applies_caps():
     kwargs = FakeAgent.instances[-1].kwargs
     assert kwargs["max_iterations"] == 5
     assert kwargs["max_tokens"] == 1234
-    assert kwargs["enabled_toolsets"] == []
+    assert kwargs["enabled_toolsets"] == ["quay_diagnostic"]
+    assert kwargs["disabled_toolsets"] == ["kanban"]
     assert kwargs["platform"] == "quay-orchestrator"
     assert kwargs["skip_context_files"] is True
     assert kwargs["skip_memory"] is True
@@ -3517,8 +3591,8 @@ def test_config_env_overrides_remediation(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Adversarial-review hardening: F1 allowlist, F2 tool-less, F3 fail-closed
-# loop guard, F4 friction-on-escalate (BRIX-1878).
+# Adversarial-review hardening: F1 allowlist, F2 diagnostic tool boundary,
+# F3 fail-closed loop guard, F4 friction-on-escalate (BRIX-1878).
 # ---------------------------------------------------------------------------
 
 
@@ -3608,13 +3682,13 @@ def test_drain_real_remediator_escalates_novel_category():
     assert len(remediator.agent_calls) == 1
 
 
-# -- F2: tool-less guarantee regardless of ambient env -----------------------
+# -- F2: diagnostic visibility with kanban mutations still blocked -----------
 
 
 class ToolResolvingAgent:
     """Agent stub whose ``.tools`` are computed by the REAL model_tools
     resolver, exactly like ``agent_init.init_agent`` does. This exercises the
-    tool-less guarantee end-to-end rather than stubbing it out."""
+    orchestrator tool boundary end-to-end rather than stubbing it out."""
 
     instances: list = []
 
@@ -3630,9 +3704,33 @@ class ToolResolvingAgent:
         ToolResolvingAgent.instances.append(self)
 
 
-def test_remediation_agent_is_tool_less_even_with_kanban_env(monkeypatch):
+def _tool_names(agent) -> set[str]:
+    return {tool["function"]["name"] for tool in agent.tools}
+
+
+def test_conversation_decider_stays_tool_less_even_with_kanban_env(monkeypatch):
     # model_tools force-appends the `kanban` toolset when HERMES_KANBAN_TASK is
-    # set. The orchestrator agent must still resolve to ZERO tools.
+    # set. The Slack conversation decider is still a pure reasoner and must
+    # resolve to ZERO tools.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "kanban-task-42")
+    ToolResolvingAgent.instances = []
+    decider = quay.HermesConversationDecider(
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=ToolResolvingAgent,
+    )
+    agent = decider._build_agent(safe_handoff(), max_iterations=2)
+    assert agent.kwargs["enabled_toolsets"] == []
+    assert agent.kwargs["disabled_toolsets"] == ["kanban"]
+    # Force-append neutralized: the decider agent holds no tools at all.
+    assert agent.tools == []
+
+
+def test_remediation_agent_gets_diagnostic_tools_but_no_kanban(monkeypatch):
+    # The blocker remediator is no longer a zero-tool reasoner: it needs local
+    # evidence access for artifacts, logs, and worktrees. Its tool surface is
+    # read-only, and kanban lifecycle tools remain disabled so task mutations
+    # stay in orchestrator codepaths.
     monkeypatch.setenv("HERMES_KANBAN_TASK", "kanban-task-42")
     ToolResolvingAgent.instances = []
     rem = quay.HandoffRemediator(
@@ -3642,11 +3740,79 @@ def test_remediation_agent_is_tool_less_even_with_kanban_env(monkeypatch):
         agent_class=ToolResolvingAgent,
         skill_loader=(lambda: "SKILL"),
     )
-    agent = rem._build_agent(safe_handoff(), max_iterations=3, max_tokens=100)
-    assert agent.kwargs["enabled_toolsets"] == []
+    agent = rem._build_agent(
+        safe_handoff(), max_iterations=3, max_tokens=100, tool_policy="diagnostic"
+    )
+    names = _tool_names(agent)
+    assert agent.kwargs["enabled_toolsets"] == ["quay_diagnostic"]
     assert agent.kwargs["disabled_toolsets"] == ["kanban"]
-    # Force-append neutralized: the remediation agent holds no tools at all.
-    assert agent.tools == []
+    # Web tools are part of the diagnostic toolset, but their registry check_fn
+    # hides them when CI blanks API credentials. Local evidence tools must
+    # remain available regardless.
+    assert {"read_file", "search_files", "session_search"}.issubset(names)
+    assert "terminal" not in names
+    assert "process" not in names
+    assert "write_file" not in names
+    assert "patch" not in names
+    assert "skill_manage" not in names
+    assert "cronjob" not in names
+    assert "delegate_task" not in names
+    assert not any(name.startswith("kanban_") for name in names)
+
+
+def test_remediation_agent_rejects_mutating_diagnostic_tool_resolution(monkeypatch):
+    class MutatingDiagnosticAgent:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.tools = [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "terminal"}},
+            ]
+
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=MutatingDiagnosticAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    with pytest.raises(RuntimeError, match="mutation-capable tools: terminal"):
+        rem._build_agent(
+            safe_handoff(),
+            max_iterations=3,
+            max_tokens=100,
+            tool_policy="diagnostic",
+        )
+
+
+def test_remediation_resume_gates_still_control_submissions_with_tools():
+    # Broader inspection tools must not make a model-authored resume sufficient
+    # on its own. Novel categories still escalate and never submit to Quay.
+    response = json.dumps(
+        {
+            "action": "resume",
+            "category": "diagnosed-root-cause",
+            "brief": "Run the repair command.",
+            "rationale": "I inspected the local logs.",
+        }
+    )
+    remediator = make_remediator(
+        response=response,
+        config=remediation_config(default_slack_channel=""),
+    )
+    handoff = safe_handoff()
+    quay_client = FakeQuayClient(handoff, artifact=safe_artifact())
+    drainer = quay.HandoffDrainer(
+        quay=quay_client,
+        slack=FakeSlackClient(),
+        config=remediation_config(default_slack_channel=""),
+        worker_id="test-worker",
+        remediator=remediator,
+    )
+    result = drainer.drain_one()
+    assert quay_client.submitted == []
+    assert result.metrics["remediation_escalated"] == 1
+    assert len(remediator.agent_calls) == 1
 
 
 # -- F3: loop guard fails CLOSED on a durable-write failure ------------------
