@@ -3052,7 +3052,7 @@ def test_remediator_build_agent_applies_caps():
     kwargs = FakeAgent.instances[-1].kwargs
     assert kwargs["max_iterations"] == 5
     assert kwargs["max_tokens"] == 1234
-    assert kwargs["enabled_toolsets"] is None
+    assert kwargs["enabled_toolsets"] == ["quay_diagnostic"]
     assert kwargs["disabled_toolsets"] == ["kanban"]
     assert kwargs["platform"] == "quay-orchestrator"
     assert kwargs["skip_context_files"] is True
@@ -3709,9 +3709,9 @@ def test_conversation_decider_stays_tool_less_even_with_kanban_env(monkeypatch):
 
 def test_remediation_agent_gets_diagnostic_tools_but_no_kanban(monkeypatch):
     # The blocker remediator is no longer a zero-tool reasoner: it needs local
-    # evidence access for task metadata, artifacts, logs, and worktrees. Kanban
-    # lifecycle tools remain disabled so task mutations stay in orchestrator
-    # codepaths.
+    # evidence access for artifacts, logs, and worktrees. Its tool surface is
+    # read-only, and kanban lifecycle tools remain disabled so task mutations
+    # stay in orchestrator codepaths.
     monkeypatch.setenv("HERMES_KANBAN_TASK", "kanban-task-42")
     ToolResolvingAgent.instances = []
     rem = quay.HandoffRemediator(
@@ -3725,10 +3725,44 @@ def test_remediation_agent_gets_diagnostic_tools_but_no_kanban(monkeypatch):
         safe_handoff(), max_iterations=3, max_tokens=100, tool_policy="diagnostic"
     )
     names = _tool_names(agent)
-    assert agent.kwargs["enabled_toolsets"] is None
+    assert agent.kwargs["enabled_toolsets"] == ["quay_diagnostic"]
     assert agent.kwargs["disabled_toolsets"] == ["kanban"]
-    assert {"terminal", "read_file", "search_files"}.issubset(names)
+    assert {"read_file", "search_files", "web_search", "session_search"}.issubset(
+        names
+    )
+    assert "terminal" not in names
+    assert "process" not in names
+    assert "write_file" not in names
+    assert "patch" not in names
+    assert "skill_manage" not in names
+    assert "cronjob" not in names
+    assert "delegate_task" not in names
     assert not any(name.startswith("kanban_") for name in names)
+
+
+def test_remediation_agent_rejects_mutating_diagnostic_tool_resolution(monkeypatch):
+    class MutatingDiagnosticAgent:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.tools = [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "terminal"}},
+            ]
+
+    rem = quay.HandoffRemediator(
+        config=remediation_config(),
+        runtime_resolver=lambda *, requested=None: {"provider": "openai-codex"},
+        default_model_resolver=lambda provider: "gpt-5.5",
+        agent_class=MutatingDiagnosticAgent,
+        skill_loader=(lambda: "SKILL"),
+    )
+    with pytest.raises(RuntimeError, match="mutation-capable tools: terminal"):
+        rem._build_agent(
+            safe_handoff(),
+            max_iterations=3,
+            max_tokens=100,
+            tool_policy="diagnostic",
+        )
 
 
 def test_remediation_resume_gates_still_control_submissions_with_tools():

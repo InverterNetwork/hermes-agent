@@ -1009,6 +1009,84 @@ def _assert_agent_tool_less(agent: Any) -> None:
         )
 
 
+_QUAY_DIAGNOSTIC_TOOLSETS: list[str] = ["quay_diagnostic"]
+_QUAY_DIAGNOSTIC_ALLOWED_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "session_search",
+        "skill_view",
+        "skills_list",
+        "web_extract",
+        "web_search",
+    }
+)
+_QUAY_DIAGNOSTIC_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
+    {
+        "browser_back",
+        "browser_cdp",
+        "browser_click",
+        "browser_dialog",
+        "browser_navigate",
+        "browser_press",
+        "browser_scroll",
+        "browser_type",
+        "close_terminal",
+        "computer_use",
+        "cronjob",
+        "delegate_task",
+        "execute_code",
+        "ha_call_service",
+        "image_generate",
+        "kanban_block",
+        "kanban_comment",
+        "kanban_complete",
+        "kanban_create",
+        "kanban_heartbeat",
+        "kanban_link",
+        "kanban_unblock",
+        "memory",
+        "patch",
+        "process",
+        "project_create",
+        "project_switch",
+        "skill_manage",
+        "terminal",
+        "todo",
+        "write_file",
+    }
+)
+
+
+def _resolved_tool_names(agent: Any) -> list[str]:
+    tools = getattr(agent, "tools", None) or []
+    names: list[str] = []
+    for tool in tools:
+        try:
+            name = tool["function"]["name"]
+        except (TypeError, KeyError):
+            name = str(tool)
+        names.append(str(name))
+    return sorted(names)
+
+
+def _assert_agent_diagnostic_only(agent: Any) -> None:
+    """Guarantee the blocker remediator resolved only read-only diagnostics."""
+    names = _resolved_tool_names(agent)
+    forbidden = sorted(set(names) & _QUAY_DIAGNOSTIC_FORBIDDEN_TOOLS)
+    if forbidden:
+        raise RuntimeError(
+            "orchestrator diagnostic agent resolved mutation-capable tools: "
+            + ", ".join(forbidden)
+        )
+    unexpected = sorted(set(names) - _QUAY_DIAGNOSTIC_ALLOWED_TOOLS)
+    if unexpected:
+        raise RuntimeError(
+            "orchestrator diagnostic agent resolved non-diagnostic tools: "
+            + ", ".join(unexpected)
+        )
+
+
 class _OrchestratorAgentBuilder:
     """Shared bounded-``AIAgent`` runtime/model resolution for the orchestrator.
 
@@ -1051,6 +1129,8 @@ class _OrchestratorAgentBuilder:
             agent = self._agent_factory()
             if tool_policy == "none":
                 _assert_agent_tool_less(agent)
+            else:
+                _assert_agent_diagnostic_only(agent)
             return agent
         runtime = self._resolve_runtime()
         agent_class = self._agent_class
@@ -1060,12 +1140,14 @@ class _OrchestratorAgentBuilder:
             agent_class = AIAgent
 
         # ``none`` keeps the Slack human-conversation decider as a pure reasoner.
-        # ``diagnostic`` gives the blocker remediator the normal local inspection
-        # surface so it can inspect Quay state/logs/artifacts before escalating.
-        # In both modes, kanban lifecycle tools stay disabled: task mutations are
-        # still performed by this orchestrator after deterministic gates, not by
+        # ``diagnostic`` gives the blocker remediator an explicit read-only
+        # inspection surface for Quay state/logs/artifacts before escalating.
+        # Kanban lifecycle tools stay disabled in both modes: task mutations are
+        # performed by this orchestrator after deterministic gates, never by
         # model-authored tool calls.
-        enabled_toolsets = [] if tool_policy == "none" else None
+        enabled_toolsets = (
+            [] if tool_policy == "none" else list(_QUAY_DIAGNOSTIC_TOOLSETS)
+        )
         kwargs: dict[str, Any] = dict(
             model=self._resolve_model(runtime),
             api_key=runtime.get("api_key"),
@@ -1089,6 +1171,8 @@ class _OrchestratorAgentBuilder:
         agent = agent_class(**kwargs)
         if tool_policy == "none":
             _assert_agent_tool_less(agent)
+        else:
+            _assert_agent_diagnostic_only(agent)
         return agent
 
     def _resolve_runtime(self) -> Mapping[str, Any]:
