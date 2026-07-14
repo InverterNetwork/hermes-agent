@@ -30,6 +30,8 @@ Nine units live here:
   `/usr/local/bin/quay tick`. The worker token is exported as
   `$GH_TOKEN`; the reviewer token is exported as
   `$QUAY_REVIEWER_GH_TOKEN` from `/etc/hermes/reviewer.env`.
+  Worker-useful host env such as RPC URLs is loaded from
+  `/etc/default/quay-worker-env` and inherited by spawned worker panes.
   `QUAY_DATA_DIR` points at `<HERMES_HOME>/quay/`. Operates on the
   subset of `repos[]` entries carrying a `quay:` block.
 * **`quay-serve`** — localhost-only Admin UI/API service. Installed only
@@ -73,7 +75,7 @@ Nine units live here:
 | `ops/hermes-gateway.service.d/ops-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops.env` (non-prod AWS creds — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` — plus `NEW_RELIC_API_KEY`, `NEW_RELIC_ACCOUNT_ID`, `NEW_RELIC_GRAPHQL_ENDPOINT`). Powers the `aws-lambda-debug`, `dynamodb-query`, and `new-relic-lambda` skills. Staged via `stage-secrets.sh`. The AWS keys must be from an IAM user/role with **read-only** Lambda + CloudWatch Logs + CloudFormation + DynamoDB policies attached — the skills can't enforce read-only, IAM is the boundary. |
 | `ops/hermes-gateway.service.d/ops-prod-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/ops-prod.env` (PROD AWS creds — `AWS_PROD_ACCESS_KEY_ID`, `AWS_PROD_SECRET_ACCESS_KEY`). Kept in a separate file from `ops.env` so the prod surface is visible at the filesystem level; skills (`aws-lambda-debug-prod`, `dynamodb-query-prod`) remap `AWS_PROD_*` onto the canonical AWS env-var names per-command. Same IAM rule applies — these must be read-only prod keys, ideally from a dedicated IAM user with no other privileges. Staged via `stage-secrets.sh`. |
 | `ops/hermes-gateway.service.d/z-runtime-env.conf` | Sibling drop-in. Adds `EnvironmentFile=` for `<TARGET>/auth/gateway-runtime.env` (non-secret env vars derived from `deploy.values.yaml` — `SLACK_ALLOWED_USERS`, `LINEAR_TEAM_<KEY>`, `API_SERVER_*`, `QUAY_AGENT_PROVIDER`, …). Rewritten by `setup-hermes.sh` on every install. The `z-` prefix is intentional: systemd merges drop-ins in lexical order and later `EnvironmentFile=` lines win on collision, so the values-derived file must sort *after* `slack-env.conf` to override a legacy `SLACK_ALLOWED_USERS=` line that may still be present in an older `slack.env`. |
-| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. |
+| `ops/quay-tick.service`                    | systemd service unit. `User=__AGENT_USER__` and `__TARGET_DIR__` are templated by `setup-hermes.sh`. `ExecStart=` points at `quay-tick-runner` (below) rather than `quay tick` directly, so each tick gets fresh worker and reviewer GitHub App tokens from the helper. Loads `/etc/default/quay-worker-env` for host-managed worker env such as RPC URLs. |
 | `ops/quay-github-auth`                     | Shared runtime GitHub auth preflight. Installed under `<HERMES_HOME>/hermes-agent/ops/`; validates inherited worker tokens, replaces stale ones, and fails clearly on missing helper/config or GitHub validation/mint outages before Quay runs. |
 | `ops/quay-tick-runner`                     | Tick wrapper. Installed to `/usr/local/sbin/quay-tick-runner`, root-owned. Sources `quay-github-auth`, keeps a valid pre-set worker GitHub token or mints one via `installer/hermes_github_token.py`, exports it as `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN`; when `/etc/hermes/reviewer.env` exists, mints the reviewer App token and exports it as `$QUAY_REVIEWER_GH_TOKEN`; then `exec`s `/usr/local/bin/quay tick`. |
 | `ops/quay-tick.timer`                      | systemd timer unit. 1-min cadence. |
@@ -84,7 +86,7 @@ Nine units live here:
 | `ops/quay-orchestrator-runner`             | Runner wrapper. Installed to `/usr/local/sbin/quay-orchestrator-runner` only when `quay.orchestrator.enabled=true`. Sources `quay-github-auth` before `quay_orchestrator.py drain-one --park-human-waits` so parked human follow-up polling never inherits stale GH_TOKEN/GITHUB_TOKEN; the deployed oneshot exits after posting a human prompt and later ticks poll parked replies. |
 | `ops/quay-orchestrator.service`            | systemd oneshot unit. Templated with `User=__AGENT_USER__`, `HERMES_HOME`, and `QUAY_ORCHESTRATOR_CONFIG`; reads `auth/hermes.env`, `auth/quay.env`, and `auth/slack.env`. The installed runner does not remain active for the full human reply timeout. |
 | `ops/quay-orchestrator.timer`              | systemd timer unit. 1-min cadence, protected by the runner lock. Pending delivery items and handoffs drain on later timer activations while human handoffs remain parked in `waiting_human`. |
-| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, loads `<HERMES_HOME>/auth/quay.env` with a literal `KEY=VAL` parser for adapter tokens, and keeps valid caller GitHub tokens or mints replacements from the App helper, exporting the worker token as `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN` so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
+| `ops/quay-as-hermes`                       | Operator + agent wrapper. Installed to `/usr/local/bin/quay-as-hermes`, root-owned. Defaults `QUAY_DATA_DIR` to `<HERMES_HOME>/quay`, honors caller overrides, loads `<HERMES_HOME>/auth/quay.env` with a literal `KEY=VAL` parser for adapter tokens, loads `/etc/default/quay-worker-env` for the same worker env as scheduled ticks, and keeps valid caller GitHub tokens or mints replacements from the App helper, exporting the worker token as `$QUAY_WORKER_GH_TOKEN` / `$GH_TOKEN` / `$GITHUB_TOKEN` so ad-hoc `quay …` invocations match the tick's auth surface. Re-entrant from the agent user: the same-uid branch skips `sudo` because the agent is intentionally not in sudoers, so hermes-gateway can shell out to the wrapper the same way operators do. Same `__AGENT_USER__` / `__TARGET_DIR__` templating as `quay-tick.service`. |
 | `ops/profile.d/quay-data-dir.sh`           | Login-shell drop-in. Installed to `/etc/profile.d/quay-data-dir.sh`, root-owned 0644. Exports `QUAY_DATA_DIR` for the agent user only, so `sudo -u <agent> -i` followed by `quay …` picks up the canonical dir. |
 
 ### Why hermes-gateway has no full unit in `ops/`
@@ -668,8 +670,40 @@ The unit runs `/usr/local/sbin/quay-tick-runner` (which `exec`s
   staged out-of-band by `stage-secrets.sh`. The `EnvironmentFile=` line
   is prefixed with `-` so the unit starts even before tokens are staged
   (a tick without a Linear adapter just has nothing to enqueue).
+* `/etc/default/quay-worker-env` — operator-managed worker env inherited by
+  `quay tick` and the tmux worker panes it spawns. Use this for host-staged
+  values that repo tasks need at runtime, such as `RPC_URL_4326`.
 * `/etc/default/quay-tick` — operator override slot. Preserved across
-  re-runs of the installer; delete to regenerate from defaults.
+  re-runs of the installer; delete to regenerate from defaults. Keep worker
+  runtime values in `/etc/default/quay-worker-env`, not this catch-all file.
+
+### Worker inherited env
+
+`/etc/default/quay-worker-env` is the supported operator-managed source for
+environment variables that Quay workers should inherit from the scheduled
+runtime path. `setup-hermes.sh` creates it as `root:<agent>` mode `0640` and
+preserves it on re-runs. It is deliberately outside the repo-managed
+`deploy.values.yaml`, Quay repo config, ticket bodies, and worker worktrees.
+
+Host provisioning should write this file directly, or replace it with a symlink
+to an existing host-managed env file if another provisioning layer already
+stages the values. Installer re-runs preserve an existing symlink and leave the
+target's ownership and mode to that provisioning layer. The file uses systemd
+`EnvironmentFile=` syntax: literal `KEY=VALUE` lines, no shell expansion.
+Example:
+
+```sh
+sudo install -o root -g hermes -m 0640 /dev/stdin /etc/default/quay-worker-env <<'EOF'
+RPC_URL_4326=https://example.invalid
+EOF
+```
+
+`quay-tick.service` reads the file before invoking
+`/usr/local/sbin/quay-tick-runner`; the runner inherits those variables and
+execs `quay tick`; Quay-spawned worker panes inherit the tick process
+environment. No per-ticket export is needed. `/usr/local/bin/quay-as-hermes`
+loads the same file with a literal parser so ad-hoc operator commands see the
+same worker env without executing the file as shell code.
 
 ## Staging credentials
 

@@ -419,6 +419,9 @@ def test_quay_tick_service_carries_reviewer_token_minting_env():
     installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
 
     assert "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env" in service
+    assert "EnvironmentFile=-/etc/default/quay-worker-env" in service
+    assert "quay-worker-env" in installer
+    assert "RPC_URL_4326" in installer
     assert "RuntimeDirectory=hermes" in service
     assert "QUAY_REVIEWER_GH_TOKEN" in runner
     assert "/etc/hermes/reviewer.env" in runner
