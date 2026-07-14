@@ -2866,6 +2866,25 @@ def test_remediator_budget_exhausted_runs_diagnostic_turn_for_escalation():
     assert "missing worktree" in rem.last_outcome.message
 
 
+def test_remediator_billing_budget_skips_model():
+    rem = make_remediator(
+        response='{"action":"resume","brief":"approve billing","category":"scoped-known-fix","rationale":"ok"}'
+    )
+    result = rem.remediate(
+        handoff=safe_handoff(
+            reason="billing_question",
+            summary="Worker blocked: invoice approval needs a budget decision.",
+        ),
+        task=safe_task(),
+        artifact=safe_artifact(
+            text="Need approval for invoice payment and a pricing tier upgrade."
+        ),
+    )
+    assert result is None
+    assert rem.agent_calls == []
+    assert rem.last_outcome is None
+
+
 def test_remediator_budget_exhausted_resume_is_still_blocked_post_model():
     # Even if the diagnostic model proposes a normally allowlisted resume,
     # Gate #2 re-scans the handoff evidence and blocks budget-related resumes.

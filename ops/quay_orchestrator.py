@@ -1517,7 +1517,16 @@ _AUTO_ANSWERABLE_CATEGORIES: frozenset[str] = frozenset(
 )
 
 
-_DIAGNOSTIC_ONLY_PREMODEL_REASONS: tuple[str, ...] = ("spend_or_budget:",)
+_DIAGNOSTIC_ONLY_PREMODEL_REASONS: frozenset[str] = frozenset(
+    {"spend_or_budget:budget"}
+)
+_RETRY_BUDGET_DIAGNOSTIC_MARKERS: tuple[str, ...] = (
+    "budget_exhausted",
+    "budget exhausted",
+    "retry budget",
+    "retry-budget",
+    "retry_budget",
+)
 
 
 def _normalize_category(category: Any) -> str:
@@ -1532,7 +1541,12 @@ def _is_auto_answerable_category(category: Any) -> bool:
     return _normalize_category(category) in _AUTO_ANSWERABLE_CATEGORIES
 
 
-def _should_run_diagnostic_turn_for_never_auto(reason: str | None) -> bool:
+def _should_run_diagnostic_turn_for_never_auto(
+    reason: str | None,
+    *,
+    handoff: Handoff,
+    artifact: Artifact | None,
+) -> bool:
     """Allow evidence gathering for never-auto symptoms that need inspection.
 
     Budget exhaustion is never auto-resumable, but it is often only a symptom of
@@ -1540,10 +1554,19 @@ def _should_run_diagnostic_turn_for_never_auto(reason: str | None) -> bool:
     Do not stop before the remediator can inspect local evidence and author a
     useful escalation. Gate #2 still scans the same reason and blocks any resume.
     """
-    if not reason:
+    if not reason or reason not in _DIAGNOSTIC_ONLY_PREMODEL_REASONS:
         return False
+    haystack = "\n".join(
+        part
+        for part in (
+            handoff.reason or "",
+            handoff.summary or "",
+            artifact.text if artifact else "",
+        )
+        if part
+    ).lower()
     return any(
-        reason.startswith(prefix) for prefix in _DIAGNOSTIC_ONLY_PREMODEL_REASONS
+        marker in haystack for marker in _RETRY_BUDGET_DIAGNOSTIC_MARKERS
     )
 
 
@@ -1877,7 +1900,9 @@ class HandoffRemediator(_OrchestratorAgentBuilder):
             # Gate #1a (pre-model): deterministic never-auto classifier.
             never = _never_auto_reason(handoff, task, artifact)
             if never is not None:
-                if not _should_run_diagnostic_turn_for_never_auto(never):
+                if not _should_run_diagnostic_turn_for_never_auto(
+                    never, handoff=handoff, artifact=artifact
+                ):
                     log_event(
                         self._logger,
                         "remediation_gate_blocked",
