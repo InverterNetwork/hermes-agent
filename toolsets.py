@@ -196,13 +196,12 @@ TOOLSETS = {
     "quay_diagnostic": {
         "description": (
             "Read-only Quay blocker diagnostics: inspect local files/artifacts, "
-            "search text, and consult web/session evidence without mutation tools"
+            "search text, and consult session evidence without mutation or "
+            "outbound network tools"
         ),
         "tools": [
             "read_file",
             "search_files",
-            "web_search",
-            "web_extract",
             "session_search",
             "skills_list",
             "skill_view",

@@ -1017,8 +1017,6 @@ _QUAY_DIAGNOSTIC_ALLOWED_TOOLS: frozenset[str] = frozenset(
         "session_search",
         "skill_view",
         "skills_list",
-        "web_extract",
-        "web_search",
     }
 )
 _QUAY_DIAGNOSTIC_FORBIDDEN_TOOLS: frozenset[str] = frozenset(

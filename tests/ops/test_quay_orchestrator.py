@@ -3746,10 +3746,10 @@ def test_remediation_agent_gets_diagnostic_tools_but_no_kanban(monkeypatch):
     names = _tool_names(agent)
     assert agent.kwargs["enabled_toolsets"] == ["quay_diagnostic"]
     assert agent.kwargs["disabled_toolsets"] == ["kanban"]
-    # Web tools are part of the diagnostic toolset, but their registry check_fn
-    # hides them when CI blanks API credentials. Local evidence tools must
-    # remain available regardless.
+    # Diagnostics are local-only: no outbound web tools, and no mutation tools.
     assert {"read_file", "search_files", "session_search"}.issubset(names)
+    assert "web_search" not in names
+    assert "web_extract" not in names
     assert "terminal" not in names
     assert "process" not in names
     assert "write_file" not in names
