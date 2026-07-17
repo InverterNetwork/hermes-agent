@@ -122,6 +122,32 @@ class TestCronCommandLifecycle:
         out = capsys.readouterr().out
         assert "Repeat:    ∞" in out
 
+    @pytest.mark.parametrize(
+        ("raw_deliver", "expected_display"),
+        [
+            (None, "local"),
+            ("", "local"),
+            ([], "local"),
+            ("telegram", "telegram"),
+            (["telegram", "discord"], "telegram,discord"),
+        ],
+    )
+    def test_list_normalizes_falsy_and_legacy_deliver_values(
+        self, tmp_cron_dir, capsys, monkeypatch, raw_deliver, expected_display
+    ):
+        from cron.jobs import load_jobs, save_jobs
+
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4242])
+        create_job(prompt="Delivery report", schedule="every 1h", deliver="local")
+        jobs = load_jobs()
+        jobs[0]["deliver"] = raw_deliver
+        save_jobs(jobs)
+
+        cron_command(Namespace(cron_command="list", all=True))
+
+        out = capsys.readouterr().out
+        assert f"Deliver:   {expected_display}" in out
+
 
 class TestGatewayNotRunningWarning:
     """`cron create` / `cron list` must warn when the gateway (and thus the
