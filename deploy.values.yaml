@@ -766,7 +766,7 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.12"
+  version: "v0.1.13"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
@@ -803,6 +803,7 @@ atlas:
     source_names:
       - emusd-docs
       - brix-product-docs
+      - slack-channels
     github_app:
       # GitHub App slug is intentionally `atlast-source-reader`.
       id: "3944782"
@@ -828,6 +829,48 @@ atlas:
       include:
         - "**/*.md"
       exclude: []
+    slack-channels:
+      # Principal-approved allowlist (2026-07-18), 22 channels = the Hermes
+      # deploy allowlist minus the excluded private test-devops. The bot is a
+      # member of 16; the other 6 are SKIPPED at runtime (skipped_unreachable)
+      # until it is invited. Chat is redacted at ingest and synthesis-quarantined
+      # until the M2 injection defense lands. Token read from auth/atlas.env by
+      # the SLACK_ATLAS_TOKEN env-var name (never the value).
+      type: slack
+      token_env: SLACK_ATLAS_TOKEN
+      visibility: shareable
+      bot_policy: include
+      episode_gap_minutes: 45
+      # Otto operates under both didier (prod) and babydidierdev (dev); no
+      # standalone "otto" Slack account exists.
+      agent_author_ids:
+        - U0AEQAF0W4R
+        - A0AEQABV309
+        - U0B1REM5YE9
+        - A0B1RA6L1HB
+      channel_ids:
+        - C0B23MZ0USV
+        - C0B4LLZ5Z2L
+        - C0B4A6LEW31
+        - C0B3WAWLL0L
+        - C05M45H6KAT
+        - C0B0LSP8H1B
+        - C0B0MP16YDD
+        - C097HBE6Z7E
+        - C0AJ4MM4PPT
+        - C0AEN8KDRT2
+        - C0AAN0K8UMP
+        - C0AGZUH6C15
+        - C0AH910LEV9
+        - C09R47ZHB61
+        - C08956H1V4K
+        - C0AMT3TD86R
+        - C09QSMWRJKH
+        - C09E9UX1JTH
+        - C0B5ZUS7WRG
+        - C0B79CZLM50
+        - C0AHDA8S3M1
+        - C0BGC0U8YSH
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the

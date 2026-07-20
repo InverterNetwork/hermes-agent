@@ -362,16 +362,23 @@ def test_atlas_gitbook_source_sync_is_configured():
     assert "source_names:" in values
     assert "- emusd-docs" in values
     assert "- brix-product-docs" in values
+    assert "- slack-channels" in values
     assert "brix-product-docs:" in values
     assert "type: gitbook" in values
     assert "space_id: JZwK8SE9GDTka1EcS5dD" in values
     assert "token_env: GITBOOK_API_TOKEN" in values
+    # Slack scheduled sync (F1): the source is defined and scheduled, and the
+    # token is referenced by env-var name only (never a value).
+    assert "slack-channels:" in values
+    assert "type: slack" in values
+    assert "token_env: SLACK_ATLAS_TOKEN" in values
 
     assert "get atlas.source_sync.source_names" in installer
     assert "atlas.sources.$atlas_source_name.type" in installer
-    assert "type must be github or gitbook" in installer
+    assert "type must be github, gitbook, or slack" in installer
     assert "atlas.sources.$atlas_source_name.space_id" in installer
     assert "atlas.sources.$atlas_source_name.token_env" in installer
+    assert "atlas.sources.$atlas_source_name.channel_ids" in installer
     assert 'ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"' in installer
     assert 'ATLAS_RUNTIME_ENV="$AUTH_DIR/atlas-runtime.env"' in installer
     assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" in installer
