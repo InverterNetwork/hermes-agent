@@ -1521,23 +1521,61 @@ PY
           printf '    type: gitbook\n'
           printf '    space_id: "%s"\n' "$ATLAS_SOURCE_SPACE_ID"
           printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
+        elif [[ "$ATLAS_SOURCE_TYPE" == "slack" ]]; then
+          ATLAS_SOURCE_TOKEN_ENV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.token_env" 2>/dev/null || true)"
+          ATLAS_SOURCE_VISIBILITY="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.visibility" 2>/dev/null || true)"
+          ATLAS_SOURCE_EPISODE_GAP="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.episode_gap_minutes" 2>/dev/null || true)"
+          ATLAS_SOURCE_CHANNEL_IDS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.channel_ids" --sep $'\n' 2>/dev/null || true)"
+          ATLAS_SOURCE_AGENT_IDS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.agent_author_ids" --sep $'\n' 2>/dev/null || true)"
+          [[ "$ATLAS_SOURCE_TOKEN_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.token_env must name an env var (got: $ATLAS_SOURCE_TOKEN_ENV)" >&2; exit 1; }
+          [[ "$ATLAS_SOURCE_VISIBILITY" == "shareable" || "$ATLAS_SOURCE_VISIBILITY" == "private" ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.visibility must be shareable or private (got: $ATLAS_SOURCE_VISIBILITY)" >&2; exit 1; }
+          [[ -n "$ATLAS_SOURCE_CHANNEL_IDS" ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.channel_ids must list at least one channel" >&2; exit 1; }
+          printf '    type: slack\n'
+          printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
+          printf '    visibility: "%s"\n' "$ATLAS_SOURCE_VISIBILITY"
+          printf '    bot_policy: include\n'
+          if [[ "$ATLAS_SOURCE_EPISODE_GAP" =~ ^[0-9]+$ ]]; then
+            printf '    episode_gap_minutes: %s\n' "$ATLAS_SOURCE_EPISODE_GAP"
+          fi
+          printf '    channel_ids:\n'
+          while IFS= read -r atlas_channel_id; do
+            [[ -n "$atlas_channel_id" ]] || continue
+            [[ "$atlas_channel_id" =~ ^[CG][A-Z0-9]{7,}$ ]] \
+              || { echo "FAIL: atlas.sources.$atlas_source_name.channel_ids has an invalid Slack channel id: $atlas_channel_id" >&2; exit 1; }
+            printf '      - "%s"\n' "$atlas_channel_id"
+          done <<<"$ATLAS_SOURCE_CHANNEL_IDS"
+          if [[ -n "$ATLAS_SOURCE_AGENT_IDS" ]]; then
+            printf '    agent_author_ids:\n'
+            while IFS= read -r atlas_agent_id; do
+              [[ -n "$atlas_agent_id" ]] && printf '      - "%s"\n' "$atlas_agent_id"
+            done <<<"$ATLAS_SOURCE_AGENT_IDS"
+          else
+            printf '    agent_author_ids: []\n'
+          fi
         else
-          echo "FAIL: atlas.sources.$atlas_source_name.type must be github or gitbook" >&2
+          echo "FAIL: atlas.sources.$atlas_source_name.type must be github, gitbook, or slack" >&2
           exit 1
         fi
-        if [[ -n "$ATLAS_SOURCE_INCLUDE" ]]; then
-          printf '    include:\n'
-          while IFS= read -r atlas_glob; do
-            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
-          done <<<"$ATLAS_SOURCE_INCLUDE"
-        fi
-        if [[ -n "$ATLAS_SOURCE_EXCLUDE" ]]; then
-          printf '    exclude:\n'
-          while IFS= read -r atlas_glob; do
-            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
-          done <<<"$ATLAS_SOURCE_EXCLUDE"
-        else
-          printf '    exclude: []\n'
+        # include/exclude apply to file-based sources only; the Slack schema is
+        # strict and rejects them, so skip the block for slack sources.
+        if [[ "$ATLAS_SOURCE_TYPE" != "slack" ]]; then
+          if [[ -n "$ATLAS_SOURCE_INCLUDE" ]]; then
+            printf '    include:\n'
+            while IFS= read -r atlas_glob; do
+              [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+            done <<<"$ATLAS_SOURCE_INCLUDE"
+          fi
+          if [[ -n "$ATLAS_SOURCE_EXCLUDE" ]]; then
+            printf '    exclude:\n'
+            while IFS= read -r atlas_glob; do
+              [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+            done <<<"$ATLAS_SOURCE_EXCLUDE"
+          else
+            printf '    exclude: []\n'
+          fi
         fi
       done
     fi
@@ -2179,6 +2217,10 @@ EOF
       | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-source-sync.service
     install -o root -g root -m 0644 \
       "$ATLAS_SOURCE_SYNC_TIMER_SRC" /etc/systemd/system/atlas-source-sync.timer
+    if [[ -f "$OPS_DIR/atlas-source-sync-failure.service" ]]; then
+      install -o root -g root -m 0644 \
+        "$OPS_DIR/atlas-source-sync-failure.service" /etc/systemd/system/atlas-source-sync-failure.service
+    fi
     systemctl daemon-reload
     systemctl enable --now atlas-source-sync.timer
   else
