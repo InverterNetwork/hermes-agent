@@ -1,18 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped } from '@/store/layout'
 
 import {
   $activeProjectId,
   $projectScope,
+  $projectsRpcAvailable,
+  $projectTree,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   createProject,
   enterProject,
   exitProjectScope,
+  openProjectCreate,
   pickProjectFolder,
+  projectNameForCwd,
+  refreshProjects,
   refreshWorktrees
 } from './projects'
+
+vi.mock('@/i18n', () => ({
+  translateNow: (key: string) => key
+}))
+
+vi.mock('@/store/notifications', () => ({
+  notify: vi.fn()
+}))
 
 vi.mock('@/lib/desktop-fs', () => ({
   desktopDefaultCwd: vi.fn(),
@@ -33,6 +47,8 @@ const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
+const notifications = await import('@/store/notifications')
+const notify = vi.mocked(notifications.notify)
 
 describe('project scope', () => {
   beforeEach(() => {
@@ -65,6 +81,68 @@ describe('project scope', () => {
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
     expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+  })
+})
+
+describe('projectNameForCwd', () => {
+  const treeNode = (
+    over: Partial<SidebarProjectTree> & Pick<SidebarProjectTree, 'id' | 'label'>
+  ): SidebarProjectTree => ({
+    path: null,
+    repos: [],
+    sessionCount: 0,
+    ...over
+  })
+
+  beforeEach(() => {
+    $projectTree.set([])
+  })
+
+  it('names the explicit project owning the cwd (longest path match)', () => {
+    $projectTree.set([
+      treeNode({ id: 'p_web', label: 'Website', path: '/repos/website' }),
+      treeNode({ id: 'p_api', label: 'API', path: '/repos/api' })
+    ])
+
+    expect(projectNameForCwd('/repos/website/src/app')).toBe('Website')
+  })
+
+  it('matches nested repo and worktree paths, not just the project root', () => {
+    $projectTree.set([
+      treeNode({
+        id: 'p_mono',
+        label: 'Monorepo',
+        path: '/repos/mono',
+        repos: [
+          {
+            id: 'r1',
+            label: 'mono',
+            path: '/repos/mono',
+            sessionCount: 0,
+            groups: [{ id: 'g1', label: 'feature', path: '/elsewhere/mono-feature', sessions: [] }]
+          }
+        ]
+      })
+    ])
+
+    // A linked worktree lives OUTSIDE the project root but still belongs to it.
+    expect(projectNameForCwd('/elsewhere/mono-feature/src')).toBe('Monorepo')
+  })
+
+  it('ignores auto-projects and the No-project bucket (no named identity)', () => {
+    $projectTree.set([
+      treeNode({ id: '/repos/loose', label: 'loose', path: '/repos/loose', isAuto: true }),
+      treeNode({ id: '__no_project__', label: 'No project', path: null, isNoProject: true })
+    ])
+
+    expect(projectNameForCwd('/repos/loose/src')).toBeNull()
+  })
+
+  it('returns null for a cwd in no project and for a blank cwd', () => {
+    $projectTree.set([treeNode({ id: 'p_web', label: 'Website', path: '/repos/website' })])
+
+    expect(projectNameForCwd('/somewhere/else')).toBeNull()
+    expect(projectNameForCwd('')).toBeNull()
   })
 })
 
@@ -115,6 +193,7 @@ describe('createProject', () => {
     vi.clearAllMocks()
     $sidebarAgentsGrouped.set(false)
     $activeProjectId.set(null)
+    $projectsRpcAvailable.set(null)
   })
 
   it('creates the project and flips into the grouped view so a blank slate shows it', async () => {
@@ -138,5 +217,45 @@ describe('createProject', () => {
     expect(request).toHaveBeenCalledWith('projects.create', expect.objectContaining({ name: 'Demo' }))
     expect($sidebarAgentsGrouped.get()).toBe(true)
     expect($activeProjectId.get()).toBe('p_new')
+  })
+
+  it('marks the backend stale and surfaces a friendly error when projects.create is missing', async () => {
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.create'))
+    } as never)
+
+    await expect(createProject({ folders: ['/srv/demo'], name: 'Demo' })).rejects.toThrow(
+      'sidebar.projects.staleBackend'
+    )
+    expect($projectsRpcAvailable.get()).toBe(false)
+  })
+})
+
+describe('projects RPC capability', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $projectsRpcAvailable.set(null)
+  })
+
+  it('marks the backend stale when projects.list is missing', async () => {
+    activeGateway.mockReturnValue({
+      connectionState: 'open',
+      request: vi.fn().mockRejectedValue(new Error('unknown method: projects.list'))
+    } as never)
+
+    await refreshProjects()
+
+    expect($projectsRpcAvailable.get()).toBe(false)
+  })
+
+  it('blocks opening the create dialog once the backend is known stale', () => {
+    $projectsRpcAvailable.set(false)
+
+    openProjectCreate()
+
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'warning', message: 'sidebar.projects.staleBackend' })
+    )
   })
 })
