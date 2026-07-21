@@ -2221,8 +2221,23 @@ EOF
       install -o root -g root -m 0644 \
         "$OPS_DIR/atlas-source-sync-failure.service" /etc/systemd/system/atlas-source-sync-failure.service
     fi
+    # Daily FULL reconciliation (slack whole-channel; hourly runs incremental).
+    if [[ -f "$OPS_DIR/atlas-source-sync-full.service" && -f "$OPS_DIR/atlas-source-sync-full.timer" ]]; then
+      echo "==> installing systemd timer for atlas-source-sync-full (daily full reconciliation)"
+      sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+          -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+          -e "s|__ATLAS_CONFIG__|$ATLAS_CONFIG|g" \
+          -e "s|__ATLAS_SYNC_SOURCE_NAMES__|$ATLAS_SYNC_SOURCE_NAMES|g" \
+          "$OPS_DIR/atlas-source-sync-full.service" \
+        | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-source-sync-full.service
+      install -o root -g root -m 0644 \
+        "$OPS_DIR/atlas-source-sync-full.timer" /etc/systemd/system/atlas-source-sync-full.timer
+    fi
     systemctl daemon-reload
     systemctl enable --now atlas-source-sync.timer
+    if [[ -f /etc/systemd/system/atlas-source-sync-full.timer ]]; then
+      systemctl enable --now atlas-source-sync-full.timer
+    fi
   else
     echo "==> systemctl not present; skipping atlas-source-sync timer enable" >&2
   fi

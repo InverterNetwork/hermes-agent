@@ -1,0 +1,15 @@
+[Unit]
+Description=Run Atlas full source reconciliation daily
+
+[Timer]
+# Wall-clock daily, anchored on OnCalendar (always has a next elapse and re-arms
+# after any stop/restart — same rationale as atlas-source-sync.timer). The
+# hourly incremental keeps content fresh; this daily full run is the
+# authoritative deletion/old-edit reconciliation.
+OnCalendar=daily
+AccuracySec=5min
+Persistent=true
+Unit=atlas-source-sync-full.service
+
+[Install]
+WantedBy=timers.target
