@@ -395,6 +395,25 @@ def test_atlas_gitbook_source_sync_is_configured():
     assert "__TARGET_DIR__/auth/atlas.env" in profile
 
 
+def test_atlas_source_sync_full_reconciliation_is_scheduled():
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    full_service = (OPS_DIR / "atlas-source-sync-full.service").read_text(encoding="utf-8")
+    full_timer = (OPS_DIR / "atlas-source-sync-full.timer").read_text(encoding="utf-8")
+
+    # Daily full reconciliation passes --full to the runner and carries a long
+    # timeout for the whole-channel re-fetch; the hourly sync stays incremental.
+    assert "ExecStart=/usr/local/sbin/atlas-source-sync-runner --full" in full_service
+    assert "TimeoutStartSec=10800" in full_service
+    assert "OnFailure=atlas-source-sync-failure.service" in full_service
+    assert "OnCalendar=daily" in full_timer
+    assert "Unit=atlas-source-sync-full.service" in full_timer
+
+    # The installer renders + installs + enables the daily full timer.
+    assert "atlas-source-sync-full.service" in installer
+    assert "atlas-source-sync-full.timer" in installer
+    assert "systemctl enable --now atlas-source-sync-full.timer" in installer
+
+
 def test_atlas_hub_service_is_loopback_and_key_protected():
     values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
     installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
