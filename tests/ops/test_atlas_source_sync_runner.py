@@ -40,7 +40,7 @@ echo "$n" > "$cf"
 echo "[atlas-stub] sync source $name attempt=$n args=$*"
 case ",${STUB_LOCK_ALWAYS:-}," in *",$name,"*) echo '{"reason":"kb_write_lock_held"}'; exit 1;; esac
 case ",${STUB_LOCK_ONCE:-}," in *",$name,"*) if [ "$n" -eq 1 ]; then echo '{"reason":"kb_write_lock_held"}'; exit 1; fi;; esac
-case ",${STUB_FAIL:-}," in *",$name,"*) echo "[atlas-stub] $name deterministic failure"; exit 1;; esac
+case ",${STUB_FAIL:-}," in *",$name,"*) echo "[atlas-stub] $name deterministic failure"; exit "${STUB_EXIT:-1}";; esac
 echo '{"event":"summary","success":true}'
 exit 0
 """
@@ -182,3 +182,59 @@ def test_single_source_backward_compatible(run_runner) -> None:
     r = run_runner("emusd-docs")
     assert r.returncode == 0
     assert "source-sync summary: emusd-docs=ok(attempts=1)" in r.stderr
+
+
+def test_malformed_retry_count_is_coerced_not_fatal(run_runner) -> None:
+    # A non-integer knob must NOT abort the runner under set -u (arithmetic on a
+    # bad value would raise "unbound variable"). It is coerced; sync still runs.
+    r = run_runner(
+        "a,b,c",
+        extra_env={"ATLAS_SYNC_LOCK_RETRIES": "banana", "STUB_LOCK_ONCE": "b"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "invalid or too large; using 3" in r.stderr
+    assert "b=ok(attempts=2)" in r.stderr  # retry still worked after coercion
+
+
+def test_oversized_retry_count_is_clamped(run_runner) -> None:
+    # A huge retry count must be clamped so a persistent lock cannot spin until
+    # the systemd timeout. With STUB_LOCK_ALWAYS the source fails after the
+    # clamped bound (3), i.e. 4 attempts — not 1000.
+    r = run_runner(
+        "b",
+        extra_env={"ATLAS_SYNC_LOCK_RETRIES": "1000", "STUB_LOCK_ALWAYS": "b"},
+    )
+    assert "invalid or too large; using 3" in r.stderr
+    assert "b=FAILED(attempts=4,exit=1)" in r.stderr, r.stderr
+    assert r.returncode != 0
+
+
+def test_persistent_lock_on_first_source_still_runs_slack(run_runner) -> None:
+    # The reported incident, worst case: the FIRST source is stuck on the lock for
+    # good. It must exhaust its bounded retries, be recorded FAILED, and the later
+    # Slack source must STILL reconcile. The run fails overall (so OnFailure fires)
+    # but Slack was not silently skipped.
+    r = run_runner(
+        "emusd-docs,slack-channels",
+        extra_env={"STUB_LOCK_ALWAYS": "emusd-docs", "ATLAS_SYNC_LOCK_RETRIES": "2"},
+    )
+    assert "emusd-docs=FAILED(attempts=3,exit=1)" in r.stderr
+    assert "slack-channels=ok(attempts=1)" in r.stderr, (
+        "Slack must reconcile even when the first source is permanently locked"
+    )
+    assert r.returncode != 0
+
+
+def test_non_one_exit_code_is_recorded_and_not_retried(run_runner) -> None:
+    # A non-lock failure with a non-1 exit code is recorded verbatim and not
+    # retried (only lock contention retries).
+    r = run_runner("a,b", extra_env={"STUB_FAIL": "b", "STUB_EXIT": "2"})
+    assert "b=FAILED(attempts=1,exit=2)" in r.stderr, r.stderr
+    assert "a=ok(attempts=1)" in r.stderr
+    assert r.returncode != 0
+
+
+def test_empty_source_list_is_a_clean_noop(run_runner) -> None:
+    r = run_runner("")
+    assert r.returncode == 0, r.stderr
+    assert "source-sync summary:" in r.stderr

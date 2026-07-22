@@ -57,8 +57,9 @@ def test_full_timer_fires_off_the_top_of_the_hour() -> None:
         f"atlas-source-sync-full.timer OnCalendar={expr!r} resolves to the top of "
         "the hour and would collide with the hourly incremental on the KB lock."
     )
-    # An explicit HH:MM:SS expression must carry a non-:00 minute.
-    m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})\s*$", expr)
+    # An explicit HH:MM:SS expression must carry a non-:00 minute (an optional
+    # trailing timezone token like "UTC" is allowed).
+    m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})(?:\s+\S+)?\s*$", expr)
     assert m is not None, (
         f"expected a concrete HH:MM:SS time-of-day, got OnCalendar={expr!r}"
     )

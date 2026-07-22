@@ -40,7 +40,7 @@ HARDENED_TIMERS = {
     # Daily full reconciliation, deliberately OFF the top of the hour so it never
     # coincides with the hourly incremental (which fires at every HH:00) on the
     # shared atlas-kb write lock. See test_atlas_source_sync_schedule.py.
-    "atlas-source-sync-full": "*-*-* 04:20:00",
+    "atlas-source-sync-full": "*-*-* 04:20:00 UTC",
 }
 
 

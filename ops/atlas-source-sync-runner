@@ -27,9 +27,26 @@ ATLAS_AS_HERMES_BIN="${ATLAS_AS_HERMES_BIN:-/usr/local/bin/atlas-as-hermes}"
 # source's reconciliation. We only ever WAIT for the lock — never remove it (an
 # orphaned-lock cleanup is an operator decision; a held lock may be a live
 # writer, and deleting it would break atomicity).
-ATLAS_SYNC_LOCK_MARKER="kb_write_lock_held"
+# Match Atlas's precheck lock signal specifically (its compact JSON reason
+# field) so incidental text can't be mistaken for lock contention.
+ATLAS_SYNC_LOCK_MARKER='"reason":"kb_write_lock_held"'
 ATLAS_SYNC_LOCK_RETRIES="${ATLAS_SYNC_LOCK_RETRIES:-3}"
 ATLAS_SYNC_LOCK_RETRY_DELAY="${ATLAS_SYNC_LOCK_RETRY_DELAY:-20}"
+
+# Coerce invalid or oversized knob values to safe bounds. This is critical: an
+# arithmetic comparison against a NON-integer value (e.g. a fat-fingered
+# /etc/default override) under `set -u` would raise "unbound variable" and kill
+# the runner mid-source — silently skipping later sources, the exact failure
+# this change exists to prevent. Check the regex FIRST so the `-gt` arithmetic
+# only ever runs on a validated integer. (0 retries is valid = no retry.)
+if ! [[ "$ATLAS_SYNC_LOCK_RETRIES" =~ ^[0-9]+$ ]] || [[ "$ATLAS_SYNC_LOCK_RETRIES" -gt 10 ]]; then
+  warn "ATLAS_SYNC_LOCK_RETRIES='${ATLAS_SYNC_LOCK_RETRIES}' invalid or too large; using 3"
+  ATLAS_SYNC_LOCK_RETRIES=3
+fi
+if ! [[ "$ATLAS_SYNC_LOCK_RETRY_DELAY" =~ ^[0-9]+$ ]] || [[ "$ATLAS_SYNC_LOCK_RETRY_DELAY" -gt 300 ]]; then
+  warn "ATLAS_SYNC_LOCK_RETRY_DELAY='${ATLAS_SYNC_LOCK_RETRY_DELAY}' invalid or too large; using 20"
+  ATLAS_SYNC_LOCK_RETRY_DELAY=20
+fi
 
 [[ -x "$HERMES_TOKEN_PYTHON" ]] || die "missing token-helper python: $HERMES_TOKEN_PYTHON"
 [[ -f "$HERMES_TOKEN_HELPER" ]] || die "missing token helper: $HERMES_TOKEN_HELPER"
@@ -71,16 +88,19 @@ IFS=', ' read -r -a source_names <<<"$ATLAS_SYNC_SOURCE_NAMES"
 set +e
 
 sync_failures=0
+src_idx=0
 declare -a sync_results=()
 
 for source_name in "${source_names[@]}"; do
   [[ -n "$source_name" ]] || continue
+  src_idx=$((src_idx + 1))
   attempt=0
   code=0
   while : ; do
     attempt=$((attempt + 1))
     warn "running atlas sync source $source_name (attempt $attempt)"
-    logf="$(mktemp 2>/dev/null || echo "/tmp/atlas-source-sync.$$.$source_name.$attempt.log")"
+    # Temp path uses an integer index, never the (untrusted-shaped) source name.
+    logf="$(mktemp 2>/dev/null || echo "/tmp/atlas-source-sync.$$.${src_idx}.${attempt}.log")"
     # Stream Atlas output live to journald (>&2) AND capture it so we can detect
     # the lock marker. pipefail keeps PIPESTATUS[0] = Atlas's own exit code.
     "$ATLAS_AS_HERMES_BIN" sync source "$source_name" "$@" 2>&1 | tee -a "$logf" >&2
@@ -89,7 +109,7 @@ for source_name in "${source_names[@]}"; do
       rm -f "$logf"
       break
     fi
-    if grep -q "$ATLAS_SYNC_LOCK_MARKER" "$logf" 2>/dev/null && [[ "$attempt" -le "$ATLAS_SYNC_LOCK_RETRIES" ]]; then
+    if grep -qF "$ATLAS_SYNC_LOCK_MARKER" "$logf" 2>/dev/null && [[ "$attempt" -le "$ATLAS_SYNC_LOCK_RETRIES" ]]; then
       rm -f "$logf"
       warn "source $source_name: KB write-lock contention; retry in ${ATLAS_SYNC_LOCK_RETRY_DELAY}s (${attempt}/${ATLAS_SYNC_LOCK_RETRIES})"
       sleep "$ATLAS_SYNC_LOCK_RETRY_DELAY"

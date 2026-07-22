@@ -18,7 +18,10 @@ Description=Run Atlas full source reconciliation daily
 # never coincides with an hourly fire. Kept deterministic (a fixed minute, not
 # RandomizedDelaySec) so the separation is reproducible and testable; the runner
 # additionally retries transient lock contention as defence-in-depth.
-OnCalendar=*-*-* 04:20:00
+#
+# Pinned to UTC explicitly so the schedule is unambiguous regardless of the
+# host's local timezone (the incident and its analysis are all in UTC).
+OnCalendar=*-*-* 04:20:00 UTC
 AccuracySec=1min
 Persistent=true
 Unit=atlas-source-sync-full.service
