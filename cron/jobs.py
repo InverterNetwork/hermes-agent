@@ -237,6 +237,16 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     return str(value)
 
 
+def _normalize_deliver_value(deliver: Any) -> str:
+    """Normalize stored delivery values into the scheduler's canonical string form."""
+    if deliver is None or deliver == "":
+        return "local"
+    if isinstance(deliver, (list, tuple)):
+        parts = [str(part).strip() for part in deliver if str(part).strip()]
+        return ",".join(parts) if parts else "local"
+    return str(deliver)
+
+
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     display = _coerce_job_text(job.get("schedule_display")).strip()
     if display:
@@ -281,6 +291,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    normalized["deliver"] = _normalize_deliver_value(normalized.get("deliver", "local"))
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:

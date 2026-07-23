@@ -275,6 +275,33 @@ class TestJobCRUD:
         assert jobs[0]["schedule_display"] == "every 60m"
         assert jobs[0]["state"] == "scheduled"
 
+    @pytest.mark.parametrize(
+        ("raw_deliver", "normalized_deliver"),
+        [
+            (None, "local"),
+            ("", "local"),
+            ([], "local"),
+            ("telegram", "telegram"),
+            (["telegram", "discord"], "telegram,discord"),
+        ],
+    )
+    def test_list_jobs_normalizes_legacy_deliver_values(
+        self, tmp_cron_dir, raw_deliver, normalized_deliver
+    ):
+        save_jobs([
+            {
+                "id": "abc123deadbe",
+                "prompt": "Report",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "enabled": True,
+                "deliver": raw_deliver,
+            }
+        ])
+
+        jobs = list_jobs()
+
+        assert jobs[0]["deliver"] == normalized_deliver
+
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
         assert remove_job(job["id"]) is True
