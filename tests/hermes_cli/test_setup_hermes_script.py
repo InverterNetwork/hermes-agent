@@ -351,29 +351,28 @@ def test_atlas_release_download_uses_authenticated_gh_path():
 
 def test_atlas_gws_install_is_version_and_checksum_pinned():
     content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    release_installer = (
+        REPO_ROOT / "installer" / "install-gws-release"
+    ).read_text(encoding="utf-8")
     values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
 
     assert 'GWS_VERSION" == "0.22.5"' in content
     assert "atlas.google_docs.minimum_atlas_version" in content
-    assert 'ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION" == "0.1.16"' in content
-    assert "minimum_atlas_version must be exactly 0.1.16" in content
-    assert "older than the Google Docs gws minimum" in content
-    assert "google-workspace-cli-${GWS_ARCH}-unknown-linux-gnu.tar.gz" in content
+    assert 'python3 "$FORK_DIR/installer/check_atlas_gws_version.py"' in content
+    assert 'ASSET="google-workspace-cli-${ARCH}-unknown-linux-gnu.tar.gz"' in release_installer
     assert "GWS_EXPECTED_SHA" in content
-    assert "sha256sum -c --strict --status" in content
-    assert content.index("sha256sum -c --strict --status") < content.index(
-        'install -o root -g root -m 0755 "$GWS_TMP/gws" "$GWS_BIN_DST"'
-    )
-    assert "pinned SHA256 mismatch" in content
-    assert '"$GWS_BIN_DST" --version' in content
+    assert 'bash "$FORK_DIR/installer/install-gws-release"' in content
     assert 'GWS_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/gws"' in content
     assert 'GWS_EXPECTED_SHA_DST="$GWS_EXPECTED_SHA_DIR/SHA256SUM.expected"' in content
-    assert 'sha256sum "$GWS_BIN_DST"' in content
-    assert 'chown root:"$AGENT_USER" "$ATLAS_GWS_CREDENTIALS_FILE"' in content
-    assert 'chmod 0640 "$ATLAS_GWS_CREDENTIALS_FILE"' in content
+    assert "os.O_RDONLY | os.O_NOFOLLOW" in content
+    assert "os.fchown(credential.fileno(), 0," in content
+    assert "os.fchmod(credential.fileno(), 0o640)" in content
+    assert 'must resolve under $AUTH_DIR' in content
+    assert '[[ -f "$ATLAS_GWS_CREDENTIALS_FILE" && ! -L "$ATLAS_GWS_CREDENTIALS_FILE" ]]' in content
+    assert 'install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 -- "$TARGET_DIR/cache" "$ATLAS_CACHE_DIR"' in content
     assert 'sudo -u "$AGENT_USER" install -d -m 0700 -- "$ATLAS_GWS_CACHE_DIR"' in content
     assert '[[ -d "$ATLAS_GWS_CACHE_DIR" && ! -L "$ATLAS_GWS_CACHE_DIR" ]]' in content
-    assert "https://github.com/${GWS_RELEASE_REPO}/releases/download/v${GWS_VERSION}/${GWS_ASSET}" in content
+    assert "https://github.com/${RELEASE_REPO}/releases/download/v${VERSION}/${ASSET}" in release_installer
     assert "gws_sha256:" in values
     assert "x86_64_linux_gnu:" in values
     assert "aarch64_linux_gnu:" in values

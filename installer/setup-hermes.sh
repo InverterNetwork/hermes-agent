@@ -367,25 +367,8 @@ if [[ "$ATLAS_ENABLED" -eq 1 && "$AUTH_METHOD" != "app" ]]; then
 fi
 
 if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
-  [[ "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION" == "0.1.16" ]] \
-    || { echo "FAIL: atlas.google_docs.minimum_atlas_version must be exactly 0.1.16 (got: ${ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION:-unset})" >&2; exit 1; }
-  python3 - "$ATLAS_VERSION" "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION" <<'PY'
-import re
-import sys
-
-def semver(value: str) -> tuple[int, int, int]:
-    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value)
-    if match is None:
-        raise SystemExit(f"FAIL: Atlas Google Docs gws migration requires a stable semver tag (got: {value})")
-    return tuple(map(int, match.groups()))
-
-actual, minimum = map(semver, sys.argv[1:])
-if actual < minimum:
-    raise SystemExit(
-        f"FAIL: atlas.version {sys.argv[1]} is older than the Google Docs gws minimum {sys.argv[2]}; "
-        "release Atlas first and update the Hermes pin"
-    )
-PY
+  python3 "$FORK_DIR/installer/check_atlas_gws_version.py" \
+    "$ATLAS_VERSION" "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION"
 fi
 
 if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
@@ -1381,25 +1364,14 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     || { echo "FAIL: atlas.google_docs.gws_release_repo must be a GitHub owner/repo slug" >&2; exit 1; }
   [[ "$GWS_EXPECTED_SHA" =~ ^[a-f0-9]{64}$ ]] \
     || { echo "FAIL: atlas.google_docs.gws_sha256.$GWS_SHA_KEY must be a lowercase SHA-256" >&2; exit 1; }
-  GWS_ASSET="google-workspace-cli-${GWS_ARCH}-unknown-linux-gnu.tar.gz"
-  GWS_TMP="$(mktemp -d)"
-  trap 'rm -rf "$GWS_TMP"' EXIT
   echo "==> installing gws ${GWS_VERSION} (${GWS_ARCH}) to $GWS_BIN_DST"
-  curl -fsSL "https://github.com/${GWS_RELEASE_REPO}/releases/download/v${GWS_VERSION}/${GWS_ASSET}" \
-    -o "$GWS_TMP/$GWS_ASSET"
-  printf '%s  %s\n' "$GWS_EXPECTED_SHA" "$GWS_TMP/$GWS_ASSET" | sha256sum -c --strict --status \
-    || { echo "FAIL: pinned SHA256 mismatch for $GWS_ASSET (gws ${GWS_VERSION})" >&2; exit 1; }
-  tar -xzf "$GWS_TMP/$GWS_ASSET" -C "$GWS_TMP"
-  [[ -x "$GWS_TMP/gws" ]] || { echo "FAIL: gws archive did not contain executable gws" >&2; exit 1; }
-  install -o root -g root -m 0755 "$GWS_TMP/gws" "$GWS_BIN_DST"
-  install -d -o root -g root -m 0755 "$GWS_EXPECTED_SHA_DIR"
-  sha256sum "$GWS_BIN_DST" | awk '{print $1}' \
-    | install -o root -g root -m 0644 /dev/stdin "$GWS_EXPECTED_SHA_DST"
-  GWS_ACTUAL_VERSION="$("$GWS_BIN_DST" --version 2>/dev/null | head -n 1)"
-  [[ " $GWS_ACTUAL_VERSION " == *" $GWS_VERSION "* ]] \
-    || { echo "FAIL: installed gws version mismatch (expected ${GWS_VERSION})" >&2; exit 1; }
-  rm -rf "$GWS_TMP"
-  trap - EXIT
+  bash "$FORK_DIR/installer/install-gws-release" \
+    --version "$GWS_VERSION" \
+    --release-repo "$GWS_RELEASE_REPO" \
+    --arch "$GWS_ARCH" \
+    --expected-sha "$GWS_EXPECTED_SHA" \
+    --bin-dst "$GWS_BIN_DST" \
+    --expected-sha-dst "$GWS_EXPECTED_SHA_DST"
 
   ATLAS_KB_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.kb_repo 2>/dev/null || true)"
   ATLAS_KB_REPO="${ATLAS_KB_REPO:-https://github.com/InverterNetwork/atlas-kb}"
@@ -1434,28 +1406,35 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     esac
     ATLAS_GWS_CREDENTIALS_FILE="$(realpath -m -- "$ATLAS_GWS_CREDENTIALS_FILE")"
     ATLAS_TARGET_REAL="$(realpath -m -- "$TARGET_DIR")"
+    ATLAS_AUTH_REAL="$(realpath -m -- "$AUTH_DIR")"
     case "$ATLAS_GWS_CREDENTIALS_FILE" in
-      "$ATLAS_TARGET_REAL"/*) ;;
+      "$ATLAS_AUTH_REAL"/*) ;;
       *)
-        echo "FAIL: atlas.google_docs.credentials_file must resolve under $TARGET_DIR" >&2
+        echo "FAIL: atlas.google_docs.credentials_file must resolve under $AUTH_DIR" >&2
         exit 1
         ;;
     esac
-    [[ -f "$ATLAS_GWS_CREDENTIALS_FILE" ]] \
-      || { echo "FAIL: Atlas gws authorized-user credential is missing: $ATLAS_GWS_CREDENTIALS_FILE" >&2; exit 1; }
-    python3 - "$ATLAS_GWS_CREDENTIALS_FILE" <<'PY'
-import json, sys
-from pathlib import Path
+    [[ -f "$ATLAS_GWS_CREDENTIALS_FILE" && ! -L "$ATLAS_GWS_CREDENTIALS_FILE" ]] \
+      || { echo "FAIL: Atlas gws authorized-user credential must be a regular non-symlink file" >&2; exit 1; }
+    python3 - "$ATLAS_GWS_CREDENTIALS_FILE" "$AGENT_USER" <<'PY'
+import grp, json, os, stat, sys
 try:
-    p = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
 except (OSError, ValueError):
-    raise SystemExit("FAIL: Atlas gws credential must be valid authorized_user JSON")
-required = ("client_id", "client_secret", "refresh_token")
-if p.get("type") != "authorized_user" or any(not isinstance(p.get(k), str) or not p[k] for k in required):
-    raise SystemExit("FAIL: Atlas gws credential must be a complete authorized_user JSON")
+    raise SystemExit("FAIL: Atlas gws credential must be a readable regular file")
+with os.fdopen(fd, encoding="utf-8") as credential:
+    if not stat.S_ISREG(os.fstat(credential.fileno()).st_mode):
+        raise SystemExit("FAIL: Atlas gws credential must be a regular file")
+    try:
+        p = json.load(credential)
+    except (OSError, ValueError):
+        raise SystemExit("FAIL: Atlas gws credential must be valid authorized_user JSON")
+    required = ("client_id", "client_secret", "refresh_token")
+    if p.get("type") != "authorized_user" or any(not isinstance(p.get(k), str) or not p[k] for k in required):
+        raise SystemExit("FAIL: Atlas gws credential must be a complete authorized_user JSON")
+    os.fchown(credential.fileno(), 0, grp.getgrnam(sys.argv[2]).gr_gid)
+    os.fchmod(credential.fileno(), 0o640)
 PY
-    chown root:"$AGENT_USER" "$ATLAS_GWS_CREDENTIALS_FILE"
-    chmod 0640 "$ATLAS_GWS_CREDENTIALS_FILE"
   fi
   [[ -n "$ATLAS_GWS_CREDENTIALS_FILE" ]] \
     || { echo "FAIL: atlas.google_docs.credentials_file is required" >&2; exit 1; }
@@ -1474,6 +1453,7 @@ PY
   ATLAS_GWS_CACHE_DIR="$(realpath -m -- "$ATLAS_GWS_CACHE_DIR")"
   ATLAS_TARGET_REAL="${ATLAS_TARGET_REAL:-$(realpath -m -- "$TARGET_DIR")}"
   case "$ATLAS_GWS_CACHE_DIR" in "$ATLAS_TARGET_REAL"/*) ;; *) echo "FAIL: atlas.google_docs.cache_dir must resolve under $TARGET_DIR" >&2; exit 1 ;; esac
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 -- "$TARGET_DIR/cache" "$ATLAS_CACHE_DIR"
   sudo -u "$AGENT_USER" install -d -m 0700 -- "$ATLAS_GWS_CACHE_DIR"
   [[ -d "$ATLAS_GWS_CACHE_DIR" && ! -L "$ATLAS_GWS_CACHE_DIR" ]] \
     || { echo "FAIL: Atlas gws cache must be a real directory: $ATLAS_GWS_CACHE_DIR" >&2; exit 1; }
@@ -1530,7 +1510,7 @@ EOF
     printf 'GOOGLE_WORKSPACE_CLI_CONFIG_DIR=%s\n' "$ATLAS_GWS_CACHE_DIR"
   } | install -o root -g "$AGENT_USER" -m 0640 /dev/stdin "$ATLAS_RUNTIME_ENV"
 
-  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config" "$ATLAS_CACHE_DIR"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config"
   if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
     install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$ATLAS_HUB_DATA_DIR"
     if [[ -f "$ATLAS_HUB_AUTH_FILE" && -f "$ATLAS_HUB_CLIENT_API_KEY_FILE" ]]; then

@@ -1203,6 +1203,13 @@ def _check_gws_binary_sha256(s: _State, gws_bin: Path) -> bool:
         return False
 
 
+def _has_legacy_atlas_google_auth(text: str) -> bool:
+    return (
+        "ATLAS_GOOGLE_SERVICE_ACCOUNT_" in text
+        or "ATLAS_GOOGLE_ACCESS_TOKEN=" in text
+    )
+
+
 def _check_atlas_gws(s: _State, runtime_env_text: str | None) -> None:
     version = _values_get(s.values_file, s.values_helper, "atlas.google_docs.gws_version")
     gws_bin = Path(s.gws_bin)
@@ -1231,10 +1238,29 @@ def _check_atlas_gws(s: _State, runtime_env_text: str | None) -> None:
                 s.v_ok(f"Atlas gws runtime env: {line.split('=', 1)[0]}")
             else:
                 s.v_drift("Atlas gws runtime env", f"missing {line}")
-        if "ATLAS_GOOGLE_SERVICE_ACCOUNT_" in runtime_env_text or "ATLAS_GOOGLE_ACCESS_TOKEN=" in runtime_env_text:
-            s.v_drift("Atlas legacy Google auth env", "service-account/access-token wiring remains")
-        else:
-            s.v_ok("Atlas legacy Google auth env absent")
+    legacy_sources: list[str] = []
+    if runtime_env_text is not None and _has_legacy_atlas_google_auth(runtime_env_text):
+        legacy_sources.append("atlas-runtime.env")
+    managed_env_paths = {
+        "atlas.env": s.args.target / "auth" / "atlas.env",
+        "atlas-as-hermes": Path(s.atlas_wrapper),
+        "atlas profile.d": Path(s.atlas_profile),
+        "atlas-hub.service": Path(s.systemd_dir) / "atlas-hub.service",
+    }
+    for label, path in managed_env_paths.items():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if _has_legacy_atlas_google_auth(text):
+            legacy_sources.append(label)
+    if legacy_sources:
+        s.v_drift(
+            "Atlas legacy Google auth env",
+            f"service-account/access-token wiring remains in {', '.join(legacy_sources)}",
+        )
+    else:
+        s.v_ok("Atlas legacy Google auth env absent")
 
     if credentials is None:
         s.v_drift("Atlas gws credential", "atlas.google_docs.credentials_file is unset")
