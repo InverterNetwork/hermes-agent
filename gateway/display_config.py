@@ -47,16 +47,34 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+<<<<<<< HEAD
     # Gateway status callbacks emitted by agent lifecycle plumbing. Values:
     # "all" = deliver lifecycle + warning statuses; "warn" = warnings only;
     # "off" = suppress both. Booleans map to all/off for YAML convenience.
     "status_callbacks": "all",
+=======
+    # Whether busy_input_mode=steer sends a visible "Steered into current run"
+    # acknowledgment after successfully injecting the user's mid-turn message.
+    # Disable when the platform should steer silently (the text still lands in
+    # the active run; only the confirmation echo is suppressed).
+    "busy_steer_ack_enabled": True,
+>>>>>>> upstream/main
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Live working-state status on platforms whose typing indicator renders
+    # text (Slack's assistant status line). Values:
+    #   "full" / true  -> verb + argument preview ("is running pytest…")
+    #   "verb"         -> verb only ("is running…") — keeps file paths and
+    #                     commands out of shared channels
+    #   "off" / false  -> static text (typing_status_text or "is thinking...")
+    # Independent of tool_progress: works even when progress bubbles are off
+    # (Slack's default), and costs no extra API calls — the existing typing
+    # refresh cadence just renders different text.
+    "live_status": "full",
 }
 
 # ---------------------------------------------------------------------------
@@ -243,6 +261,7 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         if value is True:
             return "all"
+<<<<<<< HEAD
         return str(value).lower()
     if setting == "status_callbacks":
         if value is False:
@@ -269,20 +288,45 @@ def _normalise(setting: str, value: Any) -> Any:
             "warnings_only": "warn",
         }
         return aliases.get(normalised, "all")
+=======
+        val = str(value).strip().lower()
+        if val in {"false", "0", "no"}:
+            return "off"
+        if val in {"true", "1", "yes", "on"}:
+            return "all"
+        return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+>>>>>>> upstream/main
     if setting in {
         "show_reasoning",
         "streaming",
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "busy_steer_ack_enabled",
+        "thinking_progress",
     }:
         if isinstance(value, str):
-            return value.lower() in {"true", "1", "yes", "on"}
+            val = value.strip().lower()
+            if val == "generic" and setting == "long_running_notifications":
+                return "generic"
+            return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
     if setting == "cleanup_progress":
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
+    if setting == "live_status":
+        # Tri-state: "full" (verb + preview), "verb" (verb only), "off".
+        if value is True:
+            return "full"
+        if value is False:
+            return "off"
+        val = str(value).strip().lower()
+        if val in {"true", "1", "yes", "on", "all"}:
+            return "full"
+        if val in {"false", "0", "no"}:
+            return "off"
+        return val if val in {"full", "verb", "off"} else "full"
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"
