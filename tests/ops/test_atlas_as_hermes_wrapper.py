@@ -42,10 +42,14 @@ def wrapper_env(tmp_path: Path) -> dict:
     kb_root.mkdir(parents=True)
     auth_dir = target / "auth"
     auth_dir.mkdir()
-    google_sa = auth_dir / "otto-google-sa.json"
-    google_sa.write_text("{}\n")
+    google_credential = auth_dir / "atlas-google-authorized-user.json"
+    google_credential.write_text('{"type":"authorized_user"}\n')
+    google_cache = target / "cache" / "atlas-gws"
+    google_cache.mkdir(parents=True)
     (auth_dir / "atlas-runtime.env").write_text(
-        f"ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE={google_sa}\n",
+        f"ATLAS_GWS_BIN=/usr/local/bin/gws\n"
+        f"GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE={google_credential}\n"
+        f"GOOGLE_WORKSPACE_CLI_CONFIG_DIR={google_cache}\n",
         encoding="utf-8",
     )
 
@@ -66,7 +70,9 @@ def wrapper_env(tmp_path: Path) -> dict:
         f'  printf "ATLAS_CODEX_BIN: %s\\n" "${{ATLAS_CODEX_BIN:-}}"\n'
         f'  printf "ATLAS_CODEX_TIMEOUT_MS: %s\\n" "${{ATLAS_CODEX_TIMEOUT_MS:-}}"\n'
         f'  printf "ATLAS_SESSION_ID: %s\\n" "${{ATLAS_SESSION_ID:-}}"\n'
-        f'  printf "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE: %s\\n" "${{ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE:-}}"\n'
+        f'  printf "ATLAS_GWS_BIN: %s\\n" "${{ATLAS_GWS_BIN:-}}"\n'
+        f'  printf "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE: %s\\n" "${{GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE:-}}"\n'
+        f'  printf "GOOGLE_WORKSPACE_CLI_CONFIG_DIR: %s\\n" "${{GOOGLE_WORKSPACE_CLI_CONFIG_DIR:-}}"\n'
         f'}} >> {atlas_log}\n'
     )
     atlas_bin.chmod(0o755)
@@ -85,7 +91,8 @@ def wrapper_env(tmp_path: Path) -> dict:
         "tmp": tmp_path,
         "target": target,
         "kb_root": kb_root,
-        "google_sa": google_sa,
+        "google_credential": google_credential,
+        "google_cache": google_cache,
         "bin": bin_dir,
         "atlas_bin": atlas_bin,
         "atlas_log": atlas_log,
@@ -139,7 +146,9 @@ class TestAtlasAsHermesWrapper:
         assert log["ATLAS_CODEX_BIN"] == "/usr/local/bin/codex"
         assert log["ATLAS_CODEX_TIMEOUT_MS"] == "120000"
         assert log["ATLAS_SESSION_ID"] == "hermes-agent"
-        assert log["ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE"] == str(wrapper_env["google_sa"])
+        assert log["ATLAS_GWS_BIN"] == "/usr/local/bin/gws"
+        assert log["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] == str(wrapper_env["google_credential"])
+        assert log["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] == str(wrapper_env["google_cache"])
 
     def test_operator_path_drops_to_agent_user(self, wrapper_env):
         other_user = "not-" + getpass.getuser()
@@ -161,4 +170,4 @@ class TestAtlasAsHermesWrapper:
         assert log["PWD"] == str(wrapper_env["kb_root"])
         assert log["ATLAS_CONFIG"] == str(wrapper_env["target"] / "config" / "atlas.yaml")
         assert log["ATLAS_KB_ROOT"] == str(wrapper_env["kb_root"])
-        assert log["ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE"] == str(wrapper_env["google_sa"])
+        assert log["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] == str(wrapper_env["google_credential"])
