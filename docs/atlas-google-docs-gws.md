@@ -15,12 +15,12 @@ Hermes owns installation and unattended runtime wiring for Atlas's Google Docs a
 ## Release order and rollback
 
 1. Merge and release Atlas with the no-fallback `gws` adapter. The installer refuses Atlas versions below `atlas.google_docs.minimum_atlas_version`.
-2. Update this repository's `atlas.version` to that release in the Hermes PR before merging/deploying it; the current v0.1.15 pin deliberately fails the guard.
+2. Pin this repository's `atlas.version` to that release in the Hermes PR before merging/deploying it. This PR pins `v0.1.16` (Atlas merge `565c340feed86876f585ede241ff740b5d2910ef`).
 3. Create the Workspace-internal OAuth client/grant, stage the authorized-user credential, and verify granted scopes.
 4. Run the fake-fixture suites, installer verifier, and a real canary `files.get` + `files.export` through `atlas add` as `hermes`.
 5. Deploy Hermes, monitor scheduled/unattended execution, then revoke/delete the retired Atlas service-account credential.
 
-Do not deploy Hermes first: its runtime env removes the only auth path understood by Atlas v0.1.15. Rollback is a coordinated release rollback—restore the prior Hermes release and prior Atlas binary together while the old production credential still exists. There is intentionally no runtime fallback or parallel auth path. After the old credential is retired, rollback requires an explicit new credential decision rather than silently resurrecting legacy auth.
+Do not deploy Hermes before Atlas `v0.1.16` is published and verified: its runtime env removes the only auth path understood by Atlas v0.1.15. Rollback is a coordinated release rollback—restore the prior Hermes release and prior Atlas binary together while the old production credential still exists. There is intentionally no runtime fallback or parallel auth path. After the old credential is retired, rollback requires an explicit new credential decision rather than silently resurrecting legacy auth.
 
 ## Required deployment inputs (not part of these PRs)
 
