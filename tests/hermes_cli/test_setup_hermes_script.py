@@ -349,6 +349,23 @@ def test_atlas_release_download_uses_authenticated_gh_path():
     assert "github.com/${ATLAS_RELEASE_REPO}/releases/download" not in content
 
 
+def test_atlas_gws_install_is_version_and_checksum_pinned():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
+
+    assert 'GWS_VERSION" == "0.22.5"' in content
+    assert "atlas.google_docs.minimum_atlas_version" in content
+    assert "older than the Google Docs gws minimum" in content
+    assert "google-workspace-cli-${GWS_ARCH}-unknown-linux-gnu.tar.gz" in content
+    assert "GWS_EXPECTED_SHA" in content
+    assert "sha256sum -c --strict --status" in content
+    assert '"$GWS_BIN_DST" --version' in content
+    assert "gws_sha256:" in values
+    assert "x86_64_linux_gnu:" in values
+    assert "aarch64_linux_gnu:" in values
+    assert 'minimum_atlas_version: "0.1.16"' in values
+
+
 def test_atlas_gitbook_source_sync_is_configured():
     values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
     installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
@@ -358,7 +375,10 @@ def test_atlas_gitbook_source_sync_is_configured():
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
     assert "google_docs:" in values
-    assert "service_account_file: auth/otto-google-sa.json" in values
+    assert 'gws_version: "0.22.5"' in values
+    assert "credentials_file: auth/atlas-google-authorized-user.json" in values
+    assert "cache_dir: cache/atlas-gws" in values
+    assert "de78ecdbd2f1a84cca0063a7ecbc440240fc14b6ebccbb17f4646b792a8c5c1f" in values
     assert "source_names:" in values
     assert "- emusd-docs" in values
     assert "- brix-product-docs" in values
@@ -381,7 +401,11 @@ def test_atlas_gitbook_source_sync_is_configured():
     assert "atlas.sources.$atlas_source_name.channel_ids" in installer
     assert 'ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"' in installer
     assert 'ATLAS_RUNTIME_ENV="$AUTH_DIR/atlas-runtime.env"' in installer
-    assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" in installer
+    assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" in installer
+    assert "GOOGLE_WORKSPACE_CLI_CONFIG_DIR" in installer
+    assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" not in installer
+    assert 'realpath -m -- "$ATLAS_GWS_CREDENTIALS_FILE"' in installer
+    assert 'realpath -m -- "$ATLAS_GWS_CACHE_DIR"' in installer
 
     assert "Environment=ATLAS_SYNC_SOURCE_NAMES=__ATLAS_SYNC_SOURCE_NAMES__" in service
     assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env" in service
