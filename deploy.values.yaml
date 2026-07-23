@@ -780,6 +780,7 @@ atlas:
   google_docs:
     # Atlas uses only this pinned gws binary and authorized-user grant. The
     # credential is staged out-of-band; the cache is agent-owned and writable.
+    # Relative credential/cache paths resolve under "$HERMES_HOME".
     # The installer refuses deployment until atlas.version reaches this pin.
     minimum_atlas_version: "0.1.16"
     gws_version: "0.22.5"

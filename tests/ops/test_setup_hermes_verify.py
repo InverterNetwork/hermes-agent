@@ -1105,7 +1105,7 @@ def atlas_install(install: dict) -> dict:
     (auth / "atlas-manager.env").chmod(0o640)
     gws_credential = auth / "atlas-google-authorized-user.json"
     gws_credential.write_text(
-        '{"type":"authorized_user","client_id":"fake","client_secret":"fake","refresh_token":"fake"}\n',
+        '{"type":"authorized_user","client_id":"fake","client_secret":"client-secret-sentinel","refresh_token":"refresh-token-sentinel"}\n',
         encoding="utf-8",
     )
     gws_credential.chmod(0o640)
@@ -1140,6 +1140,15 @@ def atlas_install(install: dict) -> dict:
     gws_bin = bin_dir / "gws"
     gws_bin.write_text("#!/usr/bin/env bash\necho 'gws 0.22.5'\n", encoding="utf-8")
     gws_bin.chmod(0o755)
+    gws_expected_sha = (
+        target / "hermes-agent" / "installer" / ".state" / "gws" / "SHA256SUM.expected"
+    )
+    gws_expected_sha.parent.mkdir(parents=True, exist_ok=True)
+    gws_expected_sha.write_text(
+        hashlib.sha256(gws_bin.read_bytes()).hexdigest() + "\n",
+        encoding="utf-8",
+    )
+    gws_expected_sha.chmod(0o644)
     atlas_wrapper = bin_dir / "atlas-as-hermes"
     atlas_wrapper.write_text("#!/usr/bin/env bash\nexit 0\n")
     atlas_wrapper.chmod(0o755)
@@ -1208,6 +1217,7 @@ def atlas_install(install: dict) -> dict:
     install["values_file"] = fork / "deploy.values.yaml"
     install["atlas_bin"] = atlas_bin
     install["gws_bin"] = gws_bin
+    install["gws_expected_sha"] = gws_expected_sha
     install["atlas_wrapper"] = atlas_wrapper
     install["atlas_profile"] = atlas_profile
     install["atlas_kb_root"] = kb_root
@@ -1253,6 +1263,7 @@ class TestAtlasVerify:
         assert "[OK] atlas profile.d drop-in:" in result.stdout
         assert "[OK] Atlas runtime env:" in result.stdout
         assert "[OK] gws binary version: gws 0.22.5" in result.stdout
+        assert "[OK] gws binary SHA256:" in result.stdout
         assert "[OK] Atlas gws authorized-user credential shape" in result.stdout
         assert "[OK] Atlas gws cache:" in result.stdout
         assert "[OK] Atlas legacy Google auth env absent" in result.stdout
@@ -1301,8 +1312,30 @@ class TestAtlasVerify:
         assert result.returncode == 1
         assert "[DRIFT] gws binary" in result.stderr
 
+    def test_tampered_gws_binary_is_drift(self, atlas_install):
+        atlas_install["gws_bin"].write_text(
+            "#!/usr/bin/env bash\n# changed after install\necho 'gws 0.22.5'\n",
+            encoding="utf-8",
+        )
+        atlas_install["gws_bin"].chmod(0o755)
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] gws binary SHA256" in result.stderr
+
+    def test_missing_gws_expected_sha_is_drift(self, atlas_install):
+        atlas_install["gws_expected_sha"].unlink()
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] gws binary SHA256" in result.stderr
+
     def test_gws_cache_permissions_are_drift(self, atlas_install):
         (atlas_install["target"] / "cache" / "atlas-gws").chmod(0o755)
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas gws cache" in result.stderr
+
+    def test_missing_gws_cache_is_drift(self, atlas_install):
+        (atlas_install["target"] / "cache" / "atlas-gws").rmdir()
         result = _run_verify_atlas(atlas_install)
         assert result.returncode == 1
         assert "[DRIFT] Atlas gws cache" in result.stderr
@@ -1320,6 +1353,31 @@ class TestAtlasVerify:
         result = _run_verify_atlas(atlas_install)
         assert result.returncode == 1
         assert "[DRIFT] Atlas gws authorized-user credential shape" in result.stderr
+
+    def test_gws_credential_permissions_are_secret_free_drift(self, atlas_install):
+        credential = atlas_install["target"] / "auth" / "atlas-google-authorized-user.json"
+        credential.chmod(0o644)
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas gws credential" in result.stderr
+        combined = result.stdout + result.stderr
+        assert "client-secret-sentinel" not in combined
+        assert "refresh-token-sentinel" not in combined
+
+    def test_missing_gws_runtime_env_line_is_drift(self, atlas_install):
+        runtime_env = atlas_install["target"] / "auth" / "atlas-runtime.env"
+        runtime_env.write_text(
+            "\n".join(
+                line
+                for line in runtime_env.read_text(encoding="utf-8").splitlines()
+                if not line.startswith("GOOGLE_WORKSPACE_CLI_CONFIG_DIR=")
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas gws runtime env" in result.stderr
 
     def test_legacy_atlas_google_auth_env_is_drift(self, atlas_install):
         runtime_env = atlas_install["target"] / "auth" / "atlas-runtime.env"

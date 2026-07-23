@@ -366,7 +366,9 @@ if [[ "$ATLAS_ENABLED" -eq 1 && "$AUTH_METHOD" != "app" ]]; then
   exit 2
 fi
 
-if [[ "$ATLAS_ENABLED" -eq 1 && -n "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION" ]]; then
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
+  [[ "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION" == "0.1.16" ]] \
+    || { echo "FAIL: atlas.google_docs.minimum_atlas_version must be exactly 0.1.16 (got: ${ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION:-unset})" >&2; exit 1; }
   python3 - "$ATLAS_VERSION" "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION" <<'PY'
 import re
 import sys
@@ -1321,6 +1323,8 @@ ATLAS_SYNC_SOURCE_NAMES=""
 ATLAS_GWS_CREDENTIALS_FILE=""
 ATLAS_GWS_CACHE_DIR=""
 GWS_BIN_DST="/usr/local/bin/gws"
+GWS_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/gws"
+GWS_EXPECTED_SHA_DST="$GWS_EXPECTED_SHA_DIR/SHA256SUM.expected"
 if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   case "$(uname -m)" in
     x86_64)  ATLAS_ARCH="amd64"; GWS_ARCH="x86_64"; GWS_SHA_KEY="x86_64_linux_gnu" ;;
@@ -1388,6 +1392,9 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   tar -xzf "$GWS_TMP/$GWS_ASSET" -C "$GWS_TMP"
   [[ -x "$GWS_TMP/gws" ]] || { echo "FAIL: gws archive did not contain executable gws" >&2; exit 1; }
   install -o root -g root -m 0755 "$GWS_TMP/gws" "$GWS_BIN_DST"
+  install -d -o root -g root -m 0755 "$GWS_EXPECTED_SHA_DIR"
+  sha256sum "$GWS_BIN_DST" | awk '{print $1}' \
+    | install -o root -g root -m 0644 /dev/stdin "$GWS_EXPECTED_SHA_DST"
   GWS_ACTUAL_VERSION="$("$GWS_BIN_DST" --version 2>/dev/null | head -n 1)"
   [[ "$GWS_ACTUAL_VERSION" =~ (^|[[:space:]])${GWS_VERSION}($|[[:space:]]) ]] \
     || { echo "FAIL: installed gws version mismatch (expected ${GWS_VERSION})" >&2; exit 1; }
@@ -1427,7 +1434,6 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
     esac
     ATLAS_GWS_CREDENTIALS_FILE="$(realpath -m -- "$ATLAS_GWS_CREDENTIALS_FILE")"
     ATLAS_TARGET_REAL="$(realpath -m -- "$TARGET_DIR")"
-    AUTH_DIR_REAL="$(realpath -m -- "$AUTH_DIR")"
     case "$ATLAS_GWS_CREDENTIALS_FILE" in
       "$ATLAS_TARGET_REAL"/*) ;;
       *)
@@ -1448,10 +1454,8 @@ required = ("client_id", "client_secret", "refresh_token")
 if p.get("type") != "authorized_user" or any(not isinstance(p.get(k), str) or not p[k] for k in required):
     raise SystemExit("FAIL: Atlas gws credential must be a complete authorized_user JSON")
 PY
-    if [[ "$ATLAS_GWS_CREDENTIALS_FILE" == "$AUTH_DIR_REAL"/* ]]; then
-      chown root:"$AGENT_USER" "$ATLAS_GWS_CREDENTIALS_FILE"
-      chmod 0640 "$ATLAS_GWS_CREDENTIALS_FILE"
-    fi
+    chown root:"$AGENT_USER" "$ATLAS_GWS_CREDENTIALS_FILE"
+    chmod 0640 "$ATLAS_GWS_CREDENTIALS_FILE"
   fi
   [[ -n "$ATLAS_GWS_CREDENTIALS_FILE" ]] \
     || { echo "FAIL: atlas.google_docs.credentials_file is required" >&2; exit 1; }
