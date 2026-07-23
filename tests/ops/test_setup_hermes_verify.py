@@ -1396,6 +1396,30 @@ class TestAtlasVerify:
         assert result.returncode == 1
         assert "[DRIFT] Atlas legacy Google auth env" in result.stderr
 
+    def test_legacy_atlas_google_auth_in_secret_env_is_drift(self, atlas_install):
+        secret_env = atlas_install["target"] / "auth" / "atlas.env"
+        secret_env.write_text(
+            secret_env.read_text(encoding="utf-8")
+            + "ATLAS_GOOGLE_ACCESS_TOKEN=unused-legacy-token\n",
+            encoding="utf-8",
+        )
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas legacy Google auth env" in result.stderr
+        assert "unused-legacy-token" not in result.stderr
+
+    def test_legacy_atlas_google_auth_in_unit_is_drift(self, atlas_install):
+        unit = atlas_install["systemd_dir"] / "atlas-hub.service"
+        unit.write_text(
+            unit.read_text(encoding="utf-8")
+            + "Environment=ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE=/unused/legacy.json\n",
+            encoding="utf-8",
+        )
+        result = _run_verify_atlas(atlas_install)
+        assert result.returncode == 1
+        assert "[DRIFT] Atlas legacy Google auth env" in result.stderr
+        assert "/unused/legacy.json" not in result.stderr
+
     def test_missing_atlas_kb_helper_is_drift(self, atlas_install):
         _git(atlas_install["atlas_kb_root"], "config", "--unset", "credential.https://github.com.helper")
         result = _run_verify_atlas(atlas_install)

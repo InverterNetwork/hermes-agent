@@ -7,10 +7,13 @@ Hermes owns installation and unattended runtime wiring for Atlas's Google Docs a
 - `/usr/local/bin/gws`: `root:root 0755`, exact v0.22.5, archive SHA-256 matched against the architecture-specific digest committed in `deploy.values.yaml`. A version bump requires review of upstream release notes/security advisories and a new committed digest; a sibling downloaded checksum is not trusted as the root of verification.
 - `<HERMES_HOME>/auth/atlas-google-authorized-user.json`: staged out of band, `root:hermes 0640`, valid `authorized_user` shape. It is not created by the installer and is not passed in argv.
 - `<HERMES_HOME>/cache/atlas-gws`: `hermes:hermes 0700`, writable for unattended refresh-token caching.
+- In pinned `gws` v0.22.5, `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` is read as credential input and refreshed access-token state is written separately to `GOOGLE_WORKSPACE_CLI_CONFIG_DIR/token_cache.json` (`auth.rs::get_token`). The root-owned credential therefore does not need to be writable by Hermes.
 - Generic Hermes Google credentials and the Google Workspace skill are outside this migration. The installer neither rewrites nor removes `auth/google-sa-key.json`, its config, or any other non-Atlas credential.
 - The old Atlas service-account file is not read or exported. It remains untouched during the credential-free implementation and canary, then must be revoked and deleted immediately after successful cutover.
 
 `gws` is pre-1.0 and upstream marks it unsupported. Pinning plus fail-closed install/runtime verification prevents silent upgrades; security notices require an explicit reviewed pin bump.
+
+Google Docs auth is a required part of an Atlas-enabled Hermes deployment after this coordinated migration. The installer deliberately fails if the authorized-user credential is absent; there is no supported service-account, credential-free, or air-gapped Atlas mode in this release.
 
 ## Release order and rollback
 
