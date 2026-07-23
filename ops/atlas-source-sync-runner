@@ -33,20 +33,31 @@ ATLAS_SYNC_LOCK_MARKER='"reason":"kb_write_lock_held"'
 ATLAS_SYNC_LOCK_RETRIES="${ATLAS_SYNC_LOCK_RETRIES:-3}"
 ATLAS_SYNC_LOCK_RETRY_DELAY="${ATLAS_SYNC_LOCK_RETRY_DELAY:-20}"
 
-# Coerce invalid or oversized knob values to safe bounds. This is critical: an
-# arithmetic comparison against a NON-integer value (e.g. a fat-fingered
+# Validate + normalize the retry knobs to a decimal integer in [0, max]. This is
+# critical: an arithmetic compare against a NON-integer value (a fat-fingered
 # /etc/default override) under `set -u` would raise "unbound variable" and kill
-# the runner mid-source — silently skipping later sources, the exact failure
-# this change exists to prevent. Check the regex FIRST so the `-gt` arithmetic
-# only ever runs on a validated integer. (0 retries is valid = no retry.)
-if ! [[ "$ATLAS_SYNC_LOCK_RETRIES" =~ ^[0-9]+$ ]] || [[ "$ATLAS_SYNC_LOCK_RETRIES" -gt 10 ]]; then
-  warn "ATLAS_SYNC_LOCK_RETRIES='${ATLAS_SYNC_LOCK_RETRIES}' invalid or too large; using 3"
-  ATLAS_SYNC_LOCK_RETRIES=3
-fi
-if ! [[ "$ATLAS_SYNC_LOCK_RETRY_DELAY" =~ ^[0-9]+$ ]] || [[ "$ATLAS_SYNC_LOCK_RETRY_DELAY" -gt 300 ]]; then
-  warn "ATLAS_SYNC_LOCK_RETRY_DELAY='${ATLAS_SYNC_LOCK_RETRY_DELAY}' invalid or too large; using 20"
-  ATLAS_SYNC_LOCK_RETRY_DELAY=20
-fi
+# the runner mid-source — the exact silent-skip failure this change prevents.
+# Rules, in order:
+#   * accept only 1–3 digits (bounds magnitude, so no integer overflow);
+#   * normalize with 10#... so a leading-zero value can NEVER be read as octal by
+#     the arithmetic compare while `sleep` reads it as decimal (012/0454 bug);
+#   * anything else → the safe default; a value over max → clamped to max.
+_clamp_knob() {  # name value max default -> prints the normalized value
+  local name="$1" value="$2" max="$3" default="$4"
+  if [[ ! "$value" =~ ^[0-9]{1,3}$ ]]; then
+    warn "${name}='${value}' is not a 1-3 digit integer; using ${default}"
+    printf '%s' "$default"
+    return 0
+  fi
+  value=$((10#$value))  # force base 10 (kills leading-zero octal ambiguity)
+  if [[ "$value" -gt "$max" ]]; then
+    warn "${name}=${value} exceeds max ${max}; clamping to ${max}"
+    value="$max"
+  fi
+  printf '%s' "$value"
+}
+ATLAS_SYNC_LOCK_RETRIES="$(_clamp_knob ATLAS_SYNC_LOCK_RETRIES "$ATLAS_SYNC_LOCK_RETRIES" 10 3)"
+ATLAS_SYNC_LOCK_RETRY_DELAY="$(_clamp_knob ATLAS_SYNC_LOCK_RETRY_DELAY "$ATLAS_SYNC_LOCK_RETRY_DELAY" 300 20)"
 
 [[ -x "$HERMES_TOKEN_PYTHON" ]] || die "missing token-helper python: $HERMES_TOKEN_PYTHON"
 [[ -f "$HERMES_TOKEN_HELPER" ]] || die "missing token helper: $HERMES_TOKEN_HELPER"

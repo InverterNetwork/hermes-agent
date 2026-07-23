@@ -192,21 +192,59 @@ def test_malformed_retry_count_is_coerced_not_fatal(run_runner) -> None:
         extra_env={"ATLAS_SYNC_LOCK_RETRIES": "banana", "STUB_LOCK_ONCE": "b"},
     )
     assert r.returncode == 0, r.stderr
-    assert "invalid or too large; using 3" in r.stderr
+    assert "is not a 1-3 digit integer; using 3" in r.stderr
     assert "b=ok(attempts=2)" in r.stderr  # retry still worked after coercion
 
 
-def test_oversized_retry_count_is_clamped(run_runner) -> None:
-    # A huge retry count must be clamped so a persistent lock cannot spin until
-    # the systemd timeout. With STUB_LOCK_ALWAYS the source fails after the
-    # clamped bound (3), i.e. 4 attempts — not 1000.
+def test_oversized_retry_count_over_max_is_clamped(run_runner) -> None:
+    # A 3-digit value above the max is clamped to the max (10), not spun forever.
+    # With STUB_LOCK_ALWAYS the source fails after 1 + 10 = 11 attempts.
+    r = run_runner(
+        "b",
+        extra_env={"ATLAS_SYNC_LOCK_RETRIES": "099", "STUB_LOCK_ALWAYS": "b"},
+    )
+    assert "exceeds max 10; clamping to 10" in r.stderr
+    assert "b=FAILED(attempts=11,exit=1)" in r.stderr, r.stderr
+    assert r.returncode != 0
+
+
+def test_too_many_digits_retry_count_is_coerced(run_runner) -> None:
+    # >3 digits (overflow guard) is rejected → default 3 → 4 attempts, not 1000.
     r = run_runner(
         "b",
         extra_env={"ATLAS_SYNC_LOCK_RETRIES": "1000", "STUB_LOCK_ALWAYS": "b"},
     )
-    assert "invalid or too large; using 3" in r.stderr
+    assert "is not a 1-3 digit integer; using 3" in r.stderr
     assert "b=FAILED(attempts=4,exit=1)" in r.stderr, r.stderr
     assert r.returncode != 0
+
+
+def test_leading_zero_retry_count_is_decimal_not_octal(run_runner) -> None:
+    # "012" must normalize to decimal 12 (then clamp to 10), NOT octal 10 — and it
+    # must never raise a bash arithmetic/octal error. 1 + 10 = 11 attempts.
+    r = run_runner(
+        "b",
+        extra_env={"ATLAS_SYNC_LOCK_RETRIES": "012", "STUB_LOCK_ALWAYS": "b"},
+    )
+    assert "b=FAILED(attempts=11,exit=1)" in r.stderr, r.stderr
+    assert "value too great for base" not in r.stderr  # no octal parse error
+    assert r.returncode != 0
+
+
+def test_malformed_delay_is_coerced(run_runner) -> None:
+    # A bad delay must be coerced (no set -u abort). Use an all-success run so the
+    # coerced delay is never actually slept on — we only assert the coercion.
+    r = run_runner("a,b,c", extra_env={"ATLAS_SYNC_LOCK_RETRY_DELAY": "banana"})
+    assert r.returncode == 0, r.stderr
+    assert "ATLAS_SYNC_LOCK_RETRY_DELAY='banana' is not a 1-3 digit integer; using 20" in r.stderr
+
+
+def test_oversized_delay_over_max_is_clamped(run_runner) -> None:
+    # A 4-digit delay (0454) is rejected as too many digits → default 20; a 3-digit
+    # over-max delay would clamp to 300. Either way it can never become 454s.
+    r = run_runner("a", extra_env={"ATLAS_SYNC_LOCK_RETRY_DELAY": "0454"})
+    assert r.returncode == 0, r.stderr
+    assert "ATLAS_SYNC_LOCK_RETRY_DELAY='0454' is not a 1-3 digit integer; using 20" in r.stderr
 
 
 def test_persistent_lock_on_first_source_still_runs_slack(run_runner) -> None:
@@ -234,7 +272,11 @@ def test_non_one_exit_code_is_recorded_and_not_retried(run_runner) -> None:
     assert r.returncode != 0
 
 
-def test_empty_source_list_is_a_clean_noop(run_runner) -> None:
-    r = run_runner("")
+def test_comma_only_source_list_runs_nothing(run_runner) -> None:
+    # Empty entries (a comma-only / whitespace value) are skipped, so no source is
+    # attempted and the run is a clean no-op. (A truly empty value falls back to
+    # the historical single default source, which is covered elsewhere.)
+    r = run_runner(",, ,")
     assert r.returncode == 0, r.stderr
+    assert "running atlas sync source" not in r.stderr  # nothing attempted
     assert "source-sync summary:" in r.stderr
