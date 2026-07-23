@@ -1396,7 +1396,7 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   sha256sum "$GWS_BIN_DST" | awk '{print $1}' \
     | install -o root -g root -m 0644 /dev/stdin "$GWS_EXPECTED_SHA_DST"
   GWS_ACTUAL_VERSION="$("$GWS_BIN_DST" --version 2>/dev/null | head -n 1)"
-  [[ "$GWS_ACTUAL_VERSION" =~ (^|[[:space:]])${GWS_VERSION}($|[[:space:]]) ]] \
+  [[ " $GWS_ACTUAL_VERSION " == *" $GWS_VERSION "* ]] \
     || { echo "FAIL: installed gws version mismatch (expected ${GWS_VERSION})" >&2; exit 1; }
   rm -rf "$GWS_TMP"
   trap - EXIT
@@ -1474,7 +1474,11 @@ PY
   ATLAS_GWS_CACHE_DIR="$(realpath -m -- "$ATLAS_GWS_CACHE_DIR")"
   ATLAS_TARGET_REAL="${ATLAS_TARGET_REAL:-$(realpath -m -- "$TARGET_DIR")}"
   case "$ATLAS_GWS_CACHE_DIR" in "$ATLAS_TARGET_REAL"/*) ;; *) echo "FAIL: atlas.google_docs.cache_dir must resolve under $TARGET_DIR" >&2; exit 1 ;; esac
-  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$ATLAS_GWS_CACHE_DIR"
+  sudo -u "$AGENT_USER" install -d -m 0700 -- "$ATLAS_GWS_CACHE_DIR"
+  [[ -d "$ATLAS_GWS_CACHE_DIR" && ! -L "$ATLAS_GWS_CACHE_DIR" ]] \
+    || { echo "FAIL: Atlas gws cache must be a real directory: $ATLAS_GWS_CACHE_DIR" >&2; exit 1; }
+  [[ "$(stat -Lc '%U:%G %a' -- "$ATLAS_GWS_CACHE_DIR")" == "$AGENT_USER:$AGENT_USER 700" ]] \
+    || { echo "FAIL: Atlas gws cache must be $AGENT_USER:$AGENT_USER 0700" >&2; exit 1; }
   if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
     ATLAS_HUB_HOST="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.host 2>/dev/null || true)"
     ATLAS_HUB_HOST="${ATLAS_HUB_HOST:-127.0.0.1}"

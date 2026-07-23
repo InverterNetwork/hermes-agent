@@ -1302,6 +1302,10 @@ class TestAtlasVerify:
     def test_wrong_gws_version_is_drift(self, atlas_install):
         atlas_install["gws_bin"].write_text("#!/usr/bin/env bash\necho 'gws 0.23.0'\n")
         atlas_install["gws_bin"].chmod(0o755)
+        atlas_install["gws_expected_sha"].write_text(
+            hashlib.sha256(atlas_install["gws_bin"].read_bytes()).hexdigest() + "\n",
+            encoding="utf-8",
+        )
         result = _run_verify_atlas(atlas_install)
         assert result.returncode == 1
         assert "[DRIFT] gws binary version" in result.stderr
@@ -1313,14 +1317,16 @@ class TestAtlasVerify:
         assert "[DRIFT] gws binary" in result.stderr
 
     def test_tampered_gws_binary_is_drift(self, atlas_install):
+        execution_marker = atlas_install["tmp"] / "tampered-gws-executed"
         atlas_install["gws_bin"].write_text(
-            "#!/usr/bin/env bash\n# changed after install\necho 'gws 0.22.5'\n",
+            f"#!/usr/bin/env bash\ntouch {execution_marker}\necho 'gws 0.22.5'\n",
             encoding="utf-8",
         )
         atlas_install["gws_bin"].chmod(0o755)
         result = _run_verify_atlas(atlas_install)
         assert result.returncode == 1
         assert "[DRIFT] gws binary SHA256" in result.stderr
+        assert not execution_marker.exists()
 
     def test_missing_gws_expected_sha_is_drift(self, atlas_install):
         atlas_install["gws_expected_sha"].unlink()
