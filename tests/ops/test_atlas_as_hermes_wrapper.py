@@ -170,4 +170,6 @@ class TestAtlasAsHermesWrapper:
         assert log["PWD"] == str(wrapper_env["kb_root"])
         assert log["ATLAS_CONFIG"] == str(wrapper_env["target"] / "config" / "atlas.yaml")
         assert log["ATLAS_KB_ROOT"] == str(wrapper_env["kb_root"])
+        assert log["ATLAS_GWS_BIN"] == "/usr/local/bin/gws"
         assert log["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] == str(wrapper_env["google_credential"])
+        assert log["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] == str(wrapper_env["google_cache"])
