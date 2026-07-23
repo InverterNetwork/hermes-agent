@@ -1179,25 +1179,28 @@ def _gws_expected_sha_file(target: Path) -> Path:
     )
 
 
-def _check_gws_binary_sha256(s: _State, gws_bin: Path) -> None:
+def _check_gws_binary_sha256(s: _State, gws_bin: Path) -> bool:
     expected_file = _gws_expected_sha_file(s.args.target)
     if not expected_file.is_file():
         s.v_drift("gws binary SHA256", f"missing expected hash: {expected_file}")
-        return
+        return False
     _check_mode_owner(
         s, "gws SHA256SUM.expected", _stat_info(expected_file), "644", s.rails_owner,
     )
     expected = _read_expected_sha256(expected_file)
     if not expected:
         s.v_drift("gws binary SHA256", f"invalid expected hash in {expected_file}")
-        return
+        return False
     actual = _sha256(gws_bin)
     if not actual:
         s.v_drift("gws binary SHA256", f"could not read {gws_bin}")
+        return False
     elif actual == expected:
         s.v_ok(f"gws binary SHA256: {actual}")
+        return True
     else:
         s.v_drift("gws binary SHA256", f"got {actual} (expected {expected})")
+        return False
 
 
 def _check_atlas_gws(s: _State, runtime_env_text: str | None) -> None:
@@ -1208,12 +1211,12 @@ def _check_atlas_gws(s: _State, runtime_env_text: str | None) -> None:
         s.v_drift("gws binary", f"missing or non-executable: {gws_bin}")
     else:
         _check_mode_owner(s, "gws binary", info, "755", s.rails_owner)
-        _check_gws_binary_sha256(s, gws_bin)
-        actual = _first_stdout_line([str(gws_bin), "--version"])
-        if version and re.search(rf"(?:^|\s){re.escape(version)}(?:\s|$)", actual or ""):
-            s.v_ok(f"gws binary version: {actual}")
-        else:
-            s.v_drift("gws binary version", f"got '{actual or '?'}' (expected {version or 'configured version'})")
+        if _check_gws_binary_sha256(s, gws_bin):
+            actual = _first_stdout_line([str(gws_bin), "--version"])
+            if version and re.search(rf"(?:^|\s){re.escape(version)}(?:\s|$)", actual or ""):
+                s.v_ok(f"gws binary version: {actual}")
+            else:
+                s.v_drift("gws binary version", f"got '{actual or '?'}' (expected {version or 'configured version'})")
 
     credentials = _atlas_google_path(s, "atlas.google_docs.credentials_file")
     cache_dir = _atlas_google_path(s, "atlas.google_docs.cache_dir")

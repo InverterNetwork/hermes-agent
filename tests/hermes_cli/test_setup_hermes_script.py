@@ -371,7 +371,8 @@ def test_atlas_gws_install_is_version_and_checksum_pinned():
     assert 'sha256sum "$GWS_BIN_DST"' in content
     assert 'chown root:"$AGENT_USER" "$ATLAS_GWS_CREDENTIALS_FILE"' in content
     assert 'chmod 0640 "$ATLAS_GWS_CREDENTIALS_FILE"' in content
-    assert 'install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$ATLAS_GWS_CACHE_DIR"' in content
+    assert 'sudo -u "$AGENT_USER" install -d -m 0700 -- "$ATLAS_GWS_CACHE_DIR"' in content
+    assert '[[ -d "$ATLAS_GWS_CACHE_DIR" && ! -L "$ATLAS_GWS_CACHE_DIR" ]]' in content
     assert "https://github.com/${GWS_RELEASE_REPO}/releases/download/v${GWS_VERSION}/${GWS_ASSET}" in content
     assert "gws_sha256:" in values
     assert "x86_64_linux_gnu:" in values
