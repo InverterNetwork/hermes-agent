@@ -2126,6 +2126,25 @@ def _check_systemd(s: _State) -> None:
             "quay.orchestrator.enabled",
         ) == "true":
             timers.append("quay-orchestrator.timer")
+    # When Atlas source-sync is enabled AND its timers are actually installed on
+    # this host, BOTH the hourly incremental and the daily full reconciliation
+    # timers must stay active+enabled — a silently disabled full timer means
+    # removals/old-edit reconciliation quietly stops running. Gate on the unit
+    # file existing so a host/CI where source-sync is enabled in values but the
+    # timers are not provisioned (no source-reader auth) is not falsely flagged;
+    # a disabled-but-installed timer is still caught. (The schedule separation
+    # itself is locked by the ops/ unit tests.)
+    if _values_get(
+        s.values_file,
+        s.values_helper,
+        "atlas.source_sync.enabled",
+    ) == "true":
+        for _atlas_timer in (
+            "atlas-source-sync.timer",
+            "atlas-source-sync-full.timer",
+        ):
+            if (Path(s.systemd_dir) / _atlas_timer).is_file():
+                timers.append(_atlas_timer)
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
         # systemctl emits properties in its own (alphabetical) order, not

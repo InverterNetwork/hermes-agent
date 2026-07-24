@@ -37,6 +37,10 @@ HARDENED_TIMERS = {
     "hermes-sync": "*:0/2",  # was OnUnitActiveSec=2min
     "hermes-code-sync": "*:0/5",  # was OnUnitActiveSec=5min
     "atlas-source-sync": "hourly",  # was OnUnitActiveSec=1h
+    # Daily full reconciliation, deliberately OFF the top of the hour so it never
+    # coincides with the hourly incremental (which fires at every HH:00) on the
+    # shared atlas-kb write lock. See test_atlas_source_sync_schedule.py.
+    "atlas-source-sync-full": "*-*-* 04:20:00 UTC",
 }
 
 
