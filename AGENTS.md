@@ -4,6 +4,8 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+> **Runtime code is not editable in place.** The checkout at `~/.hermes/code/hermes-agent` (and any Quay worker clone) is a **read-only mirror**: it is hard-reset to `origin/main` on a timer, and it is **not** what the running services execute (that is the root-owned install at `~/.hermes/hermes-agent`). Editing the mirror changes nothing and is silently discarded on the next sync. To change runtime behavior, **open a PR to this repo** — it ships on the next redeploy. Do not report a code change you only edited locally.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a

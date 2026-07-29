@@ -26,6 +26,16 @@ def test_installer_gateway_install_is_noninteractive():
     assert "--no-start-now --no-start-on-login" in content
 
 
+def test_installer_manages_scripts_as_state_symlink():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "==> wiring state symlinks (skills, memories, cron, scripts)" in content
+    assert "for d in skills memories cron scripts; do" in content
+    assert 'if [[ ! -e "$STATE_TARGET/$d" ]]; then' in content
+    assert 'install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 755 "$STATE_TARGET/$d"' in content
+    assert 'Move its contents into $STATE_TARGET/$d/ and retry' in content
+
+
 def test_setup_hermes_script_has_termux_path():
     content = SETUP_SCRIPT.read_text(encoding="utf-8")
 
@@ -255,6 +265,15 @@ def test_installer_provisions_agent_clis_for_quay():
     assert "quay.agent_invocation references 'claude'" not in content
 
 
+def test_quay_tick_runtime_path_includes_managed_bins():
+    content = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
+
+    assert (
+        "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        in content
+    )
+
+
 def test_installer_persists_quay_expected_sha_for_verify():
     """The installer must leave verify a SHA source of truth for the quay
     binary instead of forcing verify to trust `quay --version` output."""
@@ -330,6 +349,37 @@ def test_atlas_release_download_uses_authenticated_gh_path():
     assert "github.com/${ATLAS_RELEASE_REPO}/releases/download" not in content
 
 
+def test_atlas_gws_install_is_version_and_checksum_pinned():
+    content = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    release_installer = (
+        REPO_ROOT / "installer" / "install-gws-release"
+    ).read_text(encoding="utf-8")
+    values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
+
+    assert 'GWS_VERSION" == "0.22.5"' in content
+    assert "atlas.google_docs.minimum_atlas_version" in content
+    assert 'python3 "$FORK_DIR/installer/check_atlas_gws_version.py"' in content
+    assert 'ASSET="google-workspace-cli-${ARCH}-unknown-linux-gnu.tar.gz"' in release_installer
+    assert "GWS_EXPECTED_SHA" in content
+    assert 'bash "$FORK_DIR/installer/install-gws-release"' in content
+    assert 'GWS_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/gws"' in content
+    assert 'GWS_EXPECTED_SHA_DST="$GWS_EXPECTED_SHA_DIR/SHA256SUM.expected"' in content
+    assert "os.O_RDONLY | os.O_NOFOLLOW" in content
+    assert "os.fchown(credential.fileno(), 0," in content
+    assert "os.fchmod(credential.fileno(), 0o640)" in content
+    assert 'must resolve under $AUTH_DIR' in content
+    assert '[[ -f "$ATLAS_GWS_CREDENTIALS_FILE" && ! -L "$ATLAS_GWS_CREDENTIALS_FILE" ]]' in content
+    assert 'install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 -- "$TARGET_DIR/cache" "$ATLAS_CACHE_DIR"' in content
+    assert 'sudo -u "$AGENT_USER" install -d -m 0700 -- "$ATLAS_GWS_CACHE_DIR"' in content
+    assert '[[ -d "$ATLAS_GWS_CACHE_DIR" && ! -L "$ATLAS_GWS_CACHE_DIR" ]]' in content
+    assert "https://github.com/${RELEASE_REPO}/releases/download/v${VERSION}/${ASSET}" in release_installer
+    assert "gws_sha256:" in values
+    assert "x86_64_linux_gnu:" in values
+    assert "aarch64_linux_gnu:" in values
+    assert "94490295d9580e1e88574e715a0a162991747d12d62f8c7b8dcc8268b6c1cea0" in values
+    assert 'minimum_atlas_version: "0.1.16"' in values
+
+
 def test_atlas_gitbook_source_sync_is_configured():
     values = (REPO_ROOT / "deploy.values.yaml").read_text(encoding="utf-8")
     installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
@@ -338,25 +388,40 @@ def test_atlas_gitbook_source_sync_is_configured():
     wrapper = (OPS_DIR / "atlas-as-hermes").read_text(encoding="utf-8")
     profile = (OPS_DIR / "profile.d" / "atlas-env.sh").read_text(encoding="utf-8")
 
-    assert 'version: "v0.1.11"' in values
     assert "google_docs:" in values
-    assert "service_account_file: auth/otto-google-sa.json" in values
+    assert 'gws_version: "0.22.5"' in values
+    assert "credentials_file: auth/atlas-google-authorized-user.json" in values
+    assert "cache_dir: cache/atlas-gws" in values
+    assert "de78ecdbd2f1a84cca0063a7ecbc440240fc14b6ebccbb17f4646b792a8c5c1f" in values
     assert "source_names:" in values
     assert "- emusd-docs" in values
     assert "- brix-product-docs" in values
+    assert "- slack-channels" in values
     assert "brix-product-docs:" in values
     assert "type: gitbook" in values
     assert "space_id: JZwK8SE9GDTka1EcS5dD" in values
     assert "token_env: GITBOOK_API_TOKEN" in values
+    # Slack scheduled sync (F1): the source is defined and scheduled, and the
+    # token is referenced by env-var name only (never a value).
+    assert "slack-channels:" in values
+    assert "type: slack" in values
+    assert "token_env: SLACK_ATLAS_TOKEN" in values
 
     assert "get atlas.source_sync.source_names" in installer
     assert "atlas.sources.$atlas_source_name.type" in installer
-    assert "type must be github or gitbook" in installer
+    assert "type must be github, gitbook, or slack" in installer
     assert "atlas.sources.$atlas_source_name.space_id" in installer
     assert "atlas.sources.$atlas_source_name.token_env" in installer
+    assert "atlas.sources.$atlas_source_name.channel_ids" in installer
     assert 'ATLAS_SECRET_ENV="$AUTH_DIR/atlas.env"' in installer
     assert 'ATLAS_RUNTIME_ENV="$AUTH_DIR/atlas-runtime.env"' in installer
-    assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" in installer
+    assert "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" in installer
+    assert "GOOGLE_WORKSPACE_CLI_CONFIG_DIR" in installer
+    assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" not in installer
+    assert "service_account_file:" not in values
+    assert "ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" not in wrapper
+    assert 'realpath -m -- "$ATLAS_GWS_CREDENTIALS_FILE"' in installer
+    assert 'realpath -m -- "$ATLAS_GWS_CACHE_DIR"' in installer
 
     assert "Environment=ATLAS_SYNC_SOURCE_NAMES=__ATLAS_SYNC_SOURCE_NAMES__" in service
     assert "EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env" in service
@@ -368,6 +433,25 @@ def test_atlas_gitbook_source_sync_is_configured():
     assert "__TARGET_DIR__/auth/atlas.env" in wrapper
     assert "__TARGET_DIR__/auth/atlas-runtime.env" in profile
     assert "__TARGET_DIR__/auth/atlas.env" in profile
+
+
+def test_atlas_source_sync_full_reconciliation_is_scheduled():
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+    full_service = (OPS_DIR / "atlas-source-sync-full.service").read_text(encoding="utf-8")
+    full_timer = (OPS_DIR / "atlas-source-sync-full.timer").read_text(encoding="utf-8")
+
+    # Daily full reconciliation passes --full to the runner and carries a long
+    # timeout for the whole-channel re-fetch; the hourly sync stays incremental.
+    assert "ExecStart=/usr/local/sbin/atlas-source-sync-runner --full" in full_service
+    assert "TimeoutStartSec=10800" in full_service
+    assert "OnFailure=atlas-source-sync-failure.service" in full_service
+    assert "OnCalendar=daily" in full_timer
+    assert "Unit=atlas-source-sync-full.service" in full_timer
+
+    # The installer renders + installs + enables the daily full timer.
+    assert "atlas-source-sync-full.service" in installer
+    assert "atlas-source-sync-full.timer" in installer
+    assert "systemctl enable --now atlas-source-sync-full.timer" in installer
 
 
 def test_atlas_hub_service_is_loopback_and_key_protected():
@@ -406,11 +490,25 @@ def test_atlas_hub_service_is_loopback_and_key_protected():
 def test_quay_tick_service_carries_reviewer_token_minting_env():
     service = (OPS_DIR / "quay-tick.service").read_text(encoding="utf-8")
     runner = (OPS_DIR / "quay-tick-runner").read_text(encoding="utf-8")
+    installer = INSTALLER_SCRIPT.read_text(encoding="utf-8")
 
     assert "Environment=HERMES_REVIEWER_GH_CONFIG=/etc/hermes/reviewer.env" in service
+    assert "EnvironmentFile=-/etc/default/quay-worker-env" in service
+    assert "quay-worker-env" in installer
+    assert "RPC_URL_4326" in installer
     assert "RuntimeDirectory=hermes" in service
     assert "QUAY_REVIEWER_GH_TOKEN" in runner
     assert "/etc/hermes/reviewer.env" in runner
+    assert "QUAY_GITHUB_AUTH_SRC=\"$OPS_DIR/quay-github-auth\"" in installer
+    assert "install -o \"$AGENT_USER\" -g \"$AGENT_USER\" -m 0755 \"$QUAY_GITHUB_AUTH_SRC\" \"$QUAY_GITHUB_AUTH_DST\"" in installer
+
+
+def test_quay_orchestrator_runner_prepares_github_auth_before_parked_polls():
+    runner = (OPS_DIR / "quay-orchestrator-runner").read_text(encoding="utf-8")
+
+    assert "quay-github-auth" in runner
+    assert "quay_prepare_worker_github_auth" in runner
+    assert "--park-human-waits" in runner
 
 
 def test_quay_serve_service_is_localhost_and_token_protected():

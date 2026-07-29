@@ -2,9 +2,25 @@
 Description=Run Quay orchestrator delivery outbox drain
 
 [Timer]
-OnBootSec=45s
-OnUnitActiveSec=1min
+# Wall-clock cadence: once a minute, on the minute (BRIX-1874).
+#
+# This was previously scheduled with OnBootSec=45s + OnUnitActiveSec=1min and
+# NO OnCalendar. A monotonic-only schedule can silently deadlock: OnBootSec
+# only elapses once per boot, and OnUnitActiveSec re-anchors off the *previous*
+# service activation. If the service is stopped and the timer is later started
+# past boot (e.g. a redeploy/restart after OnBootSec has already passed) with
+# no prior activation to anchor on, systemd computes NO next elapse and the
+# timer sits active with `Trigger: n/a`, never firing again. That is exactly
+# how the outbox drain went silently dead for ~3 days.
+#
+# OnCalendar is anchored on the wall clock, so the timer always has a next
+# elapse and always re-arms after any stop/restart regardless of prior service
+# activation — the deadlock is structurally impossible.
+OnCalendar=minutely
 AccuracySec=15s
+# Meaningful now that OnCalendar is set (Persistent only affects OnCalendar):
+# if the box was down across a scheduled tick, run one catch-up drain on boot
+# instead of waiting for the next minute boundary.
 Persistent=true
 Unit=quay-orchestrator.service
 

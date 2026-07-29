@@ -1,0 +1,11 @@
+[Unit]
+Description=Atlas source sync failure alert
+
+[Service]
+# Emits an ERR-priority journal marker under the `atlas-alert` tag whenever the
+# atlas-source-sync run fails, so a failed sync is visible beyond the unit's
+# non-zero state: `journalctl -t atlas-alert -p err`. This is the dependency-free
+# baseline alert; routing atlas-alert to Slack/Telegram (via a journald-drain or
+# an ExecStart post) is a bounded follow-up that needs the target channel.
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "atlas-source-sync FAILED — inspect: journalctl -u atlas-source-sync.service -e" | systemd-cat -t atlas-alert -p err'

@@ -134,6 +134,48 @@ in-memory credentials. The mitigation against a compromised
 in-process component is operator review before install (§2.4,
 §2.5), not environment scrubbing.
 
+**Scoped exception — declarative cron secret injection.** A
+`no_agent` cron script otherwise runs with every Hermes-managed
+secret stripped. A script can request a NARROW subset back through
+two independent gates that must BOTH agree:
+
+1. **Declaration (job / hermes-state).** The cron job carries a
+   `secrets: [...]` list of env-var names. This is dev-editable and
+   PR-reviewed — it states what the script *wants*, and grants
+   nothing on its own.
+2. **Authorization (platform / host).** The operator lists the
+   injectable names under `cron.injectable_secrets` in the host
+   `config.yaml` — deployment config, never hermes-state. This
+   states what the platform *allows*.
+
+Injection is the *intersection*: only a name present in both gates
+(and holding a value in the host environment) is re-injected into
+that one script's environment. A name declared but not authorized
+is logged and skipped — never silently granted. A **hard floor**
+(GitHub tokens, provider/model API keys, the Slack app token and
+signing secret, dashboard/session tokens, other-platform bot
+tokens, remote-compute secrets) can NEVER be injected even if an
+operator lists it; only a small blessed set (`SLACK_BOT_TOKEN`, the
+motivating case) is eligible. This lets a watchdog post to Slack
+without staging a per-script out-of-band env file, while keeping
+the strip-by-default posture for everything else. It does not change
+the containment story above: an authorized secret is exposed to the
+same arbitrary third-party dependencies the script already runs, so
+operators authorize only what a reviewed script legitimately needs.
+
+The residual assumption is deliberate and bounded. `no_agent` cron
+jobs and their scripts are a **reviewed managed-state surface** — the
+scripts live in the versioned scripts directory and the jobs in the
+versioned cron store, so a `secrets:` declaration lands through the
+same review as any other state change. The agent can author a cron
+job and add a `secrets:` declaration, but it **cannot self-grant**: a
+declaration only requests a name, and injection still requires an
+operator to have allowlisted it in host config the agent cannot
+write. The operator allowlist is the ceiling and the hard floor is
+the floor — the agent can, at most, route an *already-authorized*
+secret to a script it is allowed to run, and can never widen the set
+of injectable secrets or reach a hard-floor credential.
+
 ### 2.4 In-Process Heuristics
 
 The following components screen or warn about LLM behavior. They

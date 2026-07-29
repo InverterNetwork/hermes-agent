@@ -192,6 +192,22 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "quay_diagnostic": {
+        "description": (
+            "Read-only Quay blocker diagnostics: inspect local files/artifacts, "
+            "search text, and consult session evidence without mutation or "
+            "outbound network tools"
+        ),
+        "tools": [
+            "read_file",
+            "search_files",
+            "session_search",
+            "skills_list",
+            "skill_view",
+        ],
+        "includes": [],
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",

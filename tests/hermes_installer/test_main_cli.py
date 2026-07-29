@@ -12,8 +12,9 @@ from installer.hermes_installer import __main__ as cli_main
 
 
 @pytest.fixture
-def values_file(tmp_path: Path, fake_bun_zip) -> Path:
+def values_file(tmp_path: Path, fake_bun_zip, fake_anvil_tar) -> Path:
     _src_zip, sha = fake_bun_zip
+    _src_tar, anvil_sha = fake_anvil_tar
     p = tmp_path / "deploy.values.yaml"
     p.write_text(
         yaml.safe_dump(
@@ -33,6 +34,12 @@ def values_file(tmp_path: Path, fake_bun_zip) -> Path:
                     "version": "v0.1.2",
                     "runtime_managers": {
                         "bun": {"version": "1.3.9", "linux_x64_sha256": sha}
+                    },
+                    "toolchain": {
+                        "anvil": {
+                            "version": "1.7.1",
+                            "linux_x64_sha256": anvil_sha,
+                        }
                     },
                 },
             },
@@ -83,7 +90,9 @@ def test_ensure_runtimes_end_to_end(
     )
     assert rc == 0
     assert (install_dir / "bun").is_file()
+    assert (install_dir / "anvil").is_file()
     assert (install_dir / "bun").stat().st_mode & 0o100
+    assert (install_dir / "anvil").stat().st_mode & 0o100
 
 
 def test_ensure_runtimes_missing_pin_diagnostic(
