@@ -679,6 +679,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         "/api/platforms/{platform}/events",
         adapter._handle_platform_event_callback,
     )
+    app.router.add_post("/quay/review-pr", adapter._handle_quay_review_pr)
+    app.router.add_post("/quay/admin/authorize", adapter._handle_quay_admin_authorize)
     return app
 
 
@@ -1010,7 +1012,7 @@ class TestQuayAdminAuthorizeEndpoint:
 
             assert resp.status == 401
             data = await resp.json()
-            assert data["error"]["code"] == "invalid_api_key"
+            assert data["error"]["code"] == "gateway_auth_failed"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

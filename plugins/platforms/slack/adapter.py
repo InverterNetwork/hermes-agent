@@ -54,6 +54,7 @@ from gateway.platforms.base import (
     is_host_excluded_by_no_proxy,
     resolve_proxy_url,
     safe_url_for_log,
+    cache_image_from_url,
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_video_from_bytes,
@@ -1024,6 +1025,18 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        self._trigger_router = None
+        triggers = self.config.extra.get("triggers") if self.config.extra else None
+        if triggers:
+            try:
+                from gateway.slack_triggers import SlackTriggerRouter, parse_triggers
+
+                self._trigger_router = SlackTriggerRouter(
+                    parse_triggers(triggers),
+                    bot_user_id=self._bot_user_id,
+                )
+            except Exception as exc:
+                logger.warning("[Slack] Ignoring invalid slack triggers: %s", exc)
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
         self._socket_handler_started_monotonic: Optional[float] = None
@@ -5734,7 +5747,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if allow_bots == "mentions" and not is_mentioned:
                     return
 
-        if not is_one_to_one_dm and bot_uid:
+        if not is_one_to_one_dm:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -6010,9 +6023,8 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Handle file attachments. Thread-root images recovered above are
         # delivered ahead of the trigger message's own files.
-        media_urls = list(thread_root_media_urls)
-        media_types = list(thread_root_media_types)
-        attachment_notices: List[str] = []
+        media_urls = list(thread_root_media_urls) + media_urls
+        media_types = list(thread_root_media_types) + media_types
         files = event.get("files", [])
         for f in files:
             # Slack Connect channels return stub file objects with
@@ -8487,18 +8499,18 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_strict_mention(self) -> bool:
         """When true, channel threads require an explicit @-mention on every
         message. Disables all auto-triggers (mentioned-thread memory,
-        bot-message follow-up, session-presence). Defaults to True.
+        bot-message follow-up, session-presence). Defaults to False.
         """
         configured = self.config.extra.get("strict_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() not in {"false", "0", "no", "off"}
+                return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "true").lower() not in {
-            "false",
-            "0",
-            "no",
-            "off",
+        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
         }
 
     def _slack_ignore_other_user_mentions(self) -> bool:

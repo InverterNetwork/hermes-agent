@@ -272,7 +272,7 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         or adapter._slack_message_matches_mention_patterns(text)
     )
 
-    if not is_one_to_one_dm and bot_uid:
+    if not is_one_to_one_dm:
         # allowed_channels check (whitelist — must pass before other gating)
         allowed = adapter._slack_allowed_channels()
         if allowed and channel_id not in allowed:

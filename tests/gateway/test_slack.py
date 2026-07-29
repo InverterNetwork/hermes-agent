@@ -5157,7 +5157,8 @@ class TestThreadReplyHandling:
     async def test_thread_reply_without_mention_with_session_ignored_by_default(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Slack thread replies stay silent by default even with an active session."""
+        """Strict mention mode stays silent even with an active session."""
+        adapter_with_session_store.config.extra["strict_mention"] = True
         # Simulate an active session for this thread
         session_key = "agent:main:slack:group:T_TEAM:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
@@ -5181,7 +5182,7 @@ class TestThreadReplyHandling:
         """Operators can opt back into legacy actionable thread follow-ups."""
         adapter_with_session_store.config.extra["strict_mention"] = False
         # Simulate an active session for this thread
-        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        session_key = "agent:main:slack:group:T_TEAM:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
 
         event = {
@@ -5213,6 +5214,9 @@ class TestThreadReplyHandling:
             return_value=False
         )
         mock_session_store.get_session_metadata = MagicMock(return_value="")
+        adapter_with_session_store._fetch_thread_parent_text = (
+            SlackAdapter._fetch_thread_parent_text.__get__(adapter_with_session_store)
+        )
         adapter_with_session_store._app.client.conversations_replies = AsyncMock(
             side_effect=[
                 # _bot_authored_thread_root miss path → full context fetch
@@ -5483,7 +5487,7 @@ class TestThreadReplyHandling:
     ):
         """Top-level channel messages should require mention even if session exists."""
         # Session exists but this is a top-level message (no thread_ts)
-        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        session_key = "agent:main:slack:group:T_TEAM:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
 
         event = {
