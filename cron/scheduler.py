@@ -2128,6 +2128,28 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _cron_injectable_secrets_allowlist() -> frozenset[str]:
+    """Return operator-authorized secret names for cron script injection."""
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        raw = cron_cfg.get("injectable_secrets")
+        if isinstance(raw, str):
+            raw = [raw]
+        elif not isinstance(raw, (list, tuple)):
+            if raw is not None:
+                logger.warning(
+                    "cron.injectable_secrets must be a list of names, got %s; "
+                    "ignoring (no secrets will be injectable)",
+                    type(raw).__name__,
+                )
+            raw = []
+        return frozenset(str(name).strip() for name in raw if str(name).strip())
+    except Exception as exc:
+        logger.debug("Failed to load cron.injectable_secrets allowlist: %s", exc)
+        return frozenset()
+
+
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     cfg_path = venv_dir / "pyvenv.cfg"
     try:
@@ -2189,6 +2211,8 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    *,
+    secrets: Optional[List[str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2229,6 +2253,8 @@ def _run_job_script(
             mutated, avoiding the global-side-effect bug where a cron
             job's ``os.chdir()`` leaks into concurrent gateway sessions
             (#69396).
+        secrets: Secret environment-variable names requested by the job. Only
+            names also present in the operator allowlist are injected.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2322,7 +2348,7 @@ def _run_job_script(
                 "encoding": "utf-8",
                 "errors": "replace",
             }
-        env = _sanitize_subprocess_env(os.environ.copy())
+        env = _sanitize_subprocess_env(os.environ.copy(), extra_env)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
@@ -2390,7 +2416,9 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, secrets=job.get("secrets")
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2421,10 +2449,14 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, secrets=job.get("secrets")
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, secrets=job.get("secrets")
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the

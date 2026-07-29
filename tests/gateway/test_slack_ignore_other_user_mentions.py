@@ -298,6 +298,7 @@ async def test_mentioned_thread_ignores_followup_addressed_to_other_user(adapter
     but a follow-up addressed to another human should not wake it."""
     thread_ts = "1700000000.000010"
     adapter._mentioned_threads.add(thread_ts)
+    adapter.config.extra["strict_mention"] = False
     adapter.config.extra["ignore_other_user_mentions"] = True
 
     await _run(
@@ -314,6 +315,7 @@ async def test_mentioned_thread_still_answers_plain_followup(adapter):
     mentioned thread is still answered when the option is on."""
     thread_ts = "1700000000.000020"
     adapter._mentioned_threads.add(thread_ts)
+    adapter.config.extra["strict_mention"] = False
     adapter.config.extra["ignore_other_user_mentions"] = True
 
     await _run(
