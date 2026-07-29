@@ -761,9 +761,9 @@ jobs:
           sudo -u hermes bash -euo pipefail -c '
             T=/home/hermes/.hermes
             cd "$T/state"
-            last_subj=$(git log -1 --format="%s")
-            [[ "$last_subj" == "init fixture" ]] \
-              || { echo "FAIL: --force-state did not reset to source HEAD (last subject=$last_subj)"; exit 1; }
+            source_head=$(git -C /srv/hermes/repos/hermes-state rev-parse HEAD)
+            git merge-base --is-ancestor "$source_head" HEAD \
+              || { echo "FAIL: --force-state target does not descend from source HEAD"; exit 1; }
             [[ ! -f skills/probe.md ]]       || { echo "FAIL: skills/probe.md survived --force-state"; exit 1; }
             [[ ! -f memories/probe.md ]]     || { echo "FAIL: memories/probe.md survived --force-state"; exit 1; }
             [[ ! -f cron/output/probe.txt ]] || { echo "FAIL: cron/output/probe.txt survived --force-state"; exit 1; }

@@ -2388,13 +2388,12 @@ def _check_hermes_dashboard_service(s: _State) -> None:
     else:
         s.v_drift("hermes-dashboard.service HERMES_HOME", f"missing {expected_home}")
 
-    expected_web_dist = f"Environment=HERMES_WEB_DIST={s.args.target / 'hermes-agent' / 'hermes_cli' / 'web_dist'}"
-    if expected_web_dist in text:
-        s.v_ok("hermes-dashboard.service HERMES_WEB_DIST")
+    if "Environment=HERMES_WEB_DIST=" not in text:
+        s.v_ok("hermes-dashboard.service headless mode")
     else:
         s.v_drift(
-            "hermes-dashboard.service HERMES_WEB_DIST",
-            f"missing {expected_web_dist}",
+            "hermes-dashboard.service headless mode",
+            "HERMES_WEB_DIST must not be set for the headless API service",
         )
 
     expected_base = "Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731"
@@ -2415,12 +2414,12 @@ def _check_hermes_dashboard_service(s: _State) -> None:
     else:
         s.v_drift("hermes-dashboard.service runtime env", f"missing {runtime_env}")
 
-    if re.search(r"ExecStart=.*\bdashboard\b.*--host\s+127\.0\.0\.1\b.*--port\s+9119\b", text):
+    if re.search(r"ExecStart=.*\bserve\b.*--host\s+127\.0\.0\.1\b.*--port\s+9119\b", text):
         s.v_ok("hermes-dashboard.service loopback bind: 127.0.0.1:9119")
     else:
         s.v_drift(
             "hermes-dashboard.service bind address",
-            "expected ExecStart to include dashboard --host 127.0.0.1 --port 9119",
+            "expected ExecStart to include serve --host 127.0.0.1 --port 9119",
         )
 
     after_quay = re.search(

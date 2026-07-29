@@ -1727,12 +1727,11 @@ def _enable_quay_admin_public_dashboard(install: dict) -> None:
         "Wants=network-online.target quay-serve.service\n"
         "[Service]\n"
         f"Environment=HERMES_HOME={target}\n"
-        f"Environment=HERMES_WEB_DIST={target / 'hermes-agent' / 'hermes_cli' / 'web_dist'}\n"
         "Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731\n"
         f"EnvironmentFile={target / 'auth' / 'quay.env'}\n"
         f"EnvironmentFile=-{target / 'auth' / 'gateway-runtime.env'}\n"
         f"ExecStart={target / 'hermes-agent' / 'venv' / 'bin' / 'hermes'} "
-        "dashboard --host 127.0.0.1 --port 9119 --no-open\n",
+        "serve --host 127.0.0.1 --port 9119\n",
         encoding="utf-8",
     )
 
@@ -1890,7 +1889,7 @@ class TestSetupHermesVerifyQuay:
         assert result.returncode == 0, result.stderr + "\n" + result.stdout
         assert "[OK] hermes-dashboard.service: active loaded enabled" in result.stdout
         assert "[OK] hermes-dashboard.service HERMES_HOME" in result.stdout
-        assert "[OK] hermes-dashboard.service HERMES_WEB_DIST" in result.stdout
+        assert "[OK] hermes-dashboard.service headless mode" in result.stdout
         assert "[OK] hermes-dashboard.service Quay upstream" in result.stdout
         assert "[OK] hermes-dashboard.service auth env" in result.stdout
         assert "[OK] hermes-dashboard.service runtime env" in result.stdout

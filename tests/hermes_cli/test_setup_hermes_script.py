@@ -318,12 +318,12 @@ def test_hermes_dashboard_service_is_loopback_quay_admin_proxy():
     assert "After=network-online.target quay-serve.service" in content
     assert "Wants=network-online.target quay-serve.service" in content
     assert "Environment=HERMES_HOME=__TARGET_DIR__" in content
-    assert "Environment=HERMES_WEB_DIST=__TARGET_DIR__/hermes-agent/hermes_cli/web_dist" in content
+    assert "Environment=HERMES_WEB_DIST=" not in content
     assert "Environment=QUAY_ADMIN_BASE_URL=http://127.0.0.1:9731" in content
     assert "EnvironmentFile=__TARGET_DIR__/auth/quay.env" in content
     assert "EnvironmentFile=-__TARGET_DIR__/auth/gateway-runtime.env" in content
     assert re.search(
-        r"ExecStart=.*\bhermes\s+dashboard\s+--host\s+127\.0\.0\.1\s+--port\s+9119\s+--no-open",
+        r"ExecStart=.*\bhermes\s+serve\s+--host\s+127\.0\.0\.1\s+--port\s+9119",
         content,
     )
 

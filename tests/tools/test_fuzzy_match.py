@@ -207,6 +207,39 @@ class TestReplaceAll:
         assert count == 2
         assert new == "ccc bbb ccc"
 
+    def test_self_overlapping_pattern_non_overlapping_matches(self):
+        """Self-overlapping patterns must produce non-overlapping spans.
+
+        Regression: _strategy_exact advanced the scan cursor by 1 instead of
+        len(pattern), so "aa" in "aaaa" matched at offsets 0, 1, 2 (overlapping)
+        instead of 0, 2. _apply_replacements works in reverse order, so the
+        stale offsets corrupted the file. Fix aligns with str.replace().
+        """
+        # replace_all: 2 non-overlapping matches, not 3 overlapping ones.
+        new, count, _, err = fuzzy_find_and_replace("aaaa", "aa", "b", replace_all=True)
+        assert err is None
+        assert count == 2
+        assert new == "bb"
+
+        # single-char pattern still counts every occurrence
+        new, count, _, err = fuzzy_find_and_replace("aaa", "a", "b", replace_all=True)
+        assert err is None
+        assert count == 3
+        assert new == "bbb"
+
+        # embedded in surrounding content — non-matched parts preserved
+        new, count, _, err = fuzzy_find_and_replace(
+            "prefix aaaa suffix", "aa", "b", replace_all=True
+        )
+        assert err is None
+        assert count == 2
+        assert new == "prefix bb suffix"
+
+        # without the flag, the non-overlapping count is reported (2, not 3)
+        new, count, _, err = fuzzy_find_and_replace("aaaa", "aa", "b", replace_all=False)
+        assert count == 0
+        assert "2 matches" in err
+
 
 class TestUnicodeNormalized:
     """Tests for the unicode_normalized strategy (Bug 5)."""
@@ -237,6 +270,106 @@ class TestUnicodeNormalized:
         new, count, strategy, err = fuzzy_find_and_replace(content, "hello", "hi")
         assert count == 1
         assert strategy == "exact"
+
+    def test_unicode_preserved_in_output(self):
+        """Unicode characters in unchanged portions survive the replacement."""
+        content = "Hello\u2014world"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "Hello--world", "Hello--there"
+        )
+        assert count == 1, f"Expected match, got err={err}"
+        assert strategy == "unicode_normalized"
+        # The em-dash should be preserved; only "world" → "there" should change
+        assert new == "Hello\u2014there", f"Got {new!r}"
+
+    def test_smart_quotes_preserved(self):
+        """Smart quotes survive when only the quoted text changes."""
+        content = 'He said \u201chello\u201d to her'
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, 'He said "hello" to her', 'He said "goodbye" to her'
+        )
+        assert count == 1, f"Expected match, got err={err}"
+        assert new == 'He said \u201cgoodbye\u201d to her', f"Got {new!r}"
+
+    def test_ellipsis_preserved(self):
+        """Ellipsis survives when surrounding text changes."""
+        content = "Wait for it\u2026and done"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "Wait for it...and done", "Wait for it...then done"
+        )
+        assert count == 1, f"Expected match, got err={err}"
+        assert new == "Wait for it\u2026then done", f"Got {new!r}"
+
+    def test_mixed_unicode_multiline(self):
+        """Multiple Unicode types in a multi-line block all survive."""
+        content = 'Line 1 \u2014 with dash\nLine 2 \u201cquoted\u201d text\nLine 3 plain'
+        old = 'Line 1 -- with dash\nLine 2 "quoted" text\nLine 3 plain'
+        new_str = 'Line 1 -- with dash\nLine 2 "quoted" text\nLine 3 changed'
+        new, count, strategy, err = fuzzy_find_and_replace(content, old, new_str)
+        assert count == 1, f"Expected match, got err={err}"
+        expected = 'Line 1 \u2014 with dash\nLine 2 \u201cquoted\u201d text\nLine 3 changed'
+        assert new == expected, f"Got {new!r}"
+
+    def test_no_unicode_no_change(self):
+        """When file has no Unicode, replacement is direct (no-op guard)."""
+        content = "plain text here"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "plain text here", "plain text there"
+        )
+        assert count == 1
+        assert new == "plain text there"
+
+
+class TestUnicodeSpaceAndMinusNormalized:
+    """Space-separator family + Unicode minus normalization.
+
+    Port of the anomalyco/opencode#38133 patch-matching corpus: files with
+    typographic spacing (en/em/thin spaces, narrow NBSP, CJK ideographic
+    space) or the Unicode minus sign must match a model's ASCII old_string
+    at the precise unicode_normalized strategy — not fall through to the
+    similarity-based context_aware fallback.
+    """
+
+    def test_unicode_minus_matched_and_preserved(self):
+        content = "offset = value \u2212 1\nprint(offset)\n"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "offset = value - 1", "offset = delta - 1"
+        )
+        assert count == 1, f"Expected match, got err={err}"
+        assert strategy == "unicode_normalized"
+        # The untouched minus keeps its Unicode form
+        assert "delta \u2212 1" in new, f"Got {new!r}"
+
+    def test_space_variants_match_at_unicode_strategy(self):
+        # en space, em space, thin space, narrow NBSP, medium math space,
+        # ideographic space, figure space, hair space
+        for space in ["\u2002", "\u2003", "\u2009", "\u202f",
+                      "\u205f", "\u3000", "\u2007", "\u200a"]:
+            content = f"# wait{space}30{space}seconds\nrun()\n"
+            new, count, strategy, err = fuzzy_find_and_replace(
+                content, "# wait 30 seconds", "# wait 60 seconds"
+            )
+            assert count == 1, (
+                f"space U+{ord(space):04X}: expected match, err={err}"
+            )
+            assert strategy == "unicode_normalized", (
+                f"space U+{ord(space):04X}: matched via {strategy}, "
+                "expected unicode_normalized"
+            )
+            # Unchanged spaces keep their typographic form; only the
+            # digits change.
+            assert f"60{space}seconds" in new, (
+                f"space U+{ord(space):04X}: got {new!r}"
+            )
+
+    def test_ideographic_space_cjk_line(self):
+        content = "標題\u3000第一章\nbody text\n"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "標題 第一章", "標題 第二章"
+        )
+        assert count == 1, f"Expected match, got err={err}"
+        assert strategy == "unicode_normalized"
+        assert "標題\u3000第二章" in new, f"Got {new!r}"
 
 
 class TestBlockAnchorThreshold:
