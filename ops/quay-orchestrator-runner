@@ -12,9 +12,22 @@ home="${HERMES_HOME:-$HOME/.hermes}"
 config="${QUAY_ORCHESTRATOR_CONFIG:-${BRIX_ORCHESTRATOR_CONFIG:-$home/quay/orchestrator.json}}"
 py="${QUAY_ORCHESTRATOR_PYTHON:-${BRIX_ORCHESTRATOR_PYTHON:-$home/hermes-agent/venv/bin/python}}"
 script="${QUAY_ORCHESTRATOR_SCRIPT:-${BRIX_ORCHESTRATOR_SCRIPT:-$home/hermes-agent/ops/quay_orchestrator.py}}"
+auth_helper="${HERMES_QUAY_GITHUB_AUTH:-$home/hermes-agent/ops/quay-github-auth}"
 
 if [[ ! -x "$py" ]]; then
   py="python3"
+fi
+
+if [[ ! -f "$auth_helper" ]]; then
+  auth_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/quay-github-auth"
+fi
+if [[ ! -f "$auth_helper" ]]; then
+  printf '[quay-orchestrator-runner] WARN: GitHub auth helper not found; checked HERMES_QUAY_GITHUB_AUTH and %s; continuing without worker GitHub token\n' "$auth_helper" >&2
+else
+  quay_auth_log_prefix="quay-orchestrator-runner"
+  # shellcheck source=ops/quay-github-auth
+  source "$auth_helper"
+  quay_prepare_worker_github_auth optional || true
 fi
 
 exec "$py" "$script" drain-one --config "$config" --park-human-waits "$@"

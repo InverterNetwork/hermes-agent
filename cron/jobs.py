@@ -195,6 +195,32 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def _normalize_secrets_list(secrets: Optional[Any] = None) -> List[str]:
+    """Normalize a job's declared injectable-secret names (BRIX-1870).
+
+    Accepts a single string or an iterable of names; strips blanks and
+    de-dupes preserving first-occurrence order. This is the JOB gate
+    (declaration) only — it says which secrets the script WANTS. Actual
+    injection additionally requires the name to be in the operator's
+    ``cron.injectable_secrets`` allowlist and off the hard floor (enforced at
+    run time in ``cron.scheduler``), so no validation against a secret list
+    happens here.
+    """
+    if secrets is None:
+        raw_items: List[Any] = []
+    elif isinstance(secrets, str):
+        raw_items = [secrets]
+    else:
+        raw_items = list(secrets)
+
+    normalized: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
@@ -240,6 +266,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
     normalized["prompt"] = prompt
+    normalized["secrets"] = _normalize_secrets_list(normalized.get("secrets"))
 
     name = _coerce_job_text(normalized.get("name")).strip()
     if not name:
@@ -865,6 +892,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    secrets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -909,6 +937,13 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        secrets: Optional list of secret env-var names the job's ``script``
+                needs (BRIX-1870). This is the DECLARATION gate — dev-editable
+                and PR-reviewed. At run time only names that are ALSO in the
+                operator ``cron.injectable_secrets`` allowlist (and off the
+                never-injectable hard floor) are injected into the script's
+                otherwise-stripped environment; everything else stays stripped.
+                Stored on the job even when empty for shape stability.
 
     Returns:
         The created job dict
@@ -940,6 +975,7 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_secrets = _normalize_secrets_list(secrets)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -985,6 +1021,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "secrets": normalized_secrets,
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -1114,6 +1151,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            if "secrets" in updates:
+                updated["secrets"] = _normalize_secrets_list(updated.get("secrets"))
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]

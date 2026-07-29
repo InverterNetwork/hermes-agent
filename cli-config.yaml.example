@@ -953,6 +953,30 @@ code_execution:
   max_tool_calls: 50   # Max RPC tool calls per execution (default: 50)
 
 # =============================================================================
+# Cron / Scheduled Jobs
+# =============================================================================
+# cron:
+#   script_timeout_seconds: 120   # Max seconds a cron pre-run / no_agent script may run (default: 120).
+#   mirror_delivery: false        # Mirror cron deliveries into the target chat's session transcript (default: false).
+#
+#   # OPERATOR ALLOWLIST for declarative cron secret injection.
+#   # no_agent cron scripts run with every Hermes-managed secret STRIPPED from
+#   # their environment (SECURITY.md §2.3). This is the platform AUTHORIZATION
+#   # gate: a secret is injected into a script ONLY when its name is BOTH listed
+#   # here AND declared on the job (`secrets: [...]` in jobs.json). The value is
+#   # sourced from the gateway environment (staged auth/*.env / ~/.hermes/.env),
+#   # so a token already configured for the gateway is provisioned once and
+#   # reused freely — just add its name below.
+#   #
+#   # Hard floor: GitHub tokens, provider/model API keys, the Slack APP token and
+#   # signing secret, dashboard/session tokens, and other-platform bot tokens can
+#   # NEVER be injected even if listed here. Only SLACK_BOT_TOKEN is eligible
+#   # among the always-stripped secrets. A declared-but-unauthorized name is
+#   # logged and skipped, never silently granted.
+#   injectable_secrets:
+#     - SLACK_BOT_TOKEN
+
+# =============================================================================
 # Subagent Delegation
 # =============================================================================
 # The delegate_task tool spawns child agents with isolated context.

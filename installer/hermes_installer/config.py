@@ -3,6 +3,7 @@
 ``required_runtime_managers`` walks ``repos[].quay.package_manager`` and
 returns the matching ``quay.runtime_managers.<name>`` pins, failing loud
 with an actionable diagnostic when a declared manager has no pin block.
+``required_quay_toolchain`` returns Quay host-level worker tools (anvil, ...).
 ``required_codex_pin`` does the same for the Codex CLI, but only when setup is
 provisioning Quay's standard local agent CLI set, or Atlas is enabled in
 ``codex-exec`` mode.
@@ -108,6 +109,33 @@ def required_runtime_managers(values: dict[str, Any]) -> dict[str, RuntimeManage
     return out
 
 
+def required_quay_toolchain(values: dict[str, Any]) -> dict[str, RuntimeManagerPin]:
+    """Return host-level tools Quay workers need when Quay is enabled.
+
+    These are not package managers declared by a repo's bootstrap command.
+    They are substrate tools the worker runtime itself must make available on
+    ``PATH`` for task tests, such as Foundry's ``anvil`` for fork tests.
+    """
+    quay_block = values.get("quay") or {}
+    if not isinstance(quay_block, dict):
+        return {}
+    version = quay_block.get("version")
+    if not isinstance(version, str) or not version:
+        return {}
+
+    toolchain_raw = quay_block.get("toolchain")
+    toolchain = toolchain_raw if isinstance(toolchain_raw, dict) else {}
+    return _pins_from_block(
+        toolchain,
+        requested={"anvil"},
+        path="quay.toolchain",
+        missing_message=(
+            "quay.version is set, but the Quay worker toolchain is missing "
+            "usable pins:"
+        ),
+    )
+
+
 def required_codex_pin(values: dict[str, Any], *, force: bool = False) -> CodexPin | None:
     """Return the Codex CLI pin when Atlas or live Quay config requires Codex.
 
@@ -144,6 +172,50 @@ def required_codex_pin(values: dict[str, Any], *, force: bool = False) -> CodexP
             + "\n".join(f"  - {item}" for item in invalid)
         )
     return CodexPin(version=version, linux_x64_sha256=sha.lower())
+
+
+def _pins_from_block(
+    block: dict[str, Any],
+    *,
+    requested: set[str],
+    path: str,
+    missing_message: str,
+) -> dict[str, RuntimeManagerPin]:
+    out: dict[str, RuntimeManagerPin] = {}
+    missing: list[str] = []
+    invalid: list[str] = []
+    for name in sorted(requested):
+        spec = block.get(name)
+        if not isinstance(spec, dict):
+            missing.append(name)
+            continue
+        version = spec.get("version")
+        sha = spec.get("linux_x64_sha256")
+        if not isinstance(version, str) or not version:
+            invalid.append(f"{name}: missing or non-string `version`")
+            continue
+        if not isinstance(sha, str) or len(sha) != 64:
+            invalid.append(f"{name}: `linux_x64_sha256` must be a 64-char hex string")
+            continue
+        try:
+            int(sha, 16)
+        except ValueError:
+            invalid.append(f"{name}: `linux_x64_sha256` must be a 64-char hex string")
+            continue
+        out[name] = RuntimeManagerPin(name=name, version=version, linux_x64_sha256=sha.lower())
+
+    if missing or invalid:
+        lines = [missing_message]
+        for n in missing:
+            lines.append(
+                f"  - {n}: add {path}.{n}.{{version, linux_x64_sha256}} "
+                "to deploy.values.yaml"
+            )
+        for d in invalid:
+            lines.append(f"  - {d}")
+        fail("\n".join(lines))
+
+    return out
 
 
 def _atlas_codex_active(values: dict[str, Any]) -> bool:

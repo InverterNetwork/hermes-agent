@@ -1,4 +1,4 @@
-"""Pinned-binary install machinery for runtime managers (bun, pnpm, ...).
+"""Pinned-binary install machinery for runtime managers and worker tools.
 
 Each entry in ``_RECIPES`` knows how to turn a version pin into a download
 URL and how to extract the executable from the downloaded asset. Two
@@ -6,6 +6,8 @@ archive kinds are supported:
 
 * ``"zip"`` — upstream ships a zip (bun); ``archive_member`` is the path
   inside the zip to the executable to install.
+* ``"tar.gz"`` — upstream ships a tarball (Foundry); ``archive_member`` is
+  the path inside the tarball to the executable to install.
 * ``"binary"`` — upstream ships the executable directly (pnpm); the
   downloaded file IS the install target.
 
@@ -23,6 +25,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
@@ -35,15 +38,15 @@ from .config import RuntimeManagerPin
 from .util import fail, info
 
 
-ArchiveKind = Literal["zip", "binary"]
-_ARCHIVE_KINDS: frozenset[str] = frozenset({"zip", "binary"})
+ArchiveKind = Literal["zip", "tar.gz", "binary"]
+_ARCHIVE_KINDS: frozenset[str] = frozenset({"zip", "tar.gz", "binary"})
 
 
 @dataclass(frozen=True)
 class _Recipe:
     url_template: str  # uses {version}; pinned to the linux x86_64 asset
     archive_kind: ArchiveKind = "zip"
-    # Path inside the zip to the executable; required for ``archive_kind="zip"``
+    # Path inside the archive to the executable; required for archive kinds
     # and must be ``None`` for ``archive_kind="binary"`` (the downloaded file
     # IS the install target).
     archive_member: str | None = None
@@ -57,9 +60,10 @@ class _Recipe:
                 f"archive_kind={self.archive_kind!r} is not one of "
                 f"{sorted(_ARCHIVE_KINDS)}"
             )
-        if self.archive_kind == "zip" and not self.archive_member:
+        if self.archive_kind in {"zip", "tar.gz"} and not self.archive_member:
             raise ValueError(
-                "zip recipe requires `archive_member` (path inside the zip)"
+                f"{self.archive_kind} recipe requires `archive_member` "
+                "(path inside the archive)"
             )
         if self.archive_kind == "binary" and self.archive_member is not None:
             raise ValueError(
@@ -82,6 +86,14 @@ _RECIPES: dict[str, _Recipe] = {
             "v{version}/pnpm-linux-x64"
         ),
         archive_kind="binary",
+    ),
+    "anvil": _Recipe(
+        url_template=(
+            "https://github.com/foundry-rs/foundry/releases/download/"
+            "v{version}/foundry_v{version}_linux_amd64.tar.gz"
+        ),
+        archive_kind="tar.gz",
+        archive_member="anvil",
     ),
 }
 
@@ -123,7 +135,8 @@ def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
 
     with tempfile.TemporaryDirectory(prefix=f"hermes-{pin.name}-") as tmp_str:
         tmp = Path(tmp_str)
-        suffix = ".zip" if recipe.archive_kind == "zip" else ""
+        suffix_by_kind = {"zip": ".zip", "tar.gz": ".tar.gz", "binary": ""}
+        suffix = suffix_by_kind[recipe.archive_kind]
         download_path = tmp / f"{pin.name}{suffix}"
         try:
             urllib.request.urlretrieve(url, download_path)
@@ -142,6 +155,10 @@ def ensure_runtime(pin: RuntimeManagerPin, install_path: Path) -> None:
         if recipe.archive_kind == "zip":
             source_path = _extract_zip_member(
                 pin=pin, recipe=recipe, zip_path=download_path, tmp=tmp,
+            )
+        elif recipe.archive_kind == "tar.gz":
+            source_path = _extract_tar_member(
+                pin=pin, recipe=recipe, tar_path=download_path, tmp=tmp,
             )
         elif recipe.archive_kind == "binary":
             source_path = download_path
@@ -185,6 +202,43 @@ def _extract_zip_member(
             f"{recipe.archive_member!r} missing after extract"
         )
     return member_path
+
+
+def _extract_tar_member(
+    *,
+    pin: RuntimeManagerPin,
+    recipe: _Recipe,
+    tar_path: Path,
+    tmp: Path,
+) -> Path:
+    extract_dir = tmp / "extract"
+    extract_dir.mkdir()
+    assert recipe.archive_member is not None  # validated in _Recipe.__post_init__
+    out_path = extract_dir / Path(recipe.archive_member).name
+    try:
+        with tarfile.open(tar_path, "r:gz") as tf:
+            member = tf.getmember(recipe.archive_member)
+            if not member.isfile():
+                fail(
+                    f"{pin.name} {pin.version}: archive member "
+                    f"{recipe.archive_member!r} is not a regular file"
+                )
+            src = tf.extractfile(member)
+            if src is None:
+                fail(
+                    f"{pin.name} {pin.version}: archive member "
+                    f"{recipe.archive_member!r} unreadable"
+                )
+            with src, out_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+    except KeyError:
+        fail(
+            f"{pin.name} {pin.version}: archive member "
+            f"{recipe.archive_member!r} missing after extract"
+        )
+    except tarfile.TarError as exc:
+        fail(f"{pin.name} {pin.version}: not a valid tar.gz ({exc})")
+    return out_path
 
 
 def _atomic_install(src: Path, dst: Path) -> None:

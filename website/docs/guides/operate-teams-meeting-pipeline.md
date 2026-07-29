@@ -54,7 +54,7 @@ You MUST run `maintain-subscriptions` on a schedule. Pick one of these three opt
 
 #### Option 1: Hermes cron (recommended if you already run the Hermes gateway)
 
-Hermes ships a built-in cron scheduler. The `--no-agent` mode runs a script as the job (rather than using an LLM), and `--script` must point at a file under `~/.hermes/scripts/`. First create the script:
+Hermes ships a built-in cron scheduler. The `--no-agent` mode runs a script as the job (rather than using an LLM), and `--script` must point at a file under `~/.hermes/scripts/`. On managed installs that directory is backed by `~/.hermes/state/scripts/`. First create the script:
 
 ```bash
 mkdir -p ~/.hermes/scripts
