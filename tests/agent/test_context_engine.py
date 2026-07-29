@@ -120,6 +120,16 @@ class TestDefaults:
         assert status["threshold_tokens"] == 100000
         assert 0 < status["usage_percent"] <= 100
 
+    def test_default_get_status_clamps_post_compression_sentinel(self):
+        """After a compression, last_prompt_tokens is the -1 sentinel. get_status
+        must clamp it to 0 rather than export a raw -1 or a negative
+        usage_percent on the transitional turn."""
+        engine = StubEngine()
+        engine.last_prompt_tokens = -1
+        status = engine.get_status()
+        assert status["last_prompt_tokens"] == 0
+        assert status["usage_percent"] >= 0
+
     def test_on_session_reset(self):
         engine = StubEngine()
         engine.last_prompt_tokens = 999
@@ -170,6 +180,21 @@ class TestStubEngine:
         engine.update_from_response({"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200})
         assert engine.last_prompt_tokens == 1000
         assert engine.last_completion_tokens == 200
+
+    def test_prune_tool_results_only_defaults_to_safe_noop(self):
+        # An engine implementing only the required interface (no prune override)
+        # must inherit the base no-op instead of raising AttributeError: the
+        # agent loop calls prune_tool_results_only() on the active engine after a
+        # tool call whenever full compression does not fire, so every pluggable
+        # ContextEngine reaches this path (see conversation_loop proactive-prune).
+        engine = StubEngine()
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        result, pruned = engine.prune_tool_results_only(msgs, current_tokens=10_000_000)
+        assert pruned == 0
+        assert result is msgs
 
 
 # ---------------------------------------------------------------------------

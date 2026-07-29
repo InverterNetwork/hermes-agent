@@ -2,11 +2,14 @@ name: Lint (ruff + ty)
 
 # Two things here:
 #   1. Advisory diff — ruff + ty diagnostics as a diff vs the target branch.
-#      Posts a Markdown summary and a PR comment. Exit zero always.
+#      Writes a Markdown summary to the run page. Exit zero always.
 #   2. Blocking ``ruff check .`` — enforces the explicit rules in
 #      ``[tool.ruff.lint.select]`` (currently PLW1514). Failure blocks merge.
-#      Separate job so the advisory diff still runs and posts even when
-#      enforcement fails.
+#      Separate job so the advisory diff still runs even when enforcement
+#      fails.
+#
+# CI-sensitive file review was previously here as a ``ci-review`` job but
+# has moved to ``review-labels.yml`` so it can be rerun independently.
 
 on:
   workflow_call:
@@ -18,7 +21,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write # needed to post/update PR comments
 
 concurrency:
   group: lint-${{ github.ref }}
@@ -98,6 +100,8 @@ jobs:
           echo "base ty:   $(wc -c < .lint-reports/base/ty.json) bytes"
 
       - name: Generate diff summary
+        env:
+          HEAD_REF: ${{ inputs.event_name == 'pull_request' && github.head_ref || github.ref_name }}
         run: |
           python scripts/lint_diff.py \
             --base-ruff .lint-reports/base/ruff.json \
@@ -105,49 +109,9 @@ jobs:
             --base-ty   .lint-reports/base/ty.json \
             --head-ty   .lint-reports/head/ty.json \
             --base-ref  "${{ steps.base.outputs.ref }}" \
-            --head-ref  "${{ inputs.event_name == 'pull_request' && github.head_ref || github.ref_name }}" \
+            --head-ref  "$HEAD_REF" \
             --output    .lint-reports/summary.md
           cat .lint-reports/summary.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload reports as artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: lint-reports
-          path: .lint-reports/
-          retention-days: 14
-
-      - name: Post / update PR comment
-        if: inputs.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('.lint-reports/summary.md', 'utf8');
-            const marker = '<!-- lint-diff-summary -->';
-            const fullBody = marker + '\n' + body;
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                comment_id: existing.id,
-                body: fullBody,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo:  context.repo.repo,
-                issue_number: context.issue.number,
-                body: fullBody,
-              });
-            }
 
   ruff-blocking:
     # Enforce the rules in pyproject.toml [tool.ruff.lint.select]. Currently

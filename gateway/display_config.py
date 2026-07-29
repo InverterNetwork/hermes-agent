@@ -47,16 +47,27 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
-    # Gateway status callbacks emitted by agent lifecycle plumbing. Values:
-    # "all" = deliver lifecycle + warning statuses; "warn" = warnings only;
-    # "off" = suppress both. Booleans map to all/off for YAML convenience.
-    "status_callbacks": "all",
+    # Whether busy_input_mode=steer sends a visible "Steered into current run"
+    # acknowledgment after successfully injecting the user's mid-turn message.
+    # Disable when the platform should steer silently (the text still lands in
+    # the active run; only the confirmation echo is suppressed).
+    "busy_steer_ack_enabled": True,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Live working-state status on platforms whose typing indicator renders
+    # text (Slack's assistant status line). Values:
+    #   "full" / true  -> verb + argument preview ("is running pytest…")
+    #   "verb"         -> verb only ("is running…") — keeps file paths and
+    #                     commands out of shared channels
+    #   "off" / false  -> static text (typing_status_text or "is thinking...")
+    # Independent of tool_progress: works even when progress bubbles are off
+    # (Slack's default), and costs no extra API calls — the existing typing
+    # refresh cadence just renders different text.
+    "live_status": "full",
 }
 
 # ---------------------------------------------------------------------------
@@ -133,9 +144,12 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
     # "new"/"all" spam permanent lines in channels (hermes-agent#14663).
-    # Lifecycle status callbacks are warnings-only by default so compression
-    # and retry breadcrumbs do not leak into public Slack threads.
-    "slack":           {**_TIER_MEDIUM, "tool_progress": "off", "status_callbacks": "warn"},
+    "slack":           {
+        **_TIER_MEDIUM,
+        "tool_progress": "off",
+        "long_running_notifications": False,
+        "busy_ack_detail": False,
+    },
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
     "feishu":          _TIER_MEDIUM,
@@ -149,6 +163,13 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # status update as a separate message. Promote to TIER_MEDIUM once
     # Cloud's edit_message lands.
     "whatsapp_cloud":  _TIER_LOW,
+    # Photon (managed iMessage over the gRPC sidecar) and BlueBubbles are both
+    # permanent-message iMessage inboxes with no message-edit support, so both
+    # stay TIER_LOW. This keeps tool progress, interim scratch commentary,
+    # "still working" heartbeats, and busy-ack iteration detail out of the
+    # user's iMessage thread. Without this entry Photon inherited the noisy
+    # global ("all") defaults and compacted/narrated on nearly every turn.
+    "photon":          _TIER_LOW,
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,
@@ -243,46 +264,43 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         if value is True:
             return "all"
-        return str(value).lower()
-    if setting == "status_callbacks":
-        if value is False:
+        val = str(value).strip().lower()
+        if val in {"false", "0", "no"}:
             return "off"
-        if value is True:
+        if val in {"true", "1", "yes", "on"}:
             return "all"
-        normalised = str(value).strip().lower().replace("-", "_")
-        aliases = {
-            "": "all",
-            "true": "all",
-            "yes": "all",
-            "on": "all",
-            "1": "all",
-            "all": "all",
-            "false": "off",
-            "no": "off",
-            "off": "off",
-            "0": "off",
-            "none": "off",
-            "warn": "warn",
-            "warning": "warn",
-            "warnings": "warn",
-            "warn_only": "warn",
-            "warnings_only": "warn",
-        }
-        return aliases.get(normalised, "all")
+        return val if val in {"off", "new", "all", "verbose", "log"} else "all"
     if setting in {
         "show_reasoning",
         "streaming",
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "busy_steer_ack_enabled",
+        "thinking_progress",
     }:
         if isinstance(value, str):
-            return value.lower() in {"true", "1", "yes", "on"}
+            val = value.strip().lower()
+            if val == "generic" and setting == "long_running_notifications":
+                return "generic"
+            return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
     if setting == "cleanup_progress":
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
+    if setting == "live_status":
+        # Tri-state: "full" (verb + preview), "verb" (verb only), "off".
+        if value is True:
+            return "full"
+        if value is False:
+            return "off"
+        val = str(value).strip().lower()
+        if val in {"true", "1", "yes", "on", "all"}:
+            return "full"
+        if val in {"false", "0", "no"}:
+            return "off"
+        return val if val in {"full", "verb", "off"} else "full"
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"
