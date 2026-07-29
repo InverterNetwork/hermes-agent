@@ -69,6 +69,7 @@ class _State:
     quay_runner: str
     quay_profile: str
     atlas_bin: str
+    gws_bin: str
     atlas_wrapper: str
     atlas_profile: str
     runtime_dir: str
@@ -1153,12 +1154,8 @@ def _atlas_kb_root(s: _State) -> Path:
     return s.args.target / path
 
 
-def _atlas_google_service_account_file(s: _State) -> Path | None:
-    raw = _values_get(
-        s.values_file,
-        s.values_helper,
-        "atlas.google_docs.service_account_file",
-    )
+def _atlas_google_path(s: _State, key: str) -> Path | None:
+    raw = _values_get(s.values_file, s.values_helper, key)
     if not raw:
         return None
     if raw.startswith("${HERMES_HOME}/"):
@@ -1169,6 +1166,125 @@ def _atlas_google_service_account_file(s: _State) -> Path | None:
     if path.is_absolute():
         return path
     return s.args.target / path
+
+
+def _gws_expected_sha_file(target: Path) -> Path:
+    return (
+        target
+        / "hermes-agent"
+        / "installer"
+        / ".state"
+        / "gws"
+        / "SHA256SUM.expected"
+    )
+
+
+def _check_gws_binary_sha256(s: _State, gws_bin: Path) -> bool:
+    expected_file = _gws_expected_sha_file(s.args.target)
+    if not expected_file.is_file():
+        s.v_drift("gws binary SHA256", f"missing expected hash: {expected_file}")
+        return False
+    _check_mode_owner(
+        s, "gws SHA256SUM.expected", _stat_info(expected_file), "644", s.rails_owner,
+    )
+    expected = _read_expected_sha256(expected_file)
+    if not expected:
+        s.v_drift("gws binary SHA256", f"invalid expected hash in {expected_file}")
+        return False
+    actual = _sha256(gws_bin)
+    if not actual:
+        s.v_drift("gws binary SHA256", f"could not read {gws_bin}")
+        return False
+    elif actual == expected:
+        s.v_ok(f"gws binary SHA256: {actual}")
+        return True
+    else:
+        s.v_drift("gws binary SHA256", f"got {actual} (expected {expected})")
+        return False
+
+
+def _has_legacy_atlas_google_auth(text: str) -> bool:
+    return (
+        "ATLAS_GOOGLE_SERVICE_ACCOUNT_" in text
+        or "ATLAS_GOOGLE_ACCESS_TOKEN=" in text
+    )
+
+
+def _check_atlas_gws(s: _State, runtime_env_text: str | None) -> None:
+    version = _values_get(s.values_file, s.values_helper, "atlas.google_docs.gws_version")
+    gws_bin = Path(s.gws_bin)
+    info = _executable_info(gws_bin)
+    if info is None:
+        s.v_drift("gws binary", f"missing or non-executable: {gws_bin}")
+    else:
+        _check_mode_owner(s, "gws binary", info, "755", s.rails_owner)
+        if _check_gws_binary_sha256(s, gws_bin):
+            actual = _first_stdout_line([str(gws_bin), "--version"])
+            if version and re.search(rf"(?:^|\s){re.escape(version)}(?:\s|$)", actual or ""):
+                s.v_ok(f"gws binary version: {actual}")
+            else:
+                s.v_drift("gws binary version", f"got '{actual or '?'}' (expected {version or 'configured version'})")
+
+    credentials = _atlas_google_path(s, "atlas.google_docs.credentials_file")
+    cache_dir = _atlas_google_path(s, "atlas.google_docs.cache_dir")
+    if runtime_env_text is not None:
+        expected_lines = [f"ATLAS_GWS_BIN={gws_bin}"]
+        if credentials is not None:
+            expected_lines.append(f"GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE={credentials}")
+        if cache_dir is not None:
+            expected_lines.append(f"GOOGLE_WORKSPACE_CLI_CONFIG_DIR={cache_dir}")
+        for line in expected_lines:
+            if line in runtime_env_text:
+                s.v_ok(f"Atlas gws runtime env: {line.split('=', 1)[0]}")
+            else:
+                s.v_drift("Atlas gws runtime env", f"missing {line}")
+    legacy_sources: list[str] = []
+    if runtime_env_text is not None and _has_legacy_atlas_google_auth(runtime_env_text):
+        legacy_sources.append("atlas-runtime.env")
+    managed_env_paths = {
+        "atlas.env": s.args.target / "auth" / "atlas.env",
+        "atlas-as-hermes": Path(s.atlas_wrapper),
+        "atlas profile.d": Path(s.atlas_profile),
+        "atlas-hub.service": Path(s.systemd_dir) / "atlas-hub.service",
+    }
+    for label, path in managed_env_paths.items():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if _has_legacy_atlas_google_auth(text):
+            legacy_sources.append(label)
+    if legacy_sources:
+        s.v_drift(
+            "Atlas legacy Google auth env",
+            f"service-account/access-token wiring remains in {', '.join(legacy_sources)}",
+        )
+    else:
+        s.v_ok("Atlas legacy Google auth env absent")
+
+    if credentials is None:
+        s.v_drift("Atlas gws credential", "atlas.google_docs.credentials_file is unset")
+    else:
+        _check_mode_owner(s, "Atlas gws credential", _stat_info(credentials), "640", s.rails_owner, s.agent_group)
+        try:
+            payload = json.loads(credentials.read_text(encoding="utf-8"))
+            valid = payload.get("type") == "authorized_user" and all(
+                isinstance(payload.get(key), str) and payload[key]
+                for key in ("client_id", "client_secret", "refresh_token")
+            )
+        except (OSError, ValueError, AttributeError):
+            valid = False
+        if valid:
+            s.v_ok("Atlas gws authorized-user credential shape")
+        else:
+            s.v_drift("Atlas gws authorized-user credential shape", "invalid or incomplete JSON")
+
+    if cache_dir is None:
+        s.v_drift("Atlas gws cache", "atlas.google_docs.cache_dir is unset")
+    elif not cache_dir.is_dir():
+        s.v_drift("Atlas gws cache", f"missing or not a directory: {cache_dir}")
+    else:
+        _check_mode_owner(s, "Atlas gws cache", _stat_info(cache_dir), "700", s.agent_owner, s.agent_group)
 
 
 def _atlas_expected_credential_helper(s: _State) -> str:
@@ -1335,34 +1451,16 @@ def _check_atlas_artefacts(s: _State, *, app_auth_expected: bool) -> None:
     runtime_env_info = _stat_info(runtime_env)
     if runtime_env_info is None:
         s.v_drift("Atlas runtime env", f"missing: {runtime_env}")
-        runtime_env_text = ""
+        runtime_env_text = None
     else:
         _check_mode_owner(s, "Atlas runtime env", runtime_env_info, "640", s.rails_owner)
         try:
             runtime_env_text = runtime_env.read_text(encoding="utf-8")
         except OSError as exc:
             s.v_drift("Atlas runtime env", f"unreadable: {exc}")
-            runtime_env_text = ""
+            runtime_env_text = None
 
-    google_sa_file = _atlas_google_service_account_file(s)
-    if google_sa_file is not None:
-        expected_line = f"ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE={google_sa_file}"
-        if expected_line in runtime_env_text:
-            s.v_ok("Atlas Google Docs service account env")
-        elif runtime_env_text:
-            s.v_drift("Atlas Google Docs service account env", f"missing {expected_line}")
-
-        google_sa_info = _stat_info(google_sa_file)
-        if google_sa_info is None:
-            s.v_drift("Atlas Google Docs service account file", f"missing: {google_sa_file}")
-        else:
-            _check_mode_owner(
-                s,
-                "Atlas Google Docs service account file",
-                google_sa_info,
-                "640",
-                s.rails_owner,
-            )
+    _check_atlas_gws(s, runtime_env_text)
 
     kb_root = _atlas_kb_root(s)
     kb_repo = _values_get(s.values_file, s.values_helper, "atlas.kb_repo")
@@ -2831,6 +2929,7 @@ def run(
         quay_runner=os.environ.get("HERMES_VERIFY_QUAY_RUNNER") or "/usr/local/sbin/quay-tick-runner",
         quay_profile=os.environ.get("HERMES_VERIFY_QUAY_PROFILE") or "/etc/profile.d/quay-data-dir.sh",
         atlas_bin=os.environ.get("HERMES_VERIFY_ATLAS_BIN") or "/usr/local/bin/atlas",
+        gws_bin=os.environ.get("HERMES_VERIFY_GWS_BIN") or "/usr/local/bin/gws",
         atlas_wrapper=os.environ.get("HERMES_VERIFY_ATLAS_WRAPPER") or "/usr/local/bin/atlas-as-hermes",
         atlas_profile=os.environ.get("HERMES_VERIFY_ATLAS_PROFILE") or "/etc/profile.d/atlas-env.sh",
         runtime_dir=os.environ.get("HERMES_VERIFY_RUNTIME_DIR") or "/usr/local/bin",
