@@ -2041,12 +2041,12 @@ def _check_systemd(s: _State) -> None:
         s.values_helper,
         "atlas.source_sync.enabled",
     ) == "true":
-        for _atlas_timer in (
+        _atlas_timers = (
             "atlas-source-sync.timer",
             "atlas-source-sync-full.timer",
-        ):
-            if (Path(s.systemd_dir) / _atlas_timer).is_file():
-                timers.append(_atlas_timer)
+        )
+        if any((Path(s.systemd_dir) / timer).is_file() for timer in _atlas_timers):
+            timers.extend(_atlas_timers)
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
         # systemctl emits properties in its own (alphabetical) order, not
