@@ -42,6 +42,7 @@ Usage:
 
     hermes claw migrate --dry-run  # Preview migration without changes
 """
+
 # IMPORTANT: hermes_bootstrap must be the very first import — it sets up
 # UTF-8 stdio on Windows so print()/subprocess children don't hit
 # UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
@@ -71,6 +72,10 @@ suppress_platform_ver_console()
 
 import os
 import sys
+
+# The managed render-target source tree is root-owned and read-only for the
+# runtime user, so imports must not try to create adjacent __pycache__ files.
+sys.dont_write_bytecode = True
 
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
