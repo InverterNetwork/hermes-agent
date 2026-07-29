@@ -340,6 +340,7 @@ VALUES_HELPER="$FORK_DIR/installer/values_helper.py"
   || { echo "values helper missing at $VALUES_HELPER" >&2; exit 1; }
 
 ATLAS_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.version 2>/dev/null || true)"
+ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.google_docs.minimum_atlas_version 2>/dev/null || true)"
 ATLAS_ENABLED=0
 ATLAS_HUB_ENABLED=0
 ATLAS_SOURCE_SYNC_ENABLED=0
@@ -363,6 +364,11 @@ if [[ "$ATLAS_ENABLED" -eq 1 && "$AUTH_METHOD" != "app" ]]; then
   echo "FAIL: atlas.version is set but --auth-method app was not passed." >&2
   echo "      Atlas uses the Atlas manager GitHub App for release downloads and atlas-kb git auth." >&2
   exit 2
+fi
+
+if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
+  python3 "$FORK_DIR/installer/check_atlas_gws_version.py" \
+    "$ATLAS_VERSION" "$ATLAS_GOOGLE_DOCS_MIN_ATLAS_VERSION"
 fi
 
 if [[ "$ATLAS_SOURCE_SYNC_ENABLED" -eq 1 && "$ATLAS_ENABLED" -ne 1 ]]; then
@@ -781,7 +787,7 @@ find "$TARGET_DIR/hermes-agent/venv/bin" -type f -exec chmod 755 {} +
 #   github-app.pem      — the GitHub App private key (mode 0640, root:hermes)
 #   github-app.env      — config consumed by hermes_github_token.py
 #   atlas.env           — Atlas runtime secrets such as GITBOOK_API_TOKEN
-#   atlas-runtime.env   — values-derived Atlas env such as Google Docs SA path
+#   atlas-runtime.env   — values-derived Atlas env such as gws auth/cache paths
 #   gateway-runtime.env — non-secret env vars derived from deploy.values.yaml
 #                         (SLACK_ALLOWED_USERS, …). Rewritten every run so
 #                         values.yaml stays the single source of truth.
@@ -1297,11 +1303,15 @@ ATLAS_HUB_QUERY_CONCURRENCY=""
 ATLAS_CODEX_BIN=""
 ATLAS_CODEX_TIMEOUT_MS=""
 ATLAS_SYNC_SOURCE_NAMES=""
-ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE=""
+ATLAS_GWS_CREDENTIALS_FILE=""
+ATLAS_GWS_CACHE_DIR=""
+GWS_BIN_DST="/usr/local/bin/gws"
+GWS_EXPECTED_SHA_DIR="$TARGET_DIR/hermes-agent/installer/.state/gws"
+GWS_EXPECTED_SHA_DST="$GWS_EXPECTED_SHA_DIR/SHA256SUM.expected"
 if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   case "$(uname -m)" in
-    x86_64)  ATLAS_ARCH="amd64" ;;
-    aarch64) ATLAS_ARCH="arm64" ;;
+    x86_64)  ATLAS_ARCH="amd64"; GWS_ARCH="x86_64"; GWS_SHA_KEY="x86_64_linux_gnu" ;;
+    aarch64) ATLAS_ARCH="arm64"; GWS_ARCH="aarch64"; GWS_SHA_KEY="aarch64_linux_gnu" ;;
     *) echo "FAIL: unsupported architecture $(uname -m); Atlas ships amd64/arm64 Linux only" >&2; exit 1 ;;
   esac
 
@@ -1344,6 +1354,25 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   rm -rf "$ATLAS_TMP"
   trap - EXIT
 
+  GWS_VERSION="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.google_docs.gws_version 2>/dev/null || true)"
+  GWS_RELEASE_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.google_docs.gws_release_repo 2>/dev/null || true)"
+  GWS_RELEASE_REPO="${GWS_RELEASE_REPO:-googleworkspace/cli}"
+  GWS_EXPECTED_SHA="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.google_docs.gws_sha256.$GWS_SHA_KEY" 2>/dev/null || true)"
+  [[ "$GWS_VERSION" == "0.22.5" ]] \
+    || { echo "FAIL: atlas.google_docs.gws_version must be exactly 0.22.5 (got: ${GWS_VERSION:-unset})" >&2; exit 1; }
+  [[ "$GWS_RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || { echo "FAIL: atlas.google_docs.gws_release_repo must be a GitHub owner/repo slug" >&2; exit 1; }
+  [[ "$GWS_EXPECTED_SHA" =~ ^[a-f0-9]{64}$ ]] \
+    || { echo "FAIL: atlas.google_docs.gws_sha256.$GWS_SHA_KEY must be a lowercase SHA-256" >&2; exit 1; }
+  echo "==> installing gws ${GWS_VERSION} (${GWS_ARCH}) to $GWS_BIN_DST"
+  bash "$FORK_DIR/installer/install-gws-release" \
+    --version "$GWS_VERSION" \
+    --release-repo "$GWS_RELEASE_REPO" \
+    --arch "$GWS_ARCH" \
+    --expected-sha "$GWS_EXPECTED_SHA" \
+    --bin-dst "$GWS_BIN_DST" \
+    --expected-sha-dst "$GWS_EXPECTED_SHA_DST"
+
   ATLAS_KB_REPO="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.kb_repo 2>/dev/null || true)"
   ATLAS_KB_REPO="${ATLAS_KB_REPO:-https://github.com/InverterNetwork/atlas-kb}"
   [[ "$ATLAS_KB_REPO" =~ ^https://github\.com/[^/]+/[^/]+$ ]] \
@@ -1363,32 +1392,73 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   ATLAS_AI_MODE="${ATLAS_AI_MODE:-codex-exec}"
   ATLAS_CONFIG="$TARGET_DIR/config/atlas.yaml"
   ATLAS_CACHE_DIR="$TARGET_DIR/cache/atlas"
-  ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.google_docs.service_account_file 2>/dev/null || true)"
-  if [[ -n "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" ]]; then
-    case "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" in
+  ATLAS_GWS_CREDENTIALS_FILE="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.google_docs.credentials_file 2>/dev/null || true)"
+  if [[ -n "$ATLAS_GWS_CREDENTIALS_FILE" ]]; then
+    case "$ATLAS_GWS_CREDENTIALS_FILE" in
       '${HERMES_HOME}'/*|'$HERMES_HOME'/*)
-        ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE="$TARGET_DIR/${ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE#*/}"
+        ATLAS_GWS_CREDENTIALS_FILE="$TARGET_DIR/${ATLAS_GWS_CREDENTIALS_FILE#*/}"
         ;;
       /*)
         ;;
       *)
-        ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE="$TARGET_DIR/$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE"
+        ATLAS_GWS_CREDENTIALS_FILE="$TARGET_DIR/$ATLAS_GWS_CREDENTIALS_FILE"
         ;;
     esac
-    case "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" in
-      "$TARGET_DIR"/*) ;;
+    ATLAS_GWS_CREDENTIALS_FILE="$(realpath -m -- "$ATLAS_GWS_CREDENTIALS_FILE")"
+    ATLAS_TARGET_REAL="$(realpath -m -- "$TARGET_DIR")"
+    ATLAS_AUTH_REAL="$(realpath -m -- "$AUTH_DIR")"
+    case "$ATLAS_GWS_CREDENTIALS_FILE" in
+      "$ATLAS_AUTH_REAL"/*) ;;
       *)
-        echo "FAIL: atlas.google_docs.service_account_file must resolve under $TARGET_DIR (got: $ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE)" >&2
+        echo "FAIL: atlas.google_docs.credentials_file must resolve under $AUTH_DIR" >&2
         exit 1
         ;;
     esac
-    [[ -f "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" ]] \
-      || { echo "FAIL: atlas.google_docs.service_account_file is configured but missing: $ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" >&2; exit 1; }
-    if [[ "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" == "$AUTH_DIR"/* ]]; then
-      chown root:"$AGENT_USER" "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE"
-      chmod 0640 "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE"
-    fi
+    [[ -f "$ATLAS_GWS_CREDENTIALS_FILE" && ! -L "$ATLAS_GWS_CREDENTIALS_FILE" ]] \
+      || { echo "FAIL: Atlas gws authorized-user credential must be a regular non-symlink file" >&2; exit 1; }
+    python3 - "$ATLAS_GWS_CREDENTIALS_FILE" "$AGENT_USER" <<'PY'
+import grp, json, os, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+except (OSError, ValueError):
+    raise SystemExit("FAIL: Atlas gws credential must be a readable regular file")
+with os.fdopen(fd, encoding="utf-8") as credential:
+    if not stat.S_ISREG(os.fstat(credential.fileno()).st_mode):
+        raise SystemExit("FAIL: Atlas gws credential must be a regular file")
+    try:
+        p = json.load(credential)
+    except (OSError, ValueError):
+        raise SystemExit("FAIL: Atlas gws credential must be valid authorized_user JSON")
+    required = ("client_id", "client_secret", "refresh_token")
+    if p.get("type") != "authorized_user" or any(not isinstance(p.get(k), str) or not p[k] for k in required):
+        raise SystemExit("FAIL: Atlas gws credential must be a complete authorized_user JSON")
+    os.fchown(credential.fileno(), 0, grp.getgrnam(sys.argv[2]).gr_gid)
+    os.fchmod(credential.fileno(), 0o640)
+PY
   fi
+  [[ -n "$ATLAS_GWS_CREDENTIALS_FILE" ]] \
+    || { echo "FAIL: atlas.google_docs.credentials_file is required" >&2; exit 1; }
+  ATLAS_GWS_CACHE_DIR="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.google_docs.cache_dir 2>/dev/null || true)"
+  ATLAS_GWS_CACHE_DIR="${ATLAS_GWS_CACHE_DIR:-cache/atlas-gws}"
+  case "$ATLAS_GWS_CACHE_DIR" in
+    '${HERMES_HOME}'/*|'$HERMES_HOME'/*)
+      ATLAS_GWS_CACHE_DIR="$TARGET_DIR/${ATLAS_GWS_CACHE_DIR#*/}"
+      ;;
+    /*)
+      ;;
+    *)
+      ATLAS_GWS_CACHE_DIR="$TARGET_DIR/$ATLAS_GWS_CACHE_DIR"
+      ;;
+  esac
+  ATLAS_GWS_CACHE_DIR="$(realpath -m -- "$ATLAS_GWS_CACHE_DIR")"
+  ATLAS_TARGET_REAL="${ATLAS_TARGET_REAL:-$(realpath -m -- "$TARGET_DIR")}"
+  case "$ATLAS_GWS_CACHE_DIR" in "$ATLAS_TARGET_REAL"/*) ;; *) echo "FAIL: atlas.google_docs.cache_dir must resolve under $TARGET_DIR" >&2; exit 1 ;; esac
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 -- "$TARGET_DIR/cache" "$ATLAS_CACHE_DIR"
+  sudo -u "$AGENT_USER" install -d -m 0700 -- "$ATLAS_GWS_CACHE_DIR"
+  [[ -d "$ATLAS_GWS_CACHE_DIR" && ! -L "$ATLAS_GWS_CACHE_DIR" ]] \
+    || { echo "FAIL: Atlas gws cache must be a real directory: $ATLAS_GWS_CACHE_DIR" >&2; exit 1; }
+  [[ "$(stat -Lc '%U:%G %a' -- "$ATLAS_GWS_CACHE_DIR")" == "$AGENT_USER:$AGENT_USER 700" ]] \
+    || { echo "FAIL: Atlas gws cache must be $AGENT_USER:$AGENT_USER 0700" >&2; exit 1; }
   if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
     ATLAS_HUB_HOST="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.hub.host 2>/dev/null || true)"
     ATLAS_HUB_HOST="${ATLAS_HUB_HOST:-127.0.0.1}"
@@ -1435,12 +1505,12 @@ EOF
   echo "==> rendering $ATLAS_RUNTIME_ENV from deploy.values.yaml"
   {
     printf '# Generated by setup-hermes.sh from deploy.values.yaml. Do not hand-edit.\n'
-    if [[ -n "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE" ]]; then
-      printf 'ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE=%s\n' "$ATLAS_GOOGLE_SERVICE_ACCOUNT_FILE"
-    fi
+    printf 'ATLAS_GWS_BIN=%s\n' "$GWS_BIN_DST"
+    printf 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=%s\n' "$ATLAS_GWS_CREDENTIALS_FILE"
+    printf 'GOOGLE_WORKSPACE_CLI_CONFIG_DIR=%s\n' "$ATLAS_GWS_CACHE_DIR"
   } | install -o root -g "$AGENT_USER" -m 0640 /dev/stdin "$ATLAS_RUNTIME_ENV"
 
-  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config" "$ATLAS_CACHE_DIR"
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$TARGET_DIR/config"
   if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
     install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$ATLAS_HUB_DATA_DIR"
     if [[ -f "$ATLAS_HUB_AUTH_FILE" && -f "$ATLAS_HUB_CLIENT_API_KEY_FILE" ]]; then
@@ -1521,23 +1591,61 @@ PY
           printf '    type: gitbook\n'
           printf '    space_id: "%s"\n' "$ATLAS_SOURCE_SPACE_ID"
           printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
+        elif [[ "$ATLAS_SOURCE_TYPE" == "slack" ]]; then
+          ATLAS_SOURCE_TOKEN_ENV="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.token_env" 2>/dev/null || true)"
+          ATLAS_SOURCE_VISIBILITY="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.visibility" 2>/dev/null || true)"
+          ATLAS_SOURCE_EPISODE_GAP="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.episode_gap_minutes" 2>/dev/null || true)"
+          ATLAS_SOURCE_CHANNEL_IDS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.channel_ids" --sep $'\n' 2>/dev/null || true)"
+          ATLAS_SOURCE_AGENT_IDS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.agent_author_ids" --sep $'\n' 2>/dev/null || true)"
+          [[ "$ATLAS_SOURCE_TOKEN_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.token_env must name an env var (got: $ATLAS_SOURCE_TOKEN_ENV)" >&2; exit 1; }
+          [[ "$ATLAS_SOURCE_VISIBILITY" == "shareable" || "$ATLAS_SOURCE_VISIBILITY" == "private" ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.visibility must be shareable or private (got: $ATLAS_SOURCE_VISIBILITY)" >&2; exit 1; }
+          [[ -n "$ATLAS_SOURCE_CHANNEL_IDS" ]] \
+            || { echo "FAIL: atlas.sources.$atlas_source_name.channel_ids must list at least one channel" >&2; exit 1; }
+          printf '    type: slack\n'
+          printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
+          printf '    visibility: "%s"\n' "$ATLAS_SOURCE_VISIBILITY"
+          printf '    bot_policy: include\n'
+          if [[ "$ATLAS_SOURCE_EPISODE_GAP" =~ ^[0-9]+$ ]]; then
+            printf '    episode_gap_minutes: %s\n' "$ATLAS_SOURCE_EPISODE_GAP"
+          fi
+          printf '    channel_ids:\n'
+          while IFS= read -r atlas_channel_id; do
+            [[ -n "$atlas_channel_id" ]] || continue
+            [[ "$atlas_channel_id" =~ ^[CG][A-Z0-9]{7,}$ ]] \
+              || { echo "FAIL: atlas.sources.$atlas_source_name.channel_ids has an invalid Slack channel id: $atlas_channel_id" >&2; exit 1; }
+            printf '      - "%s"\n' "$atlas_channel_id"
+          done <<<"$ATLAS_SOURCE_CHANNEL_IDS"
+          if [[ -n "$ATLAS_SOURCE_AGENT_IDS" ]]; then
+            printf '    agent_author_ids:\n'
+            while IFS= read -r atlas_agent_id; do
+              [[ -n "$atlas_agent_id" ]] && printf '      - "%s"\n' "$atlas_agent_id"
+            done <<<"$ATLAS_SOURCE_AGENT_IDS"
+          else
+            printf '    agent_author_ids: []\n'
+          fi
         else
-          echo "FAIL: atlas.sources.$atlas_source_name.type must be github or gitbook" >&2
+          echo "FAIL: atlas.sources.$atlas_source_name.type must be github, gitbook, or slack" >&2
           exit 1
         fi
-        if [[ -n "$ATLAS_SOURCE_INCLUDE" ]]; then
-          printf '    include:\n'
-          while IFS= read -r atlas_glob; do
-            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
-          done <<<"$ATLAS_SOURCE_INCLUDE"
-        fi
-        if [[ -n "$ATLAS_SOURCE_EXCLUDE" ]]; then
-          printf '    exclude:\n'
-          while IFS= read -r atlas_glob; do
-            [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
-          done <<<"$ATLAS_SOURCE_EXCLUDE"
-        else
-          printf '    exclude: []\n'
+        # include/exclude apply to file-based sources only; the Slack schema is
+        # strict and rejects them, so skip the block for slack sources.
+        if [[ "$ATLAS_SOURCE_TYPE" != "slack" ]]; then
+          if [[ -n "$ATLAS_SOURCE_INCLUDE" ]]; then
+            printf '    include:\n'
+            while IFS= read -r atlas_glob; do
+              [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+            done <<<"$ATLAS_SOURCE_INCLUDE"
+          fi
+          if [[ -n "$ATLAS_SOURCE_EXCLUDE" ]]; then
+            printf '    exclude:\n'
+            while IFS= read -r atlas_glob; do
+              [[ -n "$atlas_glob" ]] && printf '      - "%s"\n' "$atlas_glob"
+            done <<<"$ATLAS_SOURCE_EXCLUDE"
+          else
+            printf '    exclude: []\n'
+          fi
         fi
       done
     fi
@@ -2179,8 +2287,27 @@ EOF
       | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-source-sync.service
     install -o root -g root -m 0644 \
       "$ATLAS_SOURCE_SYNC_TIMER_SRC" /etc/systemd/system/atlas-source-sync.timer
+    if [[ -f "$OPS_DIR/atlas-source-sync-failure.service" ]]; then
+      install -o root -g root -m 0644 \
+        "$OPS_DIR/atlas-source-sync-failure.service" /etc/systemd/system/atlas-source-sync-failure.service
+    fi
+    # Daily FULL reconciliation (slack whole-channel; hourly runs incremental).
+    if [[ -f "$OPS_DIR/atlas-source-sync-full.service" && -f "$OPS_DIR/atlas-source-sync-full.timer" ]]; then
+      echo "==> installing systemd timer for atlas-source-sync-full (daily full reconciliation)"
+      sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+          -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+          -e "s|__ATLAS_CONFIG__|$ATLAS_CONFIG|g" \
+          -e "s|__ATLAS_SYNC_SOURCE_NAMES__|$ATLAS_SYNC_SOURCE_NAMES|g" \
+          "$OPS_DIR/atlas-source-sync-full.service" \
+        | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-source-sync-full.service
+      install -o root -g root -m 0644 \
+        "$OPS_DIR/atlas-source-sync-full.timer" /etc/systemd/system/atlas-source-sync-full.timer
+    fi
     systemctl daemon-reload
     systemctl enable --now atlas-source-sync.timer
+    if [[ -f /etc/systemd/system/atlas-source-sync-full.timer ]]; then
+      systemctl enable --now atlas-source-sync-full.timer
+    fi
   else
     echo "==> systemctl not present; skipping atlas-source-sync timer enable" >&2
   fi
