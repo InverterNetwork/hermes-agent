@@ -137,22 +137,31 @@ class TestCronCommandLifecycle:
         out = capsys.readouterr().out
         assert "Repeat:    ∞" in out
 
-    def test_list_does_not_crash_when_deliver_is_null(self, tmp_cron_dir, capsys):
-        """A job can be persisted with ``"deliver": null`` (present-but-null).
-        `cron list` must fall back to the default channel rather than crashing
-        on ``", ".join(None)`` — same dict-default pitfall as ``repeat`` (#32896).
-        """
+    @pytest.mark.parametrize(
+        ("raw_deliver", "expected_display"),
+        [
+            (None, "local"),
+            ("", "local"),
+            ([], "local"),
+            ("telegram", "telegram"),
+            (["telegram", "discord"], "telegram,discord"),
+        ],
+    )
+    def test_list_normalizes_falsy_and_legacy_deliver_values(
+        self, tmp_cron_dir, capsys, monkeypatch, raw_deliver, expected_display
+    ):
         from cron.jobs import load_jobs, save_jobs
 
-        create_job(prompt="No deliver", schedule="every 1h")
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [4242])
+        create_job(prompt="Delivery report", schedule="every 1h", deliver="local")
         jobs = load_jobs()
-        jobs[0]["deliver"] = None
+        jobs[0]["deliver"] = raw_deliver
         save_jobs(jobs)
 
         cron_command(Namespace(cron_command="list", all=True))
 
         out = capsys.readouterr().out
-        assert "Deliver:   local" in out
+        assert f"Deliver:   {expected_display}" in out
 
 
 class TestGatewayNotRunningWarning:

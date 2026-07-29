@@ -6,8 +6,23 @@ Description=Run Atlas full source reconciliation daily
 # after any stop/restart — same rationale as atlas-source-sync.timer). The
 # hourly incremental keeps content fresh; this daily full run is the
 # authoritative deletion/old-edit reconciliation.
-OnCalendar=daily
-AccuracySec=5min
+#
+# Fires at 04:20 UTC — deliberately OFF the top of the hour. atlas-source-sync
+# (incremental) runs OnCalendar=hourly, i.e. at every HH:00, and BOTH runs write
+# the SAME atlas-kb through a single KB write lock. When this full run was
+# scheduled at 00:00 (OnCalendar=daily) it fired at the exact instant as the
+# 00:00 hourly incremental; the incremental won the lock race and the full run's
+# first source hit kb_write_lock_held, exited non-zero, and (under the old
+# runner's blanket set -e) aborted the whole pass — so the Slack FULL
+# reconciliation never ran. A distinct off-the-hour minute means the daily full
+# never coincides with an hourly fire. Kept deterministic (a fixed minute, not
+# RandomizedDelaySec) so the separation is reproducible and testable; the runner
+# additionally retries transient lock contention as defence-in-depth.
+#
+# Pinned to UTC explicitly so the schedule is unambiguous regardless of the
+# host's local timezone (the incident and its analysis are all in UTC).
+OnCalendar=*-*-* 04:20:00 UTC
+AccuracySec=1min
 Persistent=true
 Unit=atlas-source-sync-full.service
 

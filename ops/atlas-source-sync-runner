@@ -20,6 +20,45 @@ HERMES_ATLAS_SOURCE_READER_GH_CONFIG="${HERMES_ATLAS_SOURCE_READER_GH_CONFIG:-$H
 ATLAS_SYNC_SOURCE_NAMES="${ATLAS_SYNC_SOURCE_NAMES:-${ATLAS_SYNC_SOURCE_NAME:-emusd-docs}}"
 ATLAS_AS_HERMES_BIN="${ATLAS_AS_HERMES_BIN:-/usr/local/bin/atlas-as-hermes}"
 
+# Transient KB write-lock contention (another sync holding the atlas-kb write
+# lock) is a RETRYABLE condition, not a source failure: Atlas emits the marker
+# below and exits non-zero without touching the KB. We retry the SAME source a
+# bounded number of times with a fixed backoff so a momentary lock cannot drop a
+# source's reconciliation. We only ever WAIT for the lock — never remove it (an
+# orphaned-lock cleanup is an operator decision; a held lock may be a live
+# writer, and deleting it would break atomicity).
+# Match Atlas's precheck lock signal specifically (its compact JSON reason
+# field) so incidental text can't be mistaken for lock contention.
+ATLAS_SYNC_LOCK_MARKER='"reason":"kb_write_lock_held"'
+ATLAS_SYNC_LOCK_RETRIES="${ATLAS_SYNC_LOCK_RETRIES:-3}"
+ATLAS_SYNC_LOCK_RETRY_DELAY="${ATLAS_SYNC_LOCK_RETRY_DELAY:-20}"
+
+# Validate + normalize the retry knobs to a decimal integer in [0, max]. This is
+# critical: an arithmetic compare against a NON-integer value (a fat-fingered
+# /etc/default override) under `set -u` would raise "unbound variable" and kill
+# the runner mid-source — the exact silent-skip failure this change prevents.
+# Rules, in order:
+#   * accept only 1–3 digits (bounds magnitude, so no integer overflow);
+#   * normalize with 10#... so a leading-zero value can NEVER be read as octal by
+#     the arithmetic compare while `sleep` reads it as decimal (012/0454 bug);
+#   * anything else → the safe default; a value over max → clamped to max.
+_clamp_knob() {  # name value max default -> prints the normalized value
+  local name="$1" value="$2" max="$3" default="$4"
+  if [[ ! "$value" =~ ^[0-9]{1,3}$ ]]; then
+    warn "${name}='${value}' is not a 1-3 digit integer; using ${default}"
+    printf '%s' "$default"
+    return 0
+  fi
+  value=$((10#$value))  # force base 10 (kills leading-zero octal ambiguity)
+  if [[ "$value" -gt "$max" ]]; then
+    warn "${name}=${value} exceeds max ${max}; clamping to ${max}"
+    value="$max"
+  fi
+  printf '%s' "$value"
+}
+ATLAS_SYNC_LOCK_RETRIES="$(_clamp_knob ATLAS_SYNC_LOCK_RETRIES "$ATLAS_SYNC_LOCK_RETRIES" 10 3)"
+ATLAS_SYNC_LOCK_RETRY_DELAY="$(_clamp_knob ATLAS_SYNC_LOCK_RETRY_DELAY "$ATLAS_SYNC_LOCK_RETRY_DELAY" 300 20)"
+
 [[ -x "$HERMES_TOKEN_PYTHON" ]] || die "missing token-helper python: $HERMES_TOKEN_PYTHON"
 [[ -f "$HERMES_TOKEN_HELPER" ]] || die "missing token helper: $HERMES_TOKEN_HELPER"
 [[ -f "$HERMES_ATLAS_SOURCE_READER_GH_CONFIG" ]] \
@@ -47,8 +86,65 @@ export GH_TOKEN="$token"
 export GITHUB_TOKEN="$token"
 
 IFS=', ' read -r -a source_names <<<"$ATLAS_SYNC_SOURCE_NAMES"
+
+# --- Per-source phase: ISOLATE failures ---------------------------------------
+# The setup phase above hard-fails (set -e): a missing token/wrapper is fatal for
+# every source. But once we start syncing, ONE source's failure must NOT abort
+# the others — that is exactly how a lock collision on the first source (e.g.
+# emusd-docs) used to silently prevent the later Slack FULL reconciliation from
+# ever running. So we drop errexit here and handle each source's exit explicitly:
+# retry transient lock contention, record a deterministic per-source result,
+# continue to the next source regardless, and exit non-zero at the end iff any
+# source genuinely failed (so OnFailure= still alerts on a real failure).
+set +e
+
+sync_failures=0
+src_idx=0
+declare -a sync_results=()
+
 for source_name in "${source_names[@]}"; do
   [[ -n "$source_name" ]] || continue
-  warn "running atlas sync source $source_name"
-  "$ATLAS_AS_HERMES_BIN" sync source "$source_name" "$@"
+  src_idx=$((src_idx + 1))
+  attempt=0
+  code=0
+  while : ; do
+    attempt=$((attempt + 1))
+    warn "running atlas sync source $source_name (attempt $attempt)"
+    # Temp path uses an integer index, never the (untrusted-shaped) source name.
+    logf="$(mktemp 2>/dev/null || echo "/tmp/atlas-source-sync.$$.${src_idx}.${attempt}.log")"
+    # Stream Atlas output live to journald (>&2) AND capture it so we can detect
+    # the lock marker. pipefail keeps PIPESTATUS[0] = Atlas's own exit code.
+    "$ATLAS_AS_HERMES_BIN" sync source "$source_name" "$@" 2>&1 | tee -a "$logf" >&2
+    code=${PIPESTATUS[0]}
+    if [[ "$code" -eq 0 ]]; then
+      rm -f "$logf"
+      break
+    fi
+    if grep -qF "$ATLAS_SYNC_LOCK_MARKER" "$logf" 2>/dev/null && [[ "$attempt" -le "$ATLAS_SYNC_LOCK_RETRIES" ]]; then
+      rm -f "$logf"
+      warn "source $source_name: KB write-lock contention; retry in ${ATLAS_SYNC_LOCK_RETRY_DELAY}s (${attempt}/${ATLAS_SYNC_LOCK_RETRIES})"
+      sleep "$ATLAS_SYNC_LOCK_RETRY_DELAY"
+      continue
+    fi
+    rm -f "$logf"
+    break
+  done
+  if [[ "$code" -eq 0 ]]; then
+    sync_results+=("${source_name}=ok(attempts=${attempt})")
+  else
+    sync_results+=("${source_name}=FAILED(attempts=${attempt},exit=${code})")
+    sync_failures=$((sync_failures + 1))
+  fi
 done
+
+# Deterministic per-source summary (source order preserved), for journald.
+warn "source-sync summary: ${sync_results[*]}"
+
+if [[ "$sync_failures" -gt 0 ]]; then
+  # Non-zero exit triggers OnFailure= and marks the unit failed, but every source
+  # was still attempted — a failure on one never silently skips the rest.
+  die "${sync_failures} source(s) failed: ${sync_results[*]}"
+fi
+
+# Explicit success (do not rely on the trailing `[[ ]]` test's own exit status).
+exit 0
