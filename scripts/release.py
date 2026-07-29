@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "hermes-agent@users.noreply.github.com": "hermes-agent",  # Quay-authored deployment config PRs
     "256073454+Kolektori@users.noreply.github.com": "Kolektori",  # PR #6436 salvage (require approval for host-bound Docker commands; container guard fast-path)
     "41764686+LIC99@users.noreply.github.com": "LIC99",  # PR #4682 salvage (warn + default to manual on unknown approvals.mode; #4261)
     "carlosmcejas@gmail.com": "cmcejas",  # PR #41188 salvage (early Telegram auth gate before event build/observe; #40863)

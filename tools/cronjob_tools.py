@@ -514,6 +514,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("no_agent"):
         result["no_agent"] = True
+    if job.get("secrets"):
+        result["secrets"] = job["secrets"]
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
@@ -587,6 +589,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    secrets: Optional[List[str]] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -654,6 +657,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                secrets=secrets or None,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -806,6 +810,10 @@ def cronjob(
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
+            if secrets is not None:
+                # Empty array clears the declared secrets; create_job/update_job
+                # normalize the shape (unique, ordered, blank-stripped).
+                updates["secrets"] = secrets or []
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:
@@ -944,6 +952,21 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "secrets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of secret env-var NAMES the script needs (e.g. [\"SLACK_BOT_TOKEN\"]). "
+                    "Cron scripts normally run with every Hermes-managed secret stripped from their environment. "
+                    "Declaring a name here requests it back — but injection also requires an OPERATOR to have "
+                    "allowlisted that name in cron.injectable_secrets in the host config.yaml, and the name must "
+                    "not be on the never-injectable hard floor (GitHub tokens, provider/model API keys, the Slack "
+                    "APP token / signing secret, dashboard/session tokens, other-platform bot tokens). Only the "
+                    "intersection is injected; anything declared but not allowlisted is logged and skipped, not "
+                    "silently granted. Declare only what the script actually uses. On update, pass an empty array "
+                    "to clear."
+                ),
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1025,6 +1048,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        secrets=args.get("secrets"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

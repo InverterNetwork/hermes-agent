@@ -2,8 +2,14 @@
 Description=Run Atlas source sync hourly
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
+# Wall-clock cadence: hourly, on the hour (BRIX-1874). Anchored on the wall
+# clock via OnCalendar rather than OnBootSec/OnUnitActiveSec, so the timer
+# always has a next elapse and always re-arms after any stop/restart. A
+# monotonic-only schedule (OnUnitActiveSec re-anchors off the *previous*
+# service activation) can compute NO next trigger if the service is stopped and
+# the timer is later started past boot with no prior activation to anchor on —
+# it then sits active with `Trigger: n/a` and silently never fires again.
+OnCalendar=hourly
 AccuracySec=1min
 Persistent=true
 Unit=atlas-source-sync.service

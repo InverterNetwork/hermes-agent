@@ -264,6 +264,14 @@
 #                                 boundary. Idempotent: a binary already at the
 #                                 pinned version is a no-op; a wrong version is
 #                                 replaced atomically.
+#   quay.toolchain             — pinned host-level worker tools the installer
+#                                 must guarantee on PATH when Quay is enabled.
+#                                 These are not repo package managers; they are
+#                                 task substrate used by worker commands/tests.
+#                                 `anvil` is installed from Foundry's verified
+#                                 Linux amd64 release tarball to
+#                                 `/usr/local/bin/anvil` so fork-test-capable
+#                                 repos can invoke it directly.
 #   Quay reference repos context — once quay.version points at an AST-136
 #                                 release, setup-hermes.sh renders
 #                                 `[context].reference_repos_root` to
@@ -495,6 +503,7 @@ slack:
       - C0B5ZUS7WRG  # requested 2026-06-01
       - C0B79CZLM50  # requested 2026-06-01
       - C0AHDA8S3M1  # requested 2026-06-27
+      - C0BGC0U8YSH  # requested 2026-07-10
     # Optional Slack channel ID the gateway treats as the agent's "home"
     # channel (for unsolicited posts). Leave blank to disable.
     home_channel: "C0B3WAWLL0L"
@@ -590,6 +599,17 @@ repos:
       # Per-repo tag vocab intentionally omitted. Add per-repo vocab here
       # once real ticket flow informs the namespace shape; absence is the
       # explicit "no vocab yet" signal.
+  - id: brix-solvers
+    url: https://github.com/InverterNetwork/brix-solvers
+    # pnpm-workspaces monorepo of solver engines (CoW Protocol, Uniswap X)
+    # filling USDC -> RWA via on-chain mint. First ticket flow: BRIX-1913.
+    base_branch: main
+    issue_tracker:
+      linear:
+        team: brix
+    quay:
+      package_manager: pnpm
+      install_cmd: "pnpm install --frozen-lockfile"
   - id: erpc
     url: https://github.com/InverterNetwork/erpc
     base_branch: main
@@ -654,7 +674,7 @@ quay:
   # provisioning entirely (data dir, config.toml, binary fetch); set once
   # a v* tag is published on the quay repo. The installer verifies the
   # downloaded binary against SHA256SUMS — this pin is the security boundary.
-  version: "v0.3.39"
+  version: "v0.3.42"
   # Public org-owned release repo for unauthenticated installer downloads.
   release_repo: InverterNetwork/quay
   # Quay Agent panel backend. All values here are non-secret and are loaded by
@@ -707,6 +727,15 @@ quay:
     pnpm:
       version: "10.33.4"
       linux_x64_sha256: "ff1795595535a10d0dfe327303f3dd02377be141190b1f5756de68edde2cf813"
+  # Host-level worker tools. These are installed into /usr/local/bin when
+  # Quay is enabled so spawned task shells inherit them from the tick runtime.
+  # `anvil` is packaged inside Foundry's Linux amd64 tarball. Resolve the SHA
+  # from the matching upstream checksum before bumping:
+  #   curl -fsSL https://github.com/foundry-rs/foundry/releases/download/v<ver>/foundry_v<ver>_linux_amd64.sha256
+  toolchain:
+    anvil:
+      version: "1.7.1"
+      linux_x64_sha256: "cf7e688ed0c4c48adffca788b496076e31060b67ac5afe1e43dbb5499c20c88b"
   adapters:
     linear:
       enabled: true
@@ -725,12 +754,19 @@ quay:
     quay_command: /usr/local/bin/quay
     reply_timeout_seconds: 1800
     poll_interval_seconds: 15
+    # BRIX-1878 agentic blocker handling (code enforces the never-auto floor):
+    # Otto authors concise escalation messages when he escalates (safe: message-only).
+    remediation_escalation_message_enabled: true
+    # Otto may auto-resume blockers his code gates deem safe & reversible.
+    remediation_enabled: true
+    # Otto files recurring Quay-CLI friction he observes to Linear (BRIX team).
+    remediation_friction_enabled: true
 atlas:
   # Pinned Atlas CLI release tag. The installer downloads atlas-linux-<arch>
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.11"
+  version: "v0.1.16"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
@@ -742,9 +778,18 @@ atlas:
     codex_binary: /usr/local/bin/codex
     codex_timeout_ms: 120000
   google_docs:
-    # Relative paths are resolved under "$HERMES_HOME". The service-account
-    # JSON itself is staged out-of-band under auth/ and is not committed.
-    service_account_file: auth/otto-google-sa.json
+    # Atlas uses only this pinned gws binary and authorized-user grant. The
+    # credential is staged out-of-band; the cache is agent-owned and writable.
+    # Relative credential/cache paths resolve under "$HERMES_HOME".
+    # The installer refuses deployment until atlas.version reaches this pin.
+    minimum_atlas_version: "0.1.16"
+    gws_version: "0.22.5"
+    gws_release_repo: googleworkspace/cli
+    gws_sha256:
+      x86_64_linux_gnu: de78ecdbd2f1a84cca0063a7ecbc440240fc14b6ebccbb17f4646b792a8c5c1f
+      aarch64_linux_gnu: 94490295d9580e1e88574e715a0a162991747d12d62f8c7b8dcc8268b6c1cea0
+    credentials_file: auth/atlas-google-authorized-user.json
+    cache_dir: cache/atlas-gws
   # Atlas Hub is served as a loopback-only API. Public access must terminate
   # TLS in a reverse proxy that forwards to this listener, or operators can
   # use an SSH tunnel for local CLI access. public_base_url must be an origin,
@@ -767,6 +812,7 @@ atlas:
     source_names:
       - emusd-docs
       - brix-product-docs
+      - slack-channels
     github_app:
       # GitHub App slug is intentionally `atlast-source-reader`.
       id: "3944782"
@@ -792,6 +838,48 @@ atlas:
       include:
         - "**/*.md"
       exclude: []
+    slack-channels:
+      # Principal-approved allowlist (2026-07-18), 22 channels = the Hermes
+      # deploy allowlist minus the excluded private test-devops. The bot is a
+      # member of 16; the other 6 are SKIPPED at runtime (skipped_unreachable)
+      # until it is invited. Chat is redacted at ingest and synthesis-quarantined
+      # until the M2 injection defense lands. Token read from auth/atlas.env by
+      # the SLACK_ATLAS_TOKEN env-var name (never the value).
+      type: slack
+      token_env: SLACK_ATLAS_TOKEN
+      visibility: shareable
+      bot_policy: include
+      episode_gap_minutes: 45
+      # Otto operates under both didier (prod) and babydidierdev (dev); no
+      # standalone "otto" Slack account exists.
+      agent_author_ids:
+        - U0AEQAF0W4R
+        - A0AEQABV309
+        - U0B1REM5YE9
+        - A0B1RA6L1HB
+      channel_ids:
+        - C0B23MZ0USV
+        - C0B4LLZ5Z2L
+        - C0B4A6LEW31
+        - C0B3WAWLL0L
+        - C05M45H6KAT
+        - C0B0LSP8H1B
+        - C0B0MP16YDD
+        - C097HBE6Z7E
+        - C0AJ4MM4PPT
+        - C0AEN8KDRT2
+        - C0AAN0K8UMP
+        - C0AGZUH6C15
+        - C0AH910LEV9
+        - C09R47ZHB61
+        - C08956H1V4K
+        - C0AMT3TD86R
+        - C09QSMWRJKH
+        - C09E9UX1JTH
+        - C0B5ZUS7WRG
+        - C0B79CZLM50
+        - C0AHDA8S3M1
+        - C0BGC0U8YSH
 
 # Channel-trigger router. Each entry binds a Slack channel to an entry
 # skill — top-level messages in that channel autonomously invoke the
