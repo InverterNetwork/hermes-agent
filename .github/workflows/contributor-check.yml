@@ -28,7 +28,11 @@ jobs:
           MERGE_BASE=$(git merge-base origin/main HEAD)
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          # Follow the PR branch's first-parent chain. Upstream sync merge
+          # commits deliberately bring in thousands of already-authored
+          # upstream commits; attribution checks should cover the fork's own
+          # commits, not every commit reachable through a merge parent.
+          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --first-parent --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."
