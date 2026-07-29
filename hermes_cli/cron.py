@@ -51,6 +51,18 @@ def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None)
     return normalized
 
 
+def _format_deliver_value(deliver) -> str:
+    """Return a display string for persisted delivery values."""
+    if deliver is None or deliver == "":
+        return "local"
+    if isinstance(deliver, str):
+        return deliver
+    if isinstance(deliver, (list, tuple)):
+        parts = [str(part).strip() for part in deliver if str(part).strip()]
+        return ", ".join(parts) if parts else "local"
+    return str(deliver)
+
+
 def _cron_api(**kwargs):
     from tools.cronjob_tools import cronjob as cronjob_tool
 
@@ -137,10 +149,7 @@ def cron_list(show_all: bool = False):
         repeat_completed = repeat_info.get("completed", 0)
         repeat_str = f"{repeat_completed}/{repeat_times}" if repeat_times else "∞"
 
-        deliver = job.get("deliver", ["local"])
-        if isinstance(deliver, str):
-            deliver = [deliver]
-        deliver_str = ", ".join(deliver)
+        deliver_str = _format_deliver_value(job.get("deliver", "local"))
 
         skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
         if state == "paused":
