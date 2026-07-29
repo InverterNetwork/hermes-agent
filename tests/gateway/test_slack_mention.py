@@ -150,10 +150,10 @@ def test_require_mention_env_var_default_true(monkeypatch):
 # Tests: _slack_strict_mention
 # ---------------------------------------------------------------------------
 
-def test_strict_mention_defaults_to_true(monkeypatch):
+def test_strict_mention_defaults_to_false(monkeypatch):
     monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
     adapter = _make_adapter()
-    assert adapter._slack_strict_mention() is True
+    assert adapter._slack_strict_mention() is False
 
 
 def test_strict_mention_true():
@@ -176,10 +176,10 @@ def test_strict_mention_string_off():
     assert adapter._slack_strict_mention() is False
 
 
-def test_strict_mention_malformed_stays_true():
-    """Unrecognised values keep strict mode ON (safe mention-gated behavior)."""
+def test_strict_mention_malformed_stays_false():
+    """Unrecognised values do not silently opt into strict mode."""
     adapter = _make_adapter(strict_mention="maybe")
-    assert adapter._slack_strict_mention() is True
+    assert adapter._slack_strict_mention() is False
 
 
 def test_strict_mention_env_var_fallback(monkeypatch):
@@ -417,12 +417,12 @@ def test_mentioned_message_always_processed():
     assert _would_process(adapter, mentioned=True, text="what's up") is True
 
 
-def test_thread_reply_with_active_session_requires_mention_by_default():
+def test_thread_reply_with_active_session_processed_by_default():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="followup",
         thread_reply=True, active_session=True,
-    ) is False
+    ) is True
 
 
 def test_thread_reply_with_active_session_processed_when_strict_disabled():
@@ -481,7 +481,7 @@ def _make_runtime_adapter(
 
 
 @pytest.mark.asyncio
-async def test_runtime_default_strict_ignores_unmentioned_active_thread_reply():
+async def test_runtime_default_processes_unmentioned_active_thread_reply():
     adapter = _make_runtime_adapter(active_session=True)
 
     await adapter._handle_slack_message({
@@ -493,7 +493,7 @@ async def test_runtime_default_strict_ignores_unmentioned_active_thread_reply():
         "team": "T1",
     })
 
-    adapter.handle_message.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
