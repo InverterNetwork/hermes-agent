@@ -897,7 +897,10 @@ class TestSlackThreadContext:
                 },
             ]
         })
-        adapter._user_name_cache = {"U1": "Ataberk", "U2": "Fabian"}
+        adapter._user_name_cache = {
+            ("T1", "U1"): "Ataberk",
+            ("T1", "U2"): "Fabian",
+        }
 
         cached_doc = tmp_path / "OWNER-GUIDE.md"
         with patch.object(
@@ -922,28 +925,23 @@ class TestSlackThreadContext:
         assert "can you read the doc" not in context
 
     @pytest.mark.asyncio
-    async def test_fetch_thread_parent_attachment_context_includes_markdown(self, tmp_path):
-        """Active thread sessions can repair missing opener attachment context."""
+    async def test_thread_attachment_context_includes_markdown(self, tmp_path):
+        """The formatter's attachment helper includes Markdown content."""
         adapter = _make_adapter()
-        mock_client = adapter._team_clients["T1"]
         owner_guide = b"# Coordinating emUSD\n\nEach workstream has one owner."
-        mock_client.conversations_replies = AsyncMock(return_value={
-            "messages": [
+        parent = {
+            "ts": "1000.0",
+            "user": "U1",
+            "text": "please read this",
+            "files": [
                 {
-                    "ts": "1000.0",
-                    "user": "U1",
-                    "text": "please read this",
-                    "files": [
-                        {
-                            "mimetype": "text/markdown",
-                            "name": "OWNER-GUIDE.md",
-                            "url_private_download": "https://files.slack.com/OWNER-GUIDE.md",
-                            "size": len(owner_guide),
-                        }
-                    ],
+                    "mimetype": "text/markdown",
+                    "name": "OWNER-GUIDE.md",
+                    "url_private_download": "https://files.slack.com/OWNER-GUIDE.md",
+                    "size": len(owner_guide),
                 }
-            ]
-        })
+            ],
+        }
 
         cached_doc = tmp_path / "OWNER-GUIDE.md"
         with patch.object(
@@ -955,9 +953,8 @@ class TestSlackThreadContext:
             return_value=str(cached_doc),
         ):
             download.return_value = owner_guide
-            context = await adapter._fetch_thread_parent_attachment_context(
-                channel_id="C1",
-                thread_ts="1000.0",
+            context = await adapter._thread_attachment_context_from_message(
+                parent,
                 team_id="T1",
             )
 
@@ -1744,4 +1741,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

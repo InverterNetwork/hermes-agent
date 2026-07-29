@@ -5722,6 +5722,9 @@ class SlackAdapter(BasePlatformAdapter):
         # the allowed_channels whitelist or user authorization above.
         force_process = bool(event.get("_hermes_force_process"))
 
+        if not is_dm and await self._maybe_dispatch_slack_trigger(event, text=text):
+            return
+
         # Some Slack bot posts arrive as ordinary-looking message events with a
         # bot *user* id but without ``bot_id``/``subtype=bot_message``.  This is
         # the shape produced by peer Hermes agents in Socket Mode on some
@@ -7564,6 +7567,44 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack] Failed to fetch thread context: %s", e)
             return ""
 
+    async def _thread_attachment_context_from_message(
+        self,
+        msg: dict,
+        *,
+        team_id: str = "",
+    ) -> str:
+        """Return supported text-file content attached to a thread message."""
+        parts: list[str] = []
+        for file_obj in msg.get("files") or []:
+            mimetype = file_obj.get("mimetype", "")
+            name = file_obj.get("name") or file_obj.get("title") or "attachment.txt"
+            url = file_obj.get("url_private_download") or file_obj.get(
+                "url_private", ""
+            )
+            _, ext = os.path.splitext(name)
+            is_text = (mimetype or "").startswith("text/") or (
+                ext.lower() in _TEXT_INJECT_EXTENSIONS
+            )
+            if not (url and is_text):
+                continue
+            size = int(file_obj.get("size") or 0)
+            if size and size > 100 * 1024:
+                continue
+            try:
+                raw_bytes = await self._download_slack_file_bytes(
+                    url, team_id=team_id
+                )
+                cache_document_from_bytes(raw_bytes, name)
+                text_content = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            except Exception as exc:
+                logger.warning("[Slack] Failed to cache thread attachment: %s", exc)
+                continue
+            display_name = re.sub(r"[^\w.\- ]", "_", name)
+            parts.append(f"[Content of {display_name}]:\n{text_content}")
+        return "\n\n".join(parts)
+
     async def _format_thread_context(
         self,
         messages: List[Dict[str, Any]],
@@ -7632,7 +7673,13 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
             msg_text = self._render_message_text(msg, bot_uid=bot_uid)
-            if not msg_text:
+            attachment_context = ""
+            if is_parent and not skip_for_delta:
+                attachment_context = await self._thread_attachment_context_from_message(
+                    msg,
+                    team_id=team_id,
+                )
+            if not msg_text and not attachment_context:
                 continue
 
             # Strip bot mentions from context messages
@@ -7643,6 +7690,11 @@ class SlackAdapter(BasePlatformAdapter):
                 parent_text = msg_text
                 if skip_for_delta:
                     continue
+
+            if attachment_context:
+                msg_text = "\n\n".join(
+                    part for part in (msg_text, attachment_context) if part
+                )
 
             if is_parent:
                 prefix = "[thread parent] "

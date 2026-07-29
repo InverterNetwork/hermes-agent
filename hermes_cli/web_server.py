@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import html
 import inspect
 import importlib.util
 import json
