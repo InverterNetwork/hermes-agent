@@ -47,6 +47,8 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "interim_assistant_messages": True,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    # Gateway lifecycle/warning status bubbles. Values: "all", "warn", "off".
+    "status_callbacks": "all",
     # Whether busy_input_mode=steer sends a visible "Steered into current run"
     # acknowledgment after successfully injecting the user's mid-turn message.
     # Disable when the platform should steer silently (the text still lands in
@@ -149,6 +151,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
         "tool_progress": "off",
         "long_running_notifications": False,
         "busy_ack_detail": False,
+        "status_callbacks": "warn",
     },
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
@@ -270,6 +273,31 @@ def _normalise(setting: str, value: Any) -> Any:
         if val in {"true", "1", "yes", "on"}:
             return "all"
         return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+    if setting == "status_callbacks":
+        if value is False:
+            return "off"
+        if value is True:
+            return "all"
+        normalised = str(value).strip().lower().replace("-", "_")
+        aliases = {
+            "": "all",
+            "true": "all",
+            "yes": "all",
+            "on": "all",
+            "1": "all",
+            "all": "all",
+            "false": "off",
+            "no": "off",
+            "off": "off",
+            "0": "off",
+            "none": "off",
+            "warn": "warn",
+            "warning": "warn",
+            "warnings": "warn",
+            "warn_only": "warn",
+            "warnings_only": "warn",
+        }
+        return aliases.get(normalised, "all")
     if setting in {
         "show_reasoning",
         "streaming",

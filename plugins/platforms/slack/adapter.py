@@ -6459,7 +6459,7 @@ class SlackAdapter(BasePlatformAdapter):
         text: Optional[str] = None,
     ) -> bool:
         """Dispatch configured top-level Slack channel triggers."""
-        router = self._trigger_router
+        router = getattr(self, "_trigger_router", None)
         if router is None:
             return False
 
@@ -8086,6 +8086,102 @@ class SlackAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         finally:
             _slash_user_id.reset(_slash_user_id_token)
+
+    async def _respond_to_slash_command(self, command: dict, text: str) -> None:
+        """Reply to a Slack slash invocation without leaking into a channel."""
+        response_url = command.get("response_url", "")
+        if response_url:
+            try:
+                async with aiohttp.ClientSession(trust_env=True) as session:
+                    await session.post(
+                        response_url,
+                        json={
+                            "response_type": "ephemeral",
+                            "replace_original": True,
+                            "text": text,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    )
+                return
+            except Exception as exc:
+                logger.warning("[Slack] slash response_url failed: %s", exc)
+
+        channel_id = command.get("channel_id", "")
+        if channel_id:
+            await self.send(channel_id, text)
+
+    async def _handle_quay_admin_slash_command(self, command: dict) -> None:
+        """Send an allowlisted Slack user a one-time Quay Admin login link."""
+        user_id = command.get("user_id", "")
+        channel_id = command.get("channel_id", "")
+        team_id = command.get("team_id", "")
+
+        from hermes_cli import quay_admin_auth
+
+        if not quay_admin_auth.is_slack_user_allowed(user_id):
+            await self._respond_to_slash_command(
+                command,
+                "You are not allowed to request Quay Admin access.",
+            )
+            return
+
+        client = self._team_clients.get(team_id)
+        if client is None and channel_id:
+            try:
+                client = self._get_client(channel_id)
+            except Exception:
+                client = None
+
+        if client is None:
+            await self._respond_to_slash_command(
+                command,
+                "Quay Admin access is allowed, but Slack DM delivery is unavailable.",
+            )
+            return
+
+        display_name = ""
+        try:
+            user_resp = await client.users_info(user=user_id)
+            profile = (user_resp.get("user") or {}).get("profile") or {}
+            display_name = (
+                profile.get("display_name")
+                or profile.get("real_name")
+                or (user_resp.get("user") or {}).get("real_name")
+                or ""
+            )
+        except Exception:
+            display_name = ""
+
+        token, _record = quay_admin_auth.create_login_token(
+            user_id,
+            display_name=display_name,
+        )
+        login_url = quay_admin_auth.build_login_url(token)
+        try:
+            dm_resp = await client.conversations_open(users=user_id)
+            dm_channel = (dm_resp.get("channel") or {}).get("id")
+            if not dm_channel:
+                raise RuntimeError("Slack did not return a DM channel")
+            await client.chat_postMessage(
+                channel=dm_channel,
+                text=(
+                    "Quay Admin login link:\n"
+                    f"{login_url}\n\n"
+                    "This one-time link expires shortly."
+                ),
+            )
+        except Exception as exc:
+            logger.warning("[Slack] Quay Admin DM failed: %s", exc)
+            await self._respond_to_slash_command(
+                command,
+                "You are allowed for Quay Admin, but I could not DM the login link.",
+            )
+            return
+
+        await self._respond_to_slash_command(
+            command,
+            "I sent you a DM with a one-time Quay Admin login link.",
+        )
 
     def _build_thread_session_key(
         self,
