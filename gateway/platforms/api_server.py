@@ -136,6 +136,13 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+DEFAULT_QUAY_REVIEW_PR_COMMAND = "/usr/local/bin/quay-as-hermes"
+DEFAULT_QUAY_REVIEW_PR_TIMEOUT_SECONDS = 60.0
+_GITHUB_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GIT_SHA_RE = re.compile(r"^[A-Fa-f0-9]{6,64}$")
+_QUAY_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_QUAY_REVIEW_EVENTS = frozenset({"opened", "synchronize", "reopened"})
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1584,266 +1591,47 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
-    @staticmethod
-    def _normalize_callback_platform(value: str) -> str:
-        normalized = (value or "").strip().lower().replace("-", "_")
-        if not re.fullmatch(r"[a-z0-9_]+", normalized):
-            return ""
-        return normalized
-
-    def _get_platform_callback_adapter(
-        self,
-        request: "web.Request",
-        platform_name: str,
-    ) -> Optional[Any]:
-        injected = request.app.get("platform_event_adapters")
-        if isinstance(injected, dict):
-            adapter = injected.get(platform_name)
-            if adapter is not None:
-                return adapter
-
-        adapter = request.app.get(f"{platform_name}_adapter")
-        if adapter is not None:
-            return adapter
-
-        runner = self.gateway_runner or request.app.get("gateway_runner")
-        adapters = getattr(runner, "adapters", None)
-        if not adapters:
-            return None
-
-        try:
-            from gateway.config import Platform as _Platform
-            return adapters.get(_Platform(platform_name))
-        except Exception:
-            for platform, candidate in adapters.items():
-                if getattr(platform, "value", platform) == platform_name:
-                    return candidate
-        return None
-
-    async def _handle_platform_event_callback(self, request: "web.Request") -> "web.Response":
-        platform_name = self._normalize_callback_platform(
-            request.match_info.get("platform", "")
-        )
-        if not platform_name:
+    def _check_quay_review_pr_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Validate the dedicated Quay PR-review bearer token."""
+        if not self._quay_review_pr_token:
             return web.json_response(
                 _openai_error(
-                    "Invalid platform name",
-                    code="invalid_platform",
-                ),
-                status=400,
-            )
-
-        adapter = self._get_platform_callback_adapter(request, platform_name)
-        if adapter is None:
-            return web.json_response(
-                _openai_error(
-                    "Platform adapter is not connected",
-                    code="platform_unavailable",
-                ),
-                status=503,
-            )
-
-        verifier = getattr(adapter, "verify_http_event_request", None)
-        dispatcher = getattr(adapter, "dispatch_http_event", None)
-        if verifier is None or dispatcher is None:
-            return web.json_response(
-                _openai_error(
-                    "Platform adapter does not support HTTP events",
-                    code="platform_http_events_unsupported",
+                    "Quay PR review enrollment is not configured. "
+                    "Set QUAY_REVIEW_PR_TOKEN in the gateway environment.",
+                    code="quay_review_pr_not_configured",
                 ),
                 status=503,
             )
 
         auth_header = request.headers.get("Authorization", "")
-        try:
-            if asyncio.iscoroutinefunction(verifier):
-                ok, code = await verifier(auth_header)
-            else:
-                # Platform verifiers may do blocking network I/O (e.g. Google
-                # signing-cert fetches) — keep that off the event loop.
-                ok, code = await asyncio.to_thread(verifier, auth_header)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit the event.
-            logger.exception(
-                "Platform HTTP event verifier failed for %s", platform_name
-            )
-            ok, code = False, "platform_event_verifier_error"
-        if not ok:
-            return web.json_response(
-                _openai_error(
-                    "Invalid platform event authorization",
-                    code=code or "invalid_platform_event_authorization",
-                ),
-                status=401,
-            )
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            if hmac.compare_digest(token, self._quay_review_pr_token):
+                return None
 
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response(
-                _openai_error("Invalid JSON in platform event", code="invalid_json"),
-                status=400,
-            )
+        return web.json_response(
+            _openai_error(
+                "Invalid Quay review token",
+                code="invalid_quay_review_token",
+            ),
+            status=401,
+        )
 
-        if not isinstance(payload, dict):
-            return web.json_response(
-                _openai_error(
-                    "Platform event must be a JSON object",
-                    code="invalid_request",
-                ),
-                status=400,
-            )
+    def check_quay_admin_authorization(self, slack_user_id: object) -> QuayAdminAuthorization:
+        """Check the dedicated Slack-ID allowlist for Quay Admin access."""
+        return authorize_quay_admin_slack_user(
+            slack_user_id,
+            self._quay_admin_allowed_users,
+        )
 
-        try:
-            result = await dispatcher(payload)
-        except Exception:
-            logger.exception("Platform HTTP event dispatch failed for %s", platform_name)
-            return web.json_response(
-                _openai_error(
-                    "Platform event dispatch failed",
-                    err_type="server_error",
-                    code="platform_event_dispatch_failed",
-                ),
-                status=500,
-            )
-
-        return web.json_response(result if isinstance(result, dict) else {})
-
-    # ------------------------------------------------------------------
-    # Multi-profile multiplexing (/p/<profile>/…)
-    # ------------------------------------------------------------------
-
-    def _resolve_request_profile(self, request: "web.Request"):
-        """Resolve + validate the /p/<profile>/ URL prefix on an API request.
-
-        Returns:
-          - ``None`` when no profile prefix is present, or multiplexing is off
-            (the prefix is ignored; request handled as the default profile).
-          - the profile name (str) when present, multiplexing is on, and the
-            profile is one this gateway serves.
-          - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured (handler/middleware returns 404).
-        """
-        profile = (request.match_info.get("profile") or "").strip()
-        if not profile:
-            return None
-        runner = getattr(self, "gateway_runner", None)
-        cfg = getattr(runner, "config", None)
-        if not getattr(cfg, "multiplex_profiles", False):
-            # Prefix supplied but multiplexing is off — ignore it, behave as
-            # the single-profile gateway (don't 404 a would-be valid route).
-            return None
-        try:
-            from hermes_cli.profiles import profiles_to_serve
-
-            served = {name for name, _ in profiles_to_serve(multiplex=True)}
-        except Exception:
-            return _PROFILE_REJECTED
-        if profile not in served:
-            return _PROFILE_REJECTED
-        return profile
-
-    @staticmethod
-    def _profile_scope(profile: Optional[str]):
-        """Enter the multiplex profile runtime scope, or a no-op when unset.
-
-        When no ``/p/<profile>/`` prefix was given AND multiplexing is active,
-        enter the DEFAULT profile's scope instead of a no-op: api_server is a
-        port-binding platform that lives on the default profile, and with
-        multiplex fail-closed ``get_secret`` active, an unscoped agent run
-        raises ``UnscopedSecretError`` on its first credential read (#61276).
-        Single-profile gateways keep the no-op — ``get_secret`` falls through
-        to ``os.environ`` there, unchanged.
-        """
-        if not profile:
-            try:
-                from agent.secret_scope import is_multiplex_active
-
-                if is_multiplex_active():
-                    from gateway.run import _profile_runtime_scope
-                    from hermes_constants import get_hermes_home
-
-                    return _profile_runtime_scope(get_hermes_home())
-            except Exception:
-                pass
-            return nullcontext()
-        from gateway.run import _profile_runtime_scope
-        from hermes_cli.profiles import get_profile_dir
-
-        return _profile_runtime_scope(get_profile_dir(profile))
-
-    def _make_profile_prefix_middleware(self):
-        """Reject unknown /p/<profile>/ prefixes and scope the request home."""
-
-        @web.middleware
-        async def profile_prefix_middleware(request: "web.Request", handler):
-            profile = self._resolve_request_profile(request)
-            if profile is _PROFILE_REJECTED:
-                return web.json_response(
-                    {"error": "Unknown or unconfigured profile"},
-                    status=404,
-                )
-            token = _api_request_profile.set(profile)
-            try:
-                with self._profile_scope(profile):
-                    return await handler(request)
-            finally:
-                _api_request_profile.reset(token)
-
-        return profile_prefix_middleware
-
-    def _http_route_table(self) -> List[tuple]:
-        """Return (method, path, handler) rows registered by ``connect()``.
-
-        Kept as a method so multiplex tests can assert the /p/<profile>/
-        mirrors without starting a real aiohttp listener.
-        """
-        routes: List[tuple] = [
-            ("GET", "/health", self._handle_health),
-            ("GET", "/health/detailed", self._handle_health_detailed),
-            ("GET", "/v1/health", self._handle_health),
-            ("GET", "/v1/models", self._handle_models),
-            ("GET", "/api/model/options", self._handle_model_options),
-            ("GET", "/v1/capabilities", self._handle_capabilities),
-            ("GET", "/v1/skills", self._handle_skills),
-            ("GET", "/v1/toolsets", self._handle_toolsets),
-            ("GET", "/api/sessions", self._handle_list_sessions),
-            ("POST", "/api/sessions", self._handle_create_session),
-            ("GET", "/api/sessions/{session_id}", self._handle_get_session),
-            ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
-            ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
-            ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
-            ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
-            ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
-            ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
-            ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
-            ("POST", "/v1/chat/completions", self._handle_chat_completions),
-            ("POST", "/v1/responses", self._handle_responses),
-            ("GET", "/v1/responses/{response_id}", self._handle_get_response),
-            ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
-            # Generic platform HTTP event callback ingress. Authenticated by
-            # the target adapter's own verifier (platform-signed bearer), NOT
-            # API_SERVER_KEY — external platforms hold no API server key.
-            ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
-            ("GET", "/api/jobs", self._handle_list_jobs),
-            ("POST", "/api/jobs", self._handle_create_job),
-            ("GET", "/api/jobs/{job_id}", self._handle_get_job),
-            ("PATCH", "/api/jobs/{job_id}", self._handle_update_job),
-            ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
-            ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
-            ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
-            ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
-            ("POST", "/v1/runs", self._handle_runs),
-            ("GET", "/v1/runs/{run_id}", self._handle_get_run),
-            ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
-            ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
-            ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
-        ]
-        if _CRON_AVAILABLE:
-            # Chronos managed-cron fire webhook (NAS → agent). Authenticated
-            # by a NAS-minted JWT (NOT API_SERVER_KEY).
-            routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
-        return routes
+    def _extract_quay_admin_slack_user_id(self, body: Any, request: "web.Request") -> object:
+        """Read the Slack user ID from a trusted caller's request."""
+        if isinstance(body, dict):
+            for key in ("slack_user_id", "user_id", "slackUserId"):
+                value = body.get(key)
+                if value is not None:
+                    return value
+        return request.headers.get("X-Slack-User-Id", "")
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -7166,12 +6954,49 @@ class APIServerAdapter(BasePlatformAdapter):
             ]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
-            # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
-            # the profile-prefix middleware validates the prefix and scopes
-            # config/credentials to that profile when multiplexing is on.
-            for method, path, handler in self._http_route_table():
-                self._app.router.add_route(method, path, handler)
-                self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            self._app.router.add_get("/health", self._handle_health)
+            self._app.router.add_get("/health/detailed", self._handle_health_detailed)
+            self._app.router.add_get("/v1/health", self._handle_health)
+            self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_get("/v1/skills", self._handle_skills)
+            self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            # Session/client control surface (thin wrappers over SessionDB + _run_agent)
+            self._app.router.add_get("/api/sessions", self._handle_list_sessions)
+            self._app.router.add_post("/api/sessions", self._handle_create_session)
+            self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
+            self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
+            self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
+            self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
+            self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
+            self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
+            self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+            self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            self._app.router.add_post("/v1/responses", self._handle_responses)
+            self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
+            self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app.router.add_post("/quay/review-pr", self._handle_quay_review_pr)
+            self._app.router.add_post("/quay/admin/authorize", self._handle_quay_admin_authorize)
+            # Cron jobs management API
+            self._app.router.add_get("/api/jobs", self._handle_list_jobs)
+            self._app.router.add_post("/api/jobs", self._handle_create_job)
+            self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
+            self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
+            self._app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
+            self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
+            self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
+            self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+
+            # Chronos managed-cron fire webhook (NAS → agent). Authenticated by a
+            # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
+            if _CRON_AVAILABLE:
+                self._app.router.add_post("/api/cron/fire", self._handle_cron_fire)
+            # Structured event streaming
+            self._app.router.add_post("/v1/runs", self._handle_runs)
+            self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
+            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
+            self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

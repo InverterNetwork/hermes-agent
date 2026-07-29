@@ -32,7 +32,6 @@ from tools.send_message_tool import (
     _resolve_slack_user_target,
     _send_matrix_via_adapter,
     _send_signal,
-    _send_slack,
     _send_telegram,
     _send_to_platform,
     send_message_tool,
@@ -879,6 +878,46 @@ class TestSendToPlatformChunking:
         assert result["success"] is True
         sent_text = send.await_args.args[2]
         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
+
+    def test_slack_thread_ts_forwarded_when_set(self, monkeypatch):
+        # When the caller passes slack_thread_ts, _send_slack must receive it
+        # as a kwarg so chat.postMessage threads under the given root ts.
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_via_adapter", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "hello in thread",
+                    slack_thread_ts="1715420800.123456",
+                )
+            )
+        assert result["success"] is True
+        send.assert_awaited_once()
+        assert send.await_args.kwargs.get("thread_id") == "1715420800.123456"
+
+    def test_slack_no_extra_kwargs_when_unset(self, monkeypatch):
+        # When slack_thread_ts is not set, _send_slack is called with
+        # exactly the three positional args. Guards the existing test
+        # assertions against accidental kwarg leakage.
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_via_adapter", send):
+            asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "plain hello",
+                )
+            )
+        assert send.await_args.kwargs.get("thread_id") is None
 
     def test_telegram_markdown_expansion_is_chunked_before_send(self, monkeypatch):
         """Telegram chunking must account for MarkdownV2 escaping expansion.
@@ -2039,41 +2078,6 @@ class TestSendMessageSchemaShape:
                     f"Schema property '{name}'.items must be a JSONSchema object, "
                     f"got {type(prop['items']).__name__}"
                 )
-
-
-class TestSendSlackPayload:
-    """_send_slack's chat.postMessage payload includes optional thread_ts."""
-
-    @staticmethod
-    def _build_mock(response_data=None):
-        mock_resp = MagicMock()
-        mock_resp.json = AsyncMock(
-            return_value=response_data or {"ok": True, "ts": "1715420900.000100"}
-        )
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=None)
-
-        mock_session = MagicMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=None)
-        mock_session.post = MagicMock(return_value=mock_resp)
-        return mock_session
-
-    def test_plain_send_omits_thread_ts(self):
-        mock_session = self._build_mock()
-        with patch("aiohttp.ClientSession", return_value=mock_session):
-            asyncio.run(_send_slack("tok", "C123", "hi"))
-        payload = mock_session.post.call_args.kwargs["json"]
-        assert payload["channel"] == "C123"
-        assert payload["text"] == "hi"
-        assert "thread_ts" not in payload
-
-    def test_thread_ts_included_when_set(self):
-        mock_session = self._build_mock()
-        with patch("aiohttp.ClientSession", return_value=mock_session):
-            asyncio.run(_send_slack("tok", "C123", "hi", thread_ts="1715420800.123456"))
-        payload = mock_session.post.call_args.kwargs["json"]
-        assert payload["thread_ts"] == "1715420800.123456"
 
 
 class TestSendToPlatformDiscordThread:

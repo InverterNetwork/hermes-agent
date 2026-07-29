@@ -1090,6 +1090,7 @@ async def _send_to_platform(
     # (media-bearing sends were already intercepted by the branch above).
     if platform == Platform.SLACK:
         last_result = None
+        slack_thread_id = slack_thread_ts or thread_id
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
             result = await _send_via_adapter(
@@ -1097,7 +1098,7 @@ async def _send_to_platform(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
+                thread_id=slack_thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
             )
@@ -1494,16 +1495,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
     except Exception as e:
         return _error(f"Telegram send failed: {e}")
-
-
-async def _send_slack(token, chat_id, message, *, thread_ts=None):
-    """Compatibility shim for the pre-plugin Slack sender signature."""
-    from types import SimpleNamespace
-
-    pconfig = SimpleNamespace(token=token, extra={})
-    return await _registry_standalone_send(
-        "slack", pconfig, chat_id, message, thread_id=thread_ts
-    )
 
 
 async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
