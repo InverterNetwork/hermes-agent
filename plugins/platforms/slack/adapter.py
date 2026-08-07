@@ -8647,18 +8647,18 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_strict_mention(self) -> bool:
         """When true, channel threads require an explicit @-mention on every
         message. Disables all auto-triggers (mentioned-thread memory,
-        bot-message follow-up, session-presence). Defaults to False.
+        bot-message follow-up, session-presence). Defaults to True.
         """
         configured = self.config.extra.get("strict_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() in {"true", "1", "yes", "on"}
+                return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
-        return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {
-            "true",
-            "1",
-            "yes",
-            "on",
+        return os.getenv("SLACK_STRICT_MENTION", "true").lower() not in {
+            "false",
+            "0",
+            "no",
+            "off",
         }
 
     def _slack_ignore_other_user_mentions(self) -> bool:

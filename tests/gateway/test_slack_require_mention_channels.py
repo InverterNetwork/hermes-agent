@@ -186,6 +186,8 @@ async def test_forced_channel_mention_routes(adapter):
 @pytest.mark.asyncio
 async def test_forced_channel_wake_checks_still_apply(adapter):
     """A previously mentioned thread still auto-follows in a forced channel."""
+    # Mentioned-thread auto-follow — only reachable with strict mode opted out.
+    adapter.config.extra["strict_mention"] = False
     adapter.config.extra["require_mention"] = False
     adapter.config.extra["require_mention_channels"] = CHANNEL_ID
     adapter._mentioned_threads.add("100.000")

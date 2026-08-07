@@ -5209,6 +5209,8 @@ class TestThreadReplyHandling:
         the bot (#24848) — e.g. parent says '<@bot> check this and ask me
         before running', a later bare 'run' reply must wake the bot even
         with no session and no in-memory mention tracking (restart-safe)."""
+        # Auto-trigger path — only reachable with strict mode opted out.
+        adapter_with_session_store.config.extra["strict_mention"] = False
         mock_session_store._entries = {}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=False
@@ -5271,6 +5273,8 @@ class TestThreadReplyHandling:
         """A TOP-LEVEL @mention starts a thread (session-scoped thread_ts
         falls back to the message ts); replies to it must auto-trigger, so
         the synthetic root is registered in _mentioned_threads (#24848)."""
+        # Thread registration is skipped in strict mode by design.
+        adapter_with_session_store.config.extra["strict_mention"] = False
         mock_session_store._entries = {}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=False
@@ -5381,6 +5385,8 @@ class TestThreadReplyHandling:
         """Unmentioned replies in active threads keep the existing behavior:
         no thread re-fetch, no context injection (once the one-shot restart
         rehydration check has found no watermark)."""
+        # Session-presence wake — only reachable with strict mode opted out.
+        adapter_with_session_store.config.extra["strict_mention"] = False
         mock_session_store._entries = {"any": MagicMock()}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=True
@@ -5415,6 +5421,8 @@ class TestThreadReplyHandling:
         + watermark), the FIRST ordinary thread reply injects messages the
         session missed while the gateway was down — exactly once. Subsequent
         replies do not re-fetch."""
+        # Ordinary (unmentioned) thread reply — needs strict mode opted out.
+        adapter_with_session_store.config.extra["strict_mention"] = False
         mock_session_store._entries = {"any": MagicMock()}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=True
@@ -8663,6 +8671,8 @@ class TestThreadImageContext:
         hydrate is skipped, so root images are never re-downloaded or
         re-delivered on later turns."""
         a = self._prep(adapter_with_session_store)
+        # Unmentioned follow-up turn — needs strict mode opted out.
+        a.config.extra["strict_mention"] = False
         a._has_active_session_for_thread = MagicMock(return_value=True)
         mock_session_store._entries = {"any": MagicMock()}
         a._fetch_thread_parent_text = AsyncMock(return_value="")
