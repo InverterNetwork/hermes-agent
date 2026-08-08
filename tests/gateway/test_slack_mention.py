@@ -150,10 +150,10 @@ def test_require_mention_env_var_default_true(monkeypatch):
 # Tests: _slack_strict_mention
 # ---------------------------------------------------------------------------
 
-def test_strict_mention_defaults_to_false(monkeypatch):
+def test_strict_mention_defaults_to_true(monkeypatch):
     monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
     adapter = _make_adapter()
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_true():
@@ -176,10 +176,10 @@ def test_strict_mention_string_off():
     assert adapter._slack_strict_mention() is False
 
 
-def test_strict_mention_malformed_stays_false():
-    """Unrecognised values do not silently opt into strict mode."""
+def test_strict_mention_malformed_stays_strict():
+    """Unrecognised values do not silently opt OUT of strict mode."""
     adapter = _make_adapter(strict_mention="maybe")
-    assert adapter._slack_strict_mention() is False
+    assert adapter._slack_strict_mention() is True
 
 
 def test_strict_mention_env_var_fallback(monkeypatch):
@@ -417,12 +417,13 @@ def test_mentioned_message_always_processed():
     assert _would_process(adapter, mentioned=True, text="what's up") is True
 
 
-def test_thread_reply_with_active_session_processed_by_default():
+def test_thread_reply_with_active_session_ignored_by_default():
+    """Strict mode is the default: an engaged thread still needs a re-mention."""
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="followup",
         thread_reply=True, active_session=True,
-    ) is True
+    ) is False
 
 
 def test_thread_reply_with_active_session_processed_when_strict_disabled():
@@ -481,7 +482,9 @@ def _make_runtime_adapter(
 
 
 @pytest.mark.asyncio
-async def test_runtime_default_processes_unmentioned_active_thread_reply():
+async def test_runtime_default_ignores_unmentioned_active_thread_reply():
+    """End-to-end: with strict_mention unset, session presence must not wake
+    the bot on an unmentioned thread reply."""
     adapter = _make_runtime_adapter(active_session=True)
 
     await adapter._handle_slack_message({
@@ -493,7 +496,28 @@ async def test_runtime_default_processes_unmentioned_active_thread_reply():
         "team": "T1",
     })
 
-    adapter.handle_message.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_default_ignores_reply_in_previously_mentioned_thread():
+    """Regression guard for the ba638cde2 default flip: being @-mentioned ONCE
+    must not make a thread permanently awake. With strict_mention unset, a
+    later unmentioned reply in a thread carrying a mention marker stays
+    silent."""
+    adapter = _make_runtime_adapter()
+    adapter._register_mentioned_thread("171234.000100", team_id="T1")
+
+    await adapter._handle_slack_message({
+        "channel": CHANNEL_ID,
+        "ts": "171234.000200",
+        "thread_ts": "171234.000100",
+        "user": "U_ALICE",
+        "text": "and the staging one too",
+        "team": "T1",
+    })
+
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
