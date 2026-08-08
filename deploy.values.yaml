@@ -839,9 +839,14 @@ atlas:
         - "**/*.md"
       exclude: []
     slack-channels:
-      # Principal-approved allowlist (2026-07-18), 22 channels = the Hermes
-      # deploy allowlist minus the excluded private test-devops. The bot is a
-      # member of 16; the other 6 are SKIPPED at runtime (skipped_unreachable)
+      # Principal-approved allowlist (2026-07-18; trimmed 2026-08-08), 18
+      # channels = the Hermes deploy allowlist minus the excluded private
+      # test-devops, minus the four alert/notification channels
+      # (itry-alerts-dev/staging/prod, otto-notifs) that carry bot alert
+      # traffic rather than human discussion. Those four stay in
+      # slack.runtime.allowed_channels and slack_triggers — this list only
+      # governs Atlas ingest. Channels the bot has not been invited to are
+      # SKIPPED at runtime (skipped_unreachable)
       # until it is invited. Chat is redacted at ingest and synthesis-quarantined
       # until the M2 injection defense lands. Token read from auth/atlas.env by
       # the SLACK_ATLAS_TOKEN env-var name (never the value).
@@ -861,16 +866,12 @@ atlas:
         - C0B23MZ0USV
         - C0B4LLZ5Z2L
         - C0B4A6LEW31
-        - C0B3WAWLL0L
         - C05M45H6KAT
         - C0B0LSP8H1B
         - C0B0MP16YDD
         - C097HBE6Z7E
         - C0AJ4MM4PPT
         - C0AEN8KDRT2
-        - C0AAN0K8UMP
-        - C0AGZUH6C15
-        - C0AH910LEV9
         - C09R47ZHB61
         - C08956H1V4K
         - C0AMT3TD86R
