@@ -23,18 +23,23 @@ import { findGroup, findGroupOfPane, type LayoutNode } from '@/components/pane-s
 import {
   $activeTreeGroup,
   $layoutTree,
+  focusedSessionTabAnchor,
   moveTreePane,
   noteActiveTreeGroup,
   revealTreePane
 } from '@/components/pane-shell/tree/store'
 import { stableArray } from '@/lib/stable-array'
 import { readJson, writeJson } from '@/lib/storage'
+import type { SessionInfo } from '@/types/hermes'
 
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import {
   $activeSessionId,
   $selectedStoredSessionId,
+  $sessions,
   $unreadFinishedSessionIds,
+  lineageAliases,
+  sessionMatchesStoredId,
   setActiveSessionStoredIdRotation
 } from './session'
 import { isSecondaryWindow } from './windows'
@@ -66,8 +71,13 @@ export function setSessionStalled(storedSessionId: string | null | undefined, st
   }
 }
 
-// --- Watchdog: marks busy sessions quiet after 8 min of stream silence -----
-export const SESSION_WATCHDOG_TIMEOUT_MS = 8 * 60 * 1000
+// --- Watchdog: marks busy sessions quiet after a long stream silence -------
+// Tuned against what this app actually does rather than a round number: a
+// typecheck or a full test run here goes quiet for minutes at a stretch and is
+// perfectly healthy, so anything under ~4 min would paint normal work as
+// suspect. Eight minutes was the other failure — longer than a user is willing
+// to sit and wonder, so the hint arrived after they had already given up on it.
+export const SESSION_WATCHDOG_TIMEOUT_MS = 5 * 60 * 1000
 const sessionWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 function armWatchdog(runtimeId: string) {
@@ -248,30 +258,88 @@ export function clearAllSessionStates() {
 // a turn), but these sets only change on busy/needsInput edges. `stableArray`
 // keeps the prior reference when membership is unchanged so `computed` skips the
 // emit — otherwise the whole sidebar + every row re-renders per token.
-const storedIds = (states: Record<string, ClientSessionState>, pred: (s: ClientSessionState) => boolean) =>
-  Object.values(states)
-    .filter(s => pred(s) && s.storedSessionId)
-    .map(s => s.storedSessionId!)
+// Published under every id the conversation answers to, not just its current
+// tip: consumers hold whichever id they were created with, and compression
+// rotates the tip out from under them (see lineageAliases).
+//
+// A conversation that has not been persisted yet has no stored id at all, and
+// dropping it here is what left the FIRST turn of a new chat with no running
+// indicator anywhere — no dot, no row arc — for as long as it took the backend
+// to hand one back. Its runtime id is the right fallback because until a stored
+// id exists the two are the same value (submit.ts: "an unpersisted
+// conversation's queue key IS its runtime id"), so the row matches; once a
+// session is persisted its runtime id is nobody's key and the fallback is inert.
+const storedIds = (
+  states: Record<string, ClientSessionState>,
+  sessions: readonly SessionInfo[],
+  pred: (s: ClientSessionState) => boolean
+) => {
+  const ids = new Set<string>()
+
+  for (const [runtimeId, state] of Object.entries(states)) {
+    if (!pred(state)) {
+      continue
+    }
+
+    for (const alias of lineageAliases(state.storedSessionId ?? runtimeId, sessions)) {
+      ids.add(alias)
+    }
+  }
+
+  return [...ids]
+}
 
 let workingIds: readonly string[] = []
 export const $workingSessionIds = computed(
-  $sessionStates,
-  states =>
+  [$sessionStates, $sessions],
+  (states, sessions) =>
     (workingIds = stableArray(
       workingIds,
-      storedIds(states, s => s.busy)
+      storedIds(states, sessions, s => s.busy)
     ))
 )
 
 let attentionIds: readonly string[] = []
 export const $attentionSessionIds = computed(
-  $sessionStates,
-  states =>
+  [$sessionStates, $sessions],
+  (states, sessions) =>
     (attentionIds = stableArray(
       attentionIds,
-      storedIds(states, s => s.needsInput)
+      storedIds(states, sessions, s => s.needsInput)
     ))
 )
+
+// An open session nothing has ever been sent to — the ⌘T tab whose backend
+// session exists but is unlisted, or a tile still waiting on its first send.
+// `blankDraftTile`'s predicate, read as a status rather than as a slot to spend.
+//
+// The row's own `message_count` is the tiebreaker, and it is load-bearing: a
+// session RESUMING also holds an empty message list for the moment between
+// binding its runtime and loading its transcript, and calling that a draft
+// would flash the wrong mark on a conversation with years of history in it.
+let draftIds: readonly string[] = []
+export const $draftSessionIds = computed([$sessionStates, $sessions], (states, sessions) => {
+  const unsent = (state: ClientSessionState) => {
+    if (state.busy || state.messages.length > 0) {
+      return false
+    }
+
+    const storedId = state.storedSessionId
+
+    // No stored id is the ⌘T tab that hasn't reached the backend yet: a draft
+    // by definition, and no row to consult. Asking anyway would match a row on
+    // an empty lineage root.
+    if (!storedId) {
+      return true
+    }
+
+    const row = sessions.find(session => sessionMatchesStoredId(session, storedId))
+
+    return !row || row.message_count === 0
+  }
+
+  return (draftIds = stableArray(draftIds, storedIds(states, sessions, unsent)))
+})
 
 // ---------------------------------------------------------------------------
 // Session tiles.
@@ -522,7 +590,11 @@ function syncTileStripOrder() {
  *  move path is what lets a tile's own TAB be dragged like a sidebar row — drop
  *  it on a zone/edge/strip and the tile goes there (drop-on-a-composer links
  *  instead, handled by the drag resolver). The session LOADED IN MAIN never
- *  opens as a tile (same transcript twice, fighting one runtime — silly). */
+ *  opens as a tile (same transcript twice, fighting one runtime — silly).
+ *
+ *  An unanchored open (⌘T, ⌘⇧T on a tile that predates anchors) docks into the
+ *  FOCUSED chat zone — the same zone ⌘1…⌘9 and ⌘W act on — so a new tab lands
+ *  in the strip the user is looking at, not always main's. */
 export function openSessionTile(
   storedSessionId: string,
   dir: TileDock = 'right',
@@ -535,8 +607,10 @@ export function openSessionTile(
     return
   }
 
+  const dock = anchor ?? focusedSessionTabAnchor() ?? undefined
+
   if (!tiles.some(t => t.storedSessionId === storedSessionId)) {
-    saveTiles([...tiles, { anchor, before, dir, storedSessionId }])
+    saveTiles([...tiles, { anchor: dock, before, dir, storedSessionId }])
     // Adoption is async via the registry — order sync runs after the move path
     // below; a brand-new tile's strip slot is already in `before`.
 
@@ -546,11 +620,11 @@ export function openSessionTile(
   // Already open: relocate the existing pane to the drop target (pane-mirror
   // only docks on first adoption, so a re-drag must move the tree pane itself).
   const tree = $layoutTree.get()
-  const target = tree ? findGroupOfPane(tree, anchor ?? 'workspace')?.id : null
+  const target = tree ? findGroupOfPane(tree, dock ?? 'workspace')?.id : null
 
   if (target) {
     moveTreePane(`${TILE_PANE_PREFIX}${storedSessionId}`, { before: before ?? null, groupId: target, pos: dir })
-    patchSessionTile(storedSessionId, { anchor, before: before ?? undefined, dir })
+    patchSessionTile(storedSessionId, { anchor: dock, before: before ?? undefined, dir })
     syncTileStripOrder()
   }
 }
@@ -629,6 +703,42 @@ export function focusedSessionNeedsRoute(focused: 'main' | 'tile' | null, worksp
   return !focused || (focused === 'main' && workspaceIsPage)
 }
 
+/** The open tab that's still an empty "New session" draft, if there is one.
+ *  That tab is the one the user would have typed into, so an open-from-nowhere
+ *  spends it instead of stacking a second blank tab beside it. Most recent
+ *  wins; a tile whose runtime hasn't bound (or whose state hasn't published) is
+ *  unknown rather than empty, so it's left alone. */
+export function blankDraftTile(
+  tiles: readonly SessionTile[],
+  states: Record<string, ClientSessionState>
+): null | SessionTile {
+  return (
+    tiles.findLast(({ runtimeId }) => {
+      const state = runtimeId ? states[runtimeId] : undefined
+
+      return Boolean(state && !state.busy && state.messages.length === 0)
+    }) ?? null
+  )
+}
+
+/** Hand an open blank draft tab over to `storedSessionId`, keeping its slot.
+ *  False when there's no such tab, so the caller can fall back. The spent draft
+ *  is DISCARDED rather than closed: it never held a conversation, so ⌘⇧T
+ *  resurrecting it would just restore an empty tab. */
+export function reuseBlankDraftTile(storedSessionId: string): boolean {
+  const tile = blankDraftTile($sessionTiles.get(), $sessionStates.get())
+
+  if (!tile || tile.storedSessionId === storedSessionId) {
+    return false
+  }
+
+  discardSessionTile(tile.storedSessionId)
+  openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before)
+  revealTreePane(`${TILE_PANE_PREFIX}${storedSessionId}`)
+
+  return true
+}
+
 // Closed-tab stack for ⌘⇧T reopen (in-memory) — keyed PER PROFILE like the
 // tiles themselves, so ⌘⇧T after a profile switch never resurrects the other
 // profile's session. The tile's placement is remembered so it returns in place.
@@ -659,8 +769,10 @@ export function discardSessionTile(storedSessionId: string) {
   saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
 }
 
-/** ⌘⇧T — reopen the most recently closed tab where it was. Skips ids that are
- *  live again (reopened, or now the primary). */
+/** ⌘⇧T — reopen the most recently closed tab where it was, then focus it.
+ *  Adoption alone is silent (won't steal the active tab), so restore has to
+ *  front the pane explicitly. Skips ids that are live again (reopened / now
+ *  the primary). */
 export function reopenLastClosedTile(): void {
   const stack = closedStack()
 
@@ -673,6 +785,7 @@ export function reopenLastClosedTile(): void {
 
     if (!$sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
       openSessionTile(storedSessionId, tile.dir, tile.anchor, tile.before)
+      focusOpenSession(storedSessionId)
 
       return
     }
@@ -725,10 +838,26 @@ export const $focusedSessionState = computed([$focusedRuntimeId, $sessionStates]
 export const selectionHomesToWorkspace = (selected: null | string, tiles: readonly SessionTile[]): boolean =>
   !(selected && tiles.some(t => t.storedSessionId === selected))
 
+// Cold-start restore is the one selection change that is NOT a navigation: the
+// route already pointed at the primary session before the window loaded, and
+// homing on it would front the workspace tab over the PERSISTED active tab —
+// then persist that clobber, so the tab you reloaded on never comes back
+// (⌘R always landing on main). use-route-resume arms this one-shot right
+// before dispatching the boot resume; the very next selection change skips
+// homing and the restored layout tree keeps its say.
+let selectionRestoreInFlight = false
+
+export function markSelectionRestore() {
+  selectionRestoreInFlight = true
+}
+
 // Homing also FRONTS the workspace tab: the resumed chat loads in the workspace
 // pane, so a zone parked on a tile tab must switch back or the click looks dead.
 $selectedStoredSessionId.listen(selected => {
-  if (!selectionHomesToWorkspace(selected, $sessionTiles.get())) {
+  const restoring = selectionRestoreInFlight
+  selectionRestoreInFlight = false
+
+  if (restoring || !selectionHomesToWorkspace(selected, $sessionTiles.get())) {
     return
   }
 
@@ -737,7 +866,7 @@ $selectedStoredSessionId.listen(selected => {
 })
 
 // Dev hook for automation (mirrors __HERMES_LAYOUT_TREE__).
-if (import.meta.env.DEV && typeof window !== 'undefined') {
+if ((import.meta.env.DEV || import.meta.env.VITE_PERF_PROBE === '1') && typeof window !== 'undefined') {
   ;(window as unknown as Record<string, unknown>).__HERMES_SESSION_TILES__ = {
     close: closeSessionTile,
     open: openSessionTile,
