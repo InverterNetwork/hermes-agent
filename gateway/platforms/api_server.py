@@ -3454,7 +3454,12 @@ class APIServerAdapter(BasePlatformAdapter):
         for tag in payload.get("tags", []):
             argv.extend(["--tag", tag])
 
-        env = os.environ.copy()
+        from tools.environments.local import build_subprocess_env
+
+        # Quay needs the full inherited env (git credentials, review tokens);
+        # scrub_secrets=False + inherit_profile_home=False preserves the exact
+        # legacy os.environ.copy() behavior, HERMES_HOME handled below.
+        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
         env["QUAY_DATA_DIR"] = self._quay_data_dir
         env.setdefault("HERMES_HOME", str(get_hermes_home()))
 
