@@ -1597,15 +1597,23 @@ PY
           ATLAS_SOURCE_EPISODE_GAP="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.episode_gap_minutes" 2>/dev/null || true)"
           ATLAS_SOURCE_CHANNEL_IDS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.channel_ids" --sep $'\n' 2>/dev/null || true)"
           ATLAS_SOURCE_AGENT_IDS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.agent_author_ids" --sep $'\n' 2>/dev/null || true)"
+          ATLAS_SOURCE_WORKSPACE_BASE_URL="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get "atlas.sources.$atlas_source_name.workspace_base_url" 2>/dev/null || true)"
           [[ "$ATLAS_SOURCE_TOKEN_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
             || { echo "FAIL: atlas.sources.$atlas_source_name.token_env must name an env var (got: $ATLAS_SOURCE_TOKEN_ENV)" >&2; exit 1; }
           [[ "$ATLAS_SOURCE_VISIBILITY" == "shareable" || "$ATLAS_SOURCE_VISIBILITY" == "private" ]] \
             || { echo "FAIL: atlas.sources.$atlas_source_name.visibility must be shareable or private (got: $ATLAS_SOURCE_VISIBILITY)" >&2; exit 1; }
           [[ -n "$ATLAS_SOURCE_CHANNEL_IDS" ]] \
             || { echo "FAIL: atlas.sources.$atlas_source_name.channel_ids must list at least one channel" >&2; exit 1; }
+          if [[ -n "$ATLAS_SOURCE_WORKSPACE_BASE_URL" ]]; then
+            [[ "$ATLAS_SOURCE_WORKSPACE_BASE_URL" =~ ^https://[A-Za-z0-9.-]+$ ]] \
+              || { echo "FAIL: atlas.sources.$atlas_source_name.workspace_base_url must be https://<host> with no path or trailing slash (got: $ATLAS_SOURCE_WORKSPACE_BASE_URL)" >&2; exit 1; }
+          fi
           printf '    type: slack\n'
           printf '    token_env: "%s"\n' "$ATLAS_SOURCE_TOKEN_ENV"
           printf '    visibility: "%s"\n' "$ATLAS_SOURCE_VISIBILITY"
+          if [[ -n "$ATLAS_SOURCE_WORKSPACE_BASE_URL" ]]; then
+            printf '    workspace_base_url: "%s"\n' "$ATLAS_SOURCE_WORKSPACE_BASE_URL"
+          fi
           printf '    bot_policy: include\n'
           if [[ "$ATLAS_SOURCE_EPISODE_GAP" =~ ^[0-9]+$ ]]; then
             printf '    episode_gap_minutes: %s\n' "$ATLAS_SOURCE_EPISODE_GAP"
