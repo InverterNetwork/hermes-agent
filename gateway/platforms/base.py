@@ -2301,8 +2301,6 @@ class MessageEvent:
     text: str
     message_type: MessageType = MessageType.TEXT
 
-<<<<<<< HEAD
-=======
     # Author of this inbound message.  Carried on the event itself (not
     # only on ``source``) so prompt builders that build per-message text
     # can resolve "who said this" without having to dig into ``source``.
@@ -2312,7 +2310,6 @@ class MessageEvent:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
 
->>>>>>> upstream/main
     # Source information
     source: SessionSource = None
 

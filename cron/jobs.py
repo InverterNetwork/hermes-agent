@@ -1622,12 +1622,9 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
-<<<<<<< HEAD
     secrets: Optional[List[str]] = None,
-=======
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
->>>>>>> upstream/main
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1672,7 +1669,6 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
-<<<<<<< HEAD
         secrets: Optional list of secret env-var names the job's ``script``
                 needs (BRIX-1870). This is the DECLARATION gate — dev-editable
                 and PR-reviewed. At run time only names that are ALSO in the
@@ -1680,7 +1676,6 @@ def create_job(
                 never-injectable hard floor) are injected into the script's
                 otherwise-stripped environment; everything else stays stripped.
                 Stored on the job even when empty for shape stability.
-=======
         monitor_script: Optional path to a cheap monitor source script (same
                 resolution/containment rules as ``script``: relative to
                 ~/.hermes/scripts/, .sh/.bash via bash, else Python). Each
@@ -1694,7 +1689,6 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
->>>>>>> upstream/main
 
     Returns:
         The created job dict
@@ -1803,15 +1797,12 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
-<<<<<<< HEAD
         "secrets": normalized_secrets,
-=======
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
         # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
         # "last_changed_at": ...}. None until the first monitor tick.
         "monitor_state": None,
->>>>>>> upstream/main
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),

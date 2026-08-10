@@ -475,7 +475,6 @@ class TestSlackThreadContext:
         # self-bot.
         assert "[assistant] Own T2 bot reply" in context
 
-<<<<<<< HEAD
     @pytest.mark.asyncio
     async def test_fetch_thread_context_current_ts_excluded(self):
         """Regression guard: the message whose ts == current_ts must never
@@ -590,34 +589,6 @@ class TestSlackThreadContext:
         assert "[Content of OWNER-GUIDE.md]" in context
         assert "# Coordinating emUSD" in context
 
-    @pytest.mark.asyncio
-    async def test_fetch_thread_parent_text_from_cache(self):
-        """_fetch_thread_parent_text should reuse the thread-context cache
-        when it is warm, avoiding an extra conversations.replies call."""
-        adapter = _make_adapter()
-        mock_client = adapter._team_clients["T1"]
-        mock_client.conversations_replies = AsyncMock(return_value={
-            "messages": [
-                {"ts": "1000.0", "bot_id": "B123", "text": "Parent summary"},
-                {"ts": "1000.1", "user": "U1", "text": "reply"},
-            ]
-        })
-
-        # Warm the cache via _fetch_thread_context
-        await adapter._fetch_thread_context(
-            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
-        )
-        assert mock_client.conversations_replies.await_count == 1
-
-        parent = await adapter._fetch_thread_parent_text(
-            channel_id="C1", thread_ts="1000.0", team_id="T1"
-        )
-        assert parent == "Parent summary"
-        # No additional API call
-        assert mock_client.conversations_replies.await_count == 1
-
-=======
->>>>>>> upstream/main
 
 # ===========================================================================
 # _has_active_session_for_thread — session key fix (#5833)

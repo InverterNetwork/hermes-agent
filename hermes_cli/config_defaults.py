@@ -1843,6 +1843,14 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "config": {
+            "google_workspace": {
+                # Optional service-account key for Google Drive, Docs, and
+                # Sheets file-level access. The JSON key remains a credential
+                # file; this config value stores only the path.
+                "service_account_key_path": "",
+            },
+        },
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -1944,6 +1952,7 @@ DEFAULT_CONFIG = {
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels
+        "strict_mention": True,        # Require @mention in Slack channel threads too
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         # Channel IDs where @mention is ALWAYS required, even when
@@ -4313,6 +4322,38 @@ OPTIONAL_ENV_VARS = {
         "prompt": "API server auth key",
         "url": None,
         "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "QUAY_REVIEW_PR_TOKEN": {
+        "description": "Bearer token for authenticated POST /quay/review-pr enrollment from GitHub Actions.",
+        "prompt": "Quay review-pr endpoint token",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "QUAY_ADMIN_ALLOWED_USERS": {
+        "description": "Comma-separated Slack user IDs allowed to request one-time Quay Admin login links. Empty or unset denies all users; wildcard access is not supported.",
+        "prompt": "Quay Admin allowed Slack user IDs",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "QUAY_ADMIN_PUBLIC_BASE_URL": {
+        "description": "Public Hermes dashboard base URL used in Slack-issued Quay Admin login links.",
+        "prompt": "Quay Admin public base URL",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "QUAY_ADMIN_BASE_URL": {
+        "description": "Internal Quay Admin serve base URL proxied by the Hermes dashboard.",
+        "prompt": "Quay Admin internal base URL",
+        "url": None,
+        "password": False,
         "category": "messaging",
         "advanced": True,
     },

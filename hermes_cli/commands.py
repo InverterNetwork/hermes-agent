@@ -1272,23 +1272,8 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-<<<<<<< HEAD
 #   - platform: gateway circuit-breaker control; reached via /hermes platform
 #     on Slack because the native slash-command registry is already at its cap.
-_SLACK_VIA_HERMES_ONLY = frozenset(
-    {
-        "topup",
-        "moa",
-        "debug",
-        "egress",
-        "init",
-        "version",
-        "diff",
-        "update",
-        "platform",
-    }
-)
-=======
 #   - heartbeat: session heartbeat management; reached via /hermes heartbeat
 #     on Slack. Added at the 50-cap — a native slot would clamp /insights.
 #   - refine: on-demand memory/skill review; reached via /hermes refine on
@@ -1296,8 +1281,7 @@ _SLACK_VIA_HERMES_ONLY = frozenset(
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
->>>>>>> upstream/main
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "platform", "heartbeat", "refine", "pause"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

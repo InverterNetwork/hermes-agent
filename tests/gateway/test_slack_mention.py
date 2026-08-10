@@ -108,7 +108,6 @@ def test_strict_mention_defaults_to_true(monkeypatch):
     assert adapter._slack_strict_mention() is True
 
 
-<<<<<<< HEAD
 def test_strict_mention_true():
     adapter = _make_adapter(strict_mention=True)
     assert adapter._slack_strict_mention() is True
@@ -131,10 +130,6 @@ def test_strict_mention_string_off():
 
 def test_strict_mention_malformed_stays_strict():
     """Unrecognised values do not silently opt OUT of strict mode."""
-=======
-def test_strict_mention_malformed_stays_false():
-    """Unrecognised values keep strict mode OFF (fail-open to legacy behavior)."""
->>>>>>> upstream/main
     adapter = _make_adapter(strict_mention="maybe")
     assert adapter._slack_strict_mention() is True
 

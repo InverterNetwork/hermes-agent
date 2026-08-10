@@ -1350,12 +1350,6 @@ class CLICommandsMixin:
 
         if len(parts) > 1:
             # Set personality
-<<<<<<< HEAD
-            personality_name = parts[1].strip().lower()
-
-            if personality_name in {"none", "default", "neutral"}:
-                self.system_prompt = ""
-=======
             personality_name = parts[1].strip()
 
             try:
@@ -1378,7 +1372,6 @@ class CLICommandsMixin:
                     )
                 except Exception:
                     self.system_prompt = ""
->>>>>>> upstream/main
                 self.agent = None  # Force re-init
                 if saved:
                     print("(^_^)b Personality cleared (saved to config)")

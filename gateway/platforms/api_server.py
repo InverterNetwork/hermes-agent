@@ -1402,8 +1402,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if raw_port is None:
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
-<<<<<<< HEAD
-        self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
         self._quay_review_pr_token: str = str(
             extra.get("quay_review_pr_token")
             or os.getenv("QUAY_REVIEW_PR_TOKEN", "")
@@ -1432,9 +1431,6 @@ class APIServerAdapter(BasePlatformAdapter):
             if "quay_admin_allowed_users" in extra
             else os.getenv("QUAY_ADMIN_ALLOWED_USERS", "")
         )
-=======
-        self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
->>>>>>> upstream/main
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )

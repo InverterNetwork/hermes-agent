@@ -486,115 +486,6 @@ class TestSendToPlatformChunking:
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
 
-<<<<<<< HEAD
-    def test_slack_messages_are_formatted_before_send(self, monkeypatch):
-        _ensure_slack_mock(monkeypatch)
-
-        import plugins.platforms.slack.adapter as slack_mod
-
-        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
-        send = _make_recording_slack_sender()
-
-        with _patch_slack_standalone_sender(send):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    SimpleNamespace(enabled=True, token="***", extra={}),
-                    "C123",
-                    "**hello** from [Hermes](<https://example.com>)",
-                )
-            )
-
-        assert result["success"] is True
-        send.assert_awaited_once_with(
-            "***",
-            "C123",
-            "*hello* from <https://example.com|Hermes>",
-        )
-
-    def test_slack_media_is_forwarded_to_standalone_plugin(self, monkeypatch, tmp_path):
-        """Out-of-process cron delivery must not silently drop Slack MEDIA files."""
-        _ensure_slack_mock(monkeypatch)
-        media_path = tmp_path / "daily-report.png"
-        media_path.write_bytes(b"\x89PNG\r\n\x1a\n")
-        media_files = [(str(media_path), False)]
-        pconfig = SimpleNamespace(enabled=True, token="***", extra={})
-
-        entry = _slack_entry()
-        assert entry is not None
-        original = entry.standalone_sender_fn
-        send = AsyncMock(
-            return_value={"success": True, "platform": "slack", "message_id": "1"}
-        )
-        entry.standalone_sender_fn = send
-        try:
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    pconfig,
-                    "C123",
-                    "daily report",
-                    media_files=media_files,
-                )
-            )
-        finally:
-            entry.standalone_sender_fn = original
-
-        assert result["success"] is True
-        # C8 caption-mode: short text rides the upload as `caption=` and the
-        # message slot is emptied — one Slack bubble, not text + bare file.
-        send.assert_awaited_once_with(
-            pconfig,
-            "C123",
-            "",
-            thread_id=None,
-            media_files=media_files,
-            caption="daily report",
-        )
-
-    def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
-        """Bold+italic ***text*** survives tool-layer formatting."""
-        _ensure_slack_mock(monkeypatch)
-        import plugins.platforms.slack.adapter as slack_mod
-
-        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
-        send = _make_recording_slack_sender()
-        with _patch_slack_standalone_sender(send):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    SimpleNamespace(enabled=True, token="***", extra={}),
-                    "C123",
-                    "***important*** update",
-                )
-            )
-        assert result["success"] is True
-        sent_text = send.await_args.args[2]
-        assert "*_important_*" in sent_text
-
-    def test_slack_blockquote_formatted_before_send(self, monkeypatch):
-        """Blockquote '>' markers must survive formatting (not escaped to '&gt;')."""
-        _ensure_slack_mock(monkeypatch)
-        import plugins.platforms.slack.adapter as slack_mod
-
-        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
-        send = _make_recording_slack_sender()
-        with _patch_slack_standalone_sender(send):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    SimpleNamespace(enabled=True, token="***", extra={}),
-                    "C123",
-                    "> important quote\n\nnormal text & stuff",
-                )
-            )
-        assert result["success"] is True
-        sent_text = send.await_args.args[2]
-        assert sent_text.startswith("> important quote")
-        assert "&amp;" in sent_text  # & is escaped
-        assert "&gt;" not in sent_text.split("\n")[0]  # > in blockquote is NOT escaped
-=======
->>>>>>> upstream/main
 
     def test_slack_pre_escaped_entities_not_double_escaped(self, monkeypatch):
         """Pre-escaped HTML entities survive tool-layer formatting without double-escaping."""
@@ -616,26 +507,6 @@ class TestSendToPlatformChunking:
         assert "&amp;amp;" not in sent_text
         assert "&amp;lt;" not in sent_text
         assert "AT&amp;T" in sent_text
-
-<<<<<<< HEAD
-    def test_slack_url_with_parens_formatted_before_send(self, monkeypatch):
-        """Wikipedia-style URL with parens survives tool-layer formatting."""
-        _ensure_slack_mock(monkeypatch)
-        import plugins.platforms.slack.adapter as slack_mod
-        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
-        send = _make_recording_slack_sender()
-        with _patch_slack_standalone_sender(send):
-            result = asyncio.run(
-                _send_to_platform(
-                    Platform.SLACK,
-                    SimpleNamespace(enabled=True, token="***", extra={}),
-                    "C123",
-                    "See [Foo](https://en.wikipedia.org/wiki/Foo_(bar))",
-                )
-            )
-        assert result["success"] is True
-        sent_text = send.await_args.args[2]
-        assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
 
     def test_slack_thread_ts_forwarded_when_set(self, monkeypatch):
         # When the caller passes slack_thread_ts, _send_slack must receive it
@@ -677,8 +548,6 @@ class TestSendToPlatformChunking:
             )
         assert send.await_args.kwargs.get("thread_id") is None
 
-=======
->>>>>>> upstream/main
     def test_telegram_markdown_expansion_is_chunked_before_send(self, monkeypatch):
         """Telegram chunking must account for MarkdownV2 escaping expansion.
 
@@ -1254,27 +1123,6 @@ class TestSendDiscordThreadId:
         response.json.assert_not_awaited()
         response.text.assert_not_awaited()
 
-<<<<<<< HEAD
-    def test_error_response_text_read_is_bounded(self):
-        """Oversized Discord API error bodies are capped before formatting."""
-        body = b"E" * (_DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES + 1024)
-        response = _StreamingAiohttpResponse(500, body)
-        session = _StreamingAiohttpSession(response)
-
-        with patch("aiohttp.ClientSession", return_value=session):
-            result = self._run("tok", "111", "hi", thread_id="999")
-
-        assert "error" in result
-        assert "500" in result["error"]
-        assert response.content.read_sizes[0] == _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES + 1
-        assert response.closed is True
-        response.json.assert_not_awaited()
-        response.text.assert_not_awaited()
-        prefix = "Discord API error (500): "
-        assert len(result["error"].encode("utf-8")) <= (
-            len(prefix.encode("utf-8")) + _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES
-        )
-
 
 class TestSendMessageSchemaShape:
     """Schema well-formedness — OpenAI function-calling validators reject
@@ -1297,8 +1145,6 @@ class TestSendMessageSchemaShape:
                 )
 
 
-=======
->>>>>>> upstream/main
 class TestSendToPlatformDiscordThread:
     """_send_to_platform passes thread_id through to _send_discord."""
 

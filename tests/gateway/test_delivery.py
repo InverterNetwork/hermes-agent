@@ -393,54 +393,6 @@ def test_local_delivery_writes_non_ascii_on_windows_codepage(tmp_path, monkeypat
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
     _simulate_windows_codepage_write(monkeypatch)
 
-<<<<<<< HEAD
-    adapter = ChunkingAdapter()
-    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
-    target = DeliveryTarget.parse("discord:123")
-
-    long_content = "x" * 5000
-
-    call_count = {"n": 0}
-
-    def failing_save(content, job_id):
-        call_count["n"] += 1
-        raise OSError("No space left on device")
-
-    monkeypatch.setattr(router, "_save_full_output", failing_save)
-
-    # Should NOT raise — audit failure is caught for chunking adapters
-    await router._deliver_to_platform(target, long_content, metadata={"job_id": "job6"})
-
-    # Adapter still got the full content
-    assert adapter.calls[0]["content"] == long_content
-    # Save was attempted (best-effort, swallowed)
-    assert call_count["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tmp_path, monkeypatch):
-    """For a non-chunking adapter, the truncation footer needs a valid saved
-    path. If the save fails there, that is a real delivery problem and the
-    error propagates (not swallowed like the chunking best-effort save)."""
-    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
-
-    adapter = NonChunkingAdapter()
-    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
-    target = DeliveryTarget.parse("discord:123")
-
-    long_content = "x" * 5000
-
-    def failing_save(content, job_id):
-        raise OSError("No space left on device")
-
-    monkeypatch.setattr(router, "_save_full_output", failing_save)
-
-    # Non-chunking adapter must truncate → needs a valid saved path → the
-    # Step 1 best-effort catch swallows the first attempt, but the Step 2
-    # retry (footer needs the path) re-raises.
-    with pytest.raises(OSError, match="No space left on device"):
-        await router._deliver_to_platform(target, long_content, metadata={"job_id": "job7"})
-=======
     router = DeliveryRouter(GatewayConfig())
 
     result = router._deliver_local(
@@ -450,4 +402,3 @@ async def test_save_failure_during_truncation_raises_for_non_chunking_adapter(tm
     written = Path(result["path"]).read_text(encoding="utf-8")
     assert "完了 ✅ café" in written
     assert "日次レポート" in written
->>>>>>> upstream/main

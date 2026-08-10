@@ -1043,13 +1043,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
-<<<<<<< HEAD
-
-=======
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
     if org_guard:
         return org_guard
->>>>>>> upstream/main
     guard = _background_review_write_guard(name, existing["path"], "edit")
     if guard:
         return guard
@@ -1122,15 +1118,11 @@ def _patch_skill(
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
-<<<<<<< HEAD
-    guard = _background_review_write_guard(name, existing["path"], "patch")
-=======
     skill_dir = existing["path"]
     org_guard = _org_mirror_write_guard(name, skill_dir, "patch")
     if org_guard:
         return org_guard
     guard = _background_review_write_guard(name, skill_dir, "patch")
->>>>>>> upstream/main
     if guard:
         return guard
 
@@ -1247,13 +1239,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
-<<<<<<< HEAD
-
-=======
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
     if org_guard:
         return org_guard
->>>>>>> upstream/main
     guard = _background_review_write_guard(name, existing["path"], "delete")
     if guard:
         return guard
@@ -1374,13 +1362,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
-<<<<<<< HEAD
-
-=======
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
     if org_guard:
         return org_guard
->>>>>>> upstream/main
     guard = _background_review_write_guard(name, existing["path"], "write_file")
     if guard:
         return guard

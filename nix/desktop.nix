@@ -102,18 +102,8 @@ let
 
         npm run postbuild
 
-<<<<<<< HEAD
-          if [ ! -f "$STAGED_PTY_NODE" ]; then
-            echo "FATAL: Missing staged node-pty native binary at $STAGED_PTY_NODE"
-            echo "node-pty must be compiled natively"
-            exit 1
-          fi
-
-        popd
-=======
         # validate staged node-pty native binary is present.
         STAGED_PTY_NODE="./dist/node_modules/node-pty/build/Release/pty.node"
->>>>>>> upstream/main
 
         if [ ! -f "$STAGED_PTY_NODE" ]; then
           echo "FATAL: Missing staged node-pty native binary at $STAGED_PTY_NODE"

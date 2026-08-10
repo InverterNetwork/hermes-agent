@@ -4532,6 +4532,23 @@ class TurnRunner:
         ctx = self._ctx
         if not ctx._status_adapter or not ctx._run_still_current():
             return
+        from gateway.display_config import resolve_display_setting
+
+        status_callback_mode = resolve_display_setting(
+            ctx.user_config,
+            "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value,
+            "status_callbacks",
+            "all",
+        )
+        if not _status_callback_mode_allows(status_callback_mode, event_type):
+            logger.debug(
+                "status_callback disabled for %s/%s mode=%s: %s",
+                ctx.source.platform.value if ctx.source.platform else "unknown",
+                event_type,
+                status_callback_mode,
+                _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+            )
+            return
         prepared_message = _prepare_gateway_status_message(
             ctx.source.platform,
             event_type,
@@ -25568,128 +25585,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=event_message_id,
                 )
             ) if _progress_thread_id else None
-<<<<<<< HEAD
-
-        def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter or not _run_still_current():
-                return
-            status_callback_mode = resolve_display_setting(
-                user_config,
-                platform_key,
-                "status_callbacks",
-                "all",
-            )
-            if not _status_callback_mode_allows(status_callback_mode, event_type):
-                logger.debug(
-                    "status_callback disabled for %s/%s mode=%s: %s",
-                    source.platform.value if source.platform else "unknown",
-                    event_type,
-                    status_callback_mode,
-                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
-                )
-                return
-            prepared_message = _prepare_gateway_status_message(
-                source.platform,
-                event_type,
-                message,
-            )
-            if prepared_message is None:
-                logger.debug(
-                    "status_callback suppressed for %s/%s: %s",
-                    source.platform.value if source.platform else "unknown",
-                    event_type,
-                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
-                )
-                return
-            _fut = safe_schedule_threadsafe(
-                _send_or_update_status_coro(_status_adapter, _status_chat_id, event_type, prepared_message, _status_thread_metadata),
-                _loop_for_step,
-                logger=logger,
-                log_message=f"status_callback ({event_type}) scheduling error",
-            )
-            if _fut is None:
-                return
-            if _cleanup_progress:
-                def _track_status_id(fut) -> None:
-                    try:
-                        res = fut.result()
-                    except Exception:
-                        return
-                    mid = getattr(res, "message_id", None)
-                    if getattr(res, "success", False) and mid:
-                        _cleanup_msg_ids.append(str(mid))
-                _fut.add_done_callback(_track_status_id)
-
-        def run_sync():
-            # The conditional re-assignment of `message` further below
-            # (prepending model-switch notes) makes Python treat it as a
-            # local variable in the entire function.  `nonlocal` lets us
-            # read *and* reassign the outer `_run_agent` parameter without
-            # triggering an UnboundLocalError on the earlier read at
-            # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
-
-            # session_key is propagated via contextvars in _set_session_env()
-            # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
-            # below — both concurrency-safe and inherited by tool worker threads.
-            # We deliberately do NOT write os.environ["HERMES_SESSION_KEY"] here:
-            # os.environ is process-global, so concurrent gateway sessions (e.g.
-            # two Discord threads) would clobber each other's value, and a tool
-            # thread whose contextvar is unset would fall back to os.environ and
-            # read the wrong session key — misrouting command-approval prompts to
-            # the wrong thread (#24100). The non-gateway surfaces don't depend on
-            # this write: CLI and cron bind the session via contextvars
-            # (set_current_session_key / session context), and only the TUI
-            # slash-worker *subprocess* exports HERMES_SESSION_KEY (from its own
-            # --session-key argv, a separate process) — so removing this in-process
-            # gateway write does not affect any of them.
-
-            # Map platform enum to the platform hint key the agent understands.
-            # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
-            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
-            
-            # Combine platform context, YAML channel_prompts hint for this chat,
-            # channel_overrides system_prompt (or global ephemeral), and gateway
-            # ephemeral prompt from _get_system_prompt_for_channel.
-            combined_ephemeral = context_prompt or ""
-            event_channel_prompt = (channel_prompt or "").strip()
-            if event_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            cfg_channel_prompt = self._get_system_prompt_for_channel(
-                source.platform,
-                source.chat_id or "",
-                thread_id=getattr(source, "thread_id", None),
-                parent_id=getattr(source, "parent_chat_id", None),
-            )
-            if cfg_channel_prompt:
-                combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
-
-            max_iterations = _current_max_iterations()
-
-            try:
-                model, runtime_kwargs = self._resolve_session_agent_runtime(
-                    source=source,
-                    session_key=session_key,
-                    user_config=user_config,
-                )
-                logger.debug(
-                    "run_agent resolved: model=%s provider=%s session=%s",
-                    model, runtime_kwargs.get("provider"), session_key or "",
-                )
-            except Exception as exc:
-                return {
-                    "final_response": f"⚠️ Provider authentication failed: {exc}",
-                    "messages": [],
-                    "api_calls": 0,
-                    "tools": [],
-=======
             if _status_thread_metadata is None and _relay_prospective_thread_id:
                 # Relay Discord auto-thread lane (see _progress_metadata above):
                 # carry the reply anchor so status/interim bubbles route into
                 # the same connector-created thread as the final reply.
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
->>>>>>> upstream/main
                 }
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the

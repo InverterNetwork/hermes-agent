@@ -64,49 +64,6 @@ class TestFreshFinalForLongLivedPreviews:
         assert adapter.send.call_count == 1  # only the initial send
         adapter.edit_message.assert_called_once()
 
-<<<<<<< HEAD
-    @pytest.mark.asyncio
-    async def test_short_lived_preview_edits_in_place(self):
-        """Finalizing a preview younger than the threshold → normal edit."""
-        adapter = _make_adapter()
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="chat",
-            config=StreamConsumerConfig(fresh_final_after_seconds=60.0),
-        )
-        await consumer._send_or_edit("hello")
-        # Preview is "new" — leave _message_created_ts at its real value.
-        await consumer._send_or_edit("hello world", finalize=True)
-        assert adapter.send.call_count == 1
-        adapter.edit_message.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_long_lived_preview_sends_fresh_final(self):
-        """Finalizing a preview older than the threshold → fresh send."""
-        adapter = _make_adapter()
-        adapter.send.side_effect = [
-            SimpleNamespace(success=True, message_id="initial_preview"),
-            SimpleNamespace(success=True, message_id="fresh_final"),
-        ]
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="chat",
-            config=StreamConsumerConfig(fresh_final_after_seconds=60.0),
-        )
-        await consumer._send_or_edit("hello")
-        # Force the preview to look stale (visible for > 60s).
-        consumer._message_created_ts = _stale_message_ts()
-        await consumer._send_or_edit("hello world", finalize=True)
-        # Fresh send happened; no edit of the old preview.
-        assert adapter.send.call_count == 2
-        adapter.edit_message.assert_not_called()
-        # The old preview was deleted as cleanup.
-        adapter.delete_message.assert_awaited_once_with("chat", "initial_preview")
-        # State was updated to the new message id.
-        assert consumer._message_id == "fresh_final"
-        assert consumer._final_response_sent is True
-=======
->>>>>>> upstream/main
 
     @pytest.mark.asyncio
     async def test_fresh_final_without_delete_support_is_best_effort(self):
@@ -129,61 +86,6 @@ class TestFreshFinalForLongLivedPreviews:
         # No delete attempt — just the fresh send.
         assert consumer._message_id == "fresh_final"
 
-<<<<<<< HEAD
-    @pytest.mark.asyncio
-    async def test_fresh_final_fallback_to_edit_on_send_failure(self):
-        """If the fresh send fails, fall back to the normal edit path."""
-        adapter = _make_adapter()
-        adapter.send.side_effect = [
-            SimpleNamespace(success=True, message_id="initial_preview"),
-            SimpleNamespace(success=False, error="network"),
-        ]
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="chat",
-            config=StreamConsumerConfig(fresh_final_after_seconds=60.0),
-        )
-        await consumer._send_or_edit("hello")
-        consumer._message_created_ts = _stale_message_ts()
-        ok = await consumer._send_or_edit("hello world", finalize=True)
-        # Fresh send was attempted and failed → edit happened instead.
-        assert adapter.send.call_count == 2
-        adapter.edit_message.assert_called_once()
-        assert ok is True
-
-    @pytest.mark.asyncio
-    async def test_only_finalize_triggers_fresh_final(self):
-        """Intermediate edits (``finalize=False``) never switch to fresh send."""
-        adapter = _make_adapter()
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="chat",
-            config=StreamConsumerConfig(fresh_final_after_seconds=60.0),
-        )
-        await consumer._send_or_edit("hello")
-        consumer._message_created_ts = _stale_message_ts()
-        await consumer._send_or_edit("hello partial")  # no finalize
-        assert adapter.send.call_count == 1
-        adapter.edit_message.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_no_edit_sentinel_is_not_affected(self):
-        """Platforms with the ``__no_edit__`` sentinel never go fresh-final."""
-        adapter = _make_adapter()
-        adapter.send.return_value = SimpleNamespace(success=True, message_id=None)
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="chat",
-            config=StreamConsumerConfig(fresh_final_after_seconds=60.0),
-        )
-        await consumer._send_or_edit("hello")
-        assert consumer._message_id == "__no_edit__"
-        assert consumer._message_created_ts is None
-        # Even with finalize=True, no fresh send — the sentinel gates it.
-        assert consumer._should_send_fresh_final() is False
-
-=======
->>>>>>> upstream/main
 
 class TestSegmentBreakDoesNotMarkFinalSent:
     """Regression for #29346 — silent response loss after tool calls.

@@ -73,11 +73,9 @@ suppress_platform_ver_console()
 import os
 import sys
 
-<<<<<<< HEAD
 # The managed render-target source tree is root-owned and read-only for the
 # runtime user, so imports must not try to create adjacent __pycache__ files.
 sys.dont_write_bytecode = True
-=======
 # ── Startup fast-path bootstrap ─────────────────────────────────────────
 # Two lines of inline path math so ``python hermes_cli/main.py`` (script
 # mode — sys.path[0] is hermes_cli/, not the repo root) can import the
@@ -86,7 +84,6 @@ _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pa
 if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast  # noqa: E402
->>>>>>> upstream/main
 
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import

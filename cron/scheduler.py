@@ -2486,17 +2486,16 @@ def _run_job_script(
         argv = [python_exe, str(path)]
 
     try:
-<<<<<<< HEAD
         from tools.environments.local import (
             _HERMES_PROVIDER_ENV_FORCE_PREFIX,
-            _sanitize_subprocess_env,
             build_cron_secret_injection,
+            build_subprocess_env,
         )
 
         # Declarative secret injection (BRIX-1870): re-grant ONLY the secrets
         # that are both declared on the job AND authorized by the operator
         # allowlist, minus the never-injectable hard floor. Everything else
-        # stays stripped by _sanitize_subprocess_env.
+        # stays stripped by the build_subprocess_env scrub path.
         extra_env: Optional[dict] = None
         if secrets:
             extra_env, _secret_warnings = build_cron_secret_injection(
@@ -2513,9 +2512,6 @@ def _run_job_script(
                     path.name,
                     _injected,
                 )
-=======
-        from tools.environments.local import build_subprocess_env
->>>>>>> upstream/main
 
         popen_kwargs = {}
         if sys.platform == "win32":
@@ -2524,11 +2520,7 @@ def _run_job_script(
                 "encoding": "utf-8",
                 "errors": "replace",
             }
-<<<<<<< HEAD
-        env = _sanitize_subprocess_env(os.environ.copy(), extra_env)
-=======
-        env = build_subprocess_env()
->>>>>>> upstream/main
+        env = build_subprocess_env(extra=extra_env)
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).

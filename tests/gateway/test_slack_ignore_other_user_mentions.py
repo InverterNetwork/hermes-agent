@@ -221,26 +221,6 @@ async def test_mentioned_thread_ignores_followup_addressed_to_other_user(adapter
     adapter.handle_message.assert_not_awaited()
 
 
-<<<<<<< HEAD
-@pytest.mark.asyncio
-async def test_mentioned_thread_still_answers_plain_followup(adapter):
-    """No over-suppression: a plain follow-up (no leading mention) in a
-    mentioned thread is still answered when the option is on."""
-    thread_ts = "1700000000.000020"
-    adapter._mentioned_threads.add(thread_ts)
-    adapter.config.extra["strict_mention"] = False
-    adapter.config.extra["ignore_other_user_mentions"] = True
-
-    await _run(
-        adapter,
-        _event("thanks, that makes sense", ts="1700000000.000021", thread_ts=thread_ts),
-    )
-
-    adapter.handle_message.assert_awaited_once()
-
-
-=======
->>>>>>> upstream/main
 # ---------------------------------------------------------------------------
 # Config bridge: config.yaml slack.ignore_other_user_mentions → extra + env
 # ---------------------------------------------------------------------------

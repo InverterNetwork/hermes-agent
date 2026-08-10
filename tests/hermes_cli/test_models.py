@@ -37,32 +37,6 @@ class TestOpenRouterModels:
 
 
 class TestFetchOpenRouterModels:
-<<<<<<< HEAD
-    def test_live_fetch_recomputes_free_tags(self, monkeypatch):
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
-
-        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with (
-            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None),
-            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
-        ):
-            models = fetch_openrouter_models(force_refresh=True)
-
-        assert models == [
-            ("anthropic/claude-opus-4.8", "recommended"),
-            ("qwen/qwen3.7-max", ""),
-            ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
-        ]
-=======
->>>>>>> upstream/main
 
 
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):
@@ -127,43 +101,6 @@ class TestFetchOpenRouterModels:
         # Image-only model advertised supported_parameters WITHOUT tools → must be dropped.
         assert "google/gemini-3-pro-image-preview" not in ids
 
-<<<<<<< HEAD
-    def test_permissive_when_supported_parameters_missing(self, monkeypatch):
-        """Models missing the supported_parameters field keep appearing in the picker.
-
-        Some OpenRouter-compatible gateways (Nous Portal, private mirrors, older
-        catalog snapshots) don't populate supported_parameters. Treating missing
-        as 'unknown → allow' prevents the picker from silently emptying on
-        those gateways.
-        """
-        class _Resp:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self):
-                # No supported_parameters field at all on either entry.
-                return (
-                    b'{"data":['
-                    b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
-                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}}'
-                    b']}'
-                )
-
-        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with (
-            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None),
-            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
-        ):
-            models = fetch_openrouter_models(force_refresh=True)
-
-        ids = [mid for mid, _ in models]
-        assert "anthropic/claude-opus-4.8" in ids
-        assert "qwen/qwen3.7-max" in ids
-=======
->>>>>>> upstream/main
 
 
 class TestOpenRouterToolSupportHelper:

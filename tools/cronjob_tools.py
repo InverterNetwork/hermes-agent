@@ -1052,12 +1052,9 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
-<<<<<<< HEAD
     secrets: Optional[List[str]] = None,
-=======
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
->>>>>>> upstream/main
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1121,30 +1118,9 @@ def cronjob(
                             success=False,
                         )
 
-<<<<<<< HEAD
-            job = create_job(
-                prompt=prompt or "",
-                schedule=schedule,
-                name=name,
-                repeat=repeat,
-                deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
-                skills=canonical_skills,
-                model=_normalize_optional_job_value(model),
-                provider=_normalize_optional_job_value(provider),
-                base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
-                script=_normalize_optional_job_value(script),
-                context_from=context_from,
-                enabled_toolsets=enabled_toolsets or None,
-                workdir=_normalize_optional_job_value(workdir),
-                no_agent=_no_agent,
-                attach_to_session=attach_to_session,
-                secrets=secrets or None,
-=======
             from cron.scheduler import (
                 CronSchedulerRegistrationError,
                 create_job_with_scheduler_registration,
->>>>>>> upstream/main
             )
 
             try:
@@ -1165,6 +1141,7 @@ def cronjob(
                     workdir=_normalize_optional_job_value(workdir),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
+                    secrets=secrets or None,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
                 )
@@ -1655,12 +1632,9 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
-<<<<<<< HEAD
         secrets=args.get("secrets"),
-=======
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
->>>>>>> upstream/main
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),
