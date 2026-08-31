@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -154,6 +155,63 @@ def _same_hermes_home(left: Path | str, right: Path | str) -> bool:
     return os.path.normcase(str(_canonical_hermes_home(left))) == os.path.normcase(
         str(_canonical_hermes_home(right))
     )
+
+
+# Mirrors hermes_cli.profiles._PROFILE_ID_RE — duplicated here because gateway
+# identity code must stay import-light (hermes_constants + stdlib only).
+_PROFILE_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def _profile_label_for_home(home: Path | str) -> Optional[str]:
+    """Best-effort profile label for a HERMES_HOME path.
+
+    Returns the profile name for ``<root>/profiles/<name>`` layouts (both
+    ``~/.hermes/profiles/coder`` and Docker ``/opt/data/profiles/coder``),
+    ``"default"`` for the deployment's root home, and ``None`` when no label
+    can be inferred.  Never raises — this feeds diagnostics only.
+    """
+    try:
+        canonical = _canonical_hermes_home(home)
+    except Exception:
+        return None
+    if canonical.parent.name == "profiles" and _PROFILE_LABEL_RE.match(canonical.name):
+        return canonical.name
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        if _same_hermes_home(canonical, get_default_hermes_root()):
+            return "default"
+    except Exception:
+        pass
+    try:
+        if _same_hermes_home(canonical, _get_platform_default_hermes_home()):
+            return "default"
+    except Exception:
+        pass
+    return None
+
+
+def scoped_lock_owner_label(record: Optional[dict[str, Any]]) -> Optional[str]:
+    """Profile label for the gateway that owns a scoped credential lock.
+
+    Scoped locks are machine-global, so the holder may belong to a different
+    HERMES_HOME profile than the caller.  Prefers the explicit ``profile``
+    field stamped by :func:`acquire_scoped_lock`; falls back to inferring the
+    label from the persisted ``hermes_home`` for locks written before the
+    profile field existed.  Returns ``None`` for legacy or malformed records
+    so callers keep their PID-only wording.
+    """
+    if not isinstance(record, dict):
+        return None
+    profile = record.get("profile")
+    if isinstance(profile, str) and _PROFILE_LABEL_RE.match(profile.strip()):
+        # Validate the persisted label — lock files are plain JSON on disk,
+        # and this string flows into log lines and a suggested CLI command.
+        return profile.strip()
+    home = record.get("hermes_home")
+    if isinstance(home, str) and home.strip():
+        return _profile_label_for_home(home)
+    return None
 
 
 def _get_pid_path() -> Path:
@@ -580,6 +638,29 @@ def _build_pid_record() -> dict:
     }
 
 
+def _get_code_identity_fields() -> dict[str, Any]:
+    """Code identity of THIS gateway process, for fleet version checks.
+
+    Lazy import so ``gateway.status`` keeps no import-time dependency on
+    ``hermes_cli``; the helper itself is cached per process. A gateway
+    keeps serving the module versions it imported at startup, so stamping
+    the identity into ``gateway_state.json`` lets `hermes update` (and the
+    dashboard) prove whether a running gateway actually picked up new code
+    after the restart phase — instead of assuming it did (#88654, #69754).
+    Never raises; degrades to absent fields.
+    """
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        identity = get_code_identity()
+        return {
+            "code_sha": identity.get("sha"),
+            "code_version": identity.get("version"),
+        }
+    except Exception:
+        return {}
+
+
 def _build_runtime_status_record() -> dict[str, Any]:
     payload = _build_pid_record()
     payload.update({
@@ -588,8 +669,10 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "restart_requested": False,
         "active_agents": 0,
         "platforms": {},
+        "session_store": {"status": "unknown"},
         "updated_at": _utc_now_iso(),
     })
+    payload.update(_get_code_identity_fields())
     return payload
 
 
@@ -951,6 +1034,38 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             pass
 
 
+def _strict_path_exists(path: Path, label: str) -> bool:
+    try:
+        path.stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(f"{label} metadata is not inspectable: {exc}") from exc
+
+
+def _is_gateway_runtime_lock_active_strict(lock_path: Path) -> bool:
+    """Probe ownership without treating access failures as absence."""
+    try:
+        handle = open(lock_path, "r+", encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(f"gateway runtime lock is not inspectable: {exc}") from exc
+    try:
+        if _try_acquire_file_lock(handle):
+            _release_file_lock(handle)
+            return False
+        return True
+    except OSError as exc:
+        raise RuntimeError(f"gateway runtime lock probe failed: {exc}") from exc
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
 def write_pid_file() -> None:
     """Write the current process PID and metadata to the gateway PID file.
 
@@ -987,7 +1102,11 @@ def write_runtime_status(
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
+    needs_attention: Any = _UNSET,
+    retrying_since: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    session_store: Any = _UNSET,
+    clear_profile_platforms: bool = False,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -995,11 +1114,29 @@ def write_runtime_status(
     previous_payload = copy.deepcopy(payload)
     current_record = _build_pid_record()
     payload.setdefault("platforms", {})
+    if clear_profile_platforms:
+        # Secondary-profile adapter health is stored in the process-level
+        # status file as ``<profile>:<platform>``.  A fresh gateway process
+        # must not inherit those entries from the prior process: they would
+        # otherwise keep /api/status degraded until every old adapter emitted
+        # a new state (and removed profiles would remain degraded forever).
+        platforms = payload["platforms"]
+        if not isinstance(platforms, dict):
+            platforms = {}
+        payload["platforms"] = {
+            key: value
+            for key, value in platforms.items()
+            if not isinstance(key, str) or ":" not in key
+        }
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
     payload["start_time"] = current_record["start_time"]
     payload["updated_at"] = _utc_now_iso()
+    # Re-stamp code identity on every write: the file can outlive the process
+    # that created it, and the top-level record must always describe the
+    # CURRENT writer's code (per-process cached, so this is a dict copy).
+    payload.update(_get_code_identity_fields())
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
@@ -1014,6 +1151,13 @@ def write_runtime_status(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if session_store is not _UNSET:
+        state = "unknown"
+        if isinstance(session_store, dict):
+            candidate = str(session_store.get("status") or "unknown")
+            if candidate in {"ok", "unavailable", "retrying", "unknown"}:
+                state = candidate
+        payload["session_store"] = {"status": state}
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})
@@ -1023,7 +1167,29 @@ def write_runtime_status(
             platform_payload["error_code"] = error_code
         if error_message is not _UNSET:
             platform_payload["error_message"] = error_message
+        if needs_attention is not _UNSET:
+            # Long-lived reconnect-loop escalation (OOF-156): True once a
+            # platform has been continuously failing/retrying past the
+            # attention threshold. Retry never stops — this is a signal for
+            # owners and fleet monitoring, not a circuit breaker. Cleared
+            # (False) on successful reconnect.
+            platform_payload["needs_attention"] = bool(needs_attention)
+        if retrying_since is not _UNSET:
+            # ISO timestamp of when the platform entered its current
+            # continuous retry episode; None clears it on reconnect.
+            platform_payload["retrying_since"] = retrying_since
         platform_payload["updated_at"] = _utc_now_iso()
+        # Writer identity: which PROCESS wrote this entry.  The top-level
+        # pid/start_time are refreshed on every write, so they only identify
+        # the file's most recent writer — per-entry provenance is what lets
+        # a reader (the /api/status cross-profile aggregation) distinguish
+        # "written by the current live process" from "preserved from a prior
+        # process" with exact (pid, start_time) equality instead of clock
+        # heuristics.  start_time is the same PID-reuse fingerprint the
+        # liveness checks use, so a recycled PID never masquerades as the
+        # original writer.
+        platform_payload["writer_pid"] = current_record["pid"]
+        platform_payload["writer_start_time"] = current_record["start_time"]
         payload["platforms"][platform] = platform_payload
 
     _write_json_file(path, payload)
@@ -1374,6 +1540,15 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         "metadata": metadata or {},
         "updated_at": _utc_now_iso(),
     }
+    # Human-readable profile label for cross-profile conflict diagnostics
+    # (OOF-3): "Telegram bot token already in use (PID 559)" gives an
+    # operator no way to tell WHICH profile owns the credential.  Stamped
+    # only on scoped-lock records (they're machine-global; PID/runtime
+    # status files are per-home and don't need it).  Omitted when no label
+    # is inferable; readers fall back to deriving it from hermes_home.
+    profile = _profile_label_for_home(_get_process_hermes_home())
+    if profile:
+        record["profile"] = profile
 
     existing = _read_json_file(lock_path)
     if existing is None and lock_path.exists():
@@ -2211,6 +2386,61 @@ def get_running_pid(
         if runtime_pid is not None:
             return runtime_pid
     return None
+
+
+def get_running_pid_identity_strict(pid_path: Path) -> Optional[tuple[int, float]]:
+    """Return a verified process identity or fail on ambiguous runtime state."""
+    resolved_pid_path = Path(pid_path)
+    resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
+    pid_exists = _strict_path_exists(resolved_pid_path, "gateway PID")
+    lock_exists = _strict_path_exists(resolved_lock_path, "gateway lock")
+    if not pid_exists and not lock_exists:
+        return None
+    if not lock_exists:
+        # No runtime lock can be owned. A stale PID file is not a live gateway.
+        return None
+    if not _is_gateway_runtime_lock_active_strict(resolved_lock_path):
+        # The lock probe is authoritative for absence. Stale or malformed files
+        # may remain after a crash, but no process currently owns this runtime.
+        return None
+    if not pid_exists:
+        raise RuntimeError("active gateway lock has no PID metadata")
+    pid_record = _read_pid_record(resolved_pid_path)
+    lock_record = _read_gateway_lock_record(resolved_lock_path)
+    if not pid_record or not lock_record:
+        raise RuntimeError("gateway PID or lock metadata is malformed")
+    pid = _pid_from_record(pid_record)
+    if pid is None or pid <= 0 or _pid_from_record(lock_record) != pid:
+        raise RuntimeError("gateway PID and lock identities disagree")
+    if not _pid_exists(pid):
+        raise RuntimeError("gateway identity is not live")
+    current_start = _get_process_start_time(pid)
+    starts = (pid_record.get("start_time"), lock_record.get("start_time"))
+    if current_start is None or any(start is None for start in starts):
+        raise RuntimeError("gateway creation time is unavailable")
+    try:
+        current = float(current_start)
+        recorded = tuple(float(start) for start in starts)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("gateway creation time is malformed") from exc
+    if current <= 0 or any(start <= 0 or abs(start - current) > 0.001 for start in recorded):
+        raise RuntimeError("gateway process identity changed")
+    if not all(_record_matches_live_gateway_pid(record, pid) for record in (pid_record, lock_record)):
+        raise RuntimeError("runtime metadata does not identify a live gateway")
+    # Windows persists a centisecond fingerprint; SCM ownership checks need the
+    # exact psutil epoch timestamp. Re-read it only after the persisted identity
+    # has been validated, and prove it still rounds to that same fingerprint.
+    if _IS_WINDOWS:
+        try:
+            import psutil  # type: ignore
+
+            exact_create_time = float(psutil.Process(pid).create_time())
+        except Exception as exc:
+            raise RuntimeError("exact gateway creation time is unavailable") from exc
+        if int(round(exact_create_time * 100)) != int(current):
+            raise RuntimeError("gateway process identity changed")
+        return pid, exact_create_time
+    return pid, current
 
 
 def get_running_pid_cached(

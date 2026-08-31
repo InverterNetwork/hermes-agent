@@ -600,6 +600,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
+                        self._set_fatal_error(
+                            "whatsapp_npm_install_failed",
+                            f"WhatsApp bridge npm install failed. Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                            retryable=False,
+                        )
                         return False
                     print(f"[{self.name}] Dependencies installed")
                     if _pkg_hash:
@@ -609,6 +614,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             pass  # Stamp is an optimization; install still succeeded
                 except Exception as e:
                     print(f"[{self.name}] Failed to install dependencies: {e}")
+                    self._set_fatal_error(
+                        "whatsapp_npm_install_failed",
+                        f"WhatsApp bridge npm install failed ({e}). Run `cd {bridge_dir} && {_npm_bin} install` manually, then restart `hermes gateway`.",
+                        retryable=False,
+                    )
                     return False
 
             # Ensure session directory exists
@@ -650,6 +660,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     self._bridge_process = None  # Not managed by us
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
+                                    # Plugin-registered native handlers.
+                                    self._wire_plugin_handlers(None)
                                     return True
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
@@ -810,6 +822,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             
             self._mark_connected()
             print(f"[{self.name}] Bridge started on port {self._bridge_port}")
+            # Plugin-registered native handlers.
+            self._wire_plugin_handlers(None)
             return True
             
         except Exception as e:
@@ -1389,7 +1403,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:

@@ -12,6 +12,7 @@ import os
 import re
 import time
 
+
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
 
@@ -84,6 +85,12 @@ _CAPTIONABLE_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | {
 # more generous, so a conservative shared ceiling keeps behavior predictable.
 _TELEGRAM_CAPTION_LIMIT = 1024
 _DEFAULT_CAPTION_LIMIT = 4096
+
+def prepare_send_message_platforms() -> None:
+    """Load enabled standalone plugins before tool schemas/cache keys are built."""
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()
 
 
 def _media_caption_split(text, media_files, *, max_caption_len):
@@ -287,18 +294,16 @@ def _handle_react(args, remove=False):
     platform_name = parts[0].strip().lower()
     target_ref = parts[1].strip() if len(parts) > 1 else None
     chat_id = None
+    prepare_send_message_platforms()
     if target_ref:
-        chat_id, _thread_id, _ = _parse_target_ref(platform_name, target_ref)
-        if not chat_id:
-            try:
-                from gateway.channel_directory import resolve_channel_name
-                resolved = resolve_channel_name(platform_name, target_ref)
-            except Exception:
-                resolved = None
-            # Opaque platform-native ids (e.g. photon space GUIDs like
-            # 'any;-;+1555...') match no parser pattern and no directory
-            # entry — pass them through verbatim; the adapter validates.
-            chat_id = resolved or target_ref
+        # Platform-native ids (e.g. photon space GUIDs like 'any;-;+1555...')
+        # match no parser pattern and no directory entry, so hand them to
+        # the adapter unchanged; it validates them.
+        chat_id, _thread_id, resolution_error = resolve_send_target(
+            platform_name, target_ref, pass_unresolved_references=True
+        )
+        if resolution_error:
+            return tool_error(resolution_error)
 
     try:
         from gateway.config import Platform, load_gateway_config
@@ -368,28 +373,13 @@ def _handle_send(args):
     chat_id = None
     thread_id = None
 
+    prepare_send_message_platforms()
     if target_ref:
-        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
-    else:
-        is_explicit = False
-
-    # Resolve human-friendly channel names to numeric IDs
-    if target_ref and not is_explicit:
-        try:
-            from gateway.channel_directory import resolve_channel_name
-            resolved = resolve_channel_name(platform_name, target_ref)
-            if resolved:
-                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
-            else:
-                return tool_error(
-                    f"Could not resolve '{target_ref}' on {platform_name}. "
-                    f"Use send_message(action='list') to see available targets."
-                )
-        except Exception:
-            return tool_error(
-                f"Could not resolve '{target_ref}' on {platform_name}. "
-                f"Try using a numeric channel ID instead."
-            )
+        chat_id, thread_id, resolution_error = resolve_send_target(
+            platform_name, target_ref
+        )
+        if resolution_error:
+            return tool_error(resolution_error)
 
     from tools.interrupt import is_interrupted
     if is_interrupted():
@@ -401,8 +391,14 @@ def _handle_send(args):
     except Exception as e:
         return json.dumps(_error(f"Failed to load gateway config: {e}"))
 
-    # Accept any platform name — built-in names resolve to their enum
-    # member, plugin platform names create dynamic members via _missing_().
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get(platform_name)
+    is_builtin = platform_name in {member.value for member in Platform}
+    if not is_builtin and entry is None:
+        return tool_error(
+            f"Unknown or unregistered plugin platform: {platform_name}"
+        )
     try:
         platform = Platform(platform_name)
     except (ValueError, KeyError):
@@ -487,15 +483,22 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        # Preserve the exact built-in call contract; only custom handlers need
+        # the complete typed request.
+        if entry is not None and entry.send_message_handler is not None:
+            send_kwargs["args"] = args
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -597,6 +600,14 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if group_id:
             return f"group:{group_id}", None, True
         return None, None, False
+    # WeCom: group IDs start with "wr" or "wc", user IDs start with "wo" or
+    # are bare alphanumeric strings. Treat any non-empty WeCom target_ref as
+    # an explicit chat_id — the adapter resolves whether to use APP_CMD_RESPONSE
+    # (groups) or APP_CMD_SEND (DMs) internally.
+    if platform_name == "wecom":
+        stripped = target_ref.strip()
+        if stripped:
+            return stripped, None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -617,7 +628,146 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
+
     return None, None, False
+
+
+def resolve_send_target(
+    platform_name: str, target_ref: str, *, pass_unresolved_references: bool = False
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve one send target the same way for every caller (model tool, CLI, cron).
+
+    Channel-directory IDs are trusted. Plugin platforms must explicitly parse
+    native target syntax; for the model-facing send tool (the default), a
+    target that can't be resolved is an error — the model can read the error
+    and pick a listed target instead.
+
+    ``pass_unresolved_references=True`` restores the old pass-through behavior for
+    callers that have no model in the loop (cron delivering a stored job's
+    output, react/unreact on platform-native message ids): if the target
+    can't be resolved and the platform is built in, or is a plugin platform
+    that declares no parser, the string is handed to the adapter exactly as
+    written and the adapter decides whether it's valid. A plugin platform
+    that DOES declare a parser stays strict for every caller — its parser is
+    the authority on native syntax.
+
+    The optional validator has the final say over parser-normalized,
+    directory-resolved, and passed-through IDs alike.
+    """
+    from gateway.config import Platform
+    from gateway.platform_registry import platform_registry
+
+    entry = platform_registry.get(platform_name)
+
+    def _validate(candidate: str) -> str | None:
+        if entry is None or entry.validate_target_ref_fn is None:
+            return None
+        try:
+            verdict = entry.validate_target_ref_fn(candidate)
+        except Exception:
+            logger.debug(
+                "Plugin target validator failed for %s", platform_name, exc_info=True
+            )
+            return f"Target validator failed for platform '{platform_name}'"
+        if verdict is True:
+            return None
+        if isinstance(verdict, str) and verdict:
+            return f"Invalid target '{target_ref}' on {platform_name}: {verdict}"
+        return f"Invalid target '{target_ref}' on {platform_name}"
+
+    if entry is not None and entry.parse_target_ref_fn is not None:
+        try:
+            parsed = entry.parse_target_ref_fn(target_ref)
+        except Exception:
+            logger.debug(
+                "Plugin target parser failed for %s", platform_name, exc_info=True
+            )
+            return None, None, f"Target parser failed for platform '{platform_name}'"
+        if parsed is not None:
+            if (
+                not isinstance(parsed, tuple)
+                or len(parsed) != 2
+                or not isinstance(parsed[0], str)
+                or not parsed[0]
+                or (parsed[1] is not None and not isinstance(parsed[1], str))
+            ):
+                return (
+                    None,
+                    None,
+                    f"Target parser for platform '{platform_name}' returned an invalid result",
+                )
+            parsed_chat_id, parsed_thread_id = parsed
+            error = _validate(parsed_chat_id)
+            return (None, None, error) if error else (
+                parsed_chat_id,
+                parsed_thread_id,
+                None,
+            )
+
+    parsed_chat_id, parsed_thread_id, explicit = _parse_target_ref(
+        platform_name, target_ref
+    )
+    if explicit and parsed_chat_id is not None:
+        error = _validate(parsed_chat_id)
+        return (None, None, error) if error else (
+            parsed_chat_id,
+            parsed_thread_id,
+            None,
+        )
+
+    resolution_failed = False
+    try:
+        from gateway.channel_directory import resolve_channel_name
+
+        resolved = resolve_channel_name(platform_name, target_ref)
+    except Exception:
+        resolved = None
+        resolution_failed = True
+    if resolved:
+        parsed_chat_id, parsed_thread_id, _ = _parse_target_ref(
+            platform_name, resolved
+        )
+        chat_id = parsed_chat_id or resolved
+        error = _validate(chat_id)
+        return (None, None, error) if error else (
+            chat_id,
+            parsed_thread_id,
+            None,
+        )
+
+    is_builtin = platform_name in {member.value for member in Platform}
+    if entry is None and not is_builtin:
+        return None, None, f"Unknown or unregistered plugin platform: {platform_name}"
+
+    def _pass_through_unresolved():
+        """Hand the raw target to the adapter unchanged (it validates)."""
+        error = _validate(target_ref)
+        if error:
+            return None, None, error
+        logger.debug(
+            "Handing unresolved target '%s' to the %s adapter unchanged "
+            "(the adapter validates it)",
+            target_ref, platform_name,
+        )
+        return target_ref, None, None
+
+    if entry is not None and entry.source == "plugin" and not is_builtin:
+        if pass_unresolved_references and entry.parse_target_ref_fn is None:
+            return _pass_through_unresolved()
+        return (
+            None,
+            None,
+            f"Could not resolve '{target_ref}' on {platform_name}. "
+            "The plugin parser did not recognize it and no channel-directory entry matched.",
+        )
+    if pass_unresolved_references:
+        return _pass_through_unresolved()
+    hint = (
+        "Try using a numeric channel ID instead."
+        if resolution_failed
+        else "Use send_message(action='list') to see available targets."
+    )
+    return None, None, f"Could not resolve '{target_ref}' on {platform_name}. {hint}"
 
 
 def _describe_media_for_mirror(media_files):
@@ -728,7 +878,48 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+
+                # The adapter's send() uses asyncio.Queue + worker tasks bound
+                # to the gateway's main event loop.  Calling send() from a
+                # different thread/loop (the agent's tool worker thread) causes
+                # a cross-loop Future deadlock: the worker loop's selector never
+                # gets woken when the gateway loop resolves the future.
+                # When on a different loop, dispatch onto the gateway loop via
+                # run_coroutine_threadsafe and await the wrapped future.
+                gateway_loop = getattr(runner, "_gateway_loop", None)
+                try:
+                    _current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _current_loop = None
+
+                _need_cross_loop = (
+                    gateway_loop is not None
+                    and _current_loop is not gateway_loop
+                )
+
+                if _need_cross_loop:
+                    if not gateway_loop.is_running():
+                        return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
+                    from agent.async_utils import safe_schedule_threadsafe
+                    fut = safe_schedule_threadsafe(
+                        adapter.send(chat_id=chat_id, content=chunk, metadata=metadata),
+                        gateway_loop,
+                        logger=logger,
+                        log_message="send_message: failed to schedule on gateway loop",
+                    )
+                    if fut is None:
+                        return {"error": "Gateway loop unavailable for send dispatch"}
+                    # Use shield so that if the caller's task is cancelled (e.g.
+                    # agent interrupt), the already-enqueued send on the gateway
+                    # loop is NOT cancelled — preventing "tool failed but message
+                    # still sent later" followed by agent retry causing duplicates.
+                    # No explicit timeout here: the adapter's internal request
+                    # timeout (15s) and the upper-layer _run_async 300s timeout
+                    # provide sufficient protection against hangs.
+                    result = await asyncio.shield(asyncio.wrap_future(fut))
+                else:
+                    # Same loop or no gateway loop (CLI, tests) — direct await.
+                    result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -780,6 +971,7 @@ async def _send_via_adapter(
     }
 
 
+<<<<<<< HEAD
 async def _send_to_platform(
     platform,
     pconfig,
@@ -790,6 +982,9 @@ async def _send_to_platform(
     force_document=False,
     slack_thread_ts=None,
 ):
+=======
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+>>>>>>> upstream/main
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -797,6 +992,8 @@ async def _send_to_platform(
     (preserves code-block boundaries, adds part indicators).
     """
     from gateway.config import Platform
+
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
 
     media_files = media_files or []
 
@@ -832,6 +1029,18 @@ async def _send_to_platform(
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
     }
+
+    # Signal's standalone path (_send_signal) speaks raw JSON-RPC and does not
+    # go through SignalAdapter.send(), so it never benefits from the adapter's
+    # native chunking. Register the platform limit here so the shared
+    # truncate_message() pass below splits long sends instead of signal-cli
+    # rejecting them. Sourced from the adapter module so the two paths can't
+    # drift (credit: @5L-hermes01 in #67279, @lkz-de in #57929).
+    try:
+        from gateway.platforms.signal import MAX_MESSAGE_LENGTH as _SIGNAL_MAX
+        _MAX_LENGTHS[Platform.SIGNAL] = _SIGNAL_MAX
+    except ImportError:
+        _MAX_LENGTHS[Platform.SIGNAL] = 8000
 
     # Check plugin registry for max_message_length
     if platform not in _MAX_LENGTHS:
@@ -1113,6 +1322,25 @@ async def _send_to_platform(
             last_result = result
         return last_result
 
+    # --- WeCom: native media attachment support via live gateway adapter ---
+    if platform == Platform.WECOM and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else None,
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
@@ -1151,6 +1379,20 @@ async def _send_to_platform(
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
         else:
+            from gateway.platform_registry import platform_registry
+
+            entry = platform_registry.get(platform_name)
+            handler = entry.send_message_handler if entry is not None else None
+            if handler is not None:
+                try:
+                    import inspect
+
+                    result = handler(args or {}, chat_id, platform_name, pconfig)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return result
+                except Exception as e:
+                    return {"error": f"Plugin send_message handler failed: {e}"}
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
             result = await _send_via_adapter(

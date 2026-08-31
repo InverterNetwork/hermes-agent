@@ -99,11 +99,12 @@ interface SidebarSessionsSectionProps {
   onToggle: () => void
   sessions: SessionInfo[]
   activeSessionId: null | string
-  onResumeSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, session?: SessionInfo) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
+  onToggleUnread: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
   rootClassName?: string
@@ -163,6 +164,11 @@ interface SidebarSessionsSectionProps {
   // pinned, messaging groups, and the project overview, where the order isn't
   // strictly by recency so a bucket would be misleading.
   grouping?: 'date' | 'none' | 'status'
+  // Inbox style: render every flat session row as a three-line card (project ·
+  // age / title / model · size). A render variant that composes with whichever
+  // grouping is active — the flat recents list opts in; dense tree surfaces
+  // (pinned, projects, messaging) keep the one-line row.
+  card?: boolean
 }
 
 export function SidebarSessionsSection({
@@ -176,6 +182,7 @@ export function SidebarSessionsSection({
   onArchiveSession,
   onBranchSession,
   onTogglePin,
+  onToggleUnread,
   onNewSessionInWorkspace,
   pinned,
   rootClassName,
@@ -204,7 +211,8 @@ export function SidebarSessionsSection({
   projectBackRow,
   dndSensors,
   showProfileTags = false,
-  grouping = 'none'
+  grouping = 'none',
+  card = false
 }: SidebarSessionsSectionProps) {
   const { t } = useI18n()
   const dividerLabels = t.sidebar.dateDivider
@@ -243,31 +251,39 @@ export function SidebarSessionsSection({
     (session: SessionInfo, draggable: boolean, branchStem?: string) => {
       const rowProps = {
         branchStem,
+        card,
         isPinned: pinned,
         isSelected: session.id === activeSessionId,
         onArchive: () => onArchiveSession(session.id),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
         onDelete: () => onDeleteSession(session.id),
         onPin: () => onTogglePin(sessionPinId(session)),
-        onResume: () => onResumeSession(session.id),
+        onToggleUnread: () => onToggleUnread(session.id),
+        onResume: () => onResumeSession(session.id, session),
         reorderable: draggable && !branchStem,
         session,
-        showProfile: showProfileTags
+        showProfile: showProfileTags,
+        unread: session.unread === true
       }
 
+      // Key by (profile, id): twins with the same stored id in two profiles
+      // are distinct rows (#92454) — a bare-id key makes React misattribute
+      // one twin's rendered state to the other.
       return draggable && !branchStem ? (
-        <SortableSidebarSessionRow key={session.id} {...rowProps} />
+        <SortableSidebarSessionRow key={`${session.profile ?? ''}::${session.id}`} {...rowProps} />
       ) : (
-        <SidebarSessionRow key={session.id} {...rowProps} />
+        <SidebarSessionRow key={`${session.profile ?? ''}::${session.id}`} {...rowProps} />
       )
     },
     [
       activeSessionId,
+      card,
       onArchiveSession,
       onBranchSession,
       onDeleteSession,
       onResumeSession,
       onTogglePin,
+      onToggleUnread,
       pinned,
       showProfileTags
     ]
@@ -444,6 +460,7 @@ export function SidebarSessionsSection({
     const virtual = (
       <VirtualSessionList
         activeSessionId={activeSessionId}
+        card={card}
         className={contentClassName}
         dividerAction={dividerAction}
         onArchiveSession={onArchiveSession}
@@ -451,6 +468,7 @@ export function SidebarSessionsSection({
         onDeleteSession={onDeleteSession}
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
+        onToggleUnread={onToggleUnread}
         pinned={pinned}
         rows={flatRows}
         showProfileTags={showProfileTags}
@@ -477,8 +495,10 @@ export function SidebarSessionsSection({
   }
 
   // The virtualizer owns its own scroller, so suppress the wrapper's overflow
-  // to avoid a double scroll container.
-  const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-y-visible')
+  // to avoid a double scroll container. Both axes: `overflow-y-visible` next
+  // to the inherited `overflow-x-hidden` computes to `auto` (CSS spec), which
+  // kept a phantom 4px scrollbar gutter and cut every row short on the right.
+  const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-visible')
 
   return (
     <SidebarGroup className={rootClassName}>
@@ -505,9 +525,11 @@ interface SortableSessionRowProps {
   session: SessionInfo
   isPinned: boolean
   isSelected: boolean
+  unread: boolean
   onArchive: () => void
   onDelete: () => void
   onPin: () => void
+  onToggleUnread: () => void
   onResume: () => void
 }
 
