@@ -1,13 +1,9 @@
-"""
-Platform adapters for messaging integrations.
+"""Platform adapters for messaging integrations (receive, send, auth, media)."""
 
-Each adapter handles:
-- Receiving messages from a platform
-- Sending messages/responses back
-- Platform-specific authentication
-- Message formatting and media handling
-"""
+from .base import BasePlatformAdapter, SendResult
+from .event import MessageEvent
 
+<<<<<<< HEAD
 from .base import BasePlatformAdapter, MessageEvent, SendResult
 
 # QQAdapter and YuanbaoAdapter were previously imported eagerly here, but
@@ -47,3 +43,6 @@ def __getattr__(name):
 
 def __dir__():
     return sorted(__all__)
+=======
+__all__ = ["BasePlatformAdapter", "MessageEvent", "SendResult"]
+>>>>>>> upstream/main
