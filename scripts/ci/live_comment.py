@@ -12,8 +12,13 @@ The comment is identified by the ``<!-- hermes-ci-review-bot -->`` marker
 previous comment from an earlier run.
 
 This runs from ``.github/workflows/ci-review-comment.yml``, a separate
-``workflow_run`` workflow. Thus ``GITHUB_RUN_ID`` names the CI run to report
-on, not the run that contains this script. The poller reports on runs that
+``workflow_run`` workflow. Thus ``CI_RUN_ID`` names the CI run to report
+on, not the run that contains this script. (The variable cannot be
+called ``GITHUB_RUN_ID``: the Actions runner sets the ``GITHUB_*``
+defaults itself and ignores an ``env:`` override, so that name would
+silently resolve to the poller's own run — which stays ``in_progress``
+for as long as the poller runs, deadlocking it against itself.)
+The poller reports on runs that
 it does not belong to. This is also how it covers a workflow that CI does
 not contain: ``WATCH_WORKFLOWS`` names sibling workflows that the same
 commit triggered (the Docker image build). Their jobs join the comment.
@@ -53,6 +58,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -420,7 +426,7 @@ def _download_artifact(
 def _parse_status_file(status_file: Path) -> list[dict]:
     """Parse a review-status.json file in GITHUB_OUTPUT format."""
     try:
-        content = status_file.read_text(encoding="utf-8").strip()
+        content = status_file.read_text(encoding="utf-8-sig").strip()
         if content.startswith("review_status="):
             content = content[len("review_status="):]
         statuses = json.loads(content)
@@ -446,7 +452,7 @@ def fetch_all_review_statuses(
     Artifacts that don't exist yet or fail to parse are silently skipped.
     """
     all_statuses: list[dict] = []
-    temp_base = Path("/tmp/review-status-artifacts")
+    temp_base = Path(tempfile.gettempdir()) / "review-status-artifacts"
 
     try:
         artifacts = _list_artifacts(token, repo, run_id)
@@ -721,7 +727,7 @@ def main() -> int:
 
     token = os.environ.get("GITHUB_TOKEN", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_id = os.environ.get("CI_RUN_ID", "")
     pr_number = os.environ.get("PR_NUMBER", "")
     run_url = os.environ.get("RUN_URL", "")
 
@@ -737,7 +743,7 @@ def main() -> int:
             print("GITHUB_REPOSITORY is required", file=sys.stderr)
             return 1
         if not run_id:
-            print("GITHUB_RUN_ID is required", file=sys.stderr)
+            print("CI_RUN_ID is required", file=sys.stderr)
             return 1
 
     # Build commit info line from env vars (set by ci-review-comment.yml).

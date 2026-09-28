@@ -20,8 +20,13 @@ Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python.
 | Author | Nous Research |
 | License | MIT |
 | Platforms | linux, macos, windows |
+<<<<<<< HEAD
 | Tags | `Google`, `Gmail`, `Calendar`, `Drive`, `Sheets`, `Docs`, `Contacts`, `Email`, `OAuth`, `Service Account` |
 | Related skills | [`himalaya`](/docs/user-guide/skills/bundled/email/email-himalaya) |
+=======
+| Tags | `Google`, `Gmail`, `Calendar`, `Drive`, `Sheets`, `Docs`, `Contacts`, `Email`, `OAuth` |
+| Related skills | [`himalaya`](../../bundled/email/email-himalaya.md) |
+>>>>>>> upstream/main
 
 ## Reference: full SKILL.md
 
@@ -47,6 +52,11 @@ Gmail, Calendar, Drive, Contacts, Sheets, and Docs — through Hermes-managed OA
 
 The setup is fully non-interactive — you drive it step by step so it works
 on CLI, Telegram, Discord, or any platform.
+
+Run the setup script with Python from the Hermes environment, not an unrelated
+system Python. `--install-deps` syncs Hermes' declared Google extra through PM;
+after syncing, restart Hermes and rerun the OAuth command. If Hermes is not
+importable, use `hermes setup` first rather than installing packages with pip.
 
 Define a shorthand first:
 
@@ -351,8 +361,9 @@ $GAPI sheets append SHEET_ID "Sheet1!A:C" --values '[["new","row","data"]]'
 ### Docs
 
 ```bash
-# Read
+# Read (a tabbed Doc returns a "tabs" array; single-tab and legacy Docs also return "body")
 $GAPI docs get DOC_ID
+$GAPI docs get DOC_ID --tab TAB_ID     # read one tab of a tabbed Doc
 
 # Create a new Doc (optionally seeded with body text)
 $GAPI docs create --title "Meeting Notes"
@@ -360,6 +371,7 @@ $GAPI docs create --title "Draft" --body "First paragraph..."
 
 # Append text to the end of an existing Doc
 $GAPI docs append DOC_ID --text "Additional content to append"
+$GAPI docs append DOC_ID --tab TAB_ID --text "..."   # --tab required when the Doc has multiple tabs
 ```
 
 ## Output Format
