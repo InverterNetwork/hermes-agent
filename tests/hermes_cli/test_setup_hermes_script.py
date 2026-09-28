@@ -12,6 +12,7 @@ OPS_DIR = REPO_ROOT / "ops"
 def test_setup_hermes_script_is_valid_shell():
     result = subprocess.run(["bash", "-n", str(SETUP_SCRIPT)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+<<<<<<< HEAD
 
 
 def test_installer_script_is_valid_shell():
@@ -585,3 +586,5 @@ def test_installer_supports_local_hermes_state_quay_fixture():
     assert 'repo_id == "hermes-state"' in verify
     assert 'repo_url == "https://github.com/InverterNetwork/hermes-state"' in verify
     assert '"--state"' in verify_cli
+=======
+>>>>>>> upstream/main
