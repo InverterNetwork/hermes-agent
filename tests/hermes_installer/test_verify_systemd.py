@@ -127,3 +127,34 @@ def test_atlas_partial_timer_install_checks_both_units(monkeypatch):
 
     assert "atlas-source-sync.timer" in checked_units
     assert "atlas-source-sync-full.timer" in checked_units
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_enrichment_timer_is_required_when_configured(monkeypatch, enabled):
+    checked = []
+    def values(_file, _helper, key):
+        return "true" if enabled and key == "atlas.index_enrich.enabled" else "false"
+    def run(argv, **kwargs):
+        if argv[0] == "systemctl":
+            checked.append(argv[-1])
+            if argv[-1] == "atlas-index-enrich.timer":
+                return 0, "ActiveState=inactive\nLoadState=not-found\nUnitFileState=disabled\n", ""
+            return 0, "ActiveState=active\nLoadState=loaded\nUnitFileState=enabled\n", ""
+        return 0, "", ""
+    monkeypatch.setattr(verify, "_values_get", values)
+    monkeypatch.setattr(verify, "_run", run)
+    monkeypatch.setattr(verify, "_owner", lambda _p: "root")
+    monkeypatch.setattr(verify.Path, "is_file", lambda _p: False)
+    state = _FakeState()
+    verify._check_systemd(state)
+    assert ("atlas-index-enrich.timer" in checked) == enabled
+    assert any("atlas-index-enrich.timer" in label for label, _ in state.drifts) == enabled
+
+
+def test_disabled_enrichment_reports_a_running_timer(monkeypatch):
+    monkeypatch.setattr(verify, "_run", _run_factory("ActiveState=active\nLoadState=loaded\nUnitFileState=enabled\n"))
+    monkeypatch.setattr(verify, "_owner", lambda _p: "root")
+    monkeypatch.setattr(verify.Path, "is_file", lambda p: p.name == "atlas-index-enrich.timer")
+    state = _FakeState()
+    verify._check_systemd(state)
+    assert ("atlas-index-enrich.timer", "active although enrichment is disabled") in state.drifts
