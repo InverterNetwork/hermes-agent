@@ -2147,6 +2147,10 @@ def _check_systemd(s: _State) -> None:
             timers.extend(_atlas_timers)
     if _values_get(s.values_file, s.values_helper, "atlas.index_enrich.enabled") == "true":
         timers.append("atlas-index-enrich.timer")
+    elif (Path(s.systemd_dir) / "atlas-index-enrich.timer").is_file():
+        rc, active, _ = _run(["systemctl", "is-active", "atlas-index-enrich.timer"])
+        if rc == 0:
+            s.v_drift("atlas-index-enrich.timer", "active although enrichment is disabled")
     for u in timers:
         # Batch the three property reads into a single `systemctl show` —
         # systemctl emits properties in its own (alphabetical) order, not

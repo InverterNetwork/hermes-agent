@@ -149,3 +149,12 @@ def test_enrichment_timer_is_required_when_configured(monkeypatch, enabled):
     verify._check_systemd(state)
     assert ("atlas-index-enrich.timer" in checked) == enabled
     assert any("atlas-index-enrich.timer" in label for label, _ in state.drifts) == enabled
+
+
+def test_disabled_enrichment_reports_a_running_timer(monkeypatch):
+    monkeypatch.setattr(verify, "_run", _run_factory("ActiveState=active\nLoadState=loaded\nUnitFileState=enabled\n"))
+    monkeypatch.setattr(verify, "_owner", lambda _p: "root")
+    monkeypatch.setattr(verify.Path, "is_file", lambda p: p.name == "atlas-index-enrich.timer")
+    state = _FakeState()
+    verify._check_systemd(state)
+    assert ("atlas-index-enrich.timer", "active although enrichment is disabled") in state.drifts

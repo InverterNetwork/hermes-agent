@@ -360,6 +360,16 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   fi
 fi
 
+ATLAS_INDEX_ENRICH_ENABLED="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.index_enrich.enabled 2>/dev/null || true)"
+if [[ "$ATLAS_INDEX_ENRICH_ENABLED" == "true" ]]; then
+  python3 - "$ATLAS_VERSION" <<'PY_VERSION'
+import re, sys
+match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", sys.argv[1])
+if match is None or tuple(map(int, match.groups())) < (0, 1, 23):
+    raise SystemExit("FAIL: atlas.index_enrich.enabled requires atlas.version >= v0.1.23")
+PY_VERSION
+fi
+
 if [[ "$ATLAS_ENABLED" -eq 1 && "$AUTH_METHOD" != "app" ]]; then
   echo "FAIL: atlas.version is set but --auth-method app was not passed." >&2
   echo "      Atlas uses the Atlas manager GitHub App for release downloads and atlas-kb git auth." >&2
@@ -2265,15 +2275,15 @@ fi
 # ---------- Atlas index enrichment ----------
 # Atlas v0.1.23 writes deterministic metadata, then enriches it asynchronously.
 # Run independently of ingestion so AI latency cannot hold the KB write lock.
-ATLAS_INDEX_ENRICH_ENABLED="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.index_enrich.enabled 2>/dev/null || true)"
 if [[ "$ATLAS_INDEX_ENRICH_ENABLED" == "true" ]]; then
-  [[ "$ATLAS_ENABLED" -eq 1 ]] || { echo "FAIL: atlas.index_enrich.enabled requires atlas.version" >&2; exit 1; }
   if command -v systemctl >/dev/null 2>&1; then
     echo "==> installing Atlas index enrichment timer"
-    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
-        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
-        "$OPS_DIR/atlas-index-enrich.service" \
-      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-index-enrich.service
+    PYTHONPATH="$FORK_DIR/installer" "$PYTHON_BIN" -m hermes_installer \
+      render-systemd-unit \
+      --template "$OPS_DIR/atlas-index-enrich.service" \
+      --out /etc/systemd/system/atlas-index-enrich.service \
+      --set "AGENT_USER=$AGENT_USER" \
+      --set "TARGET_DIR=$TARGET_DIR"
     install -o root -g root -m 0644 "$OPS_DIR/atlas-index-enrich.timer" /etc/systemd/system/atlas-index-enrich.timer
     install -o root -g root -m 0644 "$OPS_DIR/atlas-index-enrich-failure.service" /etc/systemd/system/atlas-index-enrich-failure.service
     systemctl daemon-reload
