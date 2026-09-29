@@ -1,0 +1,29 @@
+[Unit]
+# Daily FULL reconciliation. The hourly atlas-source-sync now runs Slack
+# INCREMENTALLY (fast, windowed) so it cannot time out; this daily run passes
+# --full so Slack does a whole-channel reconciliation — the authoritative pass
+# that catches deletions, edits/replies to old content, and any incremental
+# drift, protected by the bulk-delete guard. GitHub/GitBook ignore --full (they
+# are always full and fast). It carries a long timeout for the full re-fetch.
+Description=Atlas source full reconciliation (daily)
+After=network-online.target
+Wants=network-online.target
+OnFailure=atlas-source-sync-failure.service
+
+[Service]
+Type=oneshot
+User=__AGENT_USER__
+Group=__AGENT_USER__
+Environment=HERMES_HOME=__TARGET_DIR__
+Environment=ATLAS_CONFIG=__ATLAS_CONFIG__
+Environment=ATLAS_SYNC_SOURCE_NAMES=__ATLAS_SYNC_SOURCE_NAMES__
+Environment=HERMES_ATLAS_SOURCE_READER_GH_CONFIG=__TARGET_DIR__/auth/atlas-source-reader.env
+EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env
+EnvironmentFile=-__TARGET_DIR__/auth/atlas.env
+EnvironmentFile=-/etc/default/atlas-source-sync
+ExecStart=/usr/local/sbin/atlas-source-sync-runner --full
+Restart=no
+TimeoutStartSec=10800
+
+[Install]
+WantedBy=multi-user.target

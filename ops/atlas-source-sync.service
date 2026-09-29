@@ -2,6 +2,8 @@
 Description=Atlas source sync
 After=network-online.target
 Wants=network-online.target
+# Emit an ERR-priority journal alert on failure (github/gitbook/slack sync).
+OnFailure=atlas-source-sync-failure.service
 
 [Service]
 Type=oneshot

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Checksum-install one pinned googleworkspace/cli release.
+
+set -euo pipefail
+
+VERSION=""
+RELEASE_REPO=""
+ARCH=""
+EXPECTED_SHA=""
+BIN_DST=""
+EXPECTED_SHA_DST=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version) VERSION="$2"; shift 2 ;;
+    --release-repo) RELEASE_REPO="$2"; shift 2 ;;
+    --arch) ARCH="$2"; shift 2 ;;
+    --expected-sha) EXPECTED_SHA="$2"; shift 2 ;;
+    --bin-dst) BIN_DST="$2"; shift 2 ;;
+    --expected-sha-dst) EXPECTED_SHA_DST="$2"; shift 2 ;;
+    *) echo "FAIL: unknown install-gws-release argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ "$VERSION" == "0.22.5" ]] \
+  || { echo "FAIL: gws version must be exactly 0.22.5" >&2; exit 1; }
+[[ "$RELEASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+  || { echo "FAIL: gws release repository must be an owner/repo slug" >&2; exit 1; }
+[[ "$ARCH" == "x86_64" || "$ARCH" == "aarch64" ]] \
+  || { echo "FAIL: unsupported gws architecture" >&2; exit 1; }
+[[ "$EXPECTED_SHA" =~ ^[a-f0-9]{64}$ ]] \
+  || { echo "FAIL: gws expected SHA256 must be lowercase hexadecimal" >&2; exit 1; }
+[[ -n "$BIN_DST" && -n "$EXPECTED_SHA_DST" ]] \
+  || { echo "FAIL: gws destination paths are required" >&2; exit 1; }
+
+ASSET="google-workspace-cli-${ARCH}-unknown-linux-gnu.tar.gz"
+TMP="$(mktemp -d)"
+trap 'rm -rf -- "$TMP"' EXIT
+
+curl -fsSL -o "$TMP/$ASSET" -- \
+  "https://github.com/${RELEASE_REPO}/releases/download/v${VERSION}/${ASSET}"
+ACTUAL_ARCHIVE_SHA="$(sha256sum "$TMP/$ASSET" | awk '{print $1}')"
+[[ "$ACTUAL_ARCHIVE_SHA" == "$EXPECTED_SHA" ]] \
+  || { echo "FAIL: pinned SHA256 mismatch for $ASSET (gws ${VERSION})" >&2; exit 1; }
+
+tar --no-same-owner --no-same-permissions -xzf "$TMP/$ASSET" -C "$TMP"
+[[ -f "$TMP/gws" && ! -L "$TMP/gws" && -x "$TMP/gws" ]] \
+  || { echo "FAIL: gws archive did not contain a regular executable gws" >&2; exit 1; }
+ACTUAL_VERSION="$("$TMP/gws" --version 2>/dev/null | head -n 1)"
+[[ " $ACTUAL_VERSION " == *" $VERSION "* ]] \
+  || { echo "FAIL: downloaded gws version mismatch (expected ${VERSION})" >&2; exit 1; }
+
+install -m 0755 "$TMP/gws" "$BIN_DST"
+install -d -m 0755 "$(dirname "$EXPECTED_SHA_DST")"
+BIN_SHA="$(sha256sum "$BIN_DST" | awk '{print $1}')"
+printf '%s\n' "$BIN_SHA" | install -m 0644 /dev/stdin "$EXPECTED_SHA_DST"

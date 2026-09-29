@@ -15,7 +15,7 @@ Environment=ATLAS_KB_ROOT=__ATLAS_KB_ROOT__
 Environment=ATLAS_AI_MODE=__ATLAS_AI_MODE__
 Environment=ATLAS_CODEX_BIN=__ATLAS_CODEX_BIN__
 Environment=ATLAS_CODEX_TIMEOUT_MS=__ATLAS_CODEX_TIMEOUT_MS__
-# Values-derived Atlas runtime env, such as Google Docs service-account path.
+# Values-derived Atlas runtime env, including pinned gws auth/cache paths.
 EnvironmentFile=-__TARGET_DIR__/auth/atlas-runtime.env
 # Atlas source secrets such as GITBOOK_API_TOKEN live here when configured.
 EnvironmentFile=-__TARGET_DIR__/auth/atlas.env

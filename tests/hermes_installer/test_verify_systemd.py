@@ -98,3 +98,32 @@ def test_inactive_timer_reports_drift(monkeypatch, tmp_path):
     timer_drifts = [d for d in s.drifts if "timer" in d[0]]
     assert len(timer_drifts) >= 1
     assert "active=inactive" in timer_drifts[0][1]
+
+
+def test_atlas_partial_timer_install_checks_both_units(monkeypatch):
+    out = "ActiveState=active\nLoadState=loaded\nUnitFileState=enabled\n"
+    checked_units: list[str] = []
+
+    def fake_run(argv: list[str], **_: Any) -> tuple[int, str, str]:
+        if argv and argv[0] == "systemctl":
+            checked_units.append(argv[-1])
+            return 0, out, ""
+        return 0, "", ""
+
+    monkeypatch.setattr(verify, "_run", fake_run)
+    monkeypatch.setattr(verify, "_owner", lambda p: "root")
+    monkeypatch.setattr(
+        verify,
+        "_values_get",
+        lambda *_args, **_kwargs: "true",
+    )
+    monkeypatch.setattr(
+        verify.Path,
+        "is_file",
+        lambda self: self.name == "atlas-source-sync.timer",
+    )
+
+    verify._check_systemd(_FakeState())
+
+    assert "atlas-source-sync.timer" in checked_units
+    assert "atlas-source-sync-full.timer" in checked_units
