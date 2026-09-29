@@ -1,0 +1,18 @@
+[Unit]
+Description=Atlas asynchronous index enrichment
+After=network-online.target atlas-hub.service
+Wants=network-online.target
+OnFailure=atlas-index-enrich-failure.service
+
+[Service]
+Type=oneshot
+User=__AGENT_USER__
+Group=__AGENT_USER__
+Environment=HERMES_HOME=__TARGET_DIR__
+WorkingDirectory=__TARGET_DIR__
+ExecStart=/usr/local/bin/atlas-as-hermes --local index enrich
+# Per-record progress is durable, so an interrupted pass resumes next time.
+TimeoutStartSec=3600
+MemoryMax=4G
+TasksMax=128
+Restart=no

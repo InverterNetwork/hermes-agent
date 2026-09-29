@@ -766,16 +766,21 @@ atlas:
   # from the release below, verifies it against SHA256SUMS, and installs it
   # as /usr/local/bin/atlas. Keep this empty until a published Atlas release
   # exists, or to skip Atlas provisioning.
-  version: "v0.1.22"
+  version: "v0.1.23"
   release_repo: InverterNetwork/atlas
   kb_repo: https://github.com/InverterNetwork/atlas-kb
   kb_branch: main
   # Empty means "$HERMES_HOME/atlas-kb". Keep non-secret paths/config here;
   # App PEMs and Codex OAuth state are staged on the host.
   kb_root: ""
+  # AI metadata now runs separately from deterministic ingestion (Atlas v0.1.23).
+  index_enrich:
+    enabled: true
   ai:
     mode: codex-exec
     codex_binary: /usr/local/bin/codex
+    # Preserve the model currently configured for Otto on Krustentier.
+    codex_model: gpt-5.4
     codex_timeout_ms: 120000
   google_docs:
     # Atlas uses only this pinned gws binary and authorized-user grant. The

@@ -1,0 +1,6 @@
+[Unit]
+Description=Alert on Atlas index enrichment failure
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.err -t atlas-alert "Atlas index enrichment failed; inspect atlas-index-enrich.service journal"

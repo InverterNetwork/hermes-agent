@@ -218,6 +218,7 @@ jobs:
           # unchanged.
           atlas = data.setdefault("atlas", {})
           atlas["version"] = ""
+          atlas.setdefault("index_enrich", {})["enabled"] = False
           atlas_hub = atlas.setdefault("hub", {})
           atlas_hub["enabled"] = False
           atlas_hub["public_base_url"] = ""

@@ -1387,6 +1387,7 @@ if [[ "$ATLAS_ENABLED" -eq 1 ]]; then
   fi
   ATLAS_CODEX_BIN="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.codex_binary 2>/dev/null || true)"
   ATLAS_CODEX_BIN="${ATLAS_CODEX_BIN:-/usr/local/bin/codex}"
+  ATLAS_CODEX_MODEL="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.codex_model 2>/dev/null || true)"
   ATLAS_CODEX_TIMEOUT_MS="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.ai.codex_timeout_ms 2>/dev/null || true)"
   ATLAS_CODEX_TIMEOUT_MS="${ATLAS_CODEX_TIMEOUT_MS:-120000}"
   ATLAS_AI_MODE="${ATLAS_AI_MODE:-codex-exec}"
@@ -1555,6 +1556,9 @@ PY
     printf 'ai:\n'
     printf '  mode: "%s"\n' "$ATLAS_AI_MODE"
     printf '  codex_bin: "%s"\n' "$ATLAS_CODEX_BIN"
+    if [[ -n "$ATLAS_CODEX_MODEL" ]]; then
+      printf '  codex_model: "%s"\n' "$ATLAS_CODEX_MODEL"
+    fi
     printf '  timeout_ms: %s\n' "$ATLAS_CODEX_TIMEOUT_MS"
     if [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
       printf 'hub:\n'
@@ -2256,6 +2260,27 @@ EOF
   fi
 elif [[ "$ATLAS_HUB_ENABLED" -eq 1 ]]; then
   echo "==> WARNING: $ATLAS_HUB_SRC missing; skipping atlas-hub install" >&2
+fi
+
+# ---------- Atlas index enrichment ----------
+# Atlas v0.1.23 writes deterministic metadata, then enriches it asynchronously.
+# Run independently of ingestion so AI latency cannot hold the KB write lock.
+ATLAS_INDEX_ENRICH_ENABLED="$(python3 "$VALUES_HELPER" --values "$VALUES_FILE" get atlas.index_enrich.enabled 2>/dev/null || true)"
+if [[ "$ATLAS_INDEX_ENRICH_ENABLED" == "true" ]]; then
+  [[ "$ATLAS_ENABLED" -eq 1 ]] || { echo "FAIL: atlas.index_enrich.enabled requires atlas.version" >&2; exit 1; }
+  if command -v systemctl >/dev/null 2>&1; then
+    echo "==> installing Atlas index enrichment timer"
+    sed -e "s|__AGENT_USER__|$AGENT_USER|g" \
+        -e "s|__TARGET_DIR__|$TARGET_DIR|g" \
+        "$OPS_DIR/atlas-index-enrich.service" \
+      | install -o root -g root -m 0644 /dev/stdin /etc/systemd/system/atlas-index-enrich.service
+    install -o root -g root -m 0644 "$OPS_DIR/atlas-index-enrich.timer" /etc/systemd/system/atlas-index-enrich.timer
+    install -o root -g root -m 0644 "$OPS_DIR/atlas-index-enrich-failure.service" /etc/systemd/system/atlas-index-enrich-failure.service
+    systemctl daemon-reload
+    systemctl enable --now atlas-index-enrich.timer
+  fi
+elif command -v systemctl >/dev/null 2>&1 && [[ -f /etc/systemd/system/atlas-index-enrich.timer ]]; then
+  systemctl disable --now atlas-index-enrich.timer
 fi
 
 # ---------- Atlas source sync ----------
